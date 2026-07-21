@@ -44,7 +44,6 @@ archive-magic/
 ├── README.md
 ├── ARCHITECTURE.md
 ├── LICENSE
-├── THIRD_PARTY_NOTICES.md
 │
 ├── archive-magic-fetch/
 │   ├── README.md
@@ -95,7 +94,7 @@ Stage 1 defines:
 - The initial WARC 1.0 one-URL-per-file profile.
 - The completed collection directory and manifest contract.
 - Collection portability, immutability, validation, and publication invariants.
-- Licensing and third-party attribution.
+- Project licensing and the policy for reviewing dependency licenses when dependencies are introduced.
 - Exact dependency-pinning policy.
 - Acceptance criteria for the later stages.
 
@@ -108,12 +107,10 @@ Fetch publishes a self-contained collection with this logical shape:
 ```text
 collections/<slug>/
 ├── archive/
-│   ├── <url-id-00000>.warc.gz
-│   ├── <url-id-00001>.warc.gz
+│   ├── <url-id>.warc.gz
 │   └── ...
 ├── indexes/
-│   ├── <url-id-00000>.cdxj
-│   ├── <url-id-00001>.cdxj
+│   ├── <url-id>.cdxj
 │   └── ...
 └── metadata/
     ├── manifest.json
@@ -124,9 +121,15 @@ Each WARC and matching CDXJ represent exactly one exact target URL. The stable `
 
 The collection directory is the only integration contract between Fetch and Replay. Copying the `<slug>/` directory to another machine or archive root must preserve its validity. Published metadata uses normalized relative paths and contains no dependency on Fetch staging paths.
 
+The metadata files are private Archive Magic collection metadata rather than public interchange standards. Stage 3 defines their Python models, serialized JSON representation, and repeatable collection validator when it implements publication. The manifest must remain a small versioned envelope that records the collection profile, final state, artifact paths, exact sizes and checksums, and warnings needed to validate and consume the collection. A separate JSON Schema is added only if a concrete external or cross-language consumer requires one.
+
+For the initial profile, `url-id` is `url-` followed by the complete lowercase hexadecimal SHA-256 digest of the exact target URL's UTF-8 bytes. Fetch applies no URL canonicalization or Unicode normalization before hashing. It must reject the collection if an existing identifier maps to a different exact URL.
+
+All published paths are normalized POSIX-style paths relative to the collection root. Absolute paths, backslashes, empty segments, `.` or `..` segments, and paths into Fetch staging are invalid. Artifact sizes are exact non-negative byte counts. Artifact checksums use lowercase hexadecimal SHA-256 over the exact published bytes. The manifest lists every WARC, CDXJ, and source inventory artifact but does not attempt a self-referential checksum of `manifest.json`.
+
 The versioned manifest is the authoritative completion marker. It identifies every WARC, CDXJ, and inventory artifact and records its exact size and checksum. Only explicit final states such as `completed` and `completed_with_warnings` may be published. In-progress, cancelled, and failed work remains in staging, and a collection with no preserved captures is never published.
 
-The source inventory is mandatory. It contains one durable outcome for every selected capture, including the complete raw CDX row, normalized fields, source digest, calculated digest for downloaded payloads, warnings, output WARC, and record references. Source null, empty, missing, and unknown values remain distinguishable.
+The source inventory is a private Fetch audit artifact, not a Replay interface. It contains one durable outcome for every selected capture, including the complete raw CDX row, normalized fields needed by Fetch, digest information, warnings, and any output record reference. Stage 3 chooses the smallest Python and JSON representation that preserves this information; Replay must not depend on its internal fields.
 
 Published collections are immutable. Updating, extending, repairing, merging, or changing the WARC profile produces a new collection or a future explicitly versioned operation; it does not mutate published WARC bytes or indexes.
 
