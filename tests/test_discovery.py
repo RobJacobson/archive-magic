@@ -7,7 +7,13 @@ from archive_magic_fetch import cli, discovery
 
 def test_discover_uses_ia_explicit_bounds_and_no_limit(monkeypatch):
     calls = {}
-    expected = [{"url": "https://example.com/", "timestamp": "20000101000000"}]
+    expected = [
+        {
+            "urlkey": "com,example)/",
+            "url": "https://example.com/",
+            "timestamp": "20000101000000",
+        }
+    ]
 
     class FakeFetcher:
         def __init__(self, **kwargs):
@@ -26,32 +32,103 @@ def test_discover_uses_ia_explicit_bounds_and_no_limit(monkeypatch):
     }
 
 
-def test_group_captures_uses_exact_url_and_sorts_by_timestamp():
+def test_group_captures_uses_urlkey_and_sorts_variants_by_timestamp():
     captures = [
-        {"url": "https://example.com/?a=1", "timestamp": "20200102000000"},
-        {"url": "http://example.com/?a=1", "timestamp": "20200101000000"},
-        {"url": "https://example.com/?a=1", "timestamp": "20190101000000"},
-        {"url": "https://example.com/?a=2", "timestamp": "20180101000000"},
+        {
+            "urlkey": "com,example)/index.html",
+            "url": "https://example.com/index.html",
+            "timestamp": "20200102000000",
+        },
+        {
+            "urlkey": "com,example)/index.html",
+            "url": "http://www.example.com:80/index.html",
+            "timestamp": "20190101000000",
+        },
+        {
+            "urlkey": "com,example)/other.html",
+            "url": "https://example.com/other.html",
+            "timestamp": "20180101000000",
+        },
     ]
 
     grouped = discovery.group_captures(captures)
 
     assert list(grouped) == [
-        "https://example.com/?a=1",
-        "http://example.com/?a=1",
-        "https://example.com/?a=2",
+        "com,example)/index.html",
+        "com,example)/other.html",
     ]
-    assert [capture["timestamp"] for capture in grouped["https://example.com/?a=1"]] == [
+    assert [
+        capture["timestamp"]
+        for capture in grouped["com,example)/index.html"]
+    ] == [
         "20190101000000",
         "20200102000000",
     ]
 
 
+def test_group_captures_strips_fragments_before_export():
+    capture = {
+        "urlkey": "com,example)/index.html",
+        "url": "http://www.example.com:80/index.html#content-primary",
+        "timestamp": "20060114082621",
+    }
+
+    grouped = discovery.group_captures([capture])
+
+    assert capture["url"] == "http://www.example.com:80/index.html"
+    assert grouped["com,example)/index.html"] == [capture]
+
+
+def test_group_captures_strips_bare_empty_query_before_export():
+    capture = {
+        "urlkey": "com,example)/index.html",
+        "url": "http://www.example.com:80/index.html?#content-primary",
+        "timestamp": "20070129100228",
+    }
+
+    grouped = discovery.group_captures([capture])
+
+    assert capture["url"] == "http://www.example.com:80/index.html"
+    assert grouped["com,example)/index.html"] == [capture]
+
+
+def test_group_captures_preserves_nonempty_query():
+    capture = {
+        "urlkey": "com,example)/index.html?mode=print",
+        "url": "https://example.com/index.html?mode=print#content",
+        "timestamp": "20200101000000",
+    }
+
+    discovery.group_captures([capture])
+
+    assert capture["url"] == "https://example.com/index.html?mode=print"
+
+
+def test_group_captures_collapses_literal_duplicate_cdx_rows():
+    row = {
+        "urlkey": "com,example)/index.html",
+        "url": "https://example.com/index.html",
+        "timestamp": "20200101000000",
+        "status": "200",
+        "digest": "A" * 32,
+    }
+
+    grouped = discovery.group_captures([row.copy(), row.copy()])
+
+    assert grouped["com,example)/index.html"] == [row]
+
+
 def test_cli_applies_defaults_and_passes_pattern_unchanged(monkeypatch):
     calls = {}
-    captures = [{"url": "https://example.com/", "timestamp": "20000101000000"}]
-    grouped = OrderedDict([("https://example.com/", captures)])
-    paths = {"https://example.com/": object()}
+    captures = [
+        {
+            "urlkey": "com,example)/",
+            "url": "https://example.com/",
+            "timestamp": "20000101000000",
+        }
+    ]
+    grouped = OrderedDict([("com,example)/", captures)])
+    paths = {"com,example)/": object()}
 
     def fake_discover(pattern, start, end):
         calls["discover"] = (pattern, start, end)
@@ -105,4 +182,3 @@ def test_cli_rejects_unapproved_arguments():
         cli.parse_args(["example.com/*", "--output", "elsewhere"])
 
     assert error.value.code == 2
-

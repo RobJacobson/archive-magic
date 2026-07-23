@@ -1,6 +1,6 @@
 # WARC, CDX, Deduplication, and Replay Research Memo
 
-**Status:** Current research summary; non-normative · **Architecture decision updated:** 2026-07-21
+**Status:** Historical research summary; non-normative · **Architecture decision superseded:** 2026-07-22
 
 **Date:** 2026-07-20
 
@@ -8,7 +8,14 @@
 
 **Purpose:** Summarize research into WARC 1.0 and 1.1, CDX/CDXJ, `cdx_toolkit`, revisit-based deduplication, and pywb interoperability, and evaluate the implementation options behind the current Archive Magic architecture.
 
-This memo is non-normative. If it conflicts with `ARCHITECTURE.md`, the current architecture controls.
+This memo is non-normative. If it conflicts with `ARCHITECTURE-FETCH.md`, the current architecture controls.
+
+> **Decision update (2026-07-22):** The current MVP intentionally groups one
+> WARC per CDX URL key and deduplicates payload/status combinations across URL
+> spellings in that group. It writes cross-target canonical reference fields in
+> WARC 1.0 and accepts the interoperability tradeoff described below. The older
+> same-exact-URL recommendation retained in this research memo is historical,
+> not an implementation requirement.
 
 ## Executive summary
 

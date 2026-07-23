@@ -7,17 +7,20 @@ Implement the MVP described in [`ARCHITECTURE-FETCH.md`](ARCHITECTURE-FETCH.md).
 The finished feature is a small Python CLI that:
 
 1. Queries the Internet Archive CDX index for a URL pattern and optional date bounds.
-2. Groups captures by exact resource URL.
-3. Writes one WARC 1.0 `.warc.gz` file per exact URL.
-4. Downloads the first verified occurrence of each payload digest within that URL.
-5. Writes later same-URL duplicates as revisit records without downloading them again.
+2. Removes URL fragments and bare empty queries, collapses literal duplicate CDX rows, and groups distinct captures by CDX `urlkey`.
+3. Writes one WARC 1.0 `.warc.gz` file per URL-key resource family.
+4. Verifies each new IA source digest, decodes HTTP content encoding, and hashes normalized content.
+5. Omits same-resource scheme/www/default-port redirects and Internet Archive
+   playback substitutions.
+6. Writes later source or normalized-content duplicates as revisit records without unnecessary downloads or duplicate bodies.
 
 Treat the architecture memo as authoritative. Do not follow `DEPRECATED-ARCHITECTURE.md`, and do not implement `archive-magic-replay` concerns.
 
 ## Settled decisions
 
 - Python 3.12 or newer, with Python 3.14 pinned for local development.
-- `cdx_toolkit==0.9.39` for Internet Archive CDX discovery and capture retrieval.
+- `cdx_toolkit==0.9.39` for Internet Archive CDX discovery.
+- `requests==2.34.2` for raw Wayback playback streaming.
 - `warcio==1.8.1` for WARC writing.
 - Standard-library `argparse` for the CLI.
 - CLI shape:
@@ -35,8 +38,18 @@ Treat the architecture memo as authoritative. Do not follow `DEPRECATED-ARCHITEC
 - Existing output files cause an error; do not overwrite, append, merge, or resume.
 - Retrieval failures and digest mismatches warn, skip, and continue.
 - Local path, file-writing, compression, or WARC serialization failures stop the command.
-- All 3xx captures are downloaded and written as full responses. They are never revisit-deduplicated and never seed the digest map.
-- No page-dependency discovery. HTML, CSS, JavaScript, and images are independent exact URL resources.
+- Verified redirects that only switch HTTP/HTTPS, add or remove literal `www.`,
+  or add or remove the matching default port are omitted when path and query
+  are identical. Meaningful domain/path/query/nondefault-port redirects remain
+  in the WARC.
+- Internet Archive playback-generated redirects or capture substitutions are
+  never stored as origin responses. Same-resource alias substitutions are
+  omitted; meaningful substitutions warn and skip.
+- A verified omitted source digest/status is reused across the URL-key group
+  without another playback request. Undetectable `Location` changes are an
+  accepted retrieval-minimization tradeoff because CDX does not expose that
+  header.
+- No page-dependency discovery. HTML, CSS, JavaScript, and images remain independent CDX URL-key resource families.
 - No CDXJ, manifest, schema, database, staging transaction, concurrency, plugin system, or structured logging.
 
 ## Local development
@@ -69,11 +82,13 @@ archive-magic-fetch/
 │       ├── discovery.py
 │       ├── paths.py
 │       ├── export.py
+│       ├── retrieval.py
 │       └── warc.py
 └── tests/
     ├── test_discovery.py
     ├── test_paths.py
-    └── test_export.py
+    ├── test_export.py
+    └── test_retrieval.py
 ```
 
 Do not introduce `core/`, `application/`, `adapters/`, `models/`, `services/`, or abstract base classes. Prefer small ordinary functions. A tiny local dataclass or named tuple for a canonical response reference is acceptable if it makes the digest map clearer.
@@ -108,7 +123,7 @@ captures = list(
 )
 ```
 
-Do not pass a limit, filter, or collapse option. Group captures using `capture["url"]`, not `urlkey`, and sort each group by `capture["timestamp"]`.
+Do not pass a limit, filter, or server-side collapse option. Collapse only literal duplicate CDX result rows locally. Remove fragments and bare empty query delimiters from `capture["url"]`, group distinct captures using `capture["urlkey"]`, and sort each group by `capture["timestamp"]`.
 
 An empty result is successful and writes nothing. A CDX discovery failure is fatal.
 
@@ -117,25 +132,25 @@ An empty result is successful and writes nothing. A CDX discovery failure is fat
 Implement the mapping in `paths.py`:
 
 ```text
-./warcs/<scheme>/<host>/<URL directories>/<stem>--<12-char URL hash>.warc.gz
+./warcs/urlkey/<safe URL-key directories>/<stem>--<12-char URL-key hash>.warc.gz
 ```
 
 Examples:
 
 ```text
-https://example.com/
-  -> warcs/https/example.com/index--<hash>.warc.gz
+com,example)/
+  -> warcs/urlkey/com%2Cexample%29/index--<hash>.warc.gz
 
-https://example.com/images/logo.png?v=2
-  -> warcs/https/example.com/images/logo.png--<hash>.warc.gz
+com,example)/images/logo.png
+  -> warcs/urlkey/com%2Cexample%29/images/logo.png--<hash>.warc.gz
 ```
 
-The hash is the first 12 lowercase hexadecimal characters of SHA-256 over the exact URL bytes. Encode every scheme, host, and path component as one filesystem-safe segment. A URL must never introduce an absolute path, `.` or `..`, an extra separator, or a path outside `./warcs/`.
+Write beneath `warcs/urlkey/`, mirror safe encoded URL-key path segments, and use the first 12 lowercase hexadecimal characters of SHA-256 over the CDX `urlkey` as the filename suffix. A URL key must never introduce an absolute path, `.` or `..`, an extra separator, or a path outside `./warcs/`.
 
 After discovery and before any payload download:
 
-- Compute every selected URL's path.
-- Reject two URLs mapping to the same path.
+- Compute every selected URL-key group's path.
+- Reject two URL keys mapping to the same path.
 - Reject any path that already exists.
 
 ### 4. WARC helpers
@@ -146,37 +161,50 @@ Keep WARC mechanics in `warc.py`:
 - Use `WARCWriter(..., gzip=True, warc_version="1.0")`.
 - Write a minimal initial `warcinfo` record.
 - Convert the 14-digit CDX timestamp to the WARC 1.0 UTC form.
-- For fetched responses, replace `WARC-Target-URI` and `WARC-Date` with the exact CDX values before writing.
+- For fetched responses, replace `WARC-Target-URI` and `WARC-Date` with the normalized CDX values before writing.
 - Create identical-payload-digest revisit records with the current URL, current timestamp, payload digest, and `WARC-Refers-To` pointing to the canonical response record ID.
+- For cross-target revisits, set `WARC-Refers-To-Target-URI` and `WARC-Refers-To-Date` from the actual canonical response, not the current capture.
 - Do not synthesize request records.
 
 Be aware that `warcio.create_revisit_record()` supplies useful revisit fields but does not itself add the canonical response's `WARC-Record-ID` as `WARC-Refers-To`; add that header explicitly.
 
 ### 5. Export loop
 
-Implement the per-URL state machine in `export.py`.
+Implement the per-URL-key-group state machine in `export.py`.
 
-Use a fresh map for each exact URL:
+Use fresh source and normalized-content maps shared by each URL-key group:
 
 ```text
-digest -> canonical response record ID and capture date
+(CDX source digest, known status)
+    -> normalized digest and canonical response
+
+(normalized digest, known status)
+    -> canonical response record ID, target URI, and capture date
 ```
 
 For each capture in timestamp order:
 
 1. Normalize a usable CDX digest to `sha1:` plus uppercase Base32.
-2. If it is a non-redirect and the digest is already in the map, write a revisit without fetching.
-3. Otherwise call `capture.fetch_warc_record()`.
-4. Replace the synthesized target URL and date with CDX identity.
-5. Read the calculated `WARC-Payload-Digest` from the constructed response.
-6. If a usable CDX digest disagrees, warn and skip.
-7. Lazily create the output WARC only when the first response is ready to write.
-8. Write the response and log the successful download.
-9. Add a non-redirect response to the map with `setdefault()` so the first verified response stays canonical.
+2. If the same source digest and known status is already verified anywhere in the URL-key group, write a revisit using its normalized digest without fetching.
+3. Otherwise stream exact-timestamp Wayback playback with automatic decoding disabled.
+4. Detect an Internet Archive playback-generated redirect or substituted
+   capture before digest verification. Omit a same-resource alias destination;
+   warn and skip a meaningful destination.
+5. Accept an archived 4xx/5xx when playback status matches the numeric CDX
+   status; retry or skip a playback error that disagrees with CDX.
+6. Verify either the raw or playback-decoded candidate against the CDX source digest.
+7. Decode archived gzip/deflate content and repair representation-specific HTTP headers.
+8. Replace the target URL and date with normalized CDX identity.
+9. If a verified 3xx `Location` resolves to the same URL after only
+   scheme/www/default-port normalization, omit it and remember its source
+   digest/status.
+10. Read the normalized `WARC-Payload-Digest` from the constructed response.
+11. If normalized content already has a canonical response for this group/status, write a revisit; otherwise write the response.
+12. Record both source-to-normalized and normalized-to-canonical mappings.
 
-If the CDX digest is missing or malformed, download and write a full response; its calculated digest may seed the map. Do not retroactively turn that fetched response into a revisit.
+If the CDX digest is missing or malformed, download and normalize the response but do not seed the source-digest map. The normalized response may still become a revisit to existing content.
 
-If all captures for a URL are skipped, create no WARC—not even a `warcinfo`-only file.
+If all captures for a URL-key group are skipped, create no WARC—not even a `warcinfo`-only file.
 
 ### 6. Console messages
 
@@ -188,27 +216,41 @@ Required forms:
 Starting https://example.com/images/logo.png
 Downloaded 20170604120533 [a19f7c2e]
 WARNING skipped 20190812143015 https://example.com/images/logo.png: capture unavailable
+Omitted 13 canonical URL redirects
 ```
 
 The displayed download hash is the last eight characters of the normalized payload digest.
 
 ## Important implementation traps
 
-### `fetch_warc_record()` is used per unseen digest
+### Each unseen source digest is verified once
 
-It is not limited to the first capture of a URL. For digests `A, A, B, B`, fetch `A`, revisit `A`, fetch `B`, revisit `B`.
+For source digests `A, A, B, B`, fetch and verify `A`, revisit `A`, fetch and verify `B`, then revisit `B`. If `A` and `B` decode to the same normalized content, only the first is stored as a response.
 
 ### CDX identity must replace synthesized identity
 
-For Internet Archive playback, `cdx_toolkit` synthesizes a response record and may derive `WARC-Date` from an archived HTTP `Date` header. The CDX timestamp is the selected capture time and must replace it.
+The CDX timestamp is the selected capture time and must replace any playback-derived date. The CDX URL with fragments and bare empty queries removed must replace playback identity.
 
 ### Do not use stock `cdxt warc`
 
-The stock exporter retrieves duplicate captures and materializes them as full responses. Use `CaptureObject.fetch_warc_record()` only after the per-URL digest decision.
+The stock exporter retrieves duplicate captures and constructs records from automatically decoded `response.content`. Use Fetch's raw retriever so source verification happens before content normalization.
 
-### Redirect digests are unsafe deduplication keys
+### Redirect classification is narrow and happens after retrieval
 
-Different redirects often have identical empty payloads but different `Location` headers. Always fetch and write 3xx captures as full responses.
+Do not change the CDX URL before requesting playback or before writing a
+meaningful response. After retrieval, omit a verified 3xx only when its
+resolved `Location` has the same hostname after stripping one literal `www.`,
+the same path and query, and differs otherwise only by HTTP/HTTPS or a matching
+default port. Preserve domain, path, query, and nondefault-port changes.
+
+Wayback may manufacture a redirect or replay a nearby capture when the exact
+one is unavailable. Detect its playback metadata before digest verification
+and never write that result as an origin response.
+
+CDX does not expose `Location`. Once one source digest/status is verified as an
+omitted alias, reuse that classification across the URL-key group without
+another download. This assumes an invisible destination change did not occur;
+checking it would require retrieving every otherwise duplicate row.
 
 ### A failed capture is not a failed URL
 
@@ -226,19 +268,28 @@ At minimum cover:
 
 1. Date defaults and explicit date pass-through.
 2. Discovery with explicit bounds and no result limit.
-3. Exact-URL grouping and timestamp sorting.
+3. Fragment and bare-empty-query removal, literal-row collapse, URL-key grouping, and timestamp sorting.
 4. Recognizable, safe, deterministic URL path mapping.
-5. Query-string and HTTP/HTTPS path separation.
+5. HTTP/HTTPS/`www` variants with one CDX URL key share one output path,
+   while genuinely distinct URL keys (including query variants) remain
+   separate.
 6. Existing-file and generated-path collision failures before retrieval.
-7. Response then revisit for a repeated same-URL digest, with only one fetch.
-8. Independent fetches for the same digest at different URLs.
-9. A new digest later in one URL uses the same retrieval path as the first digest.
-10. Redirect captures always produce full responses.
-11. Missing digest downloads a full response and seeds the calculated digest.
-12. Retrieval failure warns and processing continues.
-13. Digest mismatch warns, skips, and does not seed the map.
-14. An all-skipped URL produces no file.
-15. Output parses with `warcio.ArchiveIterator` as WARC 1.0 and has the expected record order, URL, date, digest, and `WARC-Refers-To` values.
+7. Response then revisit for a repeated same-target-URL digest/status, with only one fetch.
+8. One fetch for the same digest/status across target URL spellings, followed by a cross-target revisit with correct canonical reference fields.
+9. Raw and playback-decoded candidates verify correctly against CDX source digests.
+10. Distinct gzip source digests can normalize to one response plus revisits.
+11. A verified scheme/www/default-port redirect with unchanged path/query is
+    omitted, summarized, and not refetched for the same source digest/status.
+12. A meaningful domain/path/query/nondefault-port redirect is preserved.
+13. An IA-generated alias substitution is omitted, while a meaningful
+    substitution warns and is never written.
+14. An archived 4xx/5xx matching CDX status is verified and preserved without
+    retry, while a mismatched playback error is retried or skipped.
+15. Missing digest downloads and normalizes but does not seed source identity.
+16. Retrieval failure warns and processing continues.
+17. Digest mismatch warns, skips, and does not seed either map.
+18. An all-skipped URL produces no file.
+19. Output parses with `warcio.ArchiveIterator` as WARC 1.0 and has the expected record order, URL, date, normalized digest, and `WARC-Refers-To` values.
 
 After deterministic tests pass, an optional manual smoke test may make a very small Internet Archive request. Do not make remote availability part of the automated test result.
 
@@ -248,8 +299,12 @@ After deterministic tests pass, an optional manual smoke test may make a very sm
 - `uv run pytest` passes with the repository's pinned Python 3.14 interpreter.
 - The `archive-magic-fetch` command exposes only the agreed arguments.
 - All deterministic tests pass.
-- A small manual run creates parseable WARCs beneath the mirrored URL directory tree.
-- Duplicate same-URL payloads produce revisits without a second fetch.
+- A small manual run creates parseable WARCs beneath the stable URL-key directory tree.
+- Duplicate group-level payload/status combinations produce revisits without a second fetch.
+- Same-resource canonical redirects are omitted and summarized; meaningful
+  redirects are preserved.
+- Internet Archive playback substitutions are never represented as origin
+  responses.
 - Skipped captures are visible as warnings and do not stop unrelated work.
 - No feature from the architecture's non-goals or future appendix is implemented.
 

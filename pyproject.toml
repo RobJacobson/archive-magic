@@ -10,6 +10,7 @@ requires-python = ">=3.12"
 license = { text = "MIT" }
 dependencies = [
     "cdx_toolkit==0.9.39",
+    "requests==2.34.2",
     "warcio==1.8.1",
 ]
 

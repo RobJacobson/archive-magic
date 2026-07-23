@@ -1,11 +1,11 @@
-"""Safe deterministic output paths for exact resource URLs."""
+"""Safe deterministic output paths for CDX URL-key resource groups."""
 
 from __future__ import annotations
 
 import hashlib
 import os
 from pathlib import Path
-from typing import Iterable, Mapping, Union
+from typing import Mapping, Sequence, Union
 from urllib.parse import quote, urlsplit
 
 
@@ -58,8 +58,9 @@ def _host_with_port(url: str) -> tuple[str, str]:
 def warc_path(
     url: str,
     root: Union[str, os.PathLike] = DEFAULT_OUTPUT_ROOT,
+    identity: str | None = None,
 ) -> Path:
-    """Map an exact capture URL to its WARC path beneath *root*."""
+    """Map a representative URL and stable group identity beneath *root*."""
 
     parsed = urlsplit(url)
     scheme, host = _host_with_port(url)
@@ -74,7 +75,8 @@ def warc_path(
         directory_segments = path_segments[:-1]
         stem = path_segments[-1]
 
-    url_hash = hashlib.sha256(url.encode("utf-8")).hexdigest()[:12]
+    hash_input = identity if identity is not None else url
+    url_hash = hashlib.sha256(hash_input.encode("utf-8")).hexdigest()[:12]
     filename = f"{_safe_segment(stem)}--{url_hash}.warc.gz"
 
     root_path = Path(root)
@@ -93,34 +95,74 @@ def warc_path(
     return candidate
 
 
+def urlkey_warc_path(
+    urlkey: str,
+    root: Union[str, os.PathLike] = DEFAULT_OUTPUT_ROOT,
+) -> Path:
+    """Map a CDX URL key to one stable, recognizable WARC path."""
+
+    if not isinstance(urlkey, str) or not urlkey:
+        raise ValueError("CDX urlkey must be a non-empty string")
+
+    key_segments = urlkey.split("/")
+    if urlkey.endswith("/"):
+        directory_segments = key_segments[:-1]
+        stem = "index"
+    else:
+        directory_segments = key_segments[:-1]
+        stem = key_segments[-1]
+
+    urlkey_hash = hashlib.sha256(urlkey.encode("utf-8")).hexdigest()[:12]
+    filename = f"{_safe_segment(stem)}--{urlkey_hash}.warc.gz"
+    root_path = Path(root)
+    candidate = root_path.joinpath(
+        "urlkey",
+        *(_safe_segment(segment) for segment in directory_segments),
+        filename,
+    )
+
+    try:
+        candidate.relative_to(root_path)
+    except ValueError as error:  # pragma: no cover - defensive invariant
+        raise ValueError(
+            f"generated path escapes output root for {urlkey}"
+        ) from error
+
+    return candidate
+
+
 def preflight_paths(
-    urls: Union[Iterable[str], Mapping[str, object]],
+    capture_groups: Mapping[str, Sequence[Mapping]],
     root: Union[str, os.PathLike] = DEFAULT_OUTPUT_ROOT,
 ) -> dict[str, Path]:
-    """Compute all output paths and reject conflicts before retrieval."""
+    """Compute one output path per CDX URL-key group before retrieval."""
 
     output_paths = {}
     generated_paths = {}
 
-    for url in urls:
-        path = warc_path(url, root=root)
-        previous_url = generated_paths.get(path)
-        if previous_url is not None and previous_url != url:
+    for urlkey, captures in capture_groups.items():
+        if not captures:
+            raise ValueError(f"capture group is empty: {urlkey}")
+
+        path = urlkey_warc_path(urlkey, root=root)
+        previous_urlkey = generated_paths.get(path)
+        if previous_urlkey is not None and previous_urlkey != urlkey:
             raise ValueError(
-                f"output path collision for {previous_url} and {url}: {path}"
+                f"output path collision for {previous_urlkey} and {urlkey}: {path}"
             )
 
-        generated_paths[path] = url
-        output_paths[url] = path
+        generated_paths[path] = urlkey
+        output_paths[urlkey] = path
 
         try:
             os.lstat(path)
         except FileNotFoundError:
             pass
         except OSError as error:
-            raise OSError(f"cannot inspect output path for {url}: {path}") from error
+            raise OSError(
+                f"cannot inspect output path for {urlkey}: {path}"
+            ) from error
         else:
             raise FileExistsError(f"output file already exists: {path}")
 
     return output_paths
-

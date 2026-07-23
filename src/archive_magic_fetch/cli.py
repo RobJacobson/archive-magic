@@ -41,12 +41,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print("No captures found")
             return 0
 
-        captures_by_url = group_captures(captures)
-        output_paths = preflight_paths(captures_by_url)
-        export_all(captures_by_url, output_paths)
+        capture_groups = group_captures(captures)
+        output_paths = preflight_paths(capture_groups)
+        export_all(capture_groups, output_paths)
     except Exception as error:
         print(f"ERROR: {error}", file=sys.stderr)
         return 1
 
     return 0
-

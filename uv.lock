@@ -8,6 +8,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "cdx-toolkit" },
+    { name = "requests" },
     { name = "warcio" },
 ]
 
@@ -19,6 +20,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "cdx-toolkit", specifier = "==0.9.39" },
+    { name = "requests", specifier = "==2.34.2" },
     { name = "warcio", specifier = "==1.8.1" },
 ]
 
