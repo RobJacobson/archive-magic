@@ -127,7 +127,7 @@ def read_records(path):
 
 
 def output_path(tmp_path, urlkey=URLKEY):
-    return paths.urlkey_warc_path(urlkey, root=tmp_path / "warcs")
+    return paths.urlkey_warc_path(urlkey, root=tmp_path / "archives")
 
 
 def test_normalize_digest_accepts_raw_and_prefixed_sha1():
@@ -503,7 +503,7 @@ def test_all_skipped_group_creates_no_file(tmp_path):
     export.export_group(URLKEY, [selected], target, client)
 
     assert not target.exists()
-    assert not (tmp_path / "warcs").exists()
+    assert not (tmp_path / "archives").exists()
 
 
 def test_local_open_failure_is_fatal(tmp_path, monkeypatch, capsys):
@@ -558,7 +558,7 @@ def test_dedup_maps_are_scoped_to_each_group(tmp_path):
     }
     output_paths = paths.preflight_paths(
         groups,
-        root=tmp_path / "warcs",
+        root=tmp_path / "archives",
     )
     client = FakeClient(
         {

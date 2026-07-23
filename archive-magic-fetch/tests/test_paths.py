@@ -19,7 +19,7 @@ def test_root_url_has_recognizable_deterministic_path():
     url = "https://example.com/"
 
     assert paths.warc_path(url) == Path(
-        f"warcs/https/example.com/index--{url_hash(url)}.warc.gz"
+        f"../archives/https/example.com/index--{url_hash(url)}.warc.gz"
     )
 
 
@@ -27,7 +27,7 @@ def test_nested_url_uses_final_segment_and_hashes_query():
     url = "https://example.com/images/logo.png?v=2"
 
     assert paths.warc_path(url) == Path(
-        f"warcs/https/example.com/images/logo.png--{url_hash(url)}.warc.gz"
+        f"../archives/https/example.com/images/logo.png--{url_hash(url)}.warc.gz"
     )
 
 
@@ -45,12 +45,12 @@ def test_group_path_is_stable_and_hashes_urlkey(tmp_path):
     urlkey = "com,example)/index.html"
 
     result = paths.preflight_paths(
-        capture_groups(urlkey=urlkey), root=tmp_path / "warcs"
+        capture_groups(urlkey=urlkey), root=tmp_path / "archives"
     )[urlkey]
 
     assert result == (
         tmp_path
-        / "warcs"
+        / "archives"
         / "urlkey"
         / "com%2Cexample%29"
         / f"index.html--{url_hash(urlkey)}.warc.gz"
@@ -60,8 +60,9 @@ def test_group_path_is_stable_and_hashes_urlkey(tmp_path):
 def test_port_is_included_and_userinfo_is_excluded():
     url = "https://user:secret@example.com:8443/a"
     result = paths.warc_path(url)
+    relative = result.relative_to(paths.DEFAULT_OUTPUT_ROOT)
 
-    assert result.parts[1:3] == ("https", "example.com%3A8443")
+    assert relative.parts[:2] == ("https", "example.com%3A8443")
     assert "user" not in str(result)
     assert "secret" not in str(result)
 
@@ -69,10 +70,11 @@ def test_port_is_included_and_userinfo_is_excluded():
 def test_unsafe_empty_and_dot_segments_are_single_safe_components():
     url = "https://example.com/a//../CON./file:name"
     result = paths.warc_path(url)
+    relative = result.relative_to(paths.DEFAULT_OUTPUT_ROOT)
 
-    assert result.parts[3:7] == ("a", "%00", "%2E%2E", "CON%2E")
+    assert relative.parts[2:6] == ("a", "%00", "%2E%2E", "CON%2E")
     assert result.name.startswith("file%3Aname--")
-    assert result.is_relative_to(Path("warcs"))
+    assert result.is_relative_to(Path("../archives"))
 
 
 @pytest.mark.parametrize(
@@ -87,31 +89,33 @@ def test_discovered_capture_url_requires_scheme_and_host(url):
 def test_preflight_rejects_existing_target(tmp_path):
     url = "https://example.com/"
     urlkey = "com,example)/"
-    target = paths.urlkey_warc_path(urlkey, root=tmp_path / "warcs")
+    target = paths.urlkey_warc_path(urlkey, root=tmp_path / "archives")
     target.parent.mkdir(parents=True)
     target.touch()
 
     with pytest.raises(FileExistsError, match="already exists"):
         paths.preflight_paths(
-            capture_groups(url=url, urlkey=urlkey), root=tmp_path / "warcs"
+            capture_groups(url=url, urlkey=urlkey),
+            root=tmp_path / "archives",
         )
 
 
 def test_preflight_rejects_broken_symlink_target(tmp_path):
     url = "https://example.com/"
     urlkey = "com,example)/"
-    target = paths.urlkey_warc_path(urlkey, root=tmp_path / "warcs")
+    target = paths.urlkey_warc_path(urlkey, root=tmp_path / "archives")
     target.parent.mkdir(parents=True)
     target.symlink_to(tmp_path / "missing")
 
     with pytest.raises(FileExistsError, match="already exists"):
         paths.preflight_paths(
-            capture_groups(url=url, urlkey=urlkey), root=tmp_path / "warcs"
+            capture_groups(url=url, urlkey=urlkey),
+            root=tmp_path / "archives",
         )
 
 
 def test_preflight_rejects_generated_collision_before_retrieval(tmp_path, monkeypatch):
-    collision = tmp_path / "warcs" / "same.warc.gz"
+    collision = tmp_path / "archives" / "same.warc.gz"
     monkeypatch.setattr(
         paths, "urlkey_warc_path", lambda urlkey, root: collision
     )
@@ -122,14 +126,14 @@ def test_preflight_rejects_generated_collision_before_retrieval(tmp_path, monkey
                 "com,example)/a": [{"url": "https://example.com/a"}],
                 "com,example)/b": [{"url": "https://example.com/b"}],
             },
-            root=tmp_path / "warcs",
+            root=tmp_path / "archives",
         )
 
 
 def test_preflight_allows_symlinked_output_ancestor(tmp_path):
-    real_root = tmp_path / "real-warcs"
+    real_root = tmp_path / "real-archives"
     real_root.mkdir()
-    linked_root = tmp_path / "warcs"
+    linked_root = tmp_path / "archives"
     linked_root.symlink_to(real_root, target_is_directory=True)
 
     result = paths.preflight_paths(
@@ -140,7 +144,7 @@ def test_preflight_allows_symlinked_output_ancestor(tmp_path):
 
 
 def test_preflight_reports_non_directory_ancestor(tmp_path):
-    root = tmp_path / "warcs"
+    root = tmp_path / "archives"
     root.write_text("not a directory")
 
     with pytest.raises(OSError, match="cannot inspect output path"):

@@ -9,7 +9,7 @@ from typing import Mapping, Sequence, Union
 from urllib.parse import quote, urlsplit
 
 
-DEFAULT_OUTPUT_ROOT = Path("warcs")
+DEFAULT_OUTPUT_ROOT = Path("../archives")
 _WINDOWS_RESERVED_NAMES = {
     "CON",
     "PRN",
