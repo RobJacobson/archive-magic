@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import BinaryIO
 
@@ -12,28 +12,20 @@ from warcio.warcwriter import WARCWriter
 
 @dataclass(frozen=True)
 class CanonicalResponse:
-    """Reference to the first verified response for one payload digest."""
+    """Reference to the first response for one payload/status signature."""
 
     record_id: str
     target_uri: str
     capture_date: str
 
 
-def cdx_timestamp_to_warc_date(timestamp: str) -> str:
-    """Convert a full CDX timestamp to the WARC 1.0 UTC representation."""
+def timestamp_to_warc_date(timestamp: datetime) -> str:
+    """Normalize an aware timestamp to second-precision WARC UTC form."""
 
-    parsed = datetime.strptime(timestamp, "%Y%m%d%H%M%S")
-    return parsed.strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def prepare_response(record, url: str, timestamp: str):
-    """Replace synthesized capture identity with authoritative CDX identity."""
-
-    record.rec_headers.replace_header("WARC-Target-URI", url)
-    record.rec_headers.replace_header(
-        "WARC-Date", cdx_timestamp_to_warc_date(timestamp)
-    )
-    return record
+    if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+        raise ValueError("capture timestamp must include a timezone")
+    normalized = timestamp.astimezone(timezone.utc).replace(microsecond=0)
+    return normalized.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def open_new_warc(path: Path) -> tuple[BinaryIO, WARCWriter]:
@@ -78,7 +70,7 @@ def write_response(writer: WARCWriter, record) -> CanonicalResponse:
 def write_revisit(
     writer: WARCWriter,
     url: str,
-    timestamp: str,
+    capture_date: str,
     digest: str,
     canonical: CanonicalResponse,
 ) -> None:
@@ -90,7 +82,7 @@ def write_revisit(
         refers_to_uri=canonical.target_uri,
         refers_to_date=canonical.capture_date,
         warc_headers_dict={
-            "WARC-Date": cdx_timestamp_to_warc_date(timestamp),
+            "WARC-Date": capture_date,
         },
     )
     revisit.rec_headers.add_header("WARC-Refers-To", canonical.record_id)

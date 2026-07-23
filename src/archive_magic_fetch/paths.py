@@ -132,7 +132,7 @@ def urlkey_warc_path(
 
 
 def preflight_paths(
-    capture_groups: Mapping[str, Sequence[Mapping]],
+    capture_groups: Mapping[str, Sequence[object]],
     root: Union[str, os.PathLike] = DEFAULT_OUTPUT_ROOT,
 ) -> dict[str, Path]:
     """Compute one output path per CDX URL-key group before retrieval."""

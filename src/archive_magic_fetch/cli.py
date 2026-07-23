@@ -7,9 +7,17 @@ import sys
 from datetime import datetime, timezone
 from typing import Optional, Sequence
 
+from wayback import WaybackClient, WaybackSession
+
 from .discovery import discover, group_captures
 from .export import export_all
 from .paths import preflight_paths
+
+
+USER_AGENT = (
+    "archive-magic-fetch/0.1.0 "
+    "(+https://github.com/RobJacobson/archive-magic)"
+)
 
 
 def current_utc_cdx_timestamp() -> str:
@@ -36,14 +44,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     date_end = args.end or current_utc_cdx_timestamp()
 
     try:
-        captures = discover(args.url_pattern, date_start, date_end)
-        if not captures:
-            print("No captures found")
-            return 0
+        session = WaybackSession(user_agent=USER_AGENT)
+        with WaybackClient(session=session) as client:
+            captures = discover(
+                client,
+                args.url_pattern,
+                date_start,
+                date_end,
+            )
+            if not captures:
+                print("No captures found")
+                return 0
 
-        capture_groups = group_captures(captures)
-        output_paths = preflight_paths(capture_groups)
-        export_all(capture_groups, output_paths)
+            capture_groups = group_captures(captures)
+            output_paths = preflight_paths(capture_groups)
+            export_all(capture_groups, output_paths, client)
     except Exception as error:
         print(f"ERROR: {error}", file=sys.stderr)
         return 1

@@ -1,14 +1,21 @@
 import base64
 import hashlib
-from io import BytesIO
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from warcio.archiveiterator import ArchiveIterator
-from warcio.recordbuilder import RecordBuilder
-from warcio.statusandheaders import StatusAndHeaders
+from wayback import CdxRecord
+from wayback.exceptions import (
+    BlockedByRobotsError,
+    BlockedSiteError,
+    MementoPlaybackError,
+    NoMementoError,
+    RateLimitError,
+    UnexpectedResponseFormat,
+    WaybackRetryError,
+)
 
-from archive_magic_fetch import discovery, export, paths
-from archive_magic_fetch.retrieval import PlaybackSubstitution, RetrievedResponse
+from archive_magic_fetch import export, paths, retrieval, warc
 
 
 URLKEY = "com,example)/resource"
@@ -19,59 +26,99 @@ def payload_digest(payload):
     return f"sha1:{encoded}"
 
 
-def make_response(url, payload=b"payload", status="200", location=None):
-    builder = RecordBuilder(warc_version="1.0")
-    response_headers = [("Content-Type", "text/plain")]
-    if location is not None:
-        response_headers.append(("Location", location))
-    headers = StatusAndHeaders(
-        f"{status} Test",
-        response_headers,
-        protocol="HTTP/1.1",
+def timestamp(value):
+    return datetime.strptime(value, "%Y%m%d%H%M%S").replace(
+        tzinfo=timezone.utc
     )
-    return builder.create_warc_record(
-        url,
-        "response",
-        payload=BytesIO(payload),
+
+
+def capture(
+    *,
+    original="https://example.com/resource",
+    captured="20170101000000",
+    payload=b"payload",
+    digest=None,
+    statuscode=200,
+    urlkey=URLKEY,
+):
+    if digest is None:
+        digest = payload_digest(payload).split(":", 1)[1]
+    return CdxRecord(
+        urlkey=urlkey,
+        timestamp=timestamp(captured),
+        original=original,
+        mimetype="text/plain",
+        statuscode=statuscode,
+        digest=digest,
         length=len(payload),
-        http_headers=headers,
     )
 
 
-class FakeCapture(dict):
+class FakeMemento:
     def __init__(
         self,
+        *,
         url,
-        timestamp,
+        captured,
         payload=b"payload",
-        digest=None,
-        status="200",
-        location=None,
-        error=None,
+        status_code=200,
+        headers=None,
     ):
-        if digest is None:
-            digest = payload_digest(payload).split(":", 1)[1]
-        super().__init__(
-            url=url,
-            timestamp=timestamp,
-            digest=digest,
-            status=status,
+        self.url = url
+        self.timestamp = timestamp(captured)
+        self.status_code = status_code
+        self.memento_url = (
+            f"https://web.archive.org/web/{captured}id_/{url}"
         )
-        self.payload = payload
-        self.location = location
-        self.error = error
-        self.fetch_count = 0
+        self.headers = headers or {"Content-Type": "text/plain"}
+        self.content = payload
+        self.closed = False
 
-    def fetch_warc_record(self):
-        self.fetch_count += 1
-        if self.error is not None:
-            raise self.error
-        return make_response(
-            self["url"],
-            self.payload,
-            self["status"],
-            self.location,
-        )
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        self.closed = True
+
+
+class FakeClient:
+    def __init__(self, outcomes):
+        self.outcomes = outcomes
+        self.calls = []
+
+    def get_memento(self, selected, **kwargs):
+        self.calls.append(selected)
+        outcome = self.outcomes[selected]
+        if isinstance(outcome, list):
+            outcome = outcome.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+
+def memento_for(
+    selected,
+    *,
+    url=None,
+    captured=None,
+    payload=b"payload",
+    status_code=None,
+    headers=None,
+):
+    return FakeMemento(
+        url=url or selected.original,
+        captured=captured
+        or selected.timestamp.astimezone(timezone.utc).strftime(
+            "%Y%m%d%H%M%S"
+        ),
+        payload=payload,
+        status_code=(
+            status_code
+            if status_code is not None
+            else selected.statuscode or 200
+        ),
+        headers=headers,
+    )
 
 
 def read_records(path):
@@ -79,7 +126,7 @@ def read_records(path):
         return list(ArchiveIterator(stream))
 
 
-def output_path(tmp_path, url, urlkey=URLKEY):
+def output_path(tmp_path, urlkey=URLKEY):
     return paths.urlkey_warc_path(urlkey, root=tmp_path / "warcs")
 
 
@@ -98,331 +145,99 @@ def test_normalize_digest_rejects_unusable_values(value):
     assert export.normalize_digest(value) is None
 
 
-@pytest.mark.parametrize(
-    ("source", "target", "expected"),
-    [
-        (
-            "http://www.example.com:80/path?x=1",
-            "https://example.com/path?x=1",
-            True,
-        ),
-        (
-            "https://www.example.com/path",
-            "https://example.com/other",
-            False,
-        ),
-        (
-            "https://www.example.com/path",
-            "https://other.example/path",
-            False,
-        ),
-        (
-            "http://example.com:443/path",
-            "https://example.com:443/path",
-            False,
-        ),
-    ],
-)
-def test_canonical_alias_redirect_classification(source, target, expected):
-    assert export._is_canonical_alias_redirect(source, target) is expected
+def test_source_signature_shortcut_uses_cdx_identity(tmp_path):
+    first = capture(
+        original="https://cdx.example/first",
+        captured="20170101000000",
+    )
+    second = capture(
+        original="https://cdx.example/second",
+        captured="20180101000000",
+    )
+    first_memento = memento_for(
+        first,
+        url="https://played.example/first",
+        captured="20170102030405",
+    )
+    client = FakeClient({first: first_memento})
+    target = output_path(tmp_path)
 
+    export.export_group(URLKEY, [first, second], target, client)
 
-def test_repeated_same_url_digest_writes_response_then_revisit(tmp_path):
-    url = "https://example.com/image.png"
-    first = FakeCapture(url, "20170101000000")
-    second = FakeCapture(url, "20180101000000")
-    target = output_path(tmp_path, url)
-
-    export.export_group(URLKEY, [first, second], target)
-
-    assert (first.fetch_count, second.fetch_count) == (1, 0)
+    assert client.calls == [first]
     records = read_records(target)
-    assert [record.rec_type for record in records] == ["warcinfo", "response", "revisit"]
-    response, revisit = records[1:]
-    assert response.rec_headers.get_header("WARC-Target-URI") == url
-    assert response.rec_headers.get_header("WARC-Date") == "2017-01-01T00:00:00Z"
-    assert revisit.rec_headers.get_header("WARC-Target-URI") == url
-    assert revisit.rec_headers.get_header("WARC-Date") == "2018-01-01T00:00:00Z"
-    assert revisit.rec_headers.get_header("WARC-Payload-Digest") == payload_digest(b"payload")
-    assert revisit.rec_headers.get_header("WARC-Refers-To") == response.rec_headers.get_header(
-        "WARC-Record-ID"
-    )
-    assert revisit.rec_headers.get_header("WARC-Refers-To-Date") == response.rec_headers.get_header(
-        "WARC-Date"
-    )
-
-
-def test_same_digest_at_url_variants_fetches_once_and_uses_cross_target_revisit(
-    tmp_path,
-):
-    urls = ["https://example.com/a", "https://example.com/b"]
-    captures = [
-        FakeCapture(url, f"2017010{index}000000", payload=b"same")
-        for index, url in enumerate(urls, start=1)
-    ]
-    groups = {URLKEY: captures}
-    output_paths = paths.preflight_paths(groups, root=tmp_path / "warcs")
-
-    export.export_all(groups, output_paths)
-
-    assert [capture.fetch_count for capture in captures] == [1, 0]
-    records = read_records(output_paths[URLKEY])
     assert [record.rec_type for record in records] == [
         "warcinfo",
         "response",
         "revisit",
     ]
-    assert [
-        record.rec_headers.get_header("WARC-Target-URI")
-        for record in records[1:]
-    ] == urls
     response, revisit = records[1:]
+    assert response.rec_headers.get_header(
+        "WARC-Target-URI"
+    ) == "https://played.example/first"
+    assert (
+        response.rec_headers.get_header("WARC-Date")
+        == "2017-01-02T03:04:05Z"
+    )
+    assert revisit.rec_headers.get_header(
+        "WARC-Target-URI"
+    ) == second.original
+    assert (
+        revisit.rec_headers.get_header("WARC-Date")
+        == "2018-01-01T00:00:00Z"
+    )
     assert revisit.rec_headers.get_header(
         "WARC-Refers-To"
     ) == response.rec_headers.get_header("WARC-Record-ID")
     assert revisit.rec_headers.get_header(
         "WARC-Refers-To-Target-URI"
-    ) == urls[0]
-    assert revisit.rec_headers.get_header(
-        "WARC-Refers-To-Date"
-    ) == response.rec_headers.get_header("WARC-Date")
-
-
-def test_new_digest_uses_full_retrieval_then_later_revisit(tmp_path):
-    url = "https://example.com/resource"
-    captures = [
-        FakeCapture(url, "20170101000000", payload=b"A"),
-        FakeCapture(url, "20180101000000", payload=b"B"),
-        FakeCapture(url, "20190101000000", payload=b"B"),
-    ]
-    target = output_path(tmp_path, url)
-
-    export.export_group(URLKEY, captures, target)
-
-    assert [capture.fetch_count for capture in captures] == [1, 1, 0]
-    assert [record.rec_type for record in read_records(target)] == [
-        "warcinfo",
-        "response",
-        "response",
-        "revisit",
-    ]
-
-
-def test_repeated_redirect_digest_and_status_uses_one_download(tmp_path):
-    url = "https://example.com/redirect"
-    captures = [
-        FakeCapture(url, "20170101000000", payload=b"", status="302"),
-        FakeCapture(url, "20180101000000", payload=b"", status="302"),
-    ]
-    target = output_path(tmp_path, url)
-
-    export.export_group(URLKEY, captures, target)
-
-    assert [capture.fetch_count for capture in captures] == [1, 0]
-    assert [record.rec_type for record in read_records(target)] == [
-        "warcinfo",
-        "response",
-        "revisit",
-    ]
-
-
-def test_redirect_digest_and_status_reuses_across_url_variants(tmp_path):
-    urls = [
-        "http://www.example.com/index.html",
-        "http://example.com:80/index.html",
-    ]
-    captures = [
-        FakeCapture(url, f"2017010{index}000000", payload=b"", status="302")
-        for index, url in enumerate(urls, start=1)
-    ]
-    target = output_path(tmp_path, urls[0])
-
-    export.export_group(URLKEY, captures, target)
-
-    assert [capture.fetch_count for capture in captures] == [1, 0]
-    records = read_records(target)
-    assert [record.rec_type for record in records] == [
-        "warcinfo",
-        "response",
-        "revisit",
-    ]
-    assert records[2].rec_headers.get_header(
-        "WARC-Refers-To-Target-URI"
-    ) == urls[0]
-
-
-def test_verified_canonical_alias_redirects_are_omitted_and_summarized(
-    tmp_path, capsys
-):
-    captures = [
-        FakeCapture(
-            "http://www.example.com:80/index.html",
-            "20170101000000",
-            payload=b"redirect body",
-            status="301",
-            location="https://example.com/index.html",
-        ),
-        FakeCapture(
-            "https://www.example.com/index.html",
-            "20180101000000",
-            payload=b"redirect body",
-            status="301",
-            location="https://example.com/index.html",
-        ),
-    ]
-    target = output_path(tmp_path, captures[0]["url"])
-
-    export.export_group(URLKEY, captures, target)
-
-    assert [capture.fetch_count for capture in captures] == [1, 0]
-    assert not target.exists()
-    output = capsys.readouterr()
-    assert output.err == ""
-    assert "Omitted 2 canonical URL redirects" in output.out
-
-
-def test_meaningful_redirect_is_preserved(tmp_path):
-    url = "https://example.com/old"
-    capture = FakeCapture(
-        url,
-        "20170101000000",
-        payload=b"redirect body",
-        status="301",
-        location="https://example.com/new",
-    )
-    target = output_path(tmp_path, url)
-
-    export.export_group(URLKEY, [capture], target)
-
-    records = read_records(target)
-    assert [record.rec_type for record in records] == ["warcinfo", "response"]
+    ) == "https://played.example/first"
     assert (
-        records[1].http_headers.get_header("Location")
-        == "https://example.com/new"
+        revisit.rec_headers.get_header("WARC-Refers-To-Date")
+        == "2017-01-02T03:04:05Z"
     )
+    assert revisit.content_stream().read() == b""
 
 
-def test_wayback_alias_substitution_is_omitted_once_per_source_signature(
-    tmp_path, monkeypatch, capsys
+def test_semantic_duplicate_uses_memento_identity_and_original_canonical(
+    tmp_path,
 ):
-    captures = [
-        FakeCapture(
-            "http://www.example.com/index.html",
-            "20170101000000",
-            payload=b"redirect body",
-            status="301",
-        ),
-        FakeCapture(
-            "https://www.example.com/index.html",
-            "20180101000000",
-            payload=b"redirect body",
-            status="301",
-        ),
-    ]
-    calls = []
-
-    def substitute(capture, expected):
-        calls.append(capture["url"])
-        raise PlaybackSubstitution(
-            "Wayback substituted HTTP 302",
-            "https://example.com/index.html",
-        )
-
-    monkeypatch.setattr(export, "retrieve_response", substitute)
-    target = output_path(tmp_path, captures[0]["url"])
-
-    export.export_group(URLKEY, captures, target)
-
-    assert calls == [captures[0]["url"]]
-    assert not target.exists()
-    output = capsys.readouterr()
-    assert output.err == ""
-    assert "Omitted 2 canonical URL redirects" in output.out
-
-
-def test_wayback_meaningful_substitution_warns_and_skips(
-    tmp_path, monkeypatch, capsys
-):
-    capture = FakeCapture(
-        "https://example.com/old",
-        "20170101000000",
-        payload=b"redirect body",
-        status="301",
+    first = capture(
+        original="https://cdx.example/a",
+        captured="20170101000000",
+        digest=payload_digest(b"stored-a"),
     )
+    second = capture(
+        original="https://cdx.example/b",
+        captured="20180101000000",
+        digest=payload_digest(b"stored-b"),
+    )
+    third = capture(
+        original="https://cdx.example/c",
+        captured="20190101000000",
+        digest=payload_digest(b"stored-b"),
+    )
+    client = FakeClient(
+        {
+            first: memento_for(
+                first,
+                url="https://played.example/a",
+                captured="20170102000000",
+                payload=b"same semantic body",
+            ),
+            second: memento_for(
+                second,
+                url="https://played.example/b",
+                captured="20180102000000",
+                payload=b"same semantic body",
+            ),
+        }
+    )
+    target = output_path(tmp_path)
 
-    def substitute(capture, expected):
-        raise PlaybackSubstitution(
-            "Wayback substituted HTTP 302 (https://other.example/new)",
-            "https://other.example/new",
-        )
+    export.export_group(URLKEY, [first, second, third], target, client)
 
-    monkeypatch.setattr(export, "retrieve_response", substitute)
-    target = output_path(tmp_path, capture["url"])
-
-    export.export_group(URLKEY, [capture], target)
-
-    assert not target.exists()
-    assert "Wayback substituted HTTP 302" in capsys.readouterr().err
-
-
-def test_redirect_status_change_requires_a_new_download(tmp_path):
-    url = "https://example.com/redirect"
-    captures = [
-        FakeCapture(url, "20170101000000", payload=b"", status="301"),
-        FakeCapture(url, "20180101000000", payload=b"", status="302"),
-    ]
-    target = output_path(tmp_path, url)
-
-    export.export_group(URLKEY, captures, target)
-
-    assert [capture.fetch_count for capture in captures] == [1, 1]
-    assert [record.rec_type for record in read_records(target)] == [
-        "warcinfo",
-        "response",
-        "response",
-    ]
-
-
-def test_source_revisit_uses_verified_digest_without_download(tmp_path):
-    url = "https://example.com/redirect"
-    first = FakeCapture(url, "20170101000000", payload=b"", status="302")
-    revisit = FakeCapture(url, "20180101000000", payload=b"", status="-")
-    target = output_path(tmp_path, url)
-
-    export.export_group(URLKEY, [first, revisit], target)
-
-    assert (first.fetch_count, revisit.fetch_count) == (1, 0)
-    assert [record.rec_type for record in read_records(target)] == [
-        "warcinfo",
-        "response",
-        "revisit",
-    ]
-
-
-def test_distinct_source_digests_normalize_to_one_payload(
-    tmp_path, monkeypatch
-):
-    url = "https://example.com/content"
-    captures = [
-        FakeCapture(url, "20170101000000", digest=payload_digest(b"source-a")),
-        FakeCapture(url, "20180101000000", digest=payload_digest(b"source-b")),
-        FakeCapture(url, "20190101000000", digest=payload_digest(b"source-b")),
-    ]
-    for capture in captures:
-        capture.payload = b"normalized"
-
-    def retrieve(capture, expected):
-        return RetrievedResponse(
-            record=capture.fetch_warc_record(),
-            source_verified=True,
-        )
-
-    monkeypatch.setattr(export, "retrieve_response", retrieve)
-    target = output_path(tmp_path, url)
-
-    export.export_group(URLKEY, captures, target)
-
-    assert [capture.fetch_count for capture in captures] == [1, 1, 0]
+    assert client.calls == [first, second]
     records = read_records(target)
     assert [record.rec_type for record in records] == [
         "warcinfo",
@@ -430,21 +245,66 @@ def test_distinct_source_digests_normalize_to_one_payload(
         "revisit",
         "revisit",
     ]
+    response, semantic_revisit, source_revisit = records[1:]
+    assert semantic_revisit.rec_headers.get_header(
+        "WARC-Target-URI"
+    ) == "https://played.example/b"
+    assert (
+        semantic_revisit.rec_headers.get_header("WARC-Date")
+        == "2018-01-02T00:00:00Z"
+    )
+    assert source_revisit.rec_headers.get_header(
+        "WARC-Target-URI"
+    ) == third.original
+    assert (
+        source_revisit.rec_headers.get_header("WARC-Date")
+        == "2019-01-01T00:00:00Z"
+    )
+    canonical_id = response.rec_headers.get_header("WARC-Record-ID")
     assert {
-        record.rec_headers.get_header("WARC-Payload-Digest")
-        for record in records[1:]
-    } == {payload_digest(b"normalized")}
+        semantic_revisit.rec_headers.get_header("WARC-Refers-To"),
+        source_revisit.rec_headers.get_header("WARC-Refers-To"),
+    } == {canonical_id}
 
 
-def test_new_source_digest_is_verified_then_reuses_normalized_content(tmp_path):
-    url = "https://example.com/missing"
-    first = FakeCapture(url, "20170101000000", digest="-")
-    second = FakeCapture(url, "20180101000000")
-    target = output_path(tmp_path, url)
+def test_failed_first_occurrence_does_not_seed_source_map(
+    tmp_path,
+    capsys,
+):
+    first = capture(captured="20170101000000")
+    second = capture(captured="20180101000000")
+    client = FakeClient(
+        {
+            first: MementoPlaybackError("capture unavailable"),
+            second: memento_for(second),
+        }
+    )
+    target = output_path(tmp_path)
 
-    export.export_group(URLKEY, [first, second], target)
+    export.export_group(URLKEY, [first, second], target, client)
 
-    assert (first.fetch_count, second.fetch_count) == (1, 1)
+    assert client.calls == [first, second]
+    assert [record.rec_type for record in read_records(target)] == [
+        "warcinfo",
+        "response",
+    ]
+    assert "capture unavailable" in capsys.readouterr().err
+
+
+def test_missing_digests_still_participate_in_semantic_dedup(tmp_path):
+    first = capture(captured="20170101000000", digest="-")
+    second = capture(captured="20180101000000", digest="malformed")
+    client = FakeClient(
+        {
+            first: memento_for(first, payload=b"same"),
+            second: memento_for(second, payload=b"same"),
+        }
+    )
+    target = output_path(tmp_path)
+
+    export.export_group(URLKEY, [first, second], target, client)
+
+    assert client.calls == [first, second]
     assert [record.rec_type for record in read_records(target)] == [
         "warcinfo",
         "response",
@@ -452,15 +312,47 @@ def test_new_source_digest_is_verified_then_reuses_normalized_content(tmp_path):
     ]
 
 
-def test_missing_digest_still_writes_full_response_when_actual_was_seen(tmp_path):
-    url = "https://example.com/missing-later"
-    first = FakeCapture(url, "20170101000000")
-    second = FakeCapture(url, "20180101000000", digest="-")
-    target = output_path(tmp_path, url)
+def test_cdx_status_and_actual_status_are_integer_dedup_keys(tmp_path):
+    first = capture(captured="20170101000000", statuscode=200)
+    second = capture(captured="20180101000000", statuscode=404)
+    client = FakeClient(
+        {
+            first: memento_for(first, payload=b"same", status_code=200),
+            second: memento_for(second, payload=b"same", status_code=404),
+        }
+    )
+    target = output_path(tmp_path)
 
-    export.export_group(URLKEY, [first, second], target)
+    export.export_group(URLKEY, [first, second], target, client)
 
-    assert (first.fetch_count, second.fetch_count) == (1, 1)
+    assert client.calls == [first, second]
+    records = read_records(target)
+    assert [record.rec_type for record in records] == [
+        "warcinfo",
+        "response",
+        "response",
+    ]
+    assert [
+        record.http_headers.get_statuscode() for record in records[1:]
+    ] == ["200", "404"]
+
+
+def test_different_cdx_status_fetches_then_semantically_deduplicates(
+    tmp_path,
+):
+    first = capture(captured="20170101000000", statuscode=200)
+    second = capture(captured="20180101000000", statuscode=201)
+    client = FakeClient(
+        {
+            first: memento_for(first, payload=b"same", status_code=200),
+            second: memento_for(second, payload=b"same", status_code=200),
+        }
+    )
+    target = output_path(tmp_path)
+
+    export.export_group(URLKEY, [first, second], target, client)
+
+    assert client.calls == [first, second]
     assert [record.rec_type for record in read_records(target)] == [
         "warcinfo",
         "response",
@@ -468,56 +360,155 @@ def test_missing_digest_still_writes_full_response_when_actual_was_seen(tmp_path
     ]
 
 
-def test_retrieval_failure_warns_and_later_capture_succeeds(tmp_path, capsys):
-    url = "https://example.com/failure"
-    failed = FakeCapture(url, "20170101000000", error=RuntimeError("unavailable"))
-    successful = FakeCapture(url, "20180101000000")
-    target = output_path(tmp_path, url)
+def test_statusless_revisit_reuses_successful_digest(tmp_path):
+    first = capture(captured="20170101000000", statuscode=200)
+    revisit = capture(captured="20180101000000", statuscode=None)
+    client = FakeClient({first: memento_for(first)})
+    target = output_path(tmp_path)
 
-    export.export_group(URLKEY, [failed, successful], target)
+    export.export_group(URLKEY, [first, revisit], target, client)
 
-    assert (failed.fetch_count, successful.fetch_count) == (1, 1)
-    assert [record.rec_type for record in read_records(target)] == ["warcinfo", "response"]
+    assert client.calls == [first]
+    assert [record.rec_type for record in read_records(target)] == [
+        "warcinfo",
+        "response",
+        "revisit",
+    ]
+
+
+def test_statusless_first_occurrence_is_retrieved(tmp_path):
+    first = capture(captured="20170101000000", statuscode=None)
+    second = capture(captured="20180101000000", statuscode=None)
+    client = FakeClient({first: memento_for(first, status_code=204)})
+    target = output_path(tmp_path)
+
+    export.export_group(URLKEY, [first, second], target, client)
+
+    assert client.calls == [first]
+    records = read_records(target)
+    assert records[1].http_headers.get_statuscode() == "204"
+    assert records[2].rec_type == "revisit"
+
+
+def test_genuine_scheme_and_www_redirect_is_written(tmp_path):
+    selected = capture(
+        original="http://www.example.com/",
+        statuscode=301,
+        payload=b"redirect",
+    )
+    client = FakeClient(
+        {
+            selected: memento_for(
+                selected,
+                payload=b"redirect",
+                status_code=301,
+                headers={"Location": "https://example.com/"},
+            )
+        }
+    )
+    target = output_path(tmp_path)
+
+    export.export_group(URLKEY, [selected], target, client)
+
+    response = read_records(target)[1]
+    assert response.rec_type == "response"
+    assert response.http_headers.get_statuscode() == "301"
     assert (
-        "WARNING skipped 20170101000000 https://example.com/failure: "
-        "capture unavailable (RuntimeError: unavailable)"
-        in capsys.readouterr().err
+        response.http_headers.get_header("Location")
+        == "https://example.com/"
     )
 
 
-def test_digest_mismatch_warns_does_not_seed_and_processing_continues(tmp_path, capsys):
-    url = "https://example.com/mismatch"
-    expected = payload_digest(b"expected").split(":", 1)[1]
-    mismatch = FakeCapture(
-        url,
-        "20170101000000",
-        payload=b"different",
-        digest=expected,
+def test_skippable_wayback_errors_warn_and_unrelated_capture_continues(
+    tmp_path,
+    capsys,
+):
+    failures = [
+        MementoPlaybackError("playback failed"),
+        NoMementoError("no memento"),
+        BlockedByRobotsError("blocked by robots"),
+        BlockedSiteError("blocked site"),
+        WaybackRetryError(2, 1, RuntimeError("timeout")),
+    ]
+    captures = [
+        capture(
+            captured=f"20170{index}01000000",
+            digest=payload_digest(f"stored-{index}".encode()),
+        )
+        for index in range(1, 7)
+    ]
+    outcomes = {
+        selected: error
+        for selected, error in zip(captures[:-1], failures, strict=True)
+    }
+    outcomes[captures[-1]] = memento_for(captures[-1])
+    client = FakeClient(outcomes)
+    target = output_path(tmp_path)
+
+    export.export_group(URLKEY, captures, target, client)
+
+    assert client.calls == captures
+    assert [record.rec_type for record in read_records(target)] == [
+        "warcinfo",
+        "response",
+    ]
+    assert capsys.readouterr().err.count("WARNING skipped") == 5
+
+
+def test_unexpected_response_format_is_fatal(tmp_path):
+    selected = capture()
+    client = FakeClient(
+        {selected: UnexpectedResponseFormat("malformed response")}
     )
-    successful = FakeCapture(url, "20180101000000", payload=b"expected", digest=expected)
-    target = output_path(tmp_path, url)
 
-    export.export_group(URLKEY, [mismatch, successful], target)
+    with pytest.raises(UnexpectedResponseFormat):
+        export.export_group(
+            URLKEY,
+            [selected],
+            output_path(tmp_path),
+            client,
+        )
 
-    assert (mismatch.fetch_count, successful.fetch_count) == (1, 1)
-    assert [record.rec_type for record in read_records(target)] == ["warcinfo", "response"]
-    assert "payload digest mismatch" in capsys.readouterr().err
+
+def test_second_rate_limit_is_fatal(tmp_path, monkeypatch):
+    selected = capture()
+    client = FakeClient(
+        {
+            selected: [
+                RateLimitError(None, 1),
+                RateLimitError(None, 2),
+            ]
+        }
+    )
+    sleeps = []
+    monkeypatch.setattr(retrieval.time, "sleep", sleeps.append)
+
+    with pytest.raises(RateLimitError):
+        export.export_group(
+            URLKEY,
+            [selected],
+            output_path(tmp_path),
+            client,
+        )
+    assert sleeps == [1]
 
 
-def test_all_skipped_url_creates_no_file(tmp_path):
-    url = "https://example.com/skipped"
-    capture = FakeCapture(url, "20170101000000", error=RuntimeError("unavailable"))
-    target = output_path(tmp_path, url)
+def test_all_skipped_group_creates_no_file(tmp_path):
+    selected = capture()
+    client = FakeClient(
+        {selected: MementoPlaybackError("capture unavailable")}
+    )
+    target = output_path(tmp_path)
 
-    export.export_group(URLKEY, [capture], target)
+    export.export_group(URLKEY, [selected], target, client)
 
     assert not target.exists()
     assert not (tmp_path / "warcs").exists()
 
 
-def test_local_open_failure_is_fatal_not_a_capture_warning(tmp_path, monkeypatch, capsys):
-    url = "https://example.com/local-failure"
-    capture = FakeCapture(url, "20170101000000")
+def test_local_open_failure_is_fatal(tmp_path, monkeypatch, capsys):
+    selected = capture()
+    client = FakeClient({selected: memento_for(selected)})
 
     def fail_open(path):
         raise OSError("disk unavailable")
@@ -525,25 +516,109 @@ def test_local_open_failure_is_fatal_not_a_capture_warning(tmp_path, monkeypatch
     monkeypatch.setattr(export, "open_new_warc", fail_open)
 
     with pytest.raises(OSError, match="disk unavailable"):
-        export.export_group(URLKEY, [capture], output_path(tmp_path, url))
-
+        export.export_group(
+            URLKEY,
+            [selected],
+            output_path(tmp_path),
+            client,
+        )
     assert "WARNING" not in capsys.readouterr().err
 
 
-def test_nonresource_url_syntax_is_removed_before_fetch_and_warc_identity(
-    tmp_path,
-):
-    capture = FakeCapture(
-        "http://www.example.com:80/index.html?#content-primary",
-        "20060114082621",
+def test_warc_serialization_failure_is_fatal(tmp_path, monkeypatch):
+    selected = capture()
+    client = FakeClient({selected: memento_for(selected)})
+
+    def fail_write(writer, response):
+        raise RuntimeError("cannot serialize")
+
+    monkeypatch.setattr(export, "write_response", fail_write)
+
+    with pytest.raises(RuntimeError, match="cannot serialize"):
+        export.export_group(
+            URLKEY,
+            [selected],
+            output_path(tmp_path),
+            client,
+        )
+
+
+def test_dedup_maps_are_scoped_to_each_group(tmp_path):
+    first = capture(
+        original="https://example.com/a",
+        urlkey="com,example)/a",
     )
-    capture["urlkey"] = "com,example)/index.html"
-    groups = discovery.group_captures([capture])
-    target = paths.preflight_paths(groups, root=tmp_path / "warcs")[capture["urlkey"]]
+    second = capture(
+        original="https://example.com/b",
+        urlkey="com,example)/b",
+    )
+    groups = {
+        first.urlkey: [first],
+        second.urlkey: [second],
+    }
+    output_paths = paths.preflight_paths(
+        groups,
+        root=tmp_path / "warcs",
+    )
+    client = FakeClient(
+        {
+            first: memento_for(first),
+            second: memento_for(second),
+        }
+    )
 
-    export.export_all(groups, {capture["urlkey"]: target})
+    export.export_all(groups, output_paths, client)
 
-    assert capture.fetch_count == 1
-    assert capture["url"] == "http://www.example.com:80/index.html"
-    response = read_records(target)[1]
-    assert response.rec_headers.get_header("WARC-Target-URI") == capture["url"]
+    assert client.calls == [first, second]
+    assert all(
+        [record.rec_type for record in read_records(path)]
+        == ["warcinfo", "response"]
+        for path in output_paths.values()
+    )
+
+
+def test_generated_file_is_parseable_gzip_warc_1_0(tmp_path):
+    selected = capture()
+    target = output_path(tmp_path)
+
+    export.export_group(
+        URLKEY,
+        [selected],
+        target,
+        FakeClient({selected: memento_for(selected)}),
+    )
+
+    records = read_records(target)
+    assert records[0].rec_headers.protocol == "WARC/1.0"
+    assert records[1].rec_headers.protocol == "WARC/1.0"
+    assert records[1].rec_headers.get_header(
+        "WARC-Payload-Digest"
+    ) == payload_digest(b"payload")
+
+
+def test_open_new_warc_exclusively_rejects_existing_target(tmp_path):
+    target = tmp_path / "existing.warc.gz"
+    target.write_bytes(b"existing")
+
+    with pytest.raises(FileExistsError):
+        warc.open_new_warc(target)
+
+
+def test_timestamp_to_warc_date_normalizes_aware_non_utc_datetime():
+    value = datetime(
+        2020,
+        1,
+        2,
+        1,
+        4,
+        5,
+        999999,
+        tzinfo=timezone(timedelta(hours=-2)),
+    )
+
+    assert warc.timestamp_to_warc_date(value) == "2020-01-02T03:04:05Z"
+
+
+def test_timestamp_to_warc_date_rejects_naive_datetime():
+    with pytest.raises(ValueError, match="timezone"):
+        warc.timestamp_to_warc_date(datetime(2020, 1, 1))

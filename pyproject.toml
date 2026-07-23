@@ -9,8 +9,7 @@ description = "Export Internet Archive captures into per-URL WARC files"
 requires-python = ">=3.12"
 license = { text = "MIT" }
 dependencies = [
-    "cdx_toolkit==0.9.39",
-    "requests==2.34.2",
+    "wayback==0.5.1",
     "warcio==1.8.1",
 ]
 
