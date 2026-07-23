@@ -320,7 +320,9 @@ The files have narrow responsibilities:
 
 No `core/`, `application/`, `adapters/`, `models/`, `interfaces/`, or `services/` hierarchy is needed. A new file or abstraction should be introduced only when existing code has two concrete responsibilities that cannot remain clear as small functions.
 
-The initial runtime target is Python 3.12 or newer with exact tested dependency versions:
+The minimum runtime target is Python 3.12. Local development uses the Python
+3.14 version pinned in `.python-version` and the environment locked by `uv.lock`,
+with exact runtime dependency versions:
 
 ```text
 cdx_toolkit==0.9.39

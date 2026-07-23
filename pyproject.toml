@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "archive-magic-fetch"
+version = "0.1.0"
+description = "Export Internet Archive captures into per-URL WARC files"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+dependencies = [
+    "cdx_toolkit==0.9.39",
+    "warcio==1.8.1",
+]
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[project.scripts]
+archive-magic-fetch = "archive_magic_fetch.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
