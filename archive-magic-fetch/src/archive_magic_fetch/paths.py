@@ -103,14 +103,12 @@ def _bounded_segment(component: str, *, byte_limit: int) -> str:
         return encoded
 
     encoded = _truncate_escape_safe(encoded, byte_limit)
-    trailing_dots = len(encoded) - len(encoded.rstrip("."))
-    if trailing_dots:
-        replacement = "%2E" * trailing_dots
+    if encoded.endswith("."):
         prefix = _truncate_escape_safe(
-            encoded[:-trailing_dots],
-            byte_limit - len(replacement),
+            encoded[:-1],
+            byte_limit - len("%2E"),
         )
-        encoded = prefix + replacement
+        encoded = prefix + "%2E"
     if not encoded:  # pragma: no cover - byte limits are deliberately large
         raise ValueError("filesystem component limit is too small")
     return encoded

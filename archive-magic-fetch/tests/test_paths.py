@@ -142,6 +142,21 @@ def test_truncation_reencodes_an_exposed_trailing_dot(tmp_path):
     assert not directory.endswith(".")
 
 
+def test_truncation_reencodes_a_trailing_dot_run_within_limit(tmp_path):
+    collection = layout(tmp_path)
+    component = f"{'.' * paths.MAX_COMPONENT_BYTES}tail"
+
+    result = paths.preferred_warc_path(
+        f"com,example)/{component}/resource",
+        collection,
+    )
+    directory = result.relative_to(collection.archive_root).parts[0]
+
+    assert len(directory.encode("ascii")) <= paths.MAX_COMPONENT_BYTES
+    assert directory.endswith("%2E")
+    assert not directory.endswith(".")
+
+
 def test_overlong_collection_name_is_rejected_instead_of_merged():
     label = "a" * 63
     host = ".".join([label, label, label, "a" * 50])
