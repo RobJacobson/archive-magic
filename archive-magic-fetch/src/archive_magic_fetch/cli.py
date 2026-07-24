@@ -43,6 +43,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _report_discovery_progress(count: int) -> None:
+    """Print indeterminate discovery progress for long CDX searches."""
+
+    print(f"  fetched {count}...")
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     """Discover captures and export them, returning a process exit status."""
 
@@ -54,16 +60,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         layout = collection_layout(args.url_pattern, root=_DEFAULT_OUTPUT_ROOT)
         session = WaybackSession(user_agent=USER_AGENT)
         with WaybackClient(session=session) as client:
+            print(
+                f"Discovering captures for {args.url_pattern} "
+                f"({date_start}-{date_end})"
+            )
             captures = discover(
                 client,
                 args.url_pattern,
                 date_start,
                 date_end,
+                progress=_report_discovery_progress,
             )
             if not captures:
                 print("No captures found")
                 return 0
 
+            print(f"Discovered {len(captures)} captures")
+            print("Saving source acquisition...")
             save_acquisition(
                 captures,
                 layout=layout,
@@ -72,9 +85,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 date_end=date_end,
                 acquired_at=datetime.now(timezone.utc),
             )
+            print(f"Grouping {len(captures)} captures...")
             capture_groups = group_captures(captures)
             plan = preflight_layout(capture_groups, layout)
+            print(f"Exporting {len(capture_groups)} URL groups...")
             result = export_all(capture_groups, plan.buckets, client)
+            print("Building replay index...")
             generate_replay_index(
                 result.created_warcs,
                 layout=plan.layout,

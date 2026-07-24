@@ -32,6 +32,28 @@ def record(
     )
 
 
+def test_normalize_cdx_search_rewrites_trailing_star_to_explicit_prefix():
+    assert discovery.normalize_cdx_search("example.com/*") == (
+        "example.com/",
+        "prefix",
+    )
+    assert discovery.normalize_cdx_search("https://example.com/path/*") == (
+        "https://example.com/path/",
+        "prefix",
+    )
+
+
+def test_normalize_cdx_search_leaves_non_prefix_patterns_unchanged():
+    assert discovery.normalize_cdx_search("example.com/") == (
+        "example.com/",
+        None,
+    )
+    assert discovery.normalize_cdx_search("*.example.com") == (
+        "*.example.com",
+        None,
+    )
+
+
 def test_discover_materializes_search_with_explicit_bounds():
     expected = [record()]
     calls = []
@@ -46,23 +68,71 @@ def test_discover_materializes_search_with_explicit_bounds():
     ) == expected
     assert calls == [
         (
-            "example.com/*",
+            "example.com/",
             {
                 "from_date": "1995",
                 "to_date": "2020",
+                "resolve_revisits": False,
+                "match_type": "prefix",
+            },
+        )
+    ]
+
+
+def test_discover_passes_exact_patterns_without_match_type():
+    expected = [record()]
+    calls = []
+
+    class Client:
+        def search(self, url_pattern, **kwargs):
+            calls.append((url_pattern, kwargs))
+            return iter(expected)
+
+    assert discovery.discover(
+        Client(), "example.com/", "2002", "2002"
+    ) == expected
+    assert calls == [
+        (
+            "example.com/",
+            {
+                "from_date": "2002",
+                "to_date": "2002",
                 "resolve_revisits": False,
             },
         )
     ]
 
 
+def test_discover_reports_progress_every_thousand_captures():
+    expected = [record() for _ in range(2500)]
+    reported = []
+
+    class Client:
+        def search(self, *args, **kwargs):
+            return iter(expected)
+
+    assert (
+        discovery.discover(
+            Client(),
+            "example.com",
+            "1995",
+            "2020",
+            progress=reported.append,
+        )
+        == expected
+    )
+    assert reported == [1000, 2000]
+
+
 def test_discover_discards_partial_attempt_and_rematerializes_after_rate_limit(
     monkeypatch,
+    capsys,
 ):
     first = record(captured="20000101000000")
     second = record(captured="20010101000000")
     attempts = 0
     sleeps = []
+    reported = []
 
     class Client:
         def search(self, *args, **kwargs):
@@ -79,16 +149,28 @@ def test_discover_discards_partial_attempt_and_rematerializes_after_rate_limit(
 
     monkeypatch.setattr(discovery.time, "sleep", sleeps.append)
 
-    assert discovery.discover(Client(), "example.com", "1995", "2020") == [
+    assert discovery.discover(
+        Client(),
+        "example.com",
+        "1995",
+        "2020",
+        progress=reported.append,
+    ) == [
         first,
         second,
     ]
     assert attempts == 2
     assert sleeps == [7]
+    assert reported == []
+    assert (
+        capsys.readouterr().out
+        == "Rate limited during discovery; retrying in 7s...\n"
+    )
 
 
 def test_discover_rate_limit_without_retry_after_uses_sixty_seconds(
     monkeypatch,
+    capsys,
 ):
     attempts = 0
     sleeps = []
@@ -105,6 +187,10 @@ def test_discover_rate_limit_without_retry_after_uses_sixty_seconds(
 
     assert discovery.discover(Client(), "example.com", "1995", "2020") == []
     assert sleeps == [60]
+    assert (
+        capsys.readouterr().out
+        == "Rate limited during discovery; retrying in 60s...\n"
+    )
 
 
 def test_discover_second_rate_limit_is_fatal(monkeypatch):
@@ -225,8 +311,8 @@ def test_cli_owns_one_client_context_and_passes_same_client(monkeypatch):
     buckets = (object(),)
     calls = {}
 
-    def fake_discover(client, pattern, start, end):
-        calls["discover"] = (client, pattern, start, end)
+    def fake_discover(client, pattern, start, end, *, progress=None):
+        calls["discover"] = (client, pattern, start, end, progress)
         return [capture]
 
     def fake_export(grouped, planned_buckets, client):
@@ -282,24 +368,77 @@ def test_cli_owns_one_client_context_and_passes_same_client(monkeypatch):
     assert client.session is created["session"]
     assert client.entered is True
     assert client.exited is True
-    assert calls["discover"] == (
+    assert calls["discover"][:4] == (
         client,
         "*.example.com",
         "1995",
         "20260722123456",
     )
+    assert calls["discover"][4] is cli._report_discovery_progress
     assert calls["provenance"][0] == [capture]
     assert calls["export"] == (groups, buckets, client)
     assert calls["replay"] == ((), layout)
     assert calls["summary"].selected == 1
 
 
+def test_cli_prints_stage_messages(monkeypatch, capsys):
+    install_fake_lifecycle(monkeypatch)
+    capture = record()
+    groups = {capture.urlkey: [capture]}
+    layout = object()
+    buckets = (object(),)
+
+    monkeypatch.setattr(cli, "current_utc_cdx_timestamp", lambda: "20260722123456")
+    monkeypatch.setattr(cli, "collection_layout", lambda *args, **kwargs: layout)
+    monkeypatch.setattr(
+        cli,
+        "discover",
+        lambda *args, **kwargs: [capture],
+    )
+    monkeypatch.setattr(cli, "save_acquisition", lambda *args, **kwargs: None)
+    monkeypatch.setattr(cli, "group_captures", lambda captures: groups)
+    monkeypatch.setattr(
+        cli,
+        "preflight_layout",
+        lambda grouped, selected_layout: type(
+            "Plan",
+            (),
+            {"layout": selected_layout, "buckets": buckets},
+        )(),
+    )
+    monkeypatch.setattr(
+        cli,
+        "export_all",
+        lambda *args: type(
+            "Result",
+            (),
+            {
+                "summary": type("Summary", (), {"selected": 1})(),
+                "created_warcs": (),
+            },
+        )(),
+    )
+    monkeypatch.setattr(cli, "generate_replay_index", lambda *args, **kwargs: None)
+    monkeypatch.setattr(cli, "print_summary", lambda summary: None)
+
+    assert cli.main(["*.example.com"]) == 0
+    output = capsys.readouterr().out
+    assert output == (
+        "Discovering captures for *.example.com (1995-20260722123456)\n"
+        "Discovered 1 captures\n"
+        "Saving source acquisition...\n"
+        "Grouping 1 captures...\n"
+        "Exporting 1 URL groups...\n"
+        "Building replay index...\n"
+    )
+
+
 def test_cli_passes_explicit_dates(monkeypatch):
     created = install_fake_lifecycle(monkeypatch)
     calls = {}
 
-    def fake_discover(client, pattern, start, end):
-        calls["discover"] = (client, pattern, start, end)
+    def fake_discover(client, pattern, start, end, *, progress=None):
+        calls["discover"] = (client, pattern, start, end, progress)
         return []
 
     monkeypatch.setattr(cli, "discover", fake_discover)
@@ -307,26 +446,35 @@ def test_cli_passes_explicit_dates(monkeypatch):
     assert cli.main(
         ["example.com/*", "--start", "2018", "--end", "20200131"]
     ) == 0
-    assert calls["discover"] == (
+    assert calls["discover"][:4] == (
         created["client"],
         "example.com/*",
         "2018",
         "20200131",
     )
+    assert calls["discover"][4] is cli._report_discovery_progress
 
 
 def test_cli_empty_result_is_success(monkeypatch, capsys):
     install_fake_lifecycle(monkeypatch)
-    monkeypatch.setattr(cli, "discover", lambda *args: [])
+
+    def fake_discover(client, pattern, start, end, *, progress=None):
+        return []
+
+    monkeypatch.setattr(cli, "discover", fake_discover)
+    monkeypatch.setattr(cli, "current_utc_cdx_timestamp", lambda: "20260722123456")
 
     assert cli.main(["example.com/*"]) == 0
-    assert capsys.readouterr().out == "No captures found\n"
+    assert capsys.readouterr().out == (
+        "Discovering captures for example.com/* (1995-20260722123456)\n"
+        "No captures found\n"
+    )
 
 
 def test_cli_fatal_error_returns_one(monkeypatch, capsys):
     install_fake_lifecycle(monkeypatch)
 
-    def fail(*args):
+    def fail(*args, **kwargs):
         raise RuntimeError("discovery failed")
 
     monkeypatch.setattr(cli, "discover", fail)
@@ -344,7 +492,7 @@ def test_cli_does_not_print_summary_when_replay_indexing_fails(
     layout = object()
     bucket = object()
     monkeypatch.setattr(cli, "collection_layout", lambda *args, **kwargs: layout)
-    monkeypatch.setattr(cli, "discover", lambda *args: [selected])
+    monkeypatch.setattr(cli, "discover", lambda *args, **kwargs: [selected])
     monkeypatch.setattr(cli, "save_acquisition", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         cli,
@@ -390,7 +538,7 @@ def test_cli_retains_published_provenance_after_downstream_failure(
         "_DEFAULT_OUTPUT_ROOT",
         tmp_path / "archives",
     )
-    monkeypatch.setattr(cli, "discover", lambda *args: [selected])
+    monkeypatch.setattr(cli, "discover", lambda *args, **kwargs: [selected])
     monkeypatch.setattr(
         cli,
         "export_all",
@@ -423,3 +571,8 @@ def test_cli_rejects_unapproved_arguments():
         cli.parse_args(["example.com/*", "--output", "elsewhere"])
 
     assert error.value.code == 2
+
+
+def test_report_discovery_progress(capsys):
+    cli._report_discovery_progress(2000)
+    assert capsys.readouterr().out == "  fetched 2000...\n"
