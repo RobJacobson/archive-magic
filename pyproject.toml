@@ -1,27 +1,17 @@
-[build-system]
-requires = ["setuptools>=68"]
-build-backend = "setuptools.build_meta"
-
 [project]
-name = "archive-magic-fetch"
-version = "0.1.0"
-description = "Export Internet Archive captures into per-URL WARC files"
+name = "archive-magic"
+version = "0.0.0"
+description = "Archive Magic monorepo root"
 requires-python = ">=3.12"
-license = { text = "MIT" }
 dependencies = [
-    "cdx_toolkit==0.9.39",
-    "requests==2.34.2",
-    "warcio==1.8.1",
+    "archive-magic-fetch",
 ]
 
-[dependency-groups]
-dev = ["pytest>=8"]
+[tool.uv]
+package = false
 
-[project.scripts]
-archive-magic-fetch = "archive_magic_fetch.cli:main"
+[tool.uv.workspace]
+members = ["archive-magic-fetch"]
 
-[tool.setuptools.packages.find]
-where = ["src"]
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]
+[tool.uv.sources]
+archive-magic-fetch = { workspace = true }
