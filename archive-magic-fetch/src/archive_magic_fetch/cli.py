@@ -5,19 +5,24 @@ from __future__ import annotations
 import argparse
 import sys
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional, Sequence
 
 from wayback import WaybackClient, WaybackSession
 
 from .discovery import discover, group_captures
 from .export import export_all
-from .paths import preflight_paths
+from .paths import DEFAULT_OUTPUT_ROOT, preflight_paths
 
 
 USER_AGENT = (
     "archive-magic-fetch/0.1.0 "
     "(+https://github.com/RobJacobson/archive-magic)"
 )
+
+# archive-magic-fetch/ — sibling of archives/, independent of process cwd
+_FETCH_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+_DEFAULT_OUTPUT_ROOT = (_FETCH_PROJECT_ROOT / DEFAULT_OUTPUT_ROOT).resolve()
 
 
 def current_utc_cdx_timestamp() -> str:
@@ -57,7 +62,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 return 0
 
             capture_groups = group_captures(captures)
-            output_paths = preflight_paths(capture_groups)
+            output_paths = preflight_paths(
+                capture_groups, root=_DEFAULT_OUTPUT_ROOT
+            )
             export_all(capture_groups, output_paths, client)
     except Exception as error:
         print(f"ERROR: {error}", file=sys.stderr)

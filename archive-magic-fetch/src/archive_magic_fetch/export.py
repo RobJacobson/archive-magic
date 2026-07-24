@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import binascii
 import sys
+from dataclasses import dataclass
 from datetime import timezone
 from pathlib import Path
 from typing import Mapping, Optional, Sequence
@@ -28,6 +29,26 @@ from .warc import (
 
 
 SourceMatch = tuple[str, CanonicalResponse]
+
+
+@dataclass
+class ExportSummary:
+    """Aggregate outcomes for one export operation."""
+
+    selected: int = 0
+    responses: int = 0
+    revisits: int = 0
+    redirects_omitted: int = 0
+    playback_failures: int = 0
+
+    def add(self, other: ExportSummary) -> None:
+        """Accumulate another group's outcomes."""
+
+        self.selected += other.selected
+        self.responses += other.responses
+        self.revisits += other.revisits
+        self.redirects_omitted += other.redirects_omitted
+        self.playback_failures += other.playback_failures
 
 
 def normalize_digest(value: object) -> Optional[str]:
@@ -74,6 +95,24 @@ def _warn_skip(capture: CdxRecord, error: Exception) -> None:
     )
 
 
+def _warn_status_substitution(
+    capture: CdxRecord,
+    actual_status: int,
+) -> None:
+    print(
+        f"WARNING skipped {_cdx_timestamp(capture.timestamp)} "
+        f"{capture.original}: CDX status {capture.statuscode} but "
+        f"playback returned {actual_status}",
+        file=sys.stderr,
+    )
+
+
+def _is_redirect(status: Optional[int]) -> bool:
+    """Return whether a known HTTP status is in the 3xx class."""
+
+    return status is not None and 300 <= status < 400
+
+
 def _response_identity(record) -> tuple[str, str, str, int]:
     """Read the semantic identity needed for deduplication and revisits."""
 
@@ -101,11 +140,21 @@ def export_group(
     captures: Sequence[CdxRecord],
     path: Path,
     client,
-) -> None:
+) -> ExportSummary:
     """Export one CDX URL-key group with shared payload deduplication."""
 
     if not captures:
         raise ValueError(f"capture group is empty: {urlkey}")
+
+    eligible = [
+        capture for capture in captures if not _is_redirect(capture.statuscode)
+    ]
+    summary = ExportSummary(
+        selected=len(captures),
+        redirects_omitted=len(captures) - len(eligible),
+    )
+    if not eligible:
+        return summary
 
     source_by_signature: dict[tuple[str, int], SourceMatch] = {}
     source_by_digest: dict[str, SourceMatch] = {}
@@ -113,13 +162,13 @@ def export_group(
     stream = None
     writer = None
 
-    representative_url = captures[0].original
-    variants = len({capture.original for capture in captures})
+    representative_url = eligible[0].original
+    variants = len({capture.original for capture in eligible})
     suffix = f" ({variants} URL variants)" if variants != 1 else ""
     print(f"Starting {representative_url}{suffix}")
 
     try:
-        for capture in captures:
+        for capture in eligible:
             expected = normalize_digest(capture.digest)
             cdx_status = capture.statuscode
 
@@ -145,6 +194,7 @@ def export_group(
                     semantic_digest,
                     canonical,
                 )
+                summary.revisits += 1
                 continue
 
             try:
@@ -156,6 +206,7 @@ def export_group(
                 WaybackRetryError,
             ) as error:
                 _warn_skip(capture, error)
+                summary.playback_failures += 1
                 continue
 
             (
@@ -165,6 +216,15 @@ def export_group(
                 actual_status,
             ) = _response_identity(response)
 
+            if cdx_status is not None and actual_status != cdx_status:
+                _warn_status_substitution(capture, actual_status)
+                summary.playback_failures += 1
+                continue
+
+            if _is_redirect(actual_status):
+                summary.redirects_omitted += 1
+                continue
+
             if writer is None:
                 stream, writer = open_new_warc(path)
 
@@ -173,6 +233,7 @@ def export_group(
             )
             if canonical is None:
                 canonical = write_response(writer, response)
+                summary.responses += 1
             else:
                 write_revisit(
                     writer,
@@ -181,6 +242,7 @@ def export_group(
                     semantic_digest,
                     canonical,
                 )
+                summary.revisits += 1
 
             print(
                 f"Downloaded {_cdx_timestamp(capture.timestamp)} "
@@ -203,13 +265,27 @@ def export_group(
         if stream is not None:
             stream.close()
 
+    return summary
+
 
 def export_all(
     capture_groups: Mapping[str, Sequence[CdxRecord]],
     output_paths: Mapping[str, Path],
     client,
-) -> None:
+) -> ExportSummary:
     """Export each CDX URL-key group in discovery order."""
 
+    summary = ExportSummary()
     for urlkey, captures in capture_groups.items():
-        export_group(urlkey, captures, output_paths[urlkey], client)
+        summary.add(
+            export_group(urlkey, captures, output_paths[urlkey], client)
+        )
+
+    print(
+        f"Summary: {summary.selected} selected; "
+        f"{summary.responses} responses; "
+        f"{summary.revisits} revisits; "
+        f"{summary.redirects_omitted} redirects omitted; "
+        f"{summary.playback_failures} playback failures"
+    )
+    return summary

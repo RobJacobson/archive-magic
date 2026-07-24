@@ -337,27 +337,38 @@ def test_cdx_status_and_actual_status_are_integer_dedup_keys(tmp_path):
     ] == ["200", "404"]
 
 
-def test_different_cdx_status_fetches_then_semantically_deduplicates(
+def test_status_substitution_is_skipped_and_does_not_seed_dedup(
     tmp_path,
+    capsys,
 ):
     first = capture(captured="20170101000000", statuscode=200)
     second = capture(captured="20180101000000", statuscode=201)
+    third = capture(captured="20190101000000", statuscode=201)
     client = FakeClient(
         {
             first: memento_for(first, payload=b"same", status_code=200),
             second: memento_for(second, payload=b"same", status_code=200),
+            third: memento_for(third, payload=b"different", status_code=201),
         }
     )
     target = output_path(tmp_path)
 
-    export.export_group(URLKEY, [first, second], target, client)
+    summary = export.export_group(
+        URLKEY,
+        [first, second, third],
+        target,
+        client,
+    )
 
-    assert client.calls == [first, second]
+    assert client.calls == [first, second, third]
     assert [record.rec_type for record in read_records(target)] == [
         "warcinfo",
         "response",
-        "revisit",
+        "response",
     ]
+    assert summary.responses == 2
+    assert summary.playback_failures == 1
+    assert "CDX status 201 but playback returned 200" in capsys.readouterr().err
 
 
 def test_statusless_revisit_reuses_successful_digest(tmp_path):
@@ -390,12 +401,29 @@ def test_statusless_first_occurrence_is_retrieved(tmp_path):
     assert records[2].rec_type == "revisit"
 
 
-def test_genuine_scheme_and_www_redirect_is_written(tmp_path):
+@pytest.mark.parametrize("statuscode", [300, 301, 308, 399])
+def test_known_cdx_3xx_is_omitted_without_playback(
+    tmp_path,
+    statuscode,
+):
     selected = capture(
         original="http://www.example.com/",
-        statuscode=301,
+        statuscode=statuscode,
         payload=b"redirect",
     )
+    client = FakeClient({})
+    target = output_path(tmp_path)
+
+    summary = export.export_group(URLKEY, [selected], target, client)
+
+    assert client.calls == []
+    assert not target.exists()
+    assert summary.selected == 1
+    assert summary.redirects_omitted == 1
+
+
+def test_retrieved_statusless_redirect_is_omitted(tmp_path):
+    selected = capture(statuscode=None, payload=b"redirect")
     client = FakeClient(
         {
             selected: memento_for(
@@ -408,15 +436,13 @@ def test_genuine_scheme_and_www_redirect_is_written(tmp_path):
     )
     target = output_path(tmp_path)
 
-    export.export_group(URLKEY, [selected], target, client)
+    summary = export.export_group(URLKEY, [selected], target, client)
 
-    response = read_records(target)[1]
-    assert response.rec_type == "response"
-    assert response.http_headers.get_statuscode() == "301"
-    assert (
-        response.http_headers.get_header("Location")
-        == "https://example.com/"
-    )
+    assert client.calls == [selected]
+    assert not target.exists()
+    assert summary.selected == 1
+    assert summary.redirects_omitted == 1
+    assert summary.playback_failures == 0
 
 
 def test_skippable_wayback_errors_warn_and_unrelated_capture_continues(
@@ -543,7 +569,7 @@ def test_warc_serialization_failure_is_fatal(tmp_path, monkeypatch):
         )
 
 
-def test_dedup_maps_are_scoped_to_each_group(tmp_path):
+def test_dedup_maps_are_scoped_to_each_group(tmp_path, capsys):
     first = capture(
         original="https://example.com/a",
         urlkey="com,example)/a",
@@ -567,13 +593,21 @@ def test_dedup_maps_are_scoped_to_each_group(tmp_path):
         }
     )
 
-    export.export_all(groups, output_paths, client)
+    summary = export.export_all(groups, output_paths, client)
 
     assert client.calls == [first, second]
+    assert summary == export.ExportSummary(
+        selected=2,
+        responses=2,
+    )
     assert all(
         [record.rec_type for record in read_records(path)]
         == ["warcinfo", "response"]
         for path in output_paths.values()
+    )
+    assert capsys.readouterr().out.endswith(
+        "Summary: 2 selected; 2 responses; 0 revisits; "
+        "0 redirects omitted; 0 playback failures\n"
     )
 
 

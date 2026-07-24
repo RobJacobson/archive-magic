@@ -234,7 +234,9 @@ def test_cli_owns_one_client_context_and_passes_same_client(monkeypatch):
     monkeypatch.setattr(cli, "current_utc_cdx_timestamp", lambda: "20260722123456")
     monkeypatch.setattr(cli, "discover", fake_discover)
     monkeypatch.setattr(cli, "group_captures", lambda captures: groups)
-    monkeypatch.setattr(cli, "preflight_paths", lambda grouped: output_paths)
+    monkeypatch.setattr(
+        cli, "preflight_paths", lambda grouped, root=None: output_paths
+    )
     monkeypatch.setattr(cli, "export_all", fake_export)
 
     assert cli.main(["*.example.com"]) == 0

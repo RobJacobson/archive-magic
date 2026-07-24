@@ -1,0 +1,14 @@
+[project]
+name = "archive-magic"
+version = "0.0.0"
+description = "Archive Magic monorepo root"
+requires-python = ">=3.12"
+dependencies = [
+    "archive-magic-fetch",
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+archive-magic-fetch = { path = "archive-magic-fetch", editable = true }

@@ -14,8 +14,8 @@ Wayback Machine captures into WARC 1.0 files.
 The MVP does three things:
 
 1. Query the Wayback CDX index for a URL pattern and time range.
-2. Retrieve each selected capture needed to establish a canonical semantic
-   payload.
+2. Omit redirects and retrieve each remaining capture needed to establish a
+   canonical semantic payload.
 3. Write one gzip-compressed WARC for each CDX URL-key resource family.
 
 A resource family is the set of captures represented by one CDX
@@ -87,6 +87,11 @@ Consequently:
 Fetch always supplies both bounds. It does not impose a result limit,
 collapse, status filter, or MIME filter. It explicitly disables server-side
 revisit resolution because Fetch performs its own payload reuse policy.
+
+Discovery remains complete so the command can report how many CDX rows were
+selected and how many redirects were omitted. Known 3xx rows are removed
+locally before playback, so completeness does not cost a Memento request for
+each redirect.
 
 The MVP has no output argument. Commands are run from the
 `archive-magic-fetch/` project directory, and output is written beneath the
@@ -268,14 +273,18 @@ CLI arguments
     -> sort each group by CdxRecord.timestamp
     -> preflight every output path
     -> export each URL-key group independently
+         -> count and omit known CDX 3xx rows before playback
          -> initialize source and semantic digest maps
          -> use a successful source signature when already known
          -> otherwise retrieve the exact Memento
               -> on RateLimitError, wait and retry once
          -> convert Memento semantic content into a WARC response
+         -> reject a known CDX/Memento status mismatch
+         -> count and omit a 3xx discovered from a statusless CDX row
          -> write a response or identical-payload-digest revisit
          -> publish deduplication state only after the write succeeds
          -> close the WARC
+    -> print one aggregate export summary
     -> close the Wayback client/session
 ```
 
@@ -302,13 +311,18 @@ with client.get_memento(
     ...
 ```
 
-The options mean:
+Known CDX 3xx rows never reach this call. For remaining rows, the options mean:
 
 - `Mode.original` avoids toolbar injection and browsing-oriented URL
   rewriting.
-- `exact=True` prevents substitution with a nearby capture.
-- `follow_redirects=False` returns a selected historical 3xx response rather
-  than navigating to its destination.
+- `exact=True` rejects ordinary substitution with a nearby capture.
+- `follow_redirects=False` prevents traversal when playback itself returns a
+  historical redirect.
+
+Wayback's URL canonicalization can still return a different URL variant or
+status at the same timestamp. Fetch therefore treats a known CDX status as a
+required playback invariant. A mismatch is warned, omitted, and never allowed
+to seed deduplication.
 
 The Memento context guarantees that the underlying HTTP response closes on
 success and on WARC-construction failure.
@@ -356,9 +370,10 @@ WARC-Payload-Digest  SHA-1 over memento.content, produced by warcio
 Fetch uses the standard-library HTTP reason phrase for a known status code. An
 unknown numeric status is preserved without inventing a reason phrase.
 
-Archived 3xx, 4xx, and 5xx statuses are valid Memento responses and are
-preserved. Fetch does not compare them with CDX status as a playback
-validation mechanism.
+Archived 4xx and 5xx statuses are valid content responses and are preserved.
+Archived 3xx responses are deliberately omitted. When CDX supplies a numeric
+status, the Memento status must match it; a mismatch is treated as playback
+substitution rather than exported under the wrong CDX identity.
 
 ### 7.4 Header normalization
 
@@ -380,7 +395,7 @@ Content-Range
 
 Matching is case-insensitive. Fetch then adds one `Content-Length` equal to the
 semantic payload length. Other reconstructed historical headers, including
-`Content-Type`, cache metadata, and historical `Location`, are retained.
+`Content-Type` and cache metadata, are retained.
 
 ## 8. Per-group export and deduplication
 
@@ -408,9 +423,10 @@ Statuses remain integers or `None`; they are not stringified for map keys.
 
 A usable CDX digest is normalized to `sha1:` plus uppercase Base32.
 
-For a capture with known CDX status, Fetch may skip playback only after the
-same `(CDX digest, CDX status)` has already produced a successfully written
-response or revisit in the current group.
+Known CDX 3xx captures are omitted before consulting any map. For another
+capture with known CDX status, Fetch may skip playback only after the same
+`(CDX digest, CDX status)` has already produced a successfully written response
+or revisit in the current group.
 
 A CDX revisit or unknown-status row may use the first successful canonical
 response known for its digest. If no successful occurrence exists yet, Fetch
@@ -424,7 +440,9 @@ Source-map entries are published only after:
 
 1. Exact Memento retrieval succeeds.
 2. A usable semantic WARC response identity exists.
-3. The response or revisit write succeeds.
+3. Any known CDX status matches the actual Memento status.
+4. The actual status is not 3xx.
+5. The response or revisit write succeeds.
 
 A failed first occurrence therefore does not prevent a later occurrence from
 being retrieved.
@@ -462,6 +480,10 @@ The implemented policy can be summarized as:
 
 ```python
 for capture in captures:
+    if is_3xx(capture.statuscode):
+        count_omitted_redirect(capture)
+        continue
+
     source_match = find_successful_source_match(
         capture.digest,
         capture.statuscode,
@@ -478,6 +500,17 @@ for capture in captures:
         response = retrieve_exact_semantic_response(client, capture)
     except SKIPPABLE_WAYBACK_ERRORS as error:
         warn_and_continue(capture, error)
+        continue
+
+    if (
+        capture.statuscode is not None
+        and response.actual_status != capture.statuscode
+    ):
+        warn_status_substitution(capture, response.actual_status)
+        continue
+
+    if is_3xx(response.actual_status):
+        count_omitted_redirect(capture)
         continue
 
     semantic_key = (
@@ -506,17 +539,26 @@ This pseudocode describes policy rather than required internal names.
 
 ### 8.4 Redirects
 
-Every genuine historical redirect returned as a Memento is preserved,
-including scheme, `www`, and default-port canonicalization redirects.
+Fetch is a content-oriented export, not a lossless inventory of every CDX
+capture event. HTTP 3xx records usually describe a crawler reaching a
+noncanonical scheme, host spelling, `www` alias, or former URL rather than a
+new historical document. Preserving them would add playback requests, WARC
+noise, and unavailable-capture policy without adding content.
 
-Fetch does not classify or omit same-resource aliases, remember omitted
-redirect signatures, or print an omitted-redirect summary. Those mechanisms
-depended on custom playback-substitution parsing that the high-level client
-now owns and produced little value relative to their complexity.
+The implemented policy is deliberately uniform:
 
-Historical redirects participate in response/revisit deduplication like any
-other status. Their semantic identity includes the actual 3xx status. The
-historical `Location` reconstructed by `wayback` remains in the HTTP headers.
+- A row with a known CDX status from 300 through 399 is counted and omitted
+  before playback.
+- A statusless CDX row is retrieved normally; if its Memento status is 3xx, it
+  is counted and omitted.
+- Fetch does not classify redirects as canonicalization versus substantive
+  relocation, follow them, synthesize them, or create metadata placeholders.
+- Redirect omissions do not warn individually. The final command summary
+  reports their aggregate count.
+
+This uniform rule follows KISS. A future opt-in redirect-preservation feature
+may be added if a concrete replay or URL-migration use case justifies the
+additional requests and policy.
 
 ## 9. WARC profile
 
@@ -536,7 +578,8 @@ Every output file:
 - Includes `WARC-Refers-To`, `WARC-Refers-To-Target-URI`, and
   `WARC-Refers-To-Date` on revisits.
 - Writes an empty revisit body rather than a duplicate payload.
-- Contains no fabricated request records.
+- Contains no fabricated request, redirect, or unavailable-capture metadata
+  records.
 
 `WARC-Refers-To-Target-URI` and `WARC-Refers-To-Date` are standardized by WARC
 1.1. The MVP uses them as extension fields in WARC 1.0 so a cross-target
@@ -567,6 +610,11 @@ capture, and allow later captures and groups to continue:
 
 A skipped capture never seeds source or semantic deduplication state.
 
+A known CDX/Memento status mismatch is also warned and skipped. It indicates
+that Wayback returned a different capture identity despite exact playback
+routing. Redirect omissions are intentional content filtering, not playback
+failures, and do not produce per-capture warnings.
+
 ### 10.2 Fatal job failures
 
 Fetch stops for:
@@ -596,6 +644,7 @@ Console output remains deliberately small:
 Starting https://example.com/images/logo.png
 Downloaded 20170604120533 [a19f7c2e]
 WARNING skipped 20190812143015 https://example.com/images/logo.png: capture unavailable
+Summary: 235 selected; 209 responses; 17 revisits; 9 redirects omitted; 0 playback failures
 ```
 
 Messages are:
@@ -606,6 +655,9 @@ Messages are:
   response/revisit write, using the last eight characters of the semantic
   payload digest.
 - `WARNING skipped ...` for each approved skippable retrieval error.
+- `WARNING skipped ...` when the known CDX status and playback status differ.
+- `Summary: ...` once after all groups, including response, revisit, omitted
+  redirect, and playback-failure counts.
 - `ERROR: ...` at the CLI boundary for a fatal job error.
 
 A source-signature revisit that avoids the network is written silently.
@@ -660,7 +712,7 @@ The modules have narrow responsibilities:
 | `discovery.py` | Lazy CDX materialization, discovery rate-limit retry, value deduplication, URL-key grouping | `discover()`, `group_captures()` |
 | `paths.py` | Safe deterministic URL-key paths and complete preflight checks | `urlkey_warc_path()`, `preflight_paths()` |
 | `retrieval.py` | Exact Memento retrieval, one rate-limit retry, semantic header filtering, WARC response construction | `retrieve_response()` |
-| `export.py` | Per-group source/semantic maps, skip policy, response-versus-revisit decisions, console messages | `export_all()`, `export_group()` |
+| `export.py` | Redirect filtering, status validation, per-group source/semantic maps, response-versus-revisit decisions, aggregate outcomes, console messages | `ExportSummary`, `export_all()`, `export_group()` |
 | `warc.py` | WARC date normalization, exclusive file creation, response and revisit serialization | `timestamp_to_warc_date()`, `open_new_warc()`, `write_response()`, `write_revisit()` |
 
 No `core/`, `application/`, `adapters/`, `models/`, `interfaces/`, or
@@ -732,25 +784,31 @@ The implemented MVP is accepted when deterministic tests demonstrate:
     `Content-Length` is correct.
 14. The WARC payload digest matches the semantic body written.
 15. Known and unknown HTTP statuses produce valid status lines.
-16. Genuine historical redirects are preserved.
-17. CDX digest/status reuse begins only after successful retrieval and write.
-18. A failed first source occurrence does not suppress a later retrieval.
-19. Known CDX statuses and actual response statuses remain distinct integer
-    keys.
-20. Statusless CDX revisits use a previously successful digest occurrence or
+16. Known CDX 3xx rows are counted and omitted without playback.
+17. A statusless row whose retrieved Memento is 3xx is counted and omitted.
+18. A known CDX/Memento status mismatch warns, is omitted, and does not seed
+    deduplication.
+19. CDX digest/status reuse begins only after successful retrieval,
+    status validation, and write.
+20. A failed first source occurrence does not suppress a later retrieval.
+21. Known CDX statuses and actual response statuses remain distinct integer
+    values until playback validation succeeds.
+22. Statusless CDX revisits use a previously successful digest occurrence or
     retrieve normally when none exists.
-21. Different CDX digests that converge on one semantic payload/status produce
+23. Different CDX digests that converge on one semantic payload/status produce
     one response and revisits.
-22. Missing and malformed CDX digests retrieve normally and still participate
+24. Missing and malformed CDX digests retrieve normally and still participate
     in semantic deduplication.
-23. Source-signature shortcuts use CDX current identity while fetched
+25. Source-signature shortcuts use CDX current identity while fetched
     responses and semantic revisits use Memento identity.
-24. Approved Wayback availability failures warn and continue.
-25. Unexpected formats, repeated rate limits, filesystem errors, and WARC
+26. Approved Wayback availability failures warn and continue.
+27. Unexpected formats, repeated rate limits, filesystem errors, and WARC
     serialization errors remain fatal.
-26. An all-skipped group produces no output file.
-27. Deduplication maps do not cross URL-key group boundaries.
-28. `warcio` parses each output as gzip-compressed WARC 1.0 with the expected
+28. An all-skipped group produces no output file.
+29. Deduplication maps do not cross URL-key group boundaries.
+30. The final summary accounts for selected rows, responses, revisits,
+    intentionally omitted redirects, and playback failures.
+31. `warcio` parses each output as gzip-compressed WARC 1.0 with the expected
     response/revisit order, semantic digests, and canonical references.
 
 A small manually invoked Internet Archive smoke export may verify current
@@ -767,6 +825,8 @@ The MVP does not include:
 - Exact preservation of source-WARC representation or transfer bytes.
 - CDX-digest fixity validation against Memento content.
 - Cross-URL-key deduplication.
+- Redirect preservation, redirect classification, or unavailable-capture
+  metadata.
 - WARC 1.1.
 - CDXJ generation or replay indexes.
 - Persisted CDX inventories, manifests, checksums, schemas, or databases.
