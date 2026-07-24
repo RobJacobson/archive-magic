@@ -64,8 +64,11 @@ The public command is unchanged:
 archive-magic-fetch URL_PATTERN [--start DATE] [--end DATE]
 ```
 
-Numeric partial dates are passed through to `WaybackClient.search()`. Defaults
-are explicit:
+Numeric partial dates are passed through unchanged to `WaybackClient.search()`,
+which forwards them to the Internet Archive CDX `from`/`to` parameters. Those
+bounds are inclusive at the supplied precision (`YYYY` … `YYYYMMDDhhmmss`), so
+`--end 2003` includes captures through the end of 2003. Fetch does not rewrite,
+pad, or reinterpret them. Defaults are explicit:
 
 ```python
 date_start = args.start or "1995"
