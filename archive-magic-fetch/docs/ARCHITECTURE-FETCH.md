@@ -1,6 +1,6 @@
 # Archive Magic Fetch Architecture
 
-**Status:** Implemented MVP architecture
+**Status:** Implemented collection architecture
 
 **Scope:** `archive-magic-fetch` only
 
@@ -8,116 +8,99 @@
 
 ## 1. Decision
 
-`archive-magic-fetch` is a small Python CLI that exports Internet Archive
-Wayback Machine captures into WARC 1.0 files.
+`archive-magic-fetch` is a serial Python CLI that discovers Internet Archive
+Wayback captures and exports a self-contained website collection:
 
-The MVP does three things:
+```text
+archive-magic/
+├── archive-magic-fetch/
+└── archives/
+    └── example.com/
+        ├── sources/
+        │   └── wayback/
+        │       └── 20260723T184501.123456Z/
+        │           ├── query.json
+        │           └── captures.cdx.gz
+        ├── archive/
+        │   ├── index.warc.gz
+        │   ├── about.warc.gz
+        │   └── posts/
+        │       ├── index.warc.gz
+        │       └── hello-world.warc.gz
+        └── replay/
+            └── index.cdxj
+```
 
-1. Query the Wayback CDX index for a URL pattern and time range.
-2. Omit redirects and retrieve each remaining capture needed to establish a
-   canonical semantic payload.
-3. Write one gzip-compressed WARC for each CDX URL-key resource family.
+The three artifact areas have distinct ownership:
 
-A resource family is the set of captures represented by one CDX
-`urlkey`/SURT. It can include HTTP, HTTPS, `www`, and other URL variants that
-Wayback's CDX canonicalization groups together. Fetch writes one WARC and uses
-one deduplication namespace for the family; it does not create a separate file
-for every original URL spelling.
+- `sources/` records the complete normalized discovery result returned by the
+  high-level Wayback client.
+- `archive/` contains WARC 1.0 response and revisit records written by Fetch.
+- `replay/` indexes the exact compressed WARC bytes Fetch produced.
 
-The implementation follows KISS and YAGNI:
+The source CDX is provenance, not a replay index. It has no offsets into the
+local WARCs. The replay CDXJ is derived from WARC record metadata and compressed
+byte ranges, not copied from the Internet Archive CDX.
 
-- One Python process.
-- Serial discovery and retrieval.
-- One archive source: the Internet Archive Wayback Machine.
-- One shared `WaybackSession` and `WaybackClient` per command.
-- Public `wayback` client APIs for CDX discovery and Memento playback.
-- Upstream `CdxRecord` and `Memento` values without a local archive model.
-- Semantic response bodies rather than raw source-WARC representation bytes.
-- `warcio` for WARC construction and serialization.
-- Standard-library `argparse` and small console messages.
-- No application/core hierarchy, source-adapter framework, plugin system,
-  persisted inventory, or publication transaction.
+Readable paths organize WARC storage but do not define capture identity.
+Capture identity remains in CDX URL keys, WARC headers, target URIs, dates,
+digests, and replay-index entries.
 
-All Fetch implementation code remains in the flat
-`src/archive_magic_fetch/` package. Common Crawl and other archives are
-outside the current product contract and do not justify a generic archive
-client abstraction.
+The implementation remains deliberately small:
 
-The Git repository remains rooted at the parent `archive-magic/` directory,
-but Fetch is a self-contained project beneath `archive-magic-fetch/`. Its
-source, tests, dependency metadata, lockfile, license, development settings,
-and documentation do not depend on another project in the repository.
-Generated archive data is the one substantive sibling and lives in
-`archive-magic/archives/`.
+- one Python process and serial retrieval;
+- one Wayback session/client per command;
+- public `wayback` APIs for discovery and playback;
+- `warcio` for WARC construction;
+- `cdxj-indexer` for final-byte replay indexing;
+- a flat `src/archive_magic_fetch/` package; and
+- no source-adapter hierarchy, database, resume system, or publication service.
 
-The separate `archive-magic-replay` project is outside this document.
+## 2. CLI contract and data flow
 
-## 2. CLI contract
-
-The command accepts one URL pattern and optional numeric CDX dates:
+The public command is unchanged:
 
 ```text
 archive-magic-fetch URL_PATTERN [--start DATE] [--end DATE]
 ```
 
-Examples:
-
-```bash
-archive-magic-fetch 'https://example.com/'
-archive-magic-fetch 'https://example.com/*' --start 2018 --end 2020
-archive-magic-fetch 'https://example.com/images/*' --start 20200101
-```
-
-Numeric partial values such as `2020`, `20200131`, and `20200131153000` are
-passed through to `WaybackClient.search()`.
-
-Defaults remain explicit:
+Numeric partial dates are passed through to `WaybackClient.search()`. Defaults
+are explicit:
 
 ```python
 date_start = args.start or "1995"
 date_end = args.end or current_utc_cdx_timestamp()
 ```
 
-Consequently:
+The output root is the repository sibling `../archives`; there is no output
+argument.
 
-- Neither bound means 1995 through the present.
-- Start only means that date through the present.
-- End only means 1995 through that date.
-
-Fetch always supplies both bounds. It does not impose a result limit,
-collapse, status filter, or MIME filter. It explicitly disables server-side
-revisit resolution because Fetch performs its own payload reuse policy.
-
-Discovery remains complete so the command can report how many CDX rows were
-selected and how many redirects were omitted. Known 3xx rows are removed
-locally before playback, so completeness does not cost a Memento request for
-each redirect.
-
-The MVP has no output argument. Commands are run from the
-`archive-magic-fetch/` project directory, and output is written beneath the
-sibling `../archives/` directory:
-
-```bash
-cd archive-magic-fetch
-uv run archive-magic-fetch 'https://example.com/'
-```
-
-An empty result is successful:
+The successful flow is:
 
 ```text
-No captures found
+parse arguments and apply date defaults
+    -> derive and validate the collection name
+    -> create one WaybackSession and WaybackClient
+    -> fully materialize discovery
+    -> if empty, print "No captures found" and exit successfully
+    -> atomically publish the source acquisition
+    -> collapse value-equal records and group by urlkey
+    -> allocate readable WARC buckets
+    -> preflight all WARC and replay targets
+    -> export buckets and close their WARC streams
+    -> generate and atomically publish replay/index.cdxj
+    -> print the aggregate summary
+    -> close the client/session
 ```
 
-Invalid arguments and fatal job errors produce a nonzero exit status.
+The aggregate summary is printed only after replay indexing succeeds. A fatal
+indexing or replay-publication error therefore cannot follow an apparently
+successful final summary. If every capture is omitted or skipped, no WARC or
+replay index is created and the successful aggregate summary is still printed.
 
-## 3. Wayback dependency and client lifecycle
+## 3. Wayback client and discovery
 
-Fetch pins `wayback==0.5.1`. The package is maintained by the Environmental
-Data & Governance Initiative and is purpose-built for the Internet Archive
-Wayback Machine; it is not maintained by Internet Archive itself.
-
-The CLI creates one descriptive session and gives ownership of it to one
-client context:
+Fetch pins `wayback==0.5.1` and creates one descriptive session:
 
 ```python
 session = WaybackSession(
@@ -126,743 +109,468 @@ session = WaybackSession(
         "(+https://github.com/RobJacobson/archive-magic)"
     )
 )
-with WaybackClient(session=session) as client:
-    captures = discover(client, ...)
-    ...
-    export_all(..., client)
 ```
 
-The client spans discovery, output preflight, and export. Exiting the client
-context closes the supplied session and its pooled network connections,
-including on an empty result or fatal error.
+One `WaybackClient` context owns that session across discovery and playback.
+The library's endpoint-specific pacing remains in force. Fetch adds one bounded
+rate-limit retry:
 
-Fetch uses the `WaybackSession` 0.5.1 endpoint-specific default pacing:
+1. Sleep for `retry_after`, or 60 seconds when absent.
+2. Retry the complete search or exact Memento operation once.
+3. Propagate a second `RateLimitError`.
 
-```text
-CDX search:       0.4 calls/second (one call every 2.5 seconds)
-Memento playback: 8 calls/second   (one call every 0.125 seconds)
-```
-
-These are application-independent library limits selected in collaboration
-with Internet Archive staff. Fetch does not add a fixed delay around every
-capture, override these defaults, or reproduce the library's retry/backoff
-transport.
-
-The application adds one bounded `RateLimitError` rule around each discovery
-or Memento operation:
-
-1. On the first rate limit, sleep for `retry_after`, falling back to 60
-   seconds.
-2. Retry that complete operation once.
-3. If the retry is also rate-limited, propagate the error and stop the job.
-
-For discovery, a complete operation means fully materializing the lazy search
-iterator. Partial results from a rate-limited attempt are discarded before
-the search is restarted. For retrieval, the same selected `CdxRecord` is
-requested again.
-
-Execution remains serial. Concurrency is not required to remove the former
-six-second host-wide delay and would need shared rate-limit coordination if
-added later.
-
-## 4. Output layout and preflight
-
-Each CDX URL-key group maps to one stable WARC path beneath the repository's
-root-level `archives/` directory:
-
-```text
-archive-magic/
-├── archive-magic-fetch/
-└── archives/
-    └── urlkey/
-        └── com%2Cexample%29/
-            ├── index--a1b2c3d4e5f6.warc.gz
-            ├── images/
-            │   └── logo.png--e4f5a6b7c8d9.warc.gz
-            └── css/
-                └── site.css--91c2d3e4f5a6.warc.gz
-```
-
-The mapping rules are:
-
-1. The first directory is the literal `urlkey` namespace.
-2. URL-key path segments become nested directories.
-3. The URL-key authority/SURT component becomes a safely encoded directory.
-4. The final path segment becomes the readable filename stem.
-5. A root URL or path ending in `/` uses `index` as the stem.
-6. The stem ends with the first 12 lowercase hexadecimal characters of
-   SHA-256 over the complete `urlkey`, followed by `.warc.gz`.
-7. Query strings are not written literally; URL-key differences remain
-   distinguished by the hash.
-8. Empty, `.`, `..`, separators, control characters, and platform-unsafe
-   characters cannot escape or reshape the output root.
-
-From the project directory, the default output root is `../archives`. Fetch
-computes and checks every selected output path before Memento retrieval. It
-fails if two URL-key groups map to the same path or if a target already
-exists.
-
-WARC creation itself uses exclusive mode. The MVP does not overwrite, append,
-merge, or resume.
-
-## 5. Capture model and discovery
-
-Discovery uses the public high-level search API:
+Discovery calls:
 
 ```python
-captures = list(
-    client.search(
-        url_pattern,
-        from_date=date_start,
-        to_date=date_end,
-        resolve_revisits=False,
-    )
+client.search(
+    url_pattern,
+    from_date=date_start,
+    to_date=date_end,
+    resolve_revisits=False,
 )
 ```
 
-`WaybackClient.search()`:
+The lazy iterator is completely materialized. If the first attempt is rate
+limited after yielding rows, those partial rows are discarded before the
+whole search is retried.
 
-- interprets the supported exact, prefix, and domain URL patterns;
-- paginates with resume keys;
-- includes recent results omitted by older numbered-page approaches;
-- applies its default malformed-result filtering;
-- parses timestamps into timezone-aware UTC `datetime` values;
-- removes matching explicit default ports such as HTTP `:80` and HTTPS
-  `:443`; and
-- returns immutable, value-equal, hashable `CdxRecord` values.
+After source provenance is saved, Fetch:
 
-Fetch accepts those upstream URL and timestamp semantics. It does not maintain
-a second URL normalizer for fragments, bare queries, or default ports, and it
-does not preserve malformed timestamp syntax as an independent identity.
+1. collapses only value-equal `CdxRecord` values;
+2. groups records by normalized CDX `urlkey`; and
+3. sorts captures within each group by aware timestamp.
 
-The public capture fields used by Fetch are:
+The original discovery order, duplicates, and redirects remain present in the
+source snapshot even though downstream export transforms that selection.
 
-```text
-urlkey
-original
-timestamp
-statuscode
-digest
-```
+## 4. Collection naming
 
-`mimetype` and `length` remain part of `CdxRecord` equality even though export
-does not otherwise use them.
+The requested pattern defines one collection before network access. Supported
+exact, prefix, and leading-`*.` domain patterns use this normalization:
 
-After complete materialization, Fetch:
+1. Extract one unambiguous host with `urllib.parse`.
+2. Remove the trailing DNS dot and lowercase it.
+3. Encode it using Python's built-in codec:
 
-1. Collapses only value-equal duplicate `CdxRecord` values.
-2. Groups records by `urlkey` in first-seen group order.
-3. Sorts each group by the parsed `timestamp`.
+   ```python
+   host.encode("idna").decode("ascii")
+   ```
 
-All results remain in memory. Fetch does not persist a source inventory, CDX
-file, CDXJ, manifest, database, or checkpoint.
+4. Lowercase the ASCII result and remove an exact leading `www.`.
+5. Remove HTTP `:80` and HTTPS `:443`.
+6. Retain any other port as `--port-<number>`.
+7. Encode the result as one safe filesystem component.
 
-Incomplete discovery is fatal because Fetch cannot know the complete set of
-captures or safely preflight all output paths.
-
-## 6. Data flow
+Examples:
 
 ```text
-CLI arguments
-    -> apply explicit date defaults
-    -> create one WaybackSession and WaybackClient
-    -> fully materialize WaybackClient.search()
-         -> on RateLimitError, wait and retry the whole search once
-    -> collapse value-equal CdxRecord duplicates
-    -> group by CdxRecord.urlkey
-    -> sort each group by CdxRecord.timestamp
-    -> preflight every output path
-    -> export each URL-key group independently
-         -> count and omit known CDX 3xx rows before playback
-         -> initialize source and semantic digest maps
-         -> use a successful source signature when already known
-         -> otherwise retrieve the exact Memento
-              -> on RateLimitError, wait and retry once
-         -> convert Memento semantic content into a WARC response
-         -> reject a known CDX/Memento status mismatch
-         -> count and omit a 3xx discovered from a statusless CDX row
-         -> write a response or identical-payload-digest revisit
-         -> publish deduplication state only after the write succeeds
-         -> close the WARC
-    -> print one aggregate export summary
-    -> close the Wayback client/session
+https://Kevin.Burke.Dev/   -> kevin.burke.dev
+http://www.example.com/*   -> example.com
+*.example.com              -> example.com
+https://example.com:443/*  -> example.com
+https://example.com:8443/* -> example.com--port-8443
+https://münich.example/*   -> xn--mnich-kva.example
 ```
 
-Grouping by `urlkey` lets straightforward variants share one WARC and one
-deduplication namespace. Responses and revisits retain the appropriate
-capture-specific target identity described below. A revisit may refer to a
-canonical response whose target URI is another URL variant in the same group.
+A bare pattern's explicit port remains because no scheme identifies it as a
+default. User information, embedded wildcards, missing hosts, and patterns
+that cannot identify one website scope are rejected.
 
-## 7. Memento retrieval and response construction
+HTTP/HTTPS and ordinary `www`/apex spellings share a collection because
+Wayback canonicalizes those variants into the same capture-family semantics.
+The readable collection boundary follows that upstream identity model rather
+than splitting one website by transport or conventional hostname spelling.
 
-### 7.1 Exact playback
+Collection naming never imports the third-party `idna` package. Consequently,
+`cdxj-indexer`'s transitive `idna<3` pin cannot change collection names.
+Collection names longer than the 240-byte application component cap fail
+rather than being truncated and accidentally merging distinct websites.
 
-For an unseen source signature, Fetch delegates playback routing and response
-interpretation to the public client:
+## 5. Readable paths and filesystem limits
+
+The path/query portion of each CDX URL key maps beneath `archive/`:
+
+```text
+/                    -> archive/index.warc.gz
+/?view=full          -> archive/index%3Fview%3Dfull.warc.gz
+/about               -> archive/about.warc.gz
+/posts               -> archive/posts.warc.gz
+/posts/              -> archive/posts/index.warc.gz
+/posts/hello-world   -> archive/posts/hello-world.warc.gz
+/images/logo.png     -> archive/images/logo.png.warc.gz
+```
+
+Unsafe values are percent-encoded as one component. Empty, dot, dot-dot,
+separator, control, trailing-dot, and Windows-reserved-name cases cannot
+escape or reshape the output root. Queries remain recognizable in the
+filename so the collection remains understandable without an internal
+identity hash.
+
+Archive path components use an application limit of 240 encoded ASCII bytes,
+including `.warc.gz`. Longer values are truncated deterministically without
+cutting a `%XX` escape or appending a digest. Truncation collisions are safe
+because filenames identify buckets, not records. Safety encoding is reapplied
+after truncation so a cutoff cannot expose a literal trailing dot.
+
+Preflight checks two independent filesystem limits using the nearest existing
+ancestor:
+
+- `PC_NAME_MAX` for every complete path component; and
+- `PC_PATH_MAX` for the absolute path, including terminator space where
+  applicable.
+
+Unavailable, unlimited, or invalid platform values use conservative defaults:
+
+```text
+POSIX:   NAME_MAX 255 bytes, PATH_MAX 1024 bytes
+Windows: NAME_MAX 255 ASCII characters, PATH_MAX 260 characters
+```
+
+The 240-byte application cap does not replace the actual `NAME_MAX` check, and
+component checks do not replace `PATH_MAX`.
+
+## 6. Collision buckets and preflight
+
+`preflight_layout()` produces an ordered `ExportPlan` containing
+`WarcBucket(path, urlkeys)` values.
+
+Candidate paths are compared conservatively using:
+
+- the safe encoder's canonical uppercase percent escapes;
+- case folding;
+- trailing-dot/space normalization; and
+- the already applied component truncation and reserved-name encoding.
+
+Filesystem-equivalent candidates share one WARC:
+
+```text
+/posts/       -> archive/posts/index.warc.gz
+/posts/index  -> archive/posts/index.warc.gz
+```
+
+Preflight also detects when one planned WARC path would become the directory
+ancestor of another, including after case folding or truncation. Descendant
+groups are assigned to the ancestor WARC so a file/directory conflict cannot
+surface after playback begins.
+
+The lexically smallest safe candidate supplies the displayed bucket spelling.
+Buckets sort by collection-relative path; URL keys within a bucket sort
+lexically. Allocation is independent of discovery order.
+
+Collision buckets retain resource identity through WARC metadata and distinct
+CDXJ offsets. Sharing storage avoids arbitrary filename suffixes and prevents
+rare naming collisions from aborting unattended exports, while resetting
+deduplication at every URL key ensures storage sharing does not alter content
+policy.
+
+Before playback, preflight checks every planned WARC and
+`replay/index.cdxj`. Existing final entries, broken final symlinks,
+non-directory ancestors, component/path-limit violations, and other
+uninspectable targets are fatal. Valid directory-symlink ancestors remain
+supported.
+
+An allocation collision is valid. An existing final file is not: Fetch does
+not overwrite, append, merge, or repair output.
+
+## 7. Source provenance
+
+After complete successful discovery and before duplicate collapse, Fetch
+publishes:
+
+```text
+sources/wayback/<acquisition>/
+├── captures.cdx.gz
+└── query.json
+```
+
+The acquisition ID is UTC with microseconds:
+
+```text
+20260723T184501.123456Z
+20260723T184501.123456Z-2
+```
+
+### 7.1 Source CDX
+
+`captures.cdx.gz` is UTF-8 classic CDX:
+
+```text
+CDX N b a m s k S
+```
+
+Its fields are:
+
+```text
+urlkey timestamp original mimetype statuscode digest length
+```
+
+Timestamps use 14-digit UTC form. Absent values use `-`. Discovery order,
+value-equal duplicates, redirects, statusless rows, and non-ASCII URLs are
+preserved. Whitespace-bearing tokens are rejected rather than serialized
+ambiguously.
+
+The gzip header has no temporary filename and uses the acquisition time as
+its explicit `mtime`.
+
+### 7.2 Query manifest
+
+`query.json` is deterministic, schema-versioned JSON containing:
+
+- exact URL pattern and date bounds;
+- source identifier;
+- microsecond acquisition time;
+- installed Fetch and Wayback versions;
+- CDX header and field schema;
+- record count; and
+- lowercase SHA-256 of the final compressed CDX bytes.
+
+Package versions come from installed distribution metadata.
+
+### 7.3 Publication
+
+Both artifacts are written in a temporary sibling directory under
+`sources/wayback/`. Publication uses a same-filesystem atomic no-replace
+rename:
+
+- Linux `renameat2(RENAME_NOREPLACE)`;
+- macOS `renamex_np(RENAME_EXCL)`; or
+- Windows' non-replacing rename behavior.
+
+Fetch refuses to weaken directory publication on a platform without an
+exclusive atomic rename primitive.
+
+If a candidate ID already exists at publication time, including due to a
+concurrent process, the completed temporary directory is retried as `-2`,
+`-3`, and so forth. Publication cannot replace a directory created after an
+earlier check. Failed attempts clean their temporary directory.
+
+A published source acquisition remains valid provenance if preflight,
+playback, WARC serialization, or replay indexing later fails.
+
+## 8. Retrieval and WARC construction
+
+For an unseen source signature, Fetch requests the exact original-mode
+Memento:
 
 ```python
-with client.get_memento(
+client.get_memento(
     capture,
     mode=Mode.original,
     exact=True,
     follow_redirects=False,
-) as memento:
-    payload = memento.content
-    ...
+)
 ```
 
-Known CDX 3xx rows never reach this call. For remaining rows, the options mean:
+The response record uses the Memento's target URL, timestamp, source URI,
+status, headers, and decoded semantic body. Representation-dependent headers
+such as transfer/content encoding, source content length, and source digest
+headers are removed. Fetch writes a new semantic `Content-Length`, and
+`warcio` computes the payload digest over the stored body.
 
-- `Mode.original` avoids toolbar injection and browsing-oriented URL
-  rewriting.
-- `exact=True` rejects ordinary substitution with a nearby capture.
-- `follow_redirects=False` prevents traversal when playback itself returns a
-  historical redirect.
+Known CDX 3xx rows are counted and omitted before playback. A statusless row
+that plays back as 3xx is also counted and omitted. A known CDX/Memento status
+mismatch warns and skips the capture. Fetch does not synthesize redirects,
+unavailable-resource metadata, or broken-resource responses.
 
-Wayback's URL canonicalization can still return a different URL variant or
-status at the same timestamp. Fetch therefore treats a known CDX status as a
-required playback invariant. A mismatch is warned, omitted, and never allowed
-to seed deduplication.
+Approved Wayback playback/availability failures warn, count as playback
+failures, and allow later captures to continue. Unexpected formats, repeated
+rate limits, local filesystem errors, and serialization failures are fatal.
 
-The Memento context guarantees that the underlying HTTP response closes on
-success and on WARC-construction failure.
+## 9. Shared-WARC export and deduplication
 
-Fetch does not construct playback URLs, issue direct Requests calls, parse
-Wayback routing headers, or maintain a parallel playback exception hierarchy.
+One bucket owns one lazily opened WARC stream:
 
-### 7.2 Semantic payload policy
+1. Iterate its URL-key groups in sorted order.
+2. Initialize fresh source and semantic maps for the current group.
+3. Process captures in timestamp order.
+4. Reuse the bucket writer for later groups.
+5. Close the WARC after every assigned group completes.
 
-`Memento.content` is the semantic response body that Fetch writes. It may not
-match the representation bytes Internet Archive stored in a source WARC
-because HTTP content coding and playback transfer coding can be decoded during
-delivery.
+The WARC receives one `warcinfo` record. If every assigned capture is omitted
+or skipped, the stream is never opened and no WARC is created.
 
-This is intentional. Fetch wants equivalent compressed and uncompressed
-deliveries of the same content to deduplicate to the same semantic payload.
+Deduplication never crosses a URL-key group boundary, even when two groups
+share a WARC. Within a group:
 
-Consequently, Fetch does not:
+- a successful CDX digest/status source signature can avoid later playback;
+- statusless CDX rows can reuse a successful matching digest;
+- semantic payload digest plus actual HTTP status selects response versus
+  revisit; and
+- maps are updated only after successful validation and serialization.
 
-- stream raw playback bytes;
-- disable Requests decoding;
-- compare raw and decoded candidates;
-- decode gzip or deflate itself;
-- infer whether a content encoding came from the archive or playback;
-- compare Memento content with the CDX digest; or
-- reject a Memento because its semantic digest differs from the CDX digest.
-
-The CDX digest remains useful as a post-success retrieval-skipping hint, not as
-a fixity assertion over `Memento.content`.
-
-### 7.3 WARC response fields
-
-The response is built from public Memento fields:
+`export_all()` returns:
 
 ```text
-WARC-Target-URI      memento.url
-WARC-Date            memento.timestamp normalized to UTC second precision
-WARC-Source-URI      memento.memento_url
-HTTP status          memento.status_code
-HTTP headers         filtered memento.headers
-HTTP body            memento.content
-WARC-Payload-Digest  SHA-1 over memento.content, produced by warcio
+ExportResult(summary, created_warcs)
 ```
 
-Fetch uses the standard-library HTTP reason phrase for a known status code. An
-unknown numeric status is preserved without inventing a reason phrase.
+It does not print the aggregate summary. `created_warcs` contains only WARCs
+successfully closed during the current command and is the complete input to
+replay indexing.
 
-Archived 4xx and 5xx statuses are valid content responses and are preserved.
-Archived 3xx responses are deliberately omitted. When CDX supplies a numeric
-status, the Memento status must match it; a mismatch is treated as playback
-substitution rather than exported under the wrong CDX identity.
+## 10. Replay CDXJ
 
-### 7.4 Header normalization
-
-`Memento.headers` contains the historical headers reconstructed by the
-`wayback` client. Fetch removes fields that would incorrectly describe or
-validate a different stored representation:
-
-```text
-Content-Encoding
-Transfer-Encoding
-Content-Length
-ETag
-Content-MD5
-Content-Digest
-Digest
-Repr-Digest
-Content-Range
-```
-
-Matching is case-insensitive. Fetch then adds one `Content-Length` equal to the
-semantic payload length. Other reconstructed historical headers, including
-`Content-Type` and cache metadata, are retained.
-
-## 8. Per-group export and deduplication
-
-Each CDX URL key is an independent processing unit. Its WARC contains all
-successfully preserved captures for the URL variants in that group, in
-chronological order.
-
-Three maps are scoped to one `export_group()` call:
-
-```text
-(CDX digest, known CDX status)
-    -> semantic payload digest and canonical response
-
-CDX digest
-    -> first successful semantic payload digest and canonical response
-       used only when a later CDX row has no status
-
-(semantic payload digest, actual Memento status)
-    -> canonical response
-```
-
-Statuses remain integers or `None`; they are not stringified for map keys.
-
-### 8.1 Source-signature reuse
-
-A usable CDX digest is normalized to `sha1:` plus uppercase Base32.
-
-Known CDX 3xx captures are omitted before consulting any map. For another
-capture with known CDX status, Fetch may skip playback only after the same
-`(CDX digest, CDX status)` has already produced a successfully written response
-or revisit in the current group.
-
-A CDX revisit or unknown-status row may use the first successful canonical
-response known for its digest. If no successful occurrence exists yet, Fetch
-retrieves it normally and uses the Memento's actual status.
-
-A missing or malformed CDX digest always causes retrieval. It cannot seed or
-match a source map, but the retrieved payload still participates in semantic
-deduplication.
-
-Source-map entries are published only after:
-
-1. Exact Memento retrieval succeeds.
-2. A usable semantic WARC response identity exists.
-3. Any known CDX status matches the actual Memento status.
-4. The actual status is not 3xx.
-5. The response or revisit write succeeds.
-
-A failed first occurrence therefore does not prevent a later occurrence from
-being retrieved.
-
-When playback is skipped, no Memento exists. The revisit uses
-`CdxRecord.original` and `CdxRecord.timestamp` for its current target and date,
-while its reference fields name the canonical Memento-derived response.
-
-### 8.2 Semantic deduplication
-
-Every retrieved response has a semantic identity:
-
-```text
-(WARC-Payload-Digest over Memento.content, actual HTTP status)
-```
-
-If that identity has not appeared, Fetch writes the full response and records
-it as canonical.
-
-If it has appeared, Fetch writes an identical-payload-digest revisit using the
-retrieved Memento's target URL and timestamp. The later capture's distinct CDX
-source signature, if usable, maps to the original full canonical response, not
-to the newly written revisit.
-
-Status remains part of semantic identity so identical bodies served as, for
-example, 200 and 404 are not conflated.
-
-Different CDX digests can converge on the same semantic payload and status.
-They are each retrieved once to establish that convergence; later occurrences
-of either successful source signature can skip playback.
-
-### 8.3 Core policy
-
-The implemented policy can be summarized as:
+Fetch pins `cdxj-indexer==1.4.6` and invokes its Python API with:
 
 ```python
-for capture in captures:
-    if is_3xx(capture.statuscode):
-        count_omitted_redirect(capture)
-        continue
-
-    source_match = find_successful_source_match(
-        capture.digest,
-        capture.statuscode,
-    )
-    if source_match is not None:
-        write_revisit(
-            target=capture.original,
-            date=capture.timestamp,
-            canonical=source_match.canonical,
-        )
-        continue
-
-    try:
-        response = retrieve_exact_semantic_response(client, capture)
-    except SKIPPABLE_WAYBACK_ERRORS as error:
-        warn_and_continue(capture, error)
-        continue
-
-    if (
-        capture.statuscode is not None
-        and response.actual_status != capture.statuscode
-    ):
-        warn_status_substitution(capture, response.actual_status)
-        continue
-
-    if is_3xx(response.actual_status):
-        count_omitted_redirect(capture)
-        continue
-
-    semantic_key = (
-        response.payload_digest,
-        response.actual_status,
-    )
-
-    if writer is None:
-        writer = open_new_warc_exclusively(path)
-
-    canonical = semantic_canonicals.get(semantic_key)
-    if canonical is None:
-        canonical = write_response(writer, response)
-    else:
-        write_revisit(
-            target=response.memento_target,
-            date=response.memento_date,
-            canonical=canonical,
-        )
-
-    remember_semantic_key_after_success(semantic_key, canonical)
-    remember_source_key_after_success(capture, canonical)
+CDXJIndexer(
+    output=temporary_index,
+    inputs=created_warcs,
+    sort=True,
+    records="response,revisit",
+    dir_root=collection_root,
+).process_all()
 ```
 
-This pseudocode describes policy rather than required internal names.
+Only current-export WARCs are indexed. Other files beneath `archives/` are
+never discovered recursively.
 
-### 8.4 Redirects
+The resulting `replay/index.cdxj`:
 
-Fetch is a content-oriented export, not a lossless inventory of every CDX
-capture event. HTTP 3xx records usually describe a crawler reaching a
-noncanonical scheme, host spelling, `www` alias, or former URL rather than a
-new historical document. Preserving them would add playback requests, WARC
-noise, and unavailable-capture policy without adding content.
+- is sorted by replay URL key and timestamp;
+- derives each replay URL key from the WARC record's `WARC-Target-URI`;
+- includes collection-relative filenames such as
+  `archive/posts/index.warc.gz`;
+- records true compressed offsets and member lengths; and
+- indexes response and revisit records only.
 
-The implemented policy is deliberately uniform:
+The Internet Archive source `urlkey` is not copied into replay entries.
 
-- A row with a known CDX status from 300 through 399 is counted and omitted
-  before playback.
-- A statusless CDX row is retrieved normally; if its Memento status is 3xx, it
-  is counted and omitted.
-- Fetch does not classify redirects as canonicalization versus substantive
-  relocation, follow them, synthesize them, or create metadata placeholders.
-- Redirect omissions do not warn individually. The final command summary
-  reports their aggregate count.
+Response entries normally contain target URL, response MIME, HTTP status,
+payload digest, filename, offset, and length. Current revisit records have no
+embedded HTTP response block, so their index entries may contain:
 
-This uniform rule follows KISS. A future opt-in redirect-preservation feature
-may be added if a concrete replay or URL-migration use case justifies the
-additional requests and policy.
-
-## 9. WARC profile
-
-Every output file:
-
-- Uses WARC 1.0.
-- Uses record-at-a-time gzip compression through
-  `warcio.WARCWriter(gzip=True)`.
-- Begins with a minimal `warcinfo` record identifying Archive Magic and WARC
-  1.0.
-- Contains response and revisit records for one CDX URL-key group.
-- Uses Memento target/date/source identity for fully retrieved responses.
-- Uses CDX target/date identity only for current captures whose successful
-  source signature avoids another retrieval.
-- Includes semantic payload digests over the bodies actually written.
-- Writes canonical responses before dependent revisits.
-- Includes `WARC-Refers-To`, `WARC-Refers-To-Target-URI`, and
-  `WARC-Refers-To-Date` on revisits.
-- Writes an empty revisit body rather than a duplicate payload.
-- Contains no fabricated request, redirect, or unavailable-capture metadata
-  records.
-
-`WARC-Refers-To-Target-URI` and `WARC-Refers-To-Date` are standardized by WARC
-1.1. The MVP uses them as extension fields in WARC 1.0 so a cross-target
-revisit can name its canonical response precisely.
-
-Capture datetimes must be timezone-aware. They are normalized to UTC, truncated
-to second precision, and written with a `Z` suffix:
-
-```text
-2020-01-02T03:04:05Z
+```json
+{
+  "mime": "warc/revisit",
+  "digest": "sha1:...",
+  "filename": "archive/posts/index.warc.gz",
+  "offset": "...",
+  "length": "..."
+}
 ```
 
-If every capture for a URL-key group is skipped, Fetch creates no file for
-that group. It does not leave a `warcinfo`-only WARC or unavailable placeholder
-record.
+The indexer does not fabricate a missing status or response MIME. Revisit WARC
+records retain `WARC-Payload-Digest`, `WARC-Refers-To`,
+`WARC-Refers-To-Target-URI`, and `WARC-Refers-To-Date`, providing the digest
+and canonical references required for replay resolution.
 
-## 10. Failure and logging policy
+The index is written to a temporary sibling in `replay/`. Publication first
+uses an atomic hard link to the final name and removes the temporary name; a
+platform exclusive rename is the fallback. Either path has no-replace
+semantics, so an index created after preflight is never overwritten.
 
-### 10.1 Skippable capture failures
+An indexing or publication failure may leave completed WARCs, but never a
+truncated final index. No WARC files means no replay directory or empty index.
 
-The following public Wayback retrieval errors warn, skip only the selected
-capture, and allow later captures and groups to continue:
+## 11. Console and failure policy
 
-- `MementoPlaybackError`, including `NoMementoError`;
-- `BlockedByRobotsError`;
-- `BlockedSiteError`; and
-- exhausted `WaybackRetryError`.
-
-A skipped capture never seeds source or semantic deduplication state.
-
-A known CDX/Memento status mismatch is also warned and skipped. It indicates
-that Wayback returned a different capture identity despite exact playback
-routing. Redirect omissions are intentional content filtering, not playback
-failures, and do not produce per-capture warnings.
-
-### 10.2 Fatal job failures
-
-Fetch stops for:
-
-- invalid CLI input;
-- incomplete or malformed CDX discovery;
-- `UnexpectedResponseFormat`;
-- a second `RateLimitError` for the same operation;
-- malformed local response/WARC state;
-- programming errors;
-- two selected groups mapping to one output path;
-- an existing target WARC; and
-- directory creation, file writing, compression, or WARC serialization
-  failures.
-
-Fetch intentionally does not catch every exception as a remote skip. Doing so
-would conceal local corruption and programming defects.
-
-It does not fabricate a broken-resource response. Absence of a record naturally
-produces a missing resource during replay.
-
-### 10.3 Console output
-
-Console output remains deliberately small:
+Ordinary output remains compact:
 
 ```text
 Starting https://example.com/images/logo.png
 Downloaded 20170604120533 [a19f7c2e]
-WARNING skipped 20190812143015 https://example.com/images/logo.png: capture unavailable
+WARNING skipped 20190812143015 https://example.com/images/logo.png: unavailable
 Summary: 235 selected; 209 responses; 17 revisits; 9 redirects omitted; 0 playback failures
 ```
 
-Messages are:
+The final summary reports selected rows, responses, revisits, deliberately
+omitted redirects, and playback failures. Source-signature revisits that avoid
+the network remain silent.
 
-- `Starting ...` once for each URL-key group, with a URL-variant count when
-  needed.
-- `Downloaded ... [hash]` after each successful Memento retrieval and
-  response/revisit write, using the last eight characters of the semantic
-  payload digest.
-- `WARNING skipped ...` for each approved skippable retrieval error.
-- `WARNING skipped ...` when the known CDX status and playback status differ.
-- `Summary: ...` once after all groups, including response, revisit, omitted
-  redirect, and playback-failure counts.
-- `ERROR: ...` at the CLI boundary for a fatal job error.
+The CLI catches fatal errors, prints `ERROR: ...` to stderr, and returns 1.
+Source publication, WARC writing, and replay publication are individually
+safe, but the whole collection is intentionally not one transaction.
 
-A source-signature revisit that avoids the network is written silently.
+## 12. Project responsibilities and dependencies
 
-No logging framework, progress bar, log file, structured event protocol, or
-verbosity configuration is required.
+The flat package contains:
 
-## 11. Project layout and responsibilities
+| File | Responsibility |
+| --- | --- |
+| `cli.py` | Arguments, date defaults, client lifecycle, stage ordering, final summary/error boundary |
+| `discovery.py` | Complete search, rate-limit retry, duplicate collapse, URL-key grouping |
+| `paths.py` | Collection normalization, safe readable paths, filesystem limits, collision buckets, preflight |
+| `publication.py` | Same-filesystem atomic no-replace file/directory publication |
+| `provenance.py` | Source CDX and query-manifest serialization/publication |
+| `retrieval.py` | Exact Memento playback and semantic response construction |
+| `export.py` | Redirect/status policy, per-group deduplication, bucket export, aggregate result |
+| `warc.py` | WARC dates, exclusive creation, response/revisit serialization |
+| `replay.py` | Final-WARC CDXJ generation and publication |
 
-```text
-archive-magic/
-├── .git/
-├── .gitignore
-├── archive-magic-fetch/
-│   ├── .gitignore
-│   ├── .python-version
-│   ├── LICENSE
-│   ├── pyproject.toml
-│   ├── uv.lock
-│   ├── docs/
-│   │   ├── ARCHITECTURE-FETCH.md
-│   │   ├── WARC_CDX_DEDUPLICATION_RESEARCH_MEMO.md
-│   │   └── WAYBACK-CLIENT-REWRITE-MEMO.md
-│   ├── src/
-│   │   └── archive_magic_fetch/
-│   │       ├── __init__.py
-│   │       ├── cli.py
-│   │       ├── discovery.py
-│   │       ├── paths.py
-│   │       ├── export.py
-│   │       ├── retrieval.py
-│   │       └── warc.py
-│   └── tests/
-│       ├── test_discovery.py
-│       ├── test_paths.py
-│       ├── test_export.py
-│       └── test_retrieval.py
-└── archives/
-    └── urlkey/
-```
-
-The parent directory supplies only Git repository control and generated
-archive storage. The Fetch project can resolve dependencies, run tests, build,
-and execute from `archive-magic-fetch/` without importing files from the
-parent or another sibling.
-
-The modules have narrow responsibilities:
-
-| File | Responsibility | Principal functions |
-| --- | --- | --- |
-| `cli.py` | Arguments, date defaults, shared Wayback client lifetime, command error boundary | `parse_args()`, `main()` |
-| `discovery.py` | Lazy CDX materialization, discovery rate-limit retry, value deduplication, URL-key grouping | `discover()`, `group_captures()` |
-| `paths.py` | Safe deterministic URL-key paths and complete preflight checks | `urlkey_warc_path()`, `preflight_paths()` |
-| `retrieval.py` | Exact Memento retrieval, one rate-limit retry, semantic header filtering, WARC response construction | `retrieve_response()` |
-| `export.py` | Redirect filtering, status validation, per-group source/semantic maps, response-versus-revisit decisions, aggregate outcomes, console messages | `ExportSummary`, `export_all()`, `export_group()` |
-| `warc.py` | WARC date normalization, exclusive file creation, response and revisit serialization | `timestamp_to_warc_date()`, `open_new_warc()`, `write_response()`, `write_revisit()` |
-
-No `core/`, `application/`, `adapters/`, `models/`, `interfaces/`, or
-`services/` hierarchy is required. Add a new file or abstraction only when a
-concrete implementation responsibility can no longer remain clear as a small
-function in the existing package.
-
-The package supports Python 3.12 or newer. Local development selects Python
-3.14 through `.python-version`. The exactly pinned direct runtime dependencies
-are:
+Fetch supports Python 3.12 or newer; local development selects Python 3.14.
+Pinned runtime dependencies are:
 
 ```text
+cdxj-indexer==1.4.6
 wayback==0.5.1
 warcio==1.8.1
 ```
 
-Requests remains a transitive implementation dependency of `wayback`; Fetch
-does not import or call it directly.
+`cdxj-indexer` currently resolves `idna<3`. Collection naming is isolated from
+that dependency through Python's built-in IDNA codec. Offline tests also
+prepare an internationalized request through the locked Wayback/Requests
+stack to verify outgoing punycode behavior.
 
-`pytest>=8` belongs to the default `dev` dependency group. `uv` manages the
-local interpreter, `.venv`, lockfile, and development dependencies; it is a
-development workflow rather than part of Fetch's runtime architecture.
+## 13. Testing and acceptance
 
-## 12. Testing and acceptance
+The deterministic suite uses real `CdxRecord` values, fake Wayback clients,
+temporary collections, actual `warcio` parsing, and the real pinned CDXJ
+indexer. It does not contact Internet Archive.
 
-Routine tests use real `CdxRecord` values, fake clients/Mementos, and temporary
-directories. They do not contact Internet Archive.
+Acceptance covers:
 
-Routine local development is activation-free and runs from the standalone
-project directory:
+- collection normalization, built-in IDNA, ports, and wildcard scopes;
+- safe readable paths, query retention, component truncation, and collision
+  allocation;
+- independent `NAME_MAX` and `PATH_MAX` checks and fallbacks;
+- existing targets, broken symlinks, and invalid ancestors;
+- complete source CDX/manifest content, checksums, suffix allocation,
+  concurrent publication, and cleanup;
+- shared-WARC ownership with one `warcinfo` and fresh per-group maps;
+- unchanged retrieval, redirect, status, retry, deduplication, and failure
+  behavior;
+- sorted response/revisit CDXJ semantics and nested filenames;
+- exact offset/length selection of independently compressed WARC members;
+- replay publication races and indexer failures; and
+- final-summary ordering.
+
+Routine validation is:
 
 ```bash
-cd archive-magic-fetch
-uv run pytest
-uv run archive-magic-fetch URL_PATTERN [--start DATE] [--end DATE]
-```
-
-A clean acceptance check also runs:
-
-```bash
+uv run --package archive-magic-fetch pytest
 uv lock --check
-uv run archive-magic-fetch --help
+uv run --package archive-magic-fetch archive-magic-fetch --help
+git diff --check
 ```
 
-Generated environments, caches, and build products are excluded by the
-project `.gitignore`. The repository-root `.gitignore` excludes the sibling
-`archives/` output.
+The repository root is a uv workspace. Fetch keeps its own package metadata in
+`archive-magic-fetch/pyproject.toml`, while every workspace member shares the
+single repository-root `uv.lock`. Package-specific commands use
+`--package archive-magic-fetch`; no nested lockfile is maintained.
 
-The implemented MVP is accepted when deterministic tests demonstrate:
+## 14. Explicit non-goals
 
-1. Missing date bounds expand to 1995 and/or the present.
-2. One session/client spans discovery and export and closes at the command
-   boundary.
-3. Discovery passes both bounds, disables revisit resolution, and fully
-   materializes the lazy search.
-4. A rate limit after partial discovery discards the partial attempt and
-   retries complete materialization once.
-5. A missing `retry_after` waits 60 seconds; a second rate limit is fatal.
-6. Captures collapse only by `CdxRecord` value equality, group by `urlkey` in
-   first-seen order, and sort by aware datetime.
-7. Upstream default-port normalization is accepted.
-8. URL-key paths map safely and deterministically beneath `../archives/`.
-9. Existing targets and path collisions fail before Memento retrieval.
-10. Retrieval passes `Mode.original`, `exact=True`, and
-    `follow_redirects=False`.
-11. Mementos close on success and on WARC-construction failure.
-12. Response target/date/source/status/headers/body come from the Memento.
-13. Representation-dependent headers are removed and semantic
-    `Content-Length` is correct.
-14. The WARC payload digest matches the semantic body written.
-15. Known and unknown HTTP statuses produce valid status lines.
-16. Known CDX 3xx rows are counted and omitted without playback.
-17. A statusless row whose retrieved Memento is 3xx is counted and omitted.
-18. A known CDX/Memento status mismatch warns, is omitted, and does not seed
-    deduplication.
-19. CDX digest/status reuse begins only after successful retrieval,
-    status validation, and write.
-20. A failed first source occurrence does not suppress a later retrieval.
-21. Known CDX statuses and actual response statuses remain distinct integer
-    values until playback validation succeeds.
-22. Statusless CDX revisits use a previously successful digest occurrence or
-    retrieve normally when none exists.
-23. Different CDX digests that converge on one semantic payload/status produce
-    one response and revisits.
-24. Missing and malformed CDX digests retrieve normally and still participate
-    in semantic deduplication.
-25. Source-signature shortcuts use CDX current identity while fetched
-    responses and semantic revisits use Memento identity.
-26. Approved Wayback availability failures warn and continue.
-27. Unexpected formats, repeated rate limits, filesystem errors, and WARC
-    serialization errors remain fatal.
-28. An all-skipped group produces no output file.
-29. Deduplication maps do not cross URL-key group boundaries.
-30. The final summary accounts for selected rows, responses, revisits,
-    intentionally omitted redirects, and playback failures.
-31. `warcio` parses each output as gzip-compressed WARC 1.0 with the expected
-    response/revisit order, semantic digests, and canonical references.
+This implementation does not include:
 
-A small manually invoked Internet Archive smoke export may verify current
-upstream behavior. Remote availability is not part of the deterministic suite.
+- migration or rewriting of pre-existing archive data;
+- overwrite, append, repair, merge, or resume behavior;
+- output-root configuration;
+- a generic archive-source interface or Common Crawl;
+- source-WARC representation-byte preservation;
+- redirect preservation or unavailable-capture metadata;
+- cross-URL-key payload deduplication;
+- concurrent retrieval;
+- a replay server or pywb configuration;
+- sharded or ZipNum replay indexes;
+- a database or persistent naming registry;
+- a general manifest framework; or
+- atomic publication of the entire site collection.
 
-## 13. Explicit non-goals
+## References
 
-The MVP does not include:
-
-- Replay or any `archive-magic-replay` code.
-- Common Crawl or other archives.
-- A generic archive client interface.
-- HTML dependency discovery or page bundles.
-- Exact preservation of source-WARC representation or transfer bytes.
-- CDX-digest fixity validation against Memento content.
-- Cross-URL-key deduplication.
-- Redirect preservation, redirect classification, or unavailable-capture
-  metadata.
-- WARC 1.1.
-- CDXJ generation or replay indexes.
-- Persisted CDX inventories, manifests, checksums, schemas, or databases.
-- Atomic publication, temporary staging, resumability, or cleanup tooling.
-- Overwrite, merge, append, or repair behavior.
-- Concurrent downloads, queues, services, or workers.
-- Configurable request rates or retry counts.
-- Configuration files, environment-variable configuration, or plugin systems.
-- Machine-readable progress events or a graphical interface.
-
-## Appendix A: Potential future enhancements
-
-Consider these only after the MVP has been exercised:
-
-- Add a separate Common Crawl fetch client using public source-WARC byte
-  ranges.
-- Add configurable output roots and deliberate overwrite or resume behavior.
-- Add page bundles by discovering static HTML and CSS dependencies.
-- Add WARC 1.1 if standardized cross-target references or broader replay
-  interoperability requires it.
-- Add CDXJ indexes if a concrete replay workflow requires them.
-- Add a persisted inventory or manifest when auditability or restartability is
-  required.
-- Add bounded concurrency only after measuring serial throughput and
-  coordinating all workers through shared rate limits.
-- Add richer progress, summaries, and machine-readable output.
-- Preserve authentic request records if a source exposes them.
-- Add atomic temporary-file replacement and stale-partial cleanup.
-
-## Appendix B: Dependency and standards references
-
-- [`wayback` 0.5.1 usage and API documentation](https://wayback.readthedocs.io/en/stable/usage.html)
-- [`wayback` 0.5.1 client source and pacing behavior](https://wayback.readthedocs.io/en/stable/_modules/wayback/_client.html)
-- [`CdxRecord` digest and `Memento` model source](https://wayback.readthedocs.io/en/stable/_modules/wayback/_models.html)
-- [`wayback` exception hierarchy](https://wayback.readthedocs.io/en/stable/_modules/wayback/exceptions.html)
-- [`wayback` 0.5.1 release history](https://wayback.readthedocs.io/en/stable/release-history.html)
-- [Internet Archive automated-access guidance](https://archive.org/developers/bots.html)
-- [IIPC WARC 1.0 specification](https://iipc.github.io/warc-specifications/specifications/warc-format/warc-1.0/)
+- [`wayback` client documentation](https://wayback.readthedocs.io/en/stable/)
 - [`warcio` documentation](https://warcio.readthedocs.io/en/latest/)
+- [`cdxj-indexer` 1.4.6 implementation](https://github.com/webrecorder/cdxj-indexer/blob/v1.4.6/cdxj_indexer/main.py)
+- [pywb indexing documentation](https://pywb.readthedocs.io/en/latest/manual/indexing.html)
+- [IIPC WARC 1.0 specification](https://iipc.github.io/warc-specifications/specifications/warc-format/warc-1.0/)

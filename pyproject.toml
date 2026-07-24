@@ -10,5 +10,8 @@ dependencies = [
 [tool.uv]
 package = false
 
+[tool.uv.workspace]
+members = ["archive-magic-fetch"]
+
 [tool.uv.sources]
-archive-magic-fetch = { path = "archive-magic-fetch", editable = true }
+archive-magic-fetch = { workspace = true }

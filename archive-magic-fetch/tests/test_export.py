@@ -127,7 +127,11 @@ def read_records(path):
 
 
 def output_path(tmp_path, urlkey=URLKEY):
-    return paths.urlkey_warc_path(urlkey, root=tmp_path / "archives")
+    layout = paths.collection_layout(
+        "https://example.com/*",
+        root=tmp_path / "archives",
+    )
+    return paths.preferred_warc_path(urlkey, layout)
 
 
 def test_normalize_digest_accepts_raw_and_prefixed_sha1():
@@ -582,10 +586,11 @@ def test_dedup_maps_are_scoped_to_each_group(tmp_path, capsys):
         first.urlkey: [first],
         second.urlkey: [second],
     }
-    output_paths = paths.preflight_paths(
-        groups,
+    layout = paths.collection_layout(
+        "https://example.com/*",
         root=tmp_path / "archives",
     )
+    plan = paths.preflight_layout(groups, layout)
     client = FakeClient(
         {
             first: memento_for(first),
@@ -593,22 +598,126 @@ def test_dedup_maps_are_scoped_to_each_group(tmp_path, capsys):
         }
     )
 
-    summary = export.export_all(groups, output_paths, client)
+    result = export.export_all(groups, plan.buckets, client)
 
     assert client.calls == [first, second]
-    assert summary == export.ExportSummary(
+    assert result.summary == export.ExportSummary(
         selected=2,
         responses=2,
     )
     assert all(
         [record.rec_type for record in read_records(path)]
         == ["warcinfo", "response"]
-        for path in output_paths.values()
+        for path in result.created_warcs
     )
+    assert "Summary:" not in capsys.readouterr().out
+    export.print_summary(result.summary)
     assert capsys.readouterr().out.endswith(
         "Summary: 2 selected; 2 responses; 0 revisits; "
         "0 redirects omitted; 0 playback failures\n"
     )
+
+
+def test_colliding_groups_share_one_warc_but_not_deduplication(tmp_path):
+    trailing = capture(
+        original="https://example.com/posts/",
+        urlkey="com,example)/posts/",
+        captured="20180101000000",
+    )
+    explicit = capture(
+        original="https://example.com/posts/index",
+        urlkey="com,example)/posts/index",
+        captured="20170101000000",
+    )
+    groups = {
+        trailing.urlkey: [trailing],
+        explicit.urlkey: [explicit],
+    }
+    layout = paths.collection_layout(
+        "https://example.com/*",
+        root=tmp_path / "archives",
+    )
+    plan = paths.preflight_layout(groups, layout)
+    client = FakeClient(
+        {
+            trailing: memento_for(trailing, payload=b"same"),
+            explicit: memento_for(explicit, payload=b"same"),
+        }
+    )
+
+    result = export.export_all(groups, plan.buckets, client)
+
+    assert len(plan.buckets) == 1
+    assert client.calls == [trailing, explicit]
+    assert result.created_warcs == (
+        layout.archive_root / "posts" / "index.warc.gz",
+    )
+    assert [record.rec_type for record in read_records(result.created_warcs[0])] == [
+        "warcinfo",
+        "response",
+        "response",
+    ]
+    assert result.summary == export.ExportSummary(
+        selected=2,
+        responses=2,
+    )
+
+
+def test_file_directory_conflict_is_exported_to_ancestor_warc(tmp_path):
+    parent = capture(
+        original="https://example.com/foo",
+        urlkey="com,example)/foo",
+    )
+    descendant = capture(
+        original="https://example.com/foo.warc.gz/bar",
+        urlkey="com,example)/foo.warc.gz/bar",
+    )
+    groups = {
+        descendant.urlkey: [descendant],
+        parent.urlkey: [parent],
+    }
+    layout = paths.collection_layout(
+        "https://example.com/*",
+        root=tmp_path / "archives",
+    )
+    plan = paths.preflight_layout(groups, layout)
+
+    result = export.export_all(
+        groups,
+        plan.buckets,
+        FakeClient(
+            {
+                parent: memento_for(parent),
+                descendant: memento_for(descendant),
+            }
+        ),
+    )
+
+    assert result.created_warcs == (layout.archive_root / "foo.warc.gz",)
+    assert [record.rec_type for record in read_records(result.created_warcs[0])] == [
+        "warcinfo",
+        "response",
+        "response",
+    ]
+
+
+def test_all_skipped_bucket_returns_no_created_warc(tmp_path):
+    selected = capture(statuscode=301)
+    groups = {selected.urlkey: [selected]}
+    layout = paths.collection_layout(
+        "https://example.com/*",
+        root=tmp_path / "archives",
+    )
+    plan = paths.preflight_layout(groups, layout)
+
+    result = export.export_all(groups, plan.buckets, FakeClient({}))
+
+    assert result.created_warcs == ()
+    assert result.summary == export.ExportSummary(
+        selected=1,
+        redirects_omitted=1,
+    )
+    assert not plan.buckets[0].path.exists()
 
 
 def test_generated_file_is_parseable_gzip_warc_1_0(tmp_path):

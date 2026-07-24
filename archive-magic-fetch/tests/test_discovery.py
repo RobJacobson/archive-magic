@@ -221,23 +221,60 @@ def test_cli_owns_one_client_context_and_passes_same_client(monkeypatch):
     created = install_fake_lifecycle(monkeypatch)
     capture = record()
     groups = {capture.urlkey: [capture]}
-    output_paths = {capture.urlkey: object()}
+    layout = object()
+    buckets = (object(),)
     calls = {}
 
     def fake_discover(client, pattern, start, end):
         calls["discover"] = (client, pattern, start, end)
         return [capture]
 
-    def fake_export(grouped, paths, client):
-        calls["export"] = (grouped, paths, client)
+    def fake_export(grouped, planned_buckets, client):
+        calls["export"] = (grouped, planned_buckets, client)
+        return type(
+            "Result",
+            (),
+            {
+                "summary": type("Summary", (), {"selected": 1})(),
+                "created_warcs": (),
+            },
+        )()
 
     monkeypatch.setattr(cli, "current_utc_cdx_timestamp", lambda: "20260722123456")
+    monkeypatch.setattr(cli, "collection_layout", lambda *args, **kwargs: layout)
     monkeypatch.setattr(cli, "discover", fake_discover)
+    monkeypatch.setattr(
+        cli,
+        "save_acquisition",
+        lambda captures, **kwargs: calls.setdefault(
+            "provenance",
+            (captures, kwargs),
+        ),
+    )
     monkeypatch.setattr(cli, "group_captures", lambda captures: groups)
     monkeypatch.setattr(
-        cli, "preflight_paths", lambda grouped, root=None: output_paths
+        cli,
+        "preflight_layout",
+        lambda grouped, selected_layout: type(
+            "Plan",
+            (),
+            {"layout": selected_layout, "buckets": buckets},
+        )(),
     )
     monkeypatch.setattr(cli, "export_all", fake_export)
+    monkeypatch.setattr(
+        cli,
+        "generate_replay_index",
+        lambda created, layout: calls.setdefault(
+            "replay",
+            (created, layout),
+        ),
+    )
+    monkeypatch.setattr(
+        cli,
+        "print_summary",
+        lambda summary: calls.setdefault("summary", summary),
+    )
 
     assert cli.main(["*.example.com"]) == 0
     client = created["client"]
@@ -251,7 +288,10 @@ def test_cli_owns_one_client_context_and_passes_same_client(monkeypatch):
         "1995",
         "20260722123456",
     )
-    assert calls["export"] == (groups, output_paths, client)
+    assert calls["provenance"][0] == [capture]
+    assert calls["export"] == (groups, buckets, client)
+    assert calls["replay"] == ((), layout)
+    assert calls["summary"].selected == 1
 
 
 def test_cli_passes_explicit_dates(monkeypatch):
@@ -293,6 +333,89 @@ def test_cli_fatal_error_returns_one(monkeypatch, capsys):
 
     assert cli.main(["example.com/*"]) == 1
     assert capsys.readouterr().err == "ERROR: discovery failed\n"
+
+
+def test_cli_does_not_print_summary_when_replay_indexing_fails(
+    monkeypatch,
+    capsys,
+):
+    install_fake_lifecycle(monkeypatch)
+    selected = record()
+    layout = object()
+    bucket = object()
+    monkeypatch.setattr(cli, "collection_layout", lambda *args, **kwargs: layout)
+    monkeypatch.setattr(cli, "discover", lambda *args: [selected])
+    monkeypatch.setattr(cli, "save_acquisition", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        cli,
+        "preflight_layout",
+        lambda *args: type(
+            "Plan",
+            (),
+            {"layout": layout, "buckets": (bucket,)},
+        )(),
+    )
+    monkeypatch.setattr(
+        cli,
+        "export_all",
+        lambda *args: type(
+            "Result",
+            (),
+            {
+                "summary": type("Summary", (), {})(),
+                "created_warcs": (object(),),
+            },
+        )(),
+    )
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("index failed")
+
+    monkeypatch.setattr(cli, "generate_replay_index", fail)
+
+    assert cli.main(["example.com/*"]) == 1
+    output = capsys.readouterr()
+    assert "Summary:" not in output.out
+    assert output.err == "ERROR: index failed\n"
+
+
+def test_cli_retains_published_provenance_after_downstream_failure(
+    tmp_path,
+    monkeypatch,
+):
+    install_fake_lifecycle(monkeypatch)
+    selected = record()
+    monkeypatch.setattr(
+        cli,
+        "_DEFAULT_OUTPUT_ROOT",
+        tmp_path / "archives",
+    )
+    monkeypatch.setattr(cli, "discover", lambda *args: [selected])
+    monkeypatch.setattr(
+        cli,
+        "export_all",
+        lambda *args: type(
+            "Result",
+            (),
+            {
+                "summary": type("Summary", (), {})(),
+                "created_warcs": (),
+            },
+        )(),
+    )
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("downstream failed")
+
+    monkeypatch.setattr(cli, "generate_replay_index", fail)
+
+    assert cli.main(["https://example.com/*"]) == 1
+    acquisitions = list(
+        (tmp_path / "archives" / "example.com" / "sources" / "wayback").iterdir()
+    )
+    assert len(acquisitions) == 1
+    assert (acquisitions[0] / "captures.cdx.gz").exists()
+    assert (acquisitions[0] / "query.json").exists()
 
 
 def test_cli_rejects_unapproved_arguments():

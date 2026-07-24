@@ -11,8 +11,10 @@ from typing import Optional, Sequence
 from wayback import WaybackClient, WaybackSession
 
 from .discovery import discover, group_captures
-from .export import export_all
-from .paths import DEFAULT_OUTPUT_ROOT, preflight_paths
+from .export import export_all, print_summary
+from .paths import DEFAULT_OUTPUT_ROOT, collection_layout, preflight_layout
+from .provenance import save_acquisition
+from .replay import generate_replay_index
 
 
 USER_AGENT = (
@@ -49,6 +51,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     date_end = args.end or current_utc_cdx_timestamp()
 
     try:
+        layout = collection_layout(args.url_pattern, root=_DEFAULT_OUTPUT_ROOT)
         session = WaybackSession(user_agent=USER_AGENT)
         with WaybackClient(session=session) as client:
             captures = discover(
@@ -61,11 +64,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 print("No captures found")
                 return 0
 
-            capture_groups = group_captures(captures)
-            output_paths = preflight_paths(
-                capture_groups, root=_DEFAULT_OUTPUT_ROOT
+            save_acquisition(
+                captures,
+                layout=layout,
+                url_pattern=args.url_pattern,
+                date_start=date_start,
+                date_end=date_end,
+                acquired_at=datetime.now(timezone.utc),
             )
-            export_all(capture_groups, output_paths, client)
+            capture_groups = group_captures(captures)
+            plan = preflight_layout(capture_groups, layout)
+            result = export_all(capture_groups, plan.buckets, client)
+            generate_replay_index(
+                result.created_warcs,
+                layout=plan.layout,
+            )
+            print_summary(result.summary)
     except Exception as error:
         print(f"ERROR: {error}", file=sys.stderr)
         return 1
