@@ -18,8 +18,8 @@ from wayback.exceptions import (
     WaybackRetryError,
 )
 
-from .retrieval import retrieve_response
 from .paths import WarcBucket
+from .retrieval import RetrievalCache, retrieve_response
 from .warc import (
     CanonicalResponse,
     open_new_warc,
@@ -226,6 +226,8 @@ def _export_group(
     captures: Sequence[CdxRecord],
     client,
     writer_factory: Callable[[], object],
+    *,
+    cache: Optional[RetrievalCache] = None,
 ) -> ExportSummary:
     """Export one URL-key group using fresh payload-deduplication state."""
 
@@ -273,7 +275,7 @@ def _export_group(
             continue
 
         try:
-            response = retrieve_response(client, capture)
+            response = retrieve_response(client, capture, cache=cache)
         except (
             MementoPlaybackError,
             BlockedByRobotsError,
@@ -341,12 +343,20 @@ def export_group(
     captures: Sequence[CdxRecord],
     path: Path,
     client,
+    *,
+    cache: Optional[RetrievalCache] = None,
 ) -> ExportSummary:
     """Export one group to one lazily created WARC."""
 
     owner = _LazyWarc(path)
     try:
-        return _export_group(urlkey, captures, client, owner.get_writer)
+        return _export_group(
+            urlkey,
+            captures,
+            client,
+            owner.get_writer,
+            cache=cache,
+        )
     finally:
         owner.close()
 
@@ -355,6 +365,8 @@ def _export_bucket(
     bucket: WarcBucket,
     capture_groups: Mapping[str, Sequence[CdxRecord]],
     client,
+    *,
+    cache: Optional[RetrievalCache] = None,
 ) -> tuple[ExportSummary, bool]:
     """Export every URL-key group assigned to one lazy WARC owner."""
 
@@ -368,6 +380,7 @@ def _export_bucket(
                     capture_groups[urlkey],
                     client,
                     owner.get_writer,
+                    cache=cache,
                 )
             )
     finally:
@@ -379,6 +392,8 @@ def export_all(
     capture_groups: Mapping[str, Sequence[CdxRecord]],
     buckets: Sequence[WarcBucket],
     client,
+    *,
+    cache: Optional[RetrievalCache] = None,
 ) -> ExportResult:
     """Export ordered buckets while keeping deduplication scoped to groups."""
 
@@ -389,6 +404,7 @@ def export_all(
             bucket,
             capture_groups,
             client,
+            cache=cache,
         )
         summary.add(bucket_summary)
         if created:
@@ -397,11 +413,19 @@ def export_all(
     return ExportResult(summary, tuple(created_warcs))
 
 
-def print_summary(summary: ExportSummary) -> None:
-    """Print the stable aggregate summary after all output is complete."""
+def print_summary(
+    summary: ExportSummary,
+    *,
+    warc_mode: str = "all",
+) -> None:
+    """Print the WARC aggregate summary after WARC output is complete."""
+
+    if warc_mode == "none":
+        print("Summary: warc disabled (none)")
+        return
 
     print(
-        f"Summary: {summary.selected} selected; "
+        f"Summary: {summary.selected} selected for warc ({warc_mode}); "
         f"{summary.responses} responses; "
         f"{summary.revisits} revisits; "
         f"{summary.redirects_omitted} redirects omitted; "

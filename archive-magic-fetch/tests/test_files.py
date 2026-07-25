@@ -1,0 +1,277 @@
+from datetime import datetime, timezone
+from pathlib import Path
+
+from wayback import CdxRecord
+from wayback.exceptions import MementoPlaybackError
+
+from archive_magic_fetch import export, files, paths, retrieval
+from archive_magic_fetch.discovery import apply_output_mode, group_captures
+
+
+def timestamp(value):
+    return datetime.strptime(value, "%Y%m%d%H%M%S").replace(
+        tzinfo=timezone.utc
+    )
+
+
+def capture(
+    *,
+    original="https://example.com/",
+    captured="20170101000000",
+    statuscode=200,
+    urlkey="com,example)/",
+    payload=b"payload",
+    digest=None,
+):
+    return CdxRecord(
+        urlkey=urlkey,
+        timestamp=timestamp(captured),
+        original=original,
+        mimetype="text/html",
+        statuscode=statuscode,
+        digest=digest or ("A" * 32),
+        length=len(payload),
+    )
+
+
+class FakeMemento:
+    def __init__(self, *, url, captured, payload=b"payload", status_code=200):
+        self.url = url
+        self.timestamp = timestamp(captured)
+        self.status_code = status_code
+        self.memento_url = f"https://web.archive.org/web/{captured}id_/{url}"
+        self.headers = {"Content-Type": "text/html"}
+        self.content = payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+
+class FakeClient:
+    def __init__(self, outcomes):
+        self.outcomes = outcomes
+        self.calls = []
+
+    def get_memento(self, selected, **kwargs):
+        self.calls.append(selected)
+        outcome = self.outcomes[selected]
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+
+def memento_for(selected, *, payload=b"payload", status_code=None):
+    return FakeMemento(
+        url=selected.original,
+        captured=selected.timestamp.astimezone(timezone.utc).strftime(
+            "%Y%m%d%H%M%S"
+        ),
+        payload=payload,
+        status_code=(
+            status_code
+            if status_code is not None
+            else selected.statuscode or 200
+        ),
+    )
+
+
+def test_files_latest_writes_website_without_timestamps(tmp_path):
+    root = capture(original="https://example.com/", payload=b"home")
+    about = capture(
+        original="https://example.com/about",
+        urlkey="com,example)/about",
+        payload=b"about",
+    )
+    groups = {
+        root.urlkey: [root],
+        about.urlkey: [about],
+    }
+    layout = paths.collection_layout(
+        "https://example.com/*",
+        root=tmp_path / "archives",
+    )
+    plan = paths.preflight_website_layout(
+        groups,
+        layout,
+        include_timestamps=False,
+    )
+    client = FakeClient(
+        {
+            root: memento_for(root, payload=b"home"),
+            about: memento_for(about, payload=b"about"),
+        }
+    )
+
+    summary = files.write_website_files(groups, plan, client)
+
+    assert summary.written == 2
+    assert (
+        layout.website_root / "example.com" / "index.html"
+    ).read_bytes() == b"home"
+    assert (
+        layout.website_root / "example.com" / "about" / "index.html"
+    ).read_bytes() == b"about"
+    assert not (layout.archive_root).exists()
+    assert not (layout.replay_index).exists()
+
+
+def test_files_all_writes_timestamp_directories(tmp_path):
+    first = capture(
+        original="https://example.com/",
+        captured="20051120005053",
+        payload=b"old",
+    )
+    second = capture(
+        original="https://example.com/",
+        captured="20060715085250",
+        payload=b"new",
+        digest="B" * 32,
+    )
+    groups = {first.urlkey: [first, second]}
+    layout = paths.collection_layout(
+        "https://example.com/*",
+        root=tmp_path / "archives",
+    )
+    plan = paths.preflight_website_layout(
+        groups,
+        layout,
+        include_timestamps=True,
+    )
+    client = FakeClient(
+        {
+            first: memento_for(first, payload=b"old"),
+            second: memento_for(second, payload=b"new"),
+        }
+    )
+
+    summary = files.write_website_files(groups, plan, client)
+
+    assert summary.written == 2
+    assert (
+        layout.website_root
+        / "example.com"
+        / "20051120005053"
+        / "index.html"
+    ).read_bytes() == b"old"
+    assert (
+        layout.website_root
+        / "example.com"
+        / "20060715085250"
+        / "index.html"
+    ).read_bytes() == b"new"
+
+
+def test_warc_latest_writes_one_response_and_replay(tmp_path):
+    older = capture(captured="20100101000000", statuscode=404, payload=b"old")
+    newer_200 = capture(
+        captured="20150101000000",
+        statuscode=200,
+        payload=b"ok",
+        digest="B" * 32,
+    )
+    redirect = capture(
+        captured="20200101000000",
+        statuscode=301,
+        digest="C" * 32,
+    )
+    grouped = group_captures([older, newer_200, redirect])
+    selected = apply_output_mode(grouped, "latest")
+    layout = paths.collection_layout(
+        "https://example.com/*",
+        root=tmp_path / "archives",
+    )
+    plan = paths.preflight_layout(selected, layout)
+    client = FakeClient({newer_200: memento_for(newer_200, payload=b"ok")})
+
+    result = export.export_all(selected, plan.buckets, client)
+    from archive_magic_fetch.replay import generate_replay_index
+
+    generate_replay_index(result.created_warcs, layout=layout)
+
+    assert client.calls == [newer_200]
+    assert result.summary.responses == 1
+    assert result.summary.revisits == 0
+    assert layout.replay_index.exists()
+
+
+def test_dual_mode_fetches_shared_capture_once(tmp_path):
+    selected = capture(payload=b"shared-body")
+    groups = {selected.urlkey: [selected]}
+    layout = paths.collection_layout(
+        "https://example.com/*",
+        root=tmp_path / "archives",
+    )
+    warc_plan = paths.preflight_layout(groups, layout)
+    website_plan = paths.preflight_website_layout(
+        groups,
+        layout,
+        include_timestamps=False,
+    )
+    client = FakeClient({selected: memento_for(selected, payload=b"shared-body")})
+    cache = retrieval.RetrievalCache()
+
+    warc_result = export.export_all(
+        groups,
+        warc_plan.buckets,
+        client,
+        cache=cache,
+    )
+    files_summary = files.write_website_files(
+        groups,
+        website_plan,
+        client,
+        cache=cache,
+    )
+
+    assert client.calls == [selected]
+    assert warc_result.summary.responses == 1
+    assert files_summary.written == 1
+    assert (
+        layout.website_root / "example.com" / "index.html"
+    ).read_bytes() == b"shared-body"
+
+
+def test_empty_playback_body_counts_as_failure(tmp_path, capsys):
+    selected = capture(payload=b"")
+    groups = {selected.urlkey: [selected]}
+    layout = paths.collection_layout(
+        "https://example.com/*",
+        root=tmp_path / "archives",
+    )
+    plan = paths.preflight_website_layout(
+        groups,
+        layout,
+        include_timestamps=False,
+    )
+    client = FakeClient({selected: memento_for(selected, payload=b"")})
+
+    summary = files.write_website_files(groups, plan, client)
+
+    assert summary.written == 0
+    assert summary.playback_failures == 1
+    assert not any(layout.website_root.rglob("*"))
+    assert "empty playback body" in capsys.readouterr().err
+
+
+def test_playback_failure_does_not_create_file(tmp_path):
+    selected = capture()
+    groups = {selected.urlkey: [selected]}
+    layout = paths.collection_layout(
+        "https://example.com/*",
+        root=tmp_path / "archives",
+    )
+    plan = paths.preflight_website_layout(
+        groups,
+        layout,
+        include_timestamps=False,
+    )
+    client = FakeClient({selected: MementoPlaybackError("unavailable")})
+
+    summary = files.write_website_files(groups, plan, client)
+
+    assert summary.playback_failures == 1
+    assert summary.written == 0
+    assert list(Path(layout.website_root).rglob("*")) == []

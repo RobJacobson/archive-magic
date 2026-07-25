@@ -184,7 +184,7 @@ def test_retrieve_unknown_status_has_no_invented_reason():
     assert response.http_headers.statusline == "599"
 
 
-def test_memento_closes_when_warc_construction_fails(monkeypatch):
+def test_memento_closes_before_warc_construction_fails(monkeypatch):
     memento = FakeMemento()
 
     class FailingBuilder:
@@ -196,10 +196,11 @@ def test_memento_closes_when_warc_construction_fails(monkeypatch):
 
     monkeypatch.setattr(retrieval, "RecordBuilder", FailingBuilder)
 
-    with pytest.raises(RuntimeError, match="cannot build WARC"):
-        retrieval.retrieve_response(FakeClient([memento]), object())
+    retrieved = retrieval.retrieve_memento(FakeClient([memento]), object())
     assert memento.closed is True
-    assert isinstance(memento.exit_error, RuntimeError)
+    assert memento.exit_error is None
+    with pytest.raises(RuntimeError, match="cannot build WARC"):
+        retrieved.to_warc_record()
 
 
 def test_first_rate_limit_sleeps_and_retries_same_capture(monkeypatch):

@@ -4,7 +4,7 @@
 
 **Scope:** `archive-magic-fetch` only
 
-**Updated:** July 23, 2026
+**Updated:** July 24, 2026
 
 ## 1. Decision
 
@@ -27,16 +27,25 @@ archive-magic/
         │   └── posts/
         │       ├── index.warc.gz
         │       └── hello-world.warc.gz
-        └── replay/
-            └── index.cdxj
+        ├── replay/
+        │   └── index.cdxj
+        └── website/
+            ├── index.html
+            ├── about/
+            │   └── index.html
+            └── css/
+                └── style.css
 ```
 
-The three artifact areas have distinct ownership:
+The artifact areas have distinct ownership:
 
 - `sources/` records the complete normalized discovery result returned by the
   high-level Wayback client.
-- `archive/` contains WARC 1.0 response and revisit records written by Fetch.
+- `archive/` contains WARC 1.0 response and revisit records written by Fetch
+  when `--warc` is enabled.
 - `replay/` indexes the exact compressed WARC bytes Fetch produced.
+- `website/` contains optional loose website bodies written when `--files` is
+  enabled.
 
 The source CDX is provenance, not a replay index. It has no offsets into the
 local WARCs. The replay CDXJ is derived from WARC record metadata and compressed
@@ -58,11 +67,24 @@ The implementation remains deliberately small:
 
 ## 2. CLI contract and data flow
 
-The public command is unchanged:
+The public command is:
 
 ```text
-archive-magic-fetch URL_PATTERN [--start DATE] [--end DATE]
+archive-magic-fetch URL_PATTERN
+  [--start DATE] [--end DATE]
+  [--warc {none,latest,all}]
+  [--files {none,latest,all}]
 ```
+
+| Flag | Values | Default |
+| --- | --- | --- |
+| `--warc` | `none`, `latest`, `all` | `all` |
+| `--files` | `none`, `latest`, `all` | `none` |
+
+The two axes are independent. Default behavior remains full WARC history plus
+replay CDXJ with no loose files. `--warc none --files none` exits successfully
+with `Nothing to do: both --warc and --files are none` and performs no
+discovery.
 
 Numeric partial dates are passed through unchanged to `WaybackClient.search()`,
 which forwards them to the Internet Archive CDX `from`/`to` parameters. Those
@@ -82,24 +104,38 @@ The successful flow is:
 
 ```text
 parse arguments and apply date defaults
+    -> if warc=none and files=none: message + exit 0
     -> derive and validate the collection name
     -> create one WaybackSession and WaybackClient
     -> fully materialize discovery
     -> if empty, print "No captures found" and exit successfully
-    -> atomically publish the source acquisition
+    -> atomically publish the source acquisition (full discovery set)
     -> collapse value-equal records and group by urlkey
-    -> allocate readable WARC buckets
-    -> preflight all WARC and replay targets
-    -> export buckets and close their WARC streams
-    -> generate and atomically publish replay/index.cdxj
-    -> print the aggregate summary
+    -> build warc_selection and files_selection from output modes
+    -> if warc enabled: allocate WARC buckets and preflight WARC/replay
+    -> if files enabled: plan and preflight website/ paths
+    -> if warc enabled: export WARCs; generate replay/index.cdxj
+    -> if files enabled: write loose website bodies
+    -> print aggregate summary
     -> close the client/session
 ```
 
-The aggregate summary is printed only after replay indexing succeeds. A fatal
-indexing or replay-publication error therefore cannot follow an apparently
-successful final summary. If every capture is omitted or skipped, no WARC or
-replay index is created and the successful aggregate summary is still printed.
+Selection is an export transform. Provenance always stores the full CDX result
+for the query window, not the post-`latest` subset.
+
+`latest` keeps exactly one capture per urlkey group:
+
+1. newest capture whose CDX status is `200`; else
+2. newest capture whose status is present and not `3xx`; else
+3. omit the group.
+
+Shared captures needed by both outputs are fetched once through a retrieval
+cache and fanned out to the WARC and loose-file writers.
+
+The aggregate summary is printed only after enabled output stages succeed. A
+fatal indexing or replay-publication error therefore cannot follow an apparently
+successful final summary. If every WARC capture is omitted or skipped, no WARC
+or replay index is created and the successful aggregate summary is still printed.
 
 ## 3. Wayback client and discovery
 
@@ -191,6 +227,8 @@ rather than being truncated and accidentally merging distinct websites.
 
 ## 5. Readable paths and filesystem limits
 
+### 5.1 WARC paths
+
 The path/query portion of each CDX URL key maps beneath `archive/`:
 
 ```text
@@ -232,6 +270,42 @@ Windows: NAME_MAX 255 ASCII characters, PATH_MAX 260 characters
 The 240-byte application cap does not replace the actual `NAME_MAX` check, and
 component checks do not replace `PATH_MAX`.
 
+### 5.2 Loose website paths
+
+When `--files` is `latest` or `all`, Fetch writes decoded semantic bodies under
+`website/`. Paths follow the original site URL (Ruby wayback-machine-downloader
+spirit), with an explicit host segment so multi-host collections stay distinct:
+
+- host comes first (`www.` stripped; non-default ports use `--port-<n>`)
+- directory URLs and extension-less directory-like paths become `.../index.html`
+- `--files latest` writes `website/<host>/<site-path>` with no timestamp segment
+- `--files all` writes `website/<host>/<14-digit-timestamp>/<site-path>`
+- identical planned paths (for example same host/timestamp/path with different
+  digests) are disambiguated with a `--<digest8>` filename suffix
+
+Examples:
+
+```text
+/                 -> website/example.com/index.html
+/about            -> website/example.com/about/index.html
+/a/b/             -> website/example.com/a/b/index.html
+/css/style.css    -> website/example.com/css/style.css
+
+# --files all
+/                 -> website/example.com/20060715085250/index.html
+/css/style.css    -> website/example.com/20060715085250/css/style.css
+
+# multi-host collection (*.example.com)
+https://a.example.com/ -> website/a.example.com/index.html
+https://b.example.com/ -> website/b.example.com/index.html
+```
+
+Path components use the same safety encoding and 240-byte component mindset as
+WARC paths. Planned file-vs-directory conflicts reshape a file into
+`existing-file/index.html` when that does not clobber another planned final
+path. Existing final loose-file targets remain fatal (no resume). Empty or
+failed playback bodies do not leave empty files.
+
 ## 6. Collision buckets and preflight
 
 `preflight_layout()` produces an ordered `ExportPlan` containing
@@ -267,13 +341,17 @@ deduplication at every URL key ensures storage sharing does not alter content
 policy.
 
 Before playback, preflight checks every planned WARC and
-`replay/index.cdxj`. Existing final entries, broken final symlinks,
-non-directory ancestors, component/path-limit violations, and other
+`replay/index.cdxj` when `--warc` is enabled, and every planned `website/`
+target when `--files` is enabled. Existing final entries, broken final
+symlinks, non-directory ancestors, component/path-limit violations, and other
 uninspectable targets are fatal. Valid directory-symlink ancestors remain
 supported.
 
 An allocation collision is valid. An existing final file is not: Fetch does
 not overwrite, append, merge, or repair output.
+
+When `--warc none`, Fetch skips WARC allocation, WARC/replay preflight, WARC
+export, and replay indexing entirely.
 
 ## 7. Source provenance
 
@@ -474,12 +552,14 @@ Ordinary output remains compact:
 Starting https://example.com/images/logo.png
 Downloaded 20170604120533 [a19f7c2e]
 WARNING skipped 20190812143015 https://example.com/images/logo.png: unavailable
-Summary: 235 selected; 209 responses; 17 revisits; 9 redirects omitted; 0 playback failures
+Summary: 235 selected for warc (all); 209 responses; 17 revisits; 9 redirects omitted; 0 playback failures
+Files: 180 written (latest); 2 playback failures; 0 redirects omitted
 ```
 
-The final summary reports selected rows, responses, revisits, deliberately
-omitted redirects, and playback failures. Source-signature revisits that avoid
-the network remain silent.
+The WARC summary reports selected rows, responses, revisits, deliberately
+omitted redirects, and playback failures for the active `--warc` mode. When
+`--files` is enabled, a second line reports written bodies and failures for
+that mode. Source-signature revisits that avoid the network remain silent.
 
 The CLI catches fatal errors, prints `ERROR: ...` to stderr, and returns 1.
 Source publication, WARC writing, and replay publication are individually
@@ -491,13 +571,14 @@ The flat package contains:
 
 | File | Responsibility |
 | --- | --- |
-| `cli.py` | Arguments, date defaults, client lifecycle, stage ordering, final summary/error boundary |
-| `discovery.py` | Complete search, rate-limit retry, duplicate collapse, URL-key grouping |
-| `paths.py` | Collection normalization, safe readable paths, filesystem limits, collision buckets, preflight |
+| `cli.py` | Arguments, output-mode defaults, client lifecycle, stage gating, final summary/error boundary |
+| `discovery.py` | Complete search, rate-limit retry, duplicate collapse, URL-key grouping, latest/all selection |
+| `paths.py` | Collection normalization, safe readable WARC/website paths, collision buckets, preflight |
 | `publication.py` | Same-filesystem atomic no-replace file/directory publication |
 | `provenance.py` | Source CDX and query-manifest serialization/publication |
-| `retrieval.py` | Exact Memento playback and semantic response construction |
-| `export.py` | Redirect/status policy, per-group deduplication, bucket export, aggregate result |
+| `retrieval.py` | Exact Memento playback, semantic response construction, shared retrieval cache |
+| `export.py` | Redirect/status policy, per-group deduplication, bucket export, WARC aggregate result |
+| `files.py` | Loose website-file writing under `website/` |
 | `warc.py` | WARC dates, exclusive creation, response/revisit serialization |
 | `replay.py` | Final-WARC CDXJ generation and publication |
 
@@ -535,7 +616,9 @@ Acceptance covers:
   behavior;
 - sorted response/revisit CDXJ semantics and nested filenames;
 - exact offset/length selection of independently compressed WARC members;
-- replay publication races and indexer failures; and
+- replay publication races and indexer failures;
+- `--warc` / `--files` mode gating, latest selection preference, website path
+  layouts, and shared-capture fetch fan-out; and
 - final-summary ordering.
 
 Routine validation is:

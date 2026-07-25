@@ -10,11 +10,18 @@ from typing import Optional, Sequence
 
 from wayback import WaybackClient, WaybackSession
 
-from .discovery import discover, group_captures
-from .export import export_all, print_summary
-from .paths import DEFAULT_OUTPUT_ROOT, collection_layout, preflight_layout
+from .discovery import OUTPUT_MODES, apply_output_mode, discover, group_captures
+from .export import ExportSummary, export_all, print_summary
+from .files import FilesSummary, print_files_summary, write_website_files
+from .paths import (
+    DEFAULT_OUTPUT_ROOT,
+    collection_layout,
+    preflight_layout,
+    preflight_website_layout,
+)
 from .provenance import save_acquisition
 from .replay import generate_replay_index
+from .retrieval import RetrievalCache
 
 
 USER_AGENT = (
@@ -40,6 +47,18 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("url_pattern", metavar="URL_PATTERN")
     parser.add_argument("--start", metavar="DATE")
     parser.add_argument("--end", metavar="DATE")
+    parser.add_argument(
+        "--warc",
+        choices=OUTPUT_MODES,
+        default="all",
+        help="WARC + replay CDXJ output mode (default: all)",
+    )
+    parser.add_argument(
+        "--files",
+        choices=OUTPUT_MODES,
+        default="none",
+        help="Loose website-file output mode (default: none)",
+    )
     return parser.parse_args(argv)
 
 
@@ -55,6 +74,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
     date_start = args.start or "1995"
     date_end = args.end or current_utc_cdx_timestamp()
+    warc_mode = args.warc
+    files_mode = args.files
+
+    if warc_mode == "none" and files_mode == "none":
+        print("Nothing to do: both --warc and --files are none")
+        return 0
 
     try:
         layout = collection_layout(args.url_pattern, root=_DEFAULT_OUTPUT_ROOT)
@@ -87,15 +112,53 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )
             print(f"Grouping {len(captures)} captures...")
             capture_groups = group_captures(captures)
-            plan = preflight_layout(capture_groups, layout)
-            print(f"Exporting {len(capture_groups)} URL groups...")
-            result = export_all(capture_groups, plan.buckets, client)
-            print("Building replay index...")
-            generate_replay_index(
-                result.created_warcs,
-                layout=plan.layout,
-            )
-            print_summary(result.summary)
+            warc_groups = apply_output_mode(capture_groups, warc_mode)
+            files_groups = apply_output_mode(capture_groups, files_mode)
+
+            warc_plan = None
+            if warc_mode != "none":
+                warc_plan = preflight_layout(warc_groups, layout)
+
+            website_plan = None
+            if files_mode != "none":
+                website_plan = preflight_website_layout(
+                    files_groups,
+                    layout,
+                    include_timestamps=(files_mode == "all"),
+                )
+
+            cache = RetrievalCache()
+            warc_summary = ExportSummary()
+            if warc_plan is not None:
+                print(f"Exporting {len(warc_groups)} URL groups to WARC...")
+                warc_result = export_all(
+                    warc_groups,
+                    warc_plan.buckets,
+                    client,
+                    cache=cache,
+                )
+                warc_summary = warc_result.summary
+                print("Building replay index...")
+                generate_replay_index(
+                    warc_result.created_warcs,
+                    layout=warc_plan.layout,
+                )
+
+            files_summary = FilesSummary()
+            if website_plan is not None:
+                print(
+                    f"Writing {len(website_plan.targets)} website files..."
+                )
+                files_summary = write_website_files(
+                    files_groups,
+                    website_plan,
+                    client,
+                    cache=cache,
+                )
+
+            print_summary(warc_summary, warc_mode=warc_mode)
+            if files_mode != "none":
+                print_files_summary(files_summary, files_mode=files_mode)
     except Exception as error:
         print(f"ERROR: {error}", file=sys.stderr)
         return 1

@@ -1,9 +1,35 @@
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
+from wayback import CdxRecord
 
 from archive_magic_fetch import paths
+
+
+def _timestamp(value):
+    return datetime.strptime(value, "%Y%m%d%H%M%S").replace(
+        tzinfo=timezone.utc
+    )
+
+
+def _capture(
+    *,
+    original="https://example.com/",
+    captured="20060715085250",
+    urlkey="com,example)/",
+    digest="A" * 32,
+):
+    return CdxRecord(
+        urlkey=urlkey,
+        timestamp=_timestamp(captured),
+        original=original,
+        mimetype="text/html",
+        statuscode=200,
+        digest=digest,
+        length=10,
+    )
 
 
 def layout(tmp_path, pattern="https://example.com/*"):
@@ -344,3 +370,160 @@ def test_path_limit_fallbacks_are_used_when_pathconf_is_unavailable(
 def test_malformed_urlkeys_fail_before_export(tmp_path, urlkey):
     with pytest.raises(ValueError):
         paths.preferred_warc_path(urlkey, layout(tmp_path))
+
+
+@pytest.mark.parametrize(
+    ("original", "relative"),
+    [
+        ("https://example.com/", "website/example.com/index.html"),
+        ("https://example.com/a/b/", "website/example.com/a/b/index.html"),
+        ("https://example.com/about", "website/example.com/about/index.html"),
+        ("https://example.com/css/style.css", "website/example.com/css/style.css"),
+        (
+            "https://example.com/images/logo.png",
+            "website/example.com/images/logo.png",
+        ),
+        (
+            "https://a.example.com/",
+            "website/a.example.com/index.html",
+        ),
+    ],
+)
+def test_website_latest_paths(tmp_path, original, relative):
+    collection = layout(tmp_path)
+
+    result = paths.preferred_website_path(original, collection)
+
+    assert result.relative_to(collection.collection_root) == Path(relative)
+
+
+def test_website_all_paths_include_timestamp_directory(tmp_path):
+    collection = layout(tmp_path)
+    stamp = _timestamp("20060715085250")
+
+    result = paths.preferred_website_path(
+        "https://example.com/css/style.css",
+        collection,
+        timestamp=stamp,
+    )
+
+    assert result.relative_to(collection.collection_root) == Path(
+        "website/example.com/20060715085250/css/style.css"
+    )
+
+
+def test_website_preflight_rejects_existing_file(tmp_path):
+    collection = layout(tmp_path)
+    target = paths.preferred_website_path("https://example.com/", collection)
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"existing")
+
+    with pytest.raises(FileExistsError, match="already exists"):
+        paths.preflight_website_layout(
+            {
+                "com,example)/": [
+                    _capture(original="https://example.com/"),
+                ]
+            },
+            collection,
+            include_timestamps=False,
+        )
+
+
+def test_website_plan_reshapes_file_directory_conflict(tmp_path):
+    collection = layout(tmp_path)
+    groups = {
+        "com,example)/foo.txt": [
+            _capture(
+                original="https://example.com/foo.txt",
+                urlkey="com,example)/foo.txt",
+            )
+        ],
+        "com,example)/foo.txt/bar": [
+            _capture(
+                original="https://example.com/foo.txt/bar",
+                urlkey="com,example)/foo.txt/bar",
+            )
+        ],
+    }
+
+    plan = paths.preflight_website_layout(
+        groups,
+        collection,
+        include_timestamps=False,
+    )
+
+    relative = {
+        target.path.relative_to(collection.website_root).as_posix()
+        for target in plan.targets
+    }
+    assert relative == {
+        "example.com/foo.txt/index.html",
+        "example.com/foo.txt/bar/index.html",
+    }
+
+
+def test_website_paths_disambiguate_same_timestamp_by_digest(tmp_path):
+    collection = layout(tmp_path)
+    groups = {
+        "com,example)/": [
+            _capture(
+                original="https://example.com/",
+                captured="20170101000000",
+                digest="A" * 32,
+            ),
+            _capture(
+                original="https://example.com/",
+                captured="20170101000000",
+                digest="B" * 32,
+            ),
+        ]
+    }
+
+    plan = paths.preflight_website_layout(
+        groups,
+        collection,
+        include_timestamps=True,
+    )
+
+    relative = {
+        target.path.relative_to(collection.website_root).as_posix()
+        for target in plan.targets
+    }
+    assert relative == {
+        "example.com/20170101000000/index--AAAAAAAA.html",
+        "example.com/20170101000000/index--BBBBBBBB.html",
+    }
+
+
+def test_website_paths_keep_multi_host_captures_distinct(tmp_path):
+    collection = paths.collection_layout("*.example.com", root=tmp_path)
+    groups = {
+        "com,example,a)/": [
+            _capture(
+                original="https://a.example.com/",
+                urlkey="com,example,a)/",
+            )
+        ],
+        "com,example,b)/": [
+            _capture(
+                original="https://b.example.com/",
+                urlkey="com,example,b)/",
+            )
+        ],
+    }
+
+    plan = paths.preflight_website_layout(
+        groups,
+        collection,
+        include_timestamps=False,
+    )
+
+    relative = {
+        target.path.relative_to(collection.website_root).as_posix()
+        for target in plan.targets
+    }
+    assert relative == {
+        "a.example.com/index.html",
+        "b.example.com/index.html",
+    }

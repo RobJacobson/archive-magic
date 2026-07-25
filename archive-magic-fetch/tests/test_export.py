@@ -613,7 +613,7 @@ def test_dedup_maps_are_scoped_to_each_group(tmp_path, capsys):
     assert "Summary:" not in capsys.readouterr().out
     export.print_summary(result.summary)
     assert capsys.readouterr().out.endswith(
-        "Summary: 2 selected; 2 responses; 0 revisits; "
+        "Summary: 2 selected for warc (all); 2 responses; 0 revisits; "
         "0 redirects omitted; 0 playback failures\n"
     )
 

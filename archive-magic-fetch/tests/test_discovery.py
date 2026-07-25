@@ -32,6 +32,73 @@ def record(
     )
 
 
+def test_select_latest_prefers_newest_200_over_newer_non_200():
+    older_200 = record(captured="20100101000000", statuscode=200)
+    newer_404 = record(captured="20200101000000", statuscode=404)
+    newer_301 = record(captured="20210101000000", statuscode=301)
+
+    assert discovery.select_latest_capture(
+        [older_200, newer_404, newer_301]
+    ) is older_200
+
+
+def test_select_latest_uses_timestamp_not_input_order():
+    older_200 = record(captured="20100101000000", statuscode=200)
+    newer_200 = record(
+        captured="20200101000000",
+        statuscode=200,
+        digest="B" * 32,
+    )
+
+    assert discovery.select_latest_capture([newer_200, older_200]) is newer_200
+
+
+def test_select_latest_prefers_newest_non_redirect_when_no_200():
+    older_404 = record(captured="20100101000000", statuscode=404)
+    newer_301 = record(captured="20200101000000", statuscode=301)
+
+    assert discovery.select_latest_capture([newer_301, older_404]) is older_404
+
+
+def test_select_latest_omits_redirect_only_groups():
+    only_301 = record(captured="20200101000000", statuscode=301)
+    only_302 = record(captured="20210101000000", statuscode=302)
+
+    assert discovery.select_latest_capture([only_301, only_302]) is None
+
+
+def test_apply_output_mode_latest_and_none():
+    first = record(
+        urlkey="com,example)/",
+        captured="20100101000000",
+        statuscode=404,
+    )
+    second = record(
+        urlkey="com,example)/",
+        captured="20200101000000",
+        statuscode=200,
+    )
+    third = record(
+        urlkey="com,example)/about",
+        original="https://example.com/about",
+        captured="20200101000000",
+        statuscode=301,
+    )
+    groups = {
+        first.urlkey: [first, second],
+        third.urlkey: [third],
+    }
+
+    assert discovery.apply_output_mode(groups, "none") == {}
+    assert discovery.apply_output_mode(groups, "latest") == {
+        first.urlkey: [second],
+    }
+    assert discovery.apply_output_mode(groups, "all") == {
+        first.urlkey: [first, second],
+        third.urlkey: [third],
+    }
+
+
 def test_normalize_cdx_search_rewrites_trailing_star_to_explicit_prefix():
     assert discovery.normalize_cdx_search("example.com/*") == (
         "example.com/",
@@ -315,8 +382,8 @@ def test_cli_owns_one_client_context_and_passes_same_client(monkeypatch):
         calls["discover"] = (client, pattern, start, end, progress)
         return [capture]
 
-    def fake_export(grouped, planned_buckets, client):
-        calls["export"] = (grouped, planned_buckets, client)
+    def fake_export(grouped, planned_buckets, client, *, cache=None):
+        calls["export"] = (grouped, planned_buckets, client, cache)
         return type(
             "Result",
             (),
@@ -359,7 +426,10 @@ def test_cli_owns_one_client_context_and_passes_same_client(monkeypatch):
     monkeypatch.setattr(
         cli,
         "print_summary",
-        lambda summary: calls.setdefault("summary", summary),
+        lambda summary, **kwargs: calls.setdefault(
+            "summary",
+            (summary, kwargs),
+        ),
     )
 
     assert cli.main(["*.example.com"]) == 0
@@ -376,9 +446,13 @@ def test_cli_owns_one_client_context_and_passes_same_client(monkeypatch):
     )
     assert calls["discover"][4] is cli._report_discovery_progress
     assert calls["provenance"][0] == [capture]
-    assert calls["export"] == (groups, buckets, client)
+    assert calls["export"][0] == groups
+    assert calls["export"][1] == buckets
+    assert calls["export"][2] == client
+    assert calls["export"][3] is not None
     assert calls["replay"] == ((), layout)
-    assert calls["summary"].selected == 1
+    assert calls["summary"][0].selected == 1
+    assert calls["summary"][1] == {"warc_mode": "all"}
 
 
 def test_cli_prints_stage_messages(monkeypatch, capsys):
@@ -409,7 +483,7 @@ def test_cli_prints_stage_messages(monkeypatch, capsys):
     monkeypatch.setattr(
         cli,
         "export_all",
-        lambda *args: type(
+        lambda *args, **kwargs: type(
             "Result",
             (),
             {
@@ -419,7 +493,7 @@ def test_cli_prints_stage_messages(monkeypatch, capsys):
         )(),
     )
     monkeypatch.setattr(cli, "generate_replay_index", lambda *args, **kwargs: None)
-    monkeypatch.setattr(cli, "print_summary", lambda summary: None)
+    monkeypatch.setattr(cli, "print_summary", lambda summary, **kwargs: None)
 
     assert cli.main(["*.example.com"]) == 0
     output = capsys.readouterr().out
@@ -428,7 +502,7 @@ def test_cli_prints_stage_messages(monkeypatch, capsys):
         "Discovered 1 captures\n"
         "Saving source acquisition...\n"
         "Grouping 1 captures...\n"
-        "Exporting 1 URL groups...\n"
+        "Exporting 1 URL groups to WARC...\n"
         "Building replay index...\n"
     )
 
@@ -506,7 +580,7 @@ def test_cli_does_not_print_summary_when_replay_indexing_fails(
     monkeypatch.setattr(
         cli,
         "export_all",
-        lambda *args: type(
+        lambda *args, **kwargs: type(
             "Result",
             (),
             {
@@ -542,7 +616,7 @@ def test_cli_retains_published_provenance_after_downstream_failure(
     monkeypatch.setattr(
         cli,
         "export_all",
-        lambda *args: type(
+        lambda *args, **kwargs: type(
             "Result",
             (),
             {
@@ -564,6 +638,26 @@ def test_cli_retains_published_provenance_after_downstream_failure(
     assert len(acquisitions) == 1
     assert (acquisitions[0] / "captures.cdx.gz").exists()
     assert (acquisitions[0] / "query.json").exists()
+
+
+def test_cli_defaults_parse_to_warc_all_and_files_none():
+    args = cli.parse_args(["example.com/*"])
+    assert args.warc == "all"
+    assert args.files == "none"
+
+
+def test_cli_both_none_is_successful_noop(monkeypatch, capsys):
+    def fail(*args, **kwargs):
+        raise AssertionError("network client should not be created")
+
+    monkeypatch.setattr(cli, "WaybackSession", fail)
+    monkeypatch.setattr(cli, "WaybackClient", fail)
+    monkeypatch.setattr(cli, "collection_layout", fail)
+
+    assert cli.main(["example.com/*", "--warc", "none", "--files", "none"]) == 0
+    assert capsys.readouterr().out == (
+        "Nothing to do: both --warc and --files are none\n"
+    )
 
 
 def test_cli_rejects_unapproved_arguments():
