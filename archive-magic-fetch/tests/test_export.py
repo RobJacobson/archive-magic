@@ -4,7 +4,8 @@ import threading
 from datetime import datetime, timedelta, timezone
 
 import pytest
-from requests.exceptions import ContentDecodingError
+from requests.exceptions import ChunkedEncodingError, ContentDecodingError
+from urllib3.exceptions import IncompleteRead, ProtocolError
 from warcio.archiveiterator import ArchiveIterator
 from wayback import CdxRecord
 from wayback.exceptions import (
@@ -530,9 +531,62 @@ def test_persistent_content_decoding_error_warns_once_and_skips(
     assert client.calls == [selected, selected]
     assert not target.exists()
     assert summary.playback_failures == 1
+    assert summary.invalid_content_encoding_failures == 1
     warning = capsys.readouterr().err
     assert warning.count("WARNING skipped") == 1
-    assert "after retrying with Accept-Encoding: identity" in warning
+    assert "invalid Wayback replay response" in warning
+    assert (
+        "retrying with Accept-Encoding: identity also failed"
+        in warning
+    )
+    assert "incorrect gzip header" not in warning
+
+
+def test_repeated_truncated_response_warns_early_and_is_categorized(
+    tmp_path,
+    capsys,
+    monkeypatch,
+):
+    selected = capture()
+    truncated = [
+        WaybackRetryError(
+            1,
+            0.2,
+            ChunkedEncodingError(
+                ProtocolError(
+                    "Connection broken",
+                    IncompleteRead(130810, 144219),
+                )
+            ),
+        )
+        for _ in range(retrieval.REPEATED_TRUNCATION_ATTEMPTS)
+    ]
+    client = FakeClient({selected: truncated})
+    original = retrieval.RateLimitGate.after_throttle
+
+    def immediate(self, generation, *, retry_after=None):
+        return original(self, generation, retry_after=0)
+
+    monkeypatch.setattr(
+        retrieval.RateLimitGate,
+        "after_throttle",
+        immediate,
+    )
+
+    summary = export.export_group(
+        URLKEY,
+        [selected],
+        output_path(tmp_path),
+        client,
+    )
+
+    assert len(client.calls) == retrieval.REPEATED_TRUNCATION_ATTEMPTS
+    assert summary.playback_failures == 1
+    assert summary.truncated_response_failures == 1
+    warning = capsys.readouterr().err
+    assert "truncated Wayback response after 3 attempts over" in warning
+    assert "received 130,810 of 275,029 bytes" in warning
+    assert "IncompleteRead" not in warning
 
 
 def test_unexpected_response_format_is_fatal(tmp_path):
@@ -683,6 +737,24 @@ def test_dedup_maps_are_scoped_to_each_group(tmp_path, capsys):
     assert capsys.readouterr().out.endswith(
         "Summary: 2 selected for warc (all); 2 responses; 0 revisits; "
         "0 already present; 0 redirects omitted; 0 playback failures\n"
+    )
+
+
+def test_summary_includes_playback_failure_categories(capsys):
+    summary = export.ExportSummary(
+        selected=8,
+        responses=5,
+        playback_failures=3,
+        invalid_content_encoding_failures=1,
+        truncated_response_failures=1,
+    )
+
+    export.print_summary(summary)
+
+    assert capsys.readouterr().out == (
+        "Summary: 8 selected for warc (all); 5 responses; 0 revisits; "
+        "0 already present; 0 redirects omitted; 3 playback failures "
+        "(1 invalid content encoding, 1 truncated response, 1 other)\n"
     )
 
 

@@ -8,10 +8,12 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import timezone
 from http import HTTPStatus
+from http.client import IncompleteRead as HttpIncompleteRead
 from io import BytesIO
 from typing import Callable, Mapping, Optional, Sequence
 
 from requests.exceptions import ContentDecodingError, RequestException
+from urllib3.exceptions import IncompleteRead as Urllib3IncompleteRead
 from warcio.recordbuilder import RecordBuilder
 from warcio.statusandheaders import StatusAndHeaders
 from wayback import Mode, WaybackClient, WaybackSession
@@ -33,6 +35,7 @@ DEFAULT_CONCURRENCY = 8
 # multiplying independent exponential backoffs across every worker.
 WORKER_SESSION_RETRIES = 1
 MAX_THROTTLE_ATTEMPTS = 6
+REPEATED_TRUNCATION_ATTEMPTS = 3
 MAX_CONNECTION_BACKOFF_SECONDS = 30
 RECOVERY_SUCCESSES_PER_STEP = 8
 PREFETCH_MULTIPLIER = 2
@@ -62,6 +65,166 @@ _REPRESENTATION_HEADERS = {
 
 class MalformedContentEncodingError(MementoPlaybackError):
     """Wayback's declared content encoding does not match its response body."""
+
+    def __init__(
+        self,
+        encoding: Optional[str] = None,
+        *,
+        identity_retry_failed: bool = True,
+    ) -> None:
+        self.encoding = encoding
+        self.identity_retry_failed = identity_retry_failed
+        if encoding:
+            detail = (
+                f"Content-Encoding declares {encoding}, but the body could "
+                "not be decoded"
+            )
+        else:
+            detail = (
+                "the body could not be decoded according to its declared "
+                "Content-Encoding"
+            )
+        if identity_retry_failed:
+            retry_detail = (
+                "retrying with Accept-Encoding: identity also failed"
+            )
+        else:
+            retry_detail = (
+                "the client session could not retry with "
+                "Accept-Encoding: identity"
+            )
+        super().__init__(
+            f"invalid Wayback replay response: {detail}; {retry_detail}"
+        )
+
+
+class TruncatedWaybackResponseError(MementoPlaybackError):
+    """Wayback repeatedly stopped at the same incomplete response boundary."""
+
+    def __init__(
+        self,
+        *,
+        received_bytes: int,
+        expected_bytes: int,
+        attempts: int,
+        elapsed_seconds: float,
+    ) -> None:
+        self.received_bytes = received_bytes
+        self.expected_bytes = expected_bytes
+        self.attempts = attempts
+        self.elapsed_seconds = elapsed_seconds
+        super().__init__(
+            "truncated Wayback response after "
+            f"{attempts} attempts over {elapsed_seconds:.1f}s "
+            f"(received {received_bytes:,} of {expected_bytes:,} bytes)"
+        )
+
+
+def format_playback_failure(error: Exception) -> str:
+    """Return one concise user-facing playback failure reason."""
+
+    if isinstance(
+        error,
+        (MalformedContentEncodingError, TruncatedWaybackResponseError),
+    ):
+        return str(error)
+    if isinstance(error, WaybackRetryError):
+        elapsed = (
+            f"{float(error.time):.1f}s"
+            if isinstance(error.time, (int, float))
+            else "an unknown duration"
+        )
+        attempts = "attempt" if error.retries == 1 else "attempts"
+        return (
+            f"Wayback request failed after {error.retries} {attempts} over "
+            f"{elapsed}: {error.cause}"
+        )
+    return str(error) or type(error).__name__
+
+
+def format_playback_failure_summary(
+    total: int,
+    *,
+    invalid_content_encoding: int,
+    truncated_response: int,
+) -> str:
+    """Format a total with complete category detail when useful."""
+
+    noun = "failure" if total == 1 else "failures"
+    base = f"{total} playback {noun}"
+    categorized = invalid_content_encoding + truncated_response
+    if total == 0 or categorized == 0:
+        return base
+
+    categories = []
+    if invalid_content_encoding:
+        categories.append(
+            f"{invalid_content_encoding} invalid content encoding"
+        )
+    if truncated_response:
+        categories.append(f"{truncated_response} truncated response")
+    other = total - categorized
+    if other > 0:
+        categories.append(f"{other} other")
+    return f"{base} ({', '.join(categories)})"
+
+
+def _content_encoding(memento) -> Optional[str]:
+    """Return the historical content encoding involved in a decode failure."""
+
+    headers = getattr(memento, "headers", None)
+    if headers is None:
+        return None
+    value = headers.get("Content-Encoding")
+    if value is None:
+        return None
+    encoding = str(value).strip()
+    return encoding or None
+
+
+def _incomplete_read_boundary(
+    error: BaseException,
+) -> Optional[tuple[int, int]]:
+    """Find a structured IncompleteRead boundary in nested request errors."""
+
+    pending: list[object] = [error]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        identity = id(current)
+        if identity in seen:
+            continue
+        seen.add(identity)
+
+        if isinstance(
+            current,
+            (HttpIncompleteRead, Urllib3IncompleteRead),
+        ):
+            partial = current.partial
+            expected = current.expected
+            received = (
+                len(partial)
+                if isinstance(partial, (bytes, bytearray))
+                else partial
+            )
+            if (
+                isinstance(received, int)
+                and isinstance(expected, int)
+                and received >= 0
+                and expected >= 0
+            ):
+                return received, received + expected
+            return None
+
+        if isinstance(current, BaseException):
+            pending.extend(current.args)
+            for attribute in ("cause", "__cause__", "__context__"):
+                nested = getattr(current, attribute, None)
+                if nested is not None:
+                    pending.append(nested)
+        elif isinstance(current, (tuple, list)):
+            pending.extend(current)
+    return None
 
 
 @dataclass(frozen=True)
@@ -499,10 +662,13 @@ def _retrieve_memento_with_retry(
     identity_retry = False
     identity_headers = None
     previous_accept_encoding = _MISSING_HEADER
+    previous_truncation = None
+    repeated_truncations = 0
     try:
         while attempt_number < MAX_THROTTLE_ATTEMPTS:
             attempt_number += 1
             generation = gate.acquire()
+            memento = None
             try:
                 memento = client.get_memento(
                     capture,
@@ -529,18 +695,15 @@ def _retrieve_memento_with_retry(
                 gate.after_neutral()
                 if identity_retry:
                     raise MalformedContentEncodingError(
-                        "Wayback response body still did not match its "
-                        "Content-Encoding after retrying with "
-                        f"Accept-Encoding: identity: {error}"
+                        _content_encoding(memento)
                     ) from error
 
                 session = getattr(client, "session", None)
                 identity_headers = getattr(session, "headers", None)
                 if identity_headers is None:
                     raise MalformedContentEncodingError(
-                        "Wayback response body did not match its "
-                        "Content-Encoding and the client session cannot "
-                        f"request identity encoding: {error}"
+                        _content_encoding(memento),
+                        identity_retry_failed=False,
                     ) from error
 
                 identity_retry = True
@@ -554,6 +717,8 @@ def _retrieve_memento_with_retry(
                 if callable(reset):
                     reset()
             except RateLimitError as error:
+                previous_truncation = None
+                repeated_truncations = 0
                 gate.after_throttle(
                     generation,
                     retry_after=error.retry_after or 60,
@@ -561,12 +726,47 @@ def _retrieve_memento_with_retry(
                 if attempt_number == MAX_THROTTLE_ATTEMPTS:
                     raise
             except (WaybackRetryError, RequestException) as error:
-                gate.after_throttle(generation)
+                truncation = _incomplete_read_boundary(error)
+                if truncation is not None:
+                    if truncation == previous_truncation:
+                        repeated_truncations += 1
+                    else:
+                        previous_truncation = truncation
+                        repeated_truncations = 1
+                else:
+                    previous_truncation = None
+                    repeated_truncations = 0
+
                 session = getattr(client, "session", None)
                 reset = getattr(session, "reset", None)
                 if callable(reset):
                     reset()
+
+                repeated_boundary = (
+                    truncation is not None
+                    and repeated_truncations
+                    >= REPEATED_TRUNCATION_ATTEMPTS
+                )
+                if repeated_boundary:
+                    gate.after_neutral()
+                    received, expected = truncation
+                    raise TruncatedWaybackResponseError(
+                        received_bytes=received,
+                        expected_bytes=expected,
+                        attempts=attempt_number,
+                        elapsed_seconds=time.monotonic() - started_at,
+                    ) from error
+
+                gate.after_throttle(generation)
                 if attempt_number == MAX_THROTTLE_ATTEMPTS:
+                    if truncation is not None:
+                        received, expected = truncation
+                        raise TruncatedWaybackResponseError(
+                            received_bytes=received,
+                            expected_bytes=expected,
+                            attempts=attempt_number,
+                            elapsed_seconds=time.monotonic() - started_at,
+                        ) from error
                     if isinstance(error, RequestException):
                         raise WaybackRetryError(
                             attempt_number,

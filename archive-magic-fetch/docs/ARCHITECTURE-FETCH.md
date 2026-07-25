@@ -185,7 +185,9 @@ Fetch adds one job-wide adaptive admission gate for memento playback:
    successful requests adds one slot until the configured ceiling is restored.
 5. A capture receives at most six gate-level attempts. An exhausted 429 is
    fatal; an exhausted `WaybackRetryError` follows normal playback-failure
-   skip policy.
+   skip policy. Three consecutive failures at the same structured
+   `IncompleteRead` byte boundary stop early as a persistent truncated
+   response; changing boundaries retain the full retry budget.
 6. Memento worker sessions use one immediate in-session retry, then surface
    the problem to the shared controller. A failed worker session resets its
    connection adapters before trying again.
@@ -562,11 +564,20 @@ headers are removed. Fetch writes a new semantic `Content-Length`, and
 `warcio` computes the payload digest over the stored body.
 
 Wayback occasionally returns a replay response that declares
-`Content-Encoding: gzip` while sending an already-decoded body. Requests
-raises `ContentDecodingError` before Fetch receives the semantic bytes. The
-identity-encoding retry described in section 3 handles this known replay
-failure without slowing unrelated workers or changing the normal compressed
-transfer path.
+`Content-Encoding: gzip` while sending bytes that cannot be decoded as gzip.
+The raw response may be an already-decoded body or only a clipped decoded
+prefix bounded by stale compressed-representation metadata, so stripping the
+header is not a safe recovery. Requests raises `ContentDecodingError` before
+Fetch receives trustworthy semantic bytes. The identity-encoding retry
+described in section 3 handles recoverable cases without slowing unrelated
+workers or changing the normal compressed transfer path; a persistent
+mismatch warns and skips.
+
+Repeated incomplete transfers normally follow the adaptive connection retry
+policy. When three consecutive attempts stop at the same received/expected
+byte boundary, Fetch treats the outcome as a persistent truncated Wayback
+response, skips immediately, and reports the structured byte counts. It never
+writes a partial response as a successful capture.
 
 Known CDX 3xx rows are counted and omitted before playback. A statusless row
 that plays back as 3xx is also counted and omitted. A known CDX/Memento status
@@ -705,9 +716,9 @@ Fetched 20170604120533 https://example.com/images/logo.png
 Wrote 20170604120533 [a19f7c2e]
 Wrote 20180709183022 [c46a801d]
 Skipped existing 20190102112233
-WARNING skipped 20190812143015 https://example.com/images/logo.png: unavailable
-Summary: 235 selected for warc (all); 4 responses; 1 revisits; 221 already present; 9 redirects omitted; 0 playback failures
-Files: 180 written (latest); 2 playback failures; 0 redirects omitted
+WARNING skipped 20190812143015 https://example.com/images/logo.png: invalid Wayback replay response: Content-Encoding declares gzip, but the body could not be decoded; retrying with Accept-Encoding: identity also failed
+Summary: 235 selected for warc (all); 4 responses; 1 revisits; 221 already present; 9 redirects omitted; 2 playback failures (1 invalid content encoding, 1 truncated response)
+Files: 180 written (latest); 2 playback failures (1 invalid content encoding, 1 other); 0 redirects omitted
 Job ended: 2026-07-24T19:18:24Z
 Job duration: 14.2 minutes
 ```

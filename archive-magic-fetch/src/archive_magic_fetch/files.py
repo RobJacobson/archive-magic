@@ -19,8 +19,12 @@ from wayback.exceptions import (
 from .paths import WebsitePlan
 from .retrieval import (
     DEFAULT_CONCURRENCY,
+    MalformedContentEncodingError,
     MementoFetchPool,
     RetrievalCache,
+    TruncatedWaybackResponseError,
+    format_playback_failure,
+    format_playback_failure_summary,
     print_fetched,
     print_progress,
     retrieve_memento,
@@ -35,6 +39,20 @@ class FilesSummary:
     written: int = 0
     redirects_omitted: int = 0
     playback_failures: int = 0
+    invalid_content_encoding_failures: int = 0
+    truncated_response_failures: int = 0
+
+    def record_playback_failure(
+        self,
+        error: Optional[Exception] = None,
+    ) -> None:
+        """Count one playback failure and its actionable category."""
+
+        self.playback_failures += 1
+        if isinstance(error, MalformedContentEncodingError):
+            self.invalid_content_encoding_failures += 1
+        elif isinstance(error, TruncatedWaybackResponseError):
+            self.truncated_response_failures += 1
 
 
 def _cdx_timestamp(timestamp) -> str:
@@ -46,7 +64,7 @@ def _is_redirect(status: Optional[int]) -> bool:
 
 
 def _warn_skip(capture: CdxRecord, error: Exception) -> None:
-    reason = str(error) or type(error).__name__
+    reason = format_playback_failure(error)
     print(
         f"WARNING skipped {_cdx_timestamp(capture.timestamp)} "
         f"{capture.original}: {reason}",
@@ -183,7 +201,7 @@ def write_website_files(
                 WaybackRetryError,
             ) as error:
                 _warn_skip(capture, error)
-                summary.playback_failures += 1
+                summary.record_playback_failure(error)
                 if cache is not None:
                     cache.discard(capture, force=True)
                 continue
@@ -196,7 +214,7 @@ def write_website_files(
                 and retrieved.status_code != capture.statuscode
             ):
                 _warn_status_substitution(capture, retrieved.status_code)
-                summary.playback_failures += 1
+                summary.record_playback_failure()
                 if cache is not None:
                     cache.discard(capture, force=True)
                 continue
@@ -209,7 +227,7 @@ def write_website_files(
 
             if not retrieved.body:
                 _warn_skip(capture, ValueError("empty playback body"))
-                summary.playback_failures += 1
+                summary.record_playback_failure()
                 if cache is not None:
                     cache.discard(capture, force=True)
                 continue
@@ -236,8 +254,15 @@ def print_files_summary(summary: FilesSummary, *, files_mode: str) -> None:
         print("Files: disabled (none)")
         return
 
+    failures = format_playback_failure_summary(
+        summary.playback_failures,
+        invalid_content_encoding=(
+            summary.invalid_content_encoding_failures
+        ),
+        truncated_response=summary.truncated_response_failures,
+    )
     print(
         f"Files: {summary.written} written ({files_mode}); "
-        f"{summary.playback_failures} playback failures; "
+        f"{failures}; "
         f"{summary.redirects_omitted} redirects omitted"
     )

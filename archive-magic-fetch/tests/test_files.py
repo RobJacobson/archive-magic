@@ -278,3 +278,20 @@ def test_playback_failure_does_not_create_file(tmp_path):
     assert summary.playback_failures == 1
     assert summary.written == 0
     assert list(Path(layout.website_root).rglob("*")) == []
+
+
+def test_files_summary_includes_playback_failure_categories(capsys):
+    summary = files.FilesSummary(
+        written=4,
+        playback_failures=3,
+        invalid_content_encoding_failures=1,
+        truncated_response_failures=1,
+    )
+
+    files.print_files_summary(summary, files_mode="all")
+
+    assert capsys.readouterr().out == (
+        "Files: 4 written (all); 3 playback failures "
+        "(1 invalid content encoding, 1 truncated response, 1 other); "
+        "0 redirects omitted\n"
+    )

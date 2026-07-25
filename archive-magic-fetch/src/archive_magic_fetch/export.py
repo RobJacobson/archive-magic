@@ -26,9 +26,13 @@ from wayback.exceptions import (
 from .paths import WarcBucket
 from .retrieval import (
     DEFAULT_CONCURRENCY,
+    MalformedContentEncodingError,
     MementoFetchPool,
     MementoFetchWindow,
     RetrievalCache,
+    TruncatedWaybackResponseError,
+    format_playback_failure,
+    format_playback_failure_summary,
     print_fetched,
     print_progress,
     retrieve_response,
@@ -168,6 +172,8 @@ class ExportSummary:
     already_present: int = 0
     redirects_omitted: int = 0
     playback_failures: int = 0
+    invalid_content_encoding_failures: int = 0
+    truncated_response_failures: int = 0
 
     def add(self, other: ExportSummary) -> None:
         """Accumulate another group's outcomes."""
@@ -178,6 +184,24 @@ class ExportSummary:
         self.already_present += other.already_present
         self.redirects_omitted += other.redirects_omitted
         self.playback_failures += other.playback_failures
+        self.invalid_content_encoding_failures += (
+            other.invalid_content_encoding_failures
+        )
+        self.truncated_response_failures += (
+            other.truncated_response_failures
+        )
+
+    def record_playback_failure(
+        self,
+        error: Optional[Exception] = None,
+    ) -> None:
+        """Count one playback failure and its actionable category."""
+
+        self.playback_failures += 1
+        if isinstance(error, MalformedContentEncodingError):
+            self.invalid_content_encoding_failures += 1
+        elif isinstance(error, TruncatedWaybackResponseError):
+            self.truncated_response_failures += 1
 
 
 @dataclass(frozen=True)
@@ -224,7 +248,7 @@ def _cdx_timestamp(timestamp) -> str:
 
 
 def _warn_skip(capture: CdxRecord, error: Exception) -> None:
-    reason = str(error) or type(error).__name__
+    reason = format_playback_failure(error)
     print(
         f"WARNING skipped {_cdx_timestamp(capture.timestamp)} "
         f"{capture.original}: {reason}",
@@ -560,7 +584,7 @@ def _export_group(
                 WaybackRetryError,
             ) as error:
                 _warn_skip(capture, error)
-                summary.playback_failures += 1
+                summary.record_playback_failure(error)
                 if cache is not None:
                     cache.discard(capture)
                 continue
@@ -577,7 +601,7 @@ def _export_group(
 
             if cdx_status is not None and actual_status != cdx_status:
                 _warn_status_substitution(capture, actual_status)
-                summary.playback_failures += 1
+                summary.record_playback_failure()
                 if cache is not None:
                     cache.discard(capture)
                 continue
@@ -779,11 +803,18 @@ def print_summary(
         print("Summary: warc disabled (none)")
         return
 
+    failures = format_playback_failure_summary(
+        summary.playback_failures,
+        invalid_content_encoding=(
+            summary.invalid_content_encoding_failures
+        ),
+        truncated_response=summary.truncated_response_failures,
+    )
     print(
         f"Summary: {summary.selected} selected for warc ({warc_mode}); "
         f"{summary.responses} responses; "
         f"{summary.revisits} revisits; "
         f"{summary.already_present} already present; "
         f"{summary.redirects_omitted} redirects omitted; "
-        f"{summary.playback_failures} playback failures"
+        f"{failures}"
     )

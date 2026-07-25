@@ -5,7 +5,8 @@ import time
 from datetime import datetime, timedelta, timezone
 
 import pytest
-from requests.exceptions import ContentDecodingError
+from requests.exceptions import ChunkedEncodingError, ContentDecodingError
+from urllib3.exceptions import IncompleteRead, ProtocolError
 from wayback import Mode
 from wayback.exceptions import (
     MementoPlaybackError,
@@ -87,7 +88,10 @@ class BrokenEncodingMemento:
             "https://web.archive.org/web/20200102030405id_/"
             "https://played.example/resource"
         )
-        self.headers = {"Content-Type": "text/html"}
+        self.headers = {
+            "Content-Type": "text/html",
+            "Content-Encoding": "gzip",
+        }
         self.error = error
         self.closed = False
 
@@ -318,6 +322,19 @@ def _connection_refused_retry_error():
     )
 
 
+def _truncated_retry_error(received=130810, remaining=144219):
+    return WaybackRetryError(
+        1,
+        0.2,
+        ChunkedEncodingError(
+            ProtocolError(
+                "Connection broken",
+                IncompleteRead(received, remaining),
+            )
+        ),
+    )
+
+
 def test_connection_failure_backs_off_and_retries(monkeypatch):
     delays = _make_backoff_immediate(monkeypatch)
     capture = object()
@@ -382,6 +399,53 @@ def test_timeout_wayback_retry_uses_adaptive_retry(monkeypatch):
     assert len(client.calls) == 2
 
 
+def test_repeated_identical_incomplete_read_stops_early(monkeypatch):
+    delays = _make_backoff_immediate(monkeypatch)
+    client = FakeClient(
+        [
+            _truncated_retry_error()
+            for _ in range(retrieval.REPEATED_TRUNCATION_ATTEMPTS)
+        ]
+        + [FakeMemento()]
+    )
+
+    with pytest.raises(
+        retrieval.TruncatedWaybackResponseError
+    ) as raised:
+        retrieval.retrieve_response(client, object())
+
+    error = raised.value
+    assert len(client.calls) == retrieval.REPEATED_TRUNCATION_ATTEMPTS
+    assert delays == [None] * (
+        retrieval.REPEATED_TRUNCATION_ATTEMPTS - 1
+    )
+    assert error.received_bytes == 130810
+    assert error.expected_bytes == 275029
+    assert error.attempts == retrieval.REPEATED_TRUNCATION_ATTEMPTS
+    assert (
+        "truncated Wayback response after 3 attempts over "
+        in str(error)
+    )
+    assert "received 130,810 of 275,029 bytes" in str(error)
+
+
+def test_changing_incomplete_read_boundaries_keep_retrying(monkeypatch):
+    delays = _make_backoff_immediate(monkeypatch)
+    client = FakeClient(
+        [
+            _truncated_retry_error(received=100, remaining=200),
+            _truncated_retry_error(received=125, remaining=175),
+            FakeMemento(content=b"recovered"),
+        ]
+    )
+
+    response = retrieval.retrieve_response(client, object())
+
+    assert response.content_stream().read() == b"recovered"
+    assert len(client.calls) == 3
+    assert delays == [None, None]
+
+
 def test_content_decoding_error_retries_once_with_identity_without_throttle():
     capture = object()
     broken = BrokenEncodingMemento(
@@ -442,14 +506,19 @@ def test_identity_decoding_failure_skips_immediately_and_restores_header():
 
     with pytest.raises(
         retrieval.MalformedContentEncodingError,
-        match="after retrying with Accept-Encoding: identity",
-    ):
+        match="invalid Wayback replay response",
+    ) as raised:
         retrieval.retrieve_response(client, object(), gate=gate)
 
     assert len(client.calls) == 2
     assert client.session.headers["Accept-Encoding"] == "gzip, deflate"
     assert gate.generation == 0
     assert gate.concurrency_limit == 2
+    assert (
+        "retrying with Accept-Encoding: identity also failed"
+        in str(raised.value)
+    )
+    assert "Content-Encoding declares gzip" in str(raised.value)
 
 
 def test_make_client_factory_uses_reduced_worker_retries(monkeypatch):
