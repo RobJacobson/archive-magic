@@ -243,35 +243,37 @@ def test_memento_closes_before_warc_construction_fails(monkeypatch):
         retrieved.to_warc_record()
 
 
-def _make_backoff_immediate(monkeypatch):
-    delays = []
-    original = retrieval.RateLimitGate.after_throttle
+def _make_retries_immediate(monkeypatch):
+    rate_limit_delays = []
+    transient_failures = []
 
-    def immediate(self, generation, *, retry_after=None):
-        delays.append(retry_after)
-        coordinated = original(self, generation, retry_after=0)
-        return None if coordinated is None else retry_after
+    def pause(_self, seconds):
+        rate_limit_delays.append(seconds)
+        return True
 
-    monkeypatch.setattr(
-        retrieval.RateLimitGate,
-        "after_throttle",
-        immediate,
-    )
-    return delays
+    def backoff(failure_number):
+        transient_failures.append(failure_number)
+        return 0
+
+    monkeypatch.setattr(retrieval.RateLimitCooldown, "wait", lambda _self: None)
+    monkeypatch.setattr(retrieval.RateLimitCooldown, "pause", pause)
+    monkeypatch.setattr(retrieval, "_transient_backoff_seconds", backoff)
+    return rate_limit_delays, transient_failures
 
 
 def test_rate_limit_coordinates_backoff_and_retries_same_capture(
     monkeypatch,
     capsys,
 ):
-    delays = _make_backoff_immediate(monkeypatch)
+    rate_limit_delays, transient_failures = _make_retries_immediate(monkeypatch)
     capture = object()
     memento = FakeMemento()
     client = FakeClient([RateLimitError(None, 11), memento])
 
     retrieval.retrieve_response(client, capture)
 
-    assert delays == [11]
+    assert rate_limit_delays == [11]
+    assert transient_failures == []
     assert [call[0] for call in client.calls] == [capture, capture]
     assert capsys.readouterr().out == (
         "Rate limited by Internet Archive during playback; "
@@ -280,41 +282,47 @@ def test_rate_limit_coordinates_backoff_and_retries_same_capture(
 
 
 def test_missing_retry_after_uses_sixty_second_backoff(monkeypatch):
-    delays = _make_backoff_immediate(monkeypatch)
+    rate_limit_delays, _ = _make_retries_immediate(monkeypatch)
     client = FakeClient([RateLimitError(None, None), FakeMemento()])
 
     retrieval.retrieve_response(client, object())
 
-    assert delays == [60]
+    assert rate_limit_delays == [60]
 
 
-def test_rate_limit_does_not_consume_bounded_attempts(monkeypatch):
-    delays = _make_backoff_immediate(monkeypatch)
-    rate_limits = retrieval.MAX_THROTTLE_ATTEMPTS + 2
+def test_repeated_rate_limit_exhausts_bounded_attempts(monkeypatch):
+    rate_limit_delays, _ = _make_retries_immediate(monkeypatch)
     client = FakeClient(
         [
             RateLimitError(None, attempt)
-            for attempt in range(1, rate_limits + 1)
+            for attempt in range(1, retrieval.MAX_RETRIEVAL_ATTEMPTS + 1)
         ]
-        + [FakeMemento()]
     )
 
-    retrieval.retrieve_response(client, object())
+    with pytest.raises(WaybackRetryError):
+        retrieval.retrieve_response(client, object())
 
-    assert delays == list(range(1, rate_limits + 1))
-    assert len(client.calls) == rate_limits + 1
+    assert rate_limit_delays == list(
+        range(1, retrieval.MAX_RETRIEVAL_ATTEMPTS)
+    )
+    assert len(client.calls) == retrieval.MAX_RETRIEVAL_ATTEMPTS
 
 
-def test_rate_limit_gate_reacts_once_per_concurrent_failure_wave():
-    gate = retrieval.RateLimitGate(max_concurrency=8)
-    first = gate.acquire()
-    second = gate.acquire()
+def test_rate_limit_cooldown_blocks_until_pause_expires():
+    cooldown = retrieval.RateLimitCooldown()
+    assert cooldown.pause(0.05) is True
+    started = time.monotonic()
 
-    assert gate.after_throttle(first, retry_after=0) == 0
-    assert gate.after_throttle(second, retry_after=9) is None
+    cooldown.wait()
 
-    assert gate.generation == 1
-    assert gate.concurrency_limit == 1
+    assert time.monotonic() - started >= 0.04
+
+
+def test_rate_limit_cooldown_reports_only_the_start_of_a_shared_pause():
+    cooldown = retrieval.RateLimitCooldown()
+
+    assert cooldown.pause(0.05) is True
+    assert cooldown.pause(0.06) is False
 
 
 def _connection_refused_retry_error():
@@ -345,61 +353,35 @@ def _truncated_retry_error(received=130810, remaining=144219):
 
 
 def test_connection_failure_backs_off_and_retries(monkeypatch):
-    delays = _make_backoff_immediate(monkeypatch)
+    _, transient_failures = _make_retries_immediate(monkeypatch)
     capture = object()
     memento = FakeMemento()
     client = FakeClient([_connection_refused_retry_error(), memento])
 
     retrieval.retrieve_response(client, capture)
 
-    assert delays == [None]
+    assert transient_failures == [1]
     assert [call[0] for call in client.calls] == [capture, capture]
 
 
 def test_sustained_connection_failure_exhausts_bounded_attempts(monkeypatch):
-    delays = _make_backoff_immediate(monkeypatch)
+    _, transient_failures = _make_retries_immediate(monkeypatch)
     client = FakeClient(
         [
             _connection_refused_retry_error()
-            for _ in range(retrieval.MAX_THROTTLE_ATTEMPTS)
+            for _ in range(retrieval.MAX_RETRIEVAL_ATTEMPTS)
         ]
     )
 
     with pytest.raises(WaybackRetryError):
         retrieval.retrieve_response(client, object())
-    assert delays == [None] * retrieval.MAX_THROTTLE_ATTEMPTS
+    assert transient_failures == list(
+        range(1, retrieval.MAX_RETRIEVAL_ATTEMPTS)
+    )
 
 
-def test_gate_blocks_new_admissions_until_backoff_expires():
-    gate = retrieval.RateLimitGate(max_concurrency=2)
-    token = gate.acquire()
-    gate.after_throttle(token, retry_after=0.05)
-    started = time.monotonic()
-
-    next_token = gate.acquire()
-    elapsed = time.monotonic() - started
-    gate.after_neutral()
-
-    assert next_token == 1
-    assert elapsed >= 0.04
-
-
-def test_gate_additively_recovers_after_sustained_success():
-    gate = retrieval.RateLimitGate(max_concurrency=4)
-
-    for _ in range(retrieval.RECOVERY_SUCCESSES_PER_STEP):
-        gate.acquire()
-        gate.after_success()
-    assert gate.concurrency_limit == 3
-
-    for _ in range(retrieval.RECOVERY_SUCCESSES_PER_STEP):
-        gate.acquire()
-        gate.after_success()
-    assert gate.concurrency_limit == 4
-
-
-def test_timeout_wayback_retry_uses_adaptive_retry(monkeypatch):
-    _make_backoff_immediate(monkeypatch)
+def test_timeout_wayback_retry_uses_bounded_retry(monkeypatch):
+    _make_retries_immediate(monkeypatch)
     error = WaybackRetryError(2, 1.0, TimeoutError("read timed out"))
     client = FakeClient([error, FakeMemento()])
 
@@ -409,7 +391,7 @@ def test_timeout_wayback_retry_uses_adaptive_retry(monkeypatch):
 
 
 def test_repeated_identical_incomplete_read_stops_early(monkeypatch):
-    delays = _make_backoff_immediate(monkeypatch)
+    _, transient_failures = _make_retries_immediate(monkeypatch)
     client = FakeClient(
         [
             _truncated_retry_error()
@@ -425,9 +407,7 @@ def test_repeated_identical_incomplete_read_stops_early(monkeypatch):
 
     error = raised.value
     assert len(client.calls) == retrieval.REPEATED_TRUNCATION_ATTEMPTS
-    assert delays == [None] * (
-        retrieval.REPEATED_TRUNCATION_ATTEMPTS - 1
-    )
+    assert transient_failures == [1, 2]
     assert error.received_bytes == 130810
     assert error.expected_bytes == 275029
     assert error.attempts == retrieval.REPEATED_TRUNCATION_ATTEMPTS
@@ -439,7 +419,7 @@ def test_repeated_identical_incomplete_read_stops_early(monkeypatch):
 
 
 def test_changing_incomplete_read_boundaries_keep_retrying(monkeypatch):
-    delays = _make_backoff_immediate(monkeypatch)
+    _, transient_failures = _make_retries_immediate(monkeypatch)
     client = FakeClient(
         [
             _truncated_retry_error(received=100, remaining=200),
@@ -452,7 +432,7 @@ def test_changing_incomplete_read_boundaries_keep_retrying(monkeypatch):
 
     assert response.content_stream().read() == b"recovered"
     assert len(client.calls) == 3
-    assert delays == [None, None]
+    assert transient_failures == [1, 2]
 
 
 def test_content_decoding_error_retries_once_with_identity_without_throttle():
@@ -482,17 +462,19 @@ def test_content_decoding_error_retries_once_with_identity_without_throttle():
         return original_get(selected, **kwargs)
 
     client.get_memento = get_memento
-    gate = retrieval.RateLimitGate(max_concurrency=4)
+    cooldown = retrieval.RateLimitCooldown()
 
-    response = retrieval.retrieve_response(client, capture, gate=gate)
+    response = retrieval.retrieve_response(
+        client,
+        capture,
+        cooldown=cooldown,
+    )
 
     assert response.content_stream().read() == b"recovered"
     assert broken.closed is True
     assert encodings == ["gzip, deflate", "identity"]
     assert client.session.headers["Accept-Encoding"] == "gzip, deflate"
     assert client.session.reset_count == 1
-    assert gate.generation == 0
-    assert gate.concurrency_limit == 2
 
 
 def test_identity_decoding_failure_skips_immediately_and_restores_header():
@@ -511,18 +493,16 @@ def test_identity_decoding_failure_skips_immediately_and_restores_header():
             "reset": lambda self: None,
         },
     )()
-    gate = retrieval.RateLimitGate(max_concurrency=4)
+    cooldown = retrieval.RateLimitCooldown()
 
     with pytest.raises(
         retrieval.MalformedContentEncodingError,
         match="invalid Wayback replay response",
     ) as raised:
-        retrieval.retrieve_response(client, object(), gate=gate)
+        retrieval.retrieve_response(client, object(), cooldown=cooldown)
 
     assert len(client.calls) == 2
     assert client.session.headers["Accept-Encoding"] == "gzip, deflate"
-    assert gate.generation == 0
-    assert gate.concurrency_limit == 2
     assert (
         "retrying with Accept-Encoding: identity also failed"
         in str(raised.value)
@@ -600,7 +580,7 @@ def test_memento_fetch_pool_reuses_thread_clients_and_waits_in_order():
         return client
 
     pool = retrieval.MementoFetchPool(
-        gate=retrieval.RateLimitGate(),
+        cooldown=retrieval.RateLimitCooldown(),
         client_factory=factory,
         max_workers=2,
     )
@@ -642,7 +622,7 @@ def test_memento_fetch_pool_fetches_duplicate_capture_keys_independently():
             return FakeMemento()
 
     pool = retrieval.MementoFetchPool(
-        gate=retrieval.RateLimitGate(),
+        cooldown=retrieval.RateLimitCooldown(),
         client_factory=FactoryClient,
         max_workers=2,
     )
@@ -686,7 +666,7 @@ def test_memento_fetch_pool_reports_completion_before_ordered_wait():
         reported.set()
 
     pool = retrieval.MementoFetchPool(
-        gate=retrieval.RateLimitGate(),
+        cooldown=retrieval.RateLimitCooldown(),
         client_factory=FactoryClient,
         max_workers=2,
         on_fetched=on_fetched,

@@ -24,7 +24,7 @@ from .provenance import save_acquisition
 from .replay import generate_replay_index
 from .retrieval import (
     DEFAULT_CONCURRENCY,
-    RateLimitGate,
+    RateLimitCooldown,
     make_client_factory,
 )
 from .rewrite_local import rewrite_local_website
@@ -201,7 +201,7 @@ def _run(args: argparse.Namespace) -> int:
                     include_timestamps=(files_mode == "all"),
                 )
 
-            gate = RateLimitGate(max_concurrency=concurrency)
+            cooldown = RateLimitCooldown()
             warc_summary = ExportSummary()
             if warc_plan is not None:
                 print(
@@ -212,7 +212,7 @@ def _run(args: argparse.Namespace) -> int:
                     warc_groups,
                     warc_plan.buckets,
                     client,
-                    gate=gate,
+                    cooldown=cooldown,
                     client_factory=client_factory,
                     concurrency=concurrency,
                 )
@@ -233,7 +233,7 @@ def _run(args: argparse.Namespace) -> int:
                     files_groups,
                     website_plan,
                     client,
-                    gate=gate,
+                    cooldown=cooldown,
                     client_factory=client_factory,
                     concurrency=concurrency,
                 )

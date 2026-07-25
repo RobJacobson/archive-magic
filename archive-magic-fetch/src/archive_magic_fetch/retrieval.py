@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import random
 import threading
 import time
 from collections import deque
@@ -29,14 +30,13 @@ from .warc import timestamp_to_warc_date
 
 DEFAULT_CONCURRENCY = 8
 
-# Let the job-wide adaptive controller own sustained retry/backoff decisions.
-# One in-session retry still absorbs a single dropped connection without
-# multiplying independent exponential backoffs across every worker.
+# One in-session retry still absorbs a single dropped connection. Sustained
+# failures use the bounded per-capture retry policy below.
 WORKER_SESSION_RETRIES = 1
-MAX_THROTTLE_ATTEMPTS = 6
+MAX_RETRIEVAL_ATTEMPTS = 6
 REPEATED_TRUNCATION_ATTEMPTS = 3
 MAX_CONNECTION_BACKOFF_SECONDS = 30
-RECOVERY_SUCCESSES_PER_STEP = 8
+DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 60
 PREFETCH_MULTIPLIER = 2
 _MISSING_HEADER = object()
 
@@ -252,128 +252,40 @@ class RetrievedMemento:
         )
 
 
-class RateLimitGate:
-    """Adaptive, job-wide admission control for Wayback playback.
+class RateLimitCooldown:
+    """Share a Wayback HTTP 429 pause across all retrieval workers."""
 
-    The library's shared 8/s rate limiter spaces request starts. This gate
-    independently controls how many requests may remain in flight, because
-    server connection capacity and requests/second are different constraints.
-
-    It starts conservatively, halves concurrency and applies one coordinated
-    backoff per failure generation, then adds one slot after sustained success.
-    """
-
-    def __init__(self, max_concurrency: int = DEFAULT_CONCURRENCY) -> None:
+    def __init__(self) -> None:
         self._condition = threading.Condition()
-        self._max_concurrency = max(1, max_concurrency)
-        self._limit = min(2, self._max_concurrency)
-        self._active = 0
-        self._generation = 0
-        self._failure_streak = 0
-        self._success_streak = 0
         self._not_before = 0.0
 
-    @property
-    def generation(self) -> int:
-        """Return the current coordinated-backoff generation."""
-
-        with self._condition:
-            return self._generation
-
-    @property
-    def concurrency_limit(self) -> int:
-        """Return the current adaptive in-flight request limit."""
-
-        with self._condition:
-            return self._limit
-
-    @property
-    def max_concurrency(self) -> int:
-        return self._max_concurrency
-
-    def configure(self, max_concurrency: int) -> None:
-        """Set the job's ceiling before requests begin."""
-
-        maximum = max(1, max_concurrency)
-        with self._condition:
-            if self._active:
-                raise RuntimeError(
-                    "cannot reconfigure retrieval concurrency while active"
-                )
-            self._max_concurrency = maximum
-            self._limit = min(self._limit, maximum)
-            self._condition.notify_all()
-
-    def acquire(self) -> int:
-        """Wait for backoff and capacity, then return a generation token."""
-
+    def wait(self) -> None:
+        """Wait until the latest shared rate-limit pause expires."""
         with self._condition:
             while True:
                 delay = self._not_before - time.monotonic()
-                if delay > 0:
-                    self._condition.wait(timeout=delay)
-                    continue
-                if self._active < self._limit:
-                    self._active += 1
-                    return self._generation
-                self._condition.wait()
+                if delay <= 0:
+                    return
+                self._condition.wait(timeout=delay)
 
-    def _release(self) -> None:
-        if self._active <= 0:  # pragma: no cover - internal invariant
-            raise RuntimeError("retrieval gate released without an active slot")
-        self._active -= 1
-        self._condition.notify_all()
-
-    def after_success(self) -> None:
-        """Release a slot and cautiously restore concurrency."""
-
+    def pause(self, seconds: float) -> bool:
+        """Extend the shared pause and return whether this starts a new pause."""
+        duration = max(0.0, seconds)
         with self._condition:
-            self._release()
-            self._success_streak += 1
-            if self._success_streak < RECOVERY_SUCCESSES_PER_STEP:
-                return
-            self._success_streak = 0
-            self._failure_streak = 0
-            if self._limit < self._max_concurrency:
-                self._limit += 1
-                self._condition.notify_all()
-
-    def after_neutral(self) -> None:
-        """Release a slot for a non-capacity-related playback outcome."""
-
-        with self._condition:
-            self._release()
-
-    def after_throttle(
-        self,
-        start_generation: int,
-        *,
-        retry_after: Optional[float] = None,
-    ) -> Optional[float]:
-        """Coordinate one backoff and return its delay to the wave leader."""
-
-        with self._condition:
-            self._release()
-            if self._generation != start_generation:
-                return None
-
-            self._generation += 1
-            self._failure_streak += 1
-            self._success_streak = 0
-            self._limit = max(1, self._limit // 2)
-            if retry_after is None:
-                delay = min(
-                    2 ** (self._failure_streak - 1),
-                    MAX_CONNECTION_BACKOFF_SECONDS,
-                )
-            else:
-                delay = max(0.0, retry_after)
-            self._not_before = max(
-                self._not_before,
-                time.monotonic() + delay,
-            )
+            now = time.monotonic()
+            starts_pause = self._not_before <= now
+            self._not_before = max(self._not_before, now + duration)
             self._condition.notify_all()
-            return delay
+            return starts_pause
+
+
+def _transient_backoff_seconds(failure_number: int) -> float:
+    """Return bounded exponential backoff with full jitter."""
+    ceiling = min(
+        2 ** max(0, failure_number - 1),
+        MAX_CONNECTION_BACKOFF_SECONDS,
+    )
+    return random.uniform(0, ceiling)
 
 
 class MementoFetchPool:
@@ -386,16 +298,15 @@ class MementoFetchPool:
     def __init__(
         self,
         *,
-        gate: RateLimitGate,
+        cooldown: RateLimitCooldown,
         client_factory: Callable[[], WaybackClient],
         max_workers: int = DEFAULT_CONCURRENCY,
         on_fetched: Optional[Callable[[object], None]] = None,
     ) -> None:
-        self._gate = gate
+        self._cooldown = cooldown
         self._client_factory = client_factory
         self._on_fetched = on_fetched
         self._max_workers = max(1, max_workers)
-        self._gate.configure(self._max_workers)
         self._local = threading.local()
         self._clients: list = []
         self._clients_lock = threading.Lock()
@@ -419,7 +330,7 @@ class MementoFetchPool:
         result = retrieve_memento(
             self._thread_client(),
             capture,
-            gate=self._gate,
+            cooldown=self._cooldown,
         )
         if self._on_fetched is not None:
             self._on_fetched(capture)
@@ -522,7 +433,7 @@ def make_client_factory(user_agent: str) -> Callable[[], WaybackClient]:
     Each call creates a fresh ``WaybackSession``. Unspecified rate limits use
     the library defaults, which are shared process-wide and thread-safe.
     Worker sessions use fewer retries so connection-refused storms surface to
-    the job-wide gate quickly instead of retrying in parallel for ~64s each.
+    Fetch's bounded retry loop instead of retrying in parallel for ~64s each.
     """
 
     def factory() -> WaybackClient:
@@ -540,21 +451,22 @@ def _retrieve_memento_with_retry(
     client,
     capture,
     *,
-    gate: RateLimitGate,
+    cooldown: RateLimitCooldown,
 ) -> RetrievedMemento:
-    """Retrieve and fully consume one Memento under adaptive admission."""
+    """Retrieve and fully consume one Memento with bounded transport retries."""
 
     started_at = time.monotonic()
     attempt_number = 0
+    transient_failures = 0
     identity_retry = False
     identity_headers = None
     previous_accept_encoding = _MISSING_HEADER
     previous_truncation = None
     repeated_truncations = 0
     try:
-        while attempt_number < MAX_THROTTLE_ATTEMPTS:
+        while attempt_number < MAX_RETRIEVAL_ATTEMPTS:
+            cooldown.wait()
             attempt_number += 1
-            generation = gate.acquire()
             memento = None
             try:
                 memento = client.get_memento(
@@ -579,7 +491,6 @@ def _retrieve_memento_with_retry(
                         headers=headers,
                     )
             except ContentDecodingError as error:
-                gate.after_neutral()
                 if identity_retry:
                     raise MalformedContentEncodingError(
                         _content_encoding(memento)
@@ -606,15 +517,18 @@ def _retrieve_memento_with_retry(
             except RateLimitError as error:
                 previous_truncation = None
                 repeated_truncations = 0
-                delay = gate.after_throttle(
-                    generation,
-                    retry_after=error.retry_after or 60,
+                transient_failures = 0
+                if attempt_number == MAX_RETRIEVAL_ATTEMPTS:
+                    raise WaybackRetryError(
+                        attempt_number,
+                        time.monotonic() - started_at,
+                        error,
+                    ) from error
+                delay = (
+                    error.retry_after
+                    or DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS
                 )
-                # A rate limit is a job-level scheduling signal, not a failed
-                # capture attempt. Keep the same capture pending until IA
-                # accepts it or the user interrupts the job.
-                attempt_number -= 1
-                if delay is not None:
+                if cooldown.pause(delay):
                     print_progress(
                         "Rate limited by Internet Archive during playback; "
                         f"pausing all downloads for {delay:g}s before "
@@ -643,7 +557,6 @@ def _retrieve_memento_with_retry(
                     >= REPEATED_TRUNCATION_ATTEMPTS
                 )
                 if repeated_boundary:
-                    gate.after_neutral()
                     received, expected = truncation
                     raise TruncatedWaybackResponseError(
                         received_bytes=received,
@@ -652,8 +565,8 @@ def _retrieve_memento_with_retry(
                         elapsed_seconds=time.monotonic() - started_at,
                     ) from error
 
-                gate.after_throttle(generation)
-                if attempt_number == MAX_THROTTLE_ATTEMPTS:
+                transient_failures += 1
+                if attempt_number == MAX_RETRIEVAL_ATTEMPTS:
                     if truncation is not None:
                         received, expected = truncation
                         raise TruncatedWaybackResponseError(
@@ -669,11 +582,10 @@ def _retrieve_memento_with_retry(
                             error,
                         ) from error
                     raise
-            except BaseException:
-                gate.after_neutral()
-                raise
+                time.sleep(
+                    _transient_backoff_seconds(transient_failures)
+                )
             else:
-                gate.after_success()
                 return result
     finally:
         if identity_headers is not None:
@@ -716,15 +628,17 @@ def retrieve_memento(
     client,
     capture,
     *,
-    gate: Optional[RateLimitGate] = None,
+    cooldown: Optional[RateLimitCooldown] = None,
 ) -> RetrievedMemento:
     """Retrieve one Memento as reusable semantic body and metadata."""
 
-    active_gate = gate if gate is not None else RateLimitGate()
+    active_cooldown = (
+        cooldown if cooldown is not None else RateLimitCooldown()
+    )
     return _retrieve_memento_with_retry(
         client,
         capture,
-        gate=active_gate,
+        cooldown=active_cooldown,
     )
 
 
@@ -732,8 +646,12 @@ def retrieve_response(
     client,
     capture,
     *,
-    gate: Optional[RateLimitGate] = None,
+    cooldown: Optional[RateLimitCooldown] = None,
 ):
     """Retrieve one Memento and construct the semantic WARC response."""
 
-    return retrieve_memento(client, capture, gate=gate).to_warc_record()
+    return retrieve_memento(
+        client,
+        capture,
+        cooldown=cooldown,
+    ).to_warc_record()

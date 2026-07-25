@@ -99,6 +99,23 @@ class FakeClient:
         return outcome
 
 
+def make_retries_immediate(monkeypatch):
+    rate_limit_delays = []
+
+    def pause(_self, seconds):
+        rate_limit_delays.append(seconds)
+        return True
+
+    monkeypatch.setattr(retrieval.RateLimitCooldown, "wait", lambda _self: None)
+    monkeypatch.setattr(retrieval.RateLimitCooldown, "pause", pause)
+    monkeypatch.setattr(
+        retrieval,
+        "_transient_backoff_seconds",
+        lambda _failure_number: 0,
+    )
+    return rate_limit_delays
+
+
 def memento_for(
     selected,
     *,
@@ -367,23 +384,14 @@ def test_skippable_wayback_errors_warn_and_unrelated_capture_continues(
     outcomes[captures[-1]] = memento_for(captures[-1])
     client = FakeClient(outcomes)
     target = output_path(tmp_path)
-    original = retrieval.RateLimitGate.after_throttle
-
-    def immediate(self, generation, *, retry_after=None):
-        return original(self, generation, retry_after=0)
-
-    monkeypatch.setattr(
-        retrieval.RateLimitGate,
-        "after_throttle",
-        immediate,
-    )
+    make_retries_immediate(monkeypatch)
 
     export.export_group(URLKEY, captures, target, client)
 
     assert client.calls[:4] == captures[:4]
     assert client.calls[4:-1] == [
         captures[4]
-    ] * retrieval.MAX_THROTTLE_ATTEMPTS
+    ] * retrieval.MAX_RETRIEVAL_ATTEMPTS
     assert client.calls[-1] == captures[-1]
     assert [record.rec_type for record in read_records(target)] == [
         "warcinfo",
@@ -451,16 +459,7 @@ def test_repeated_truncated_response_warns_early_and_is_categorized(
         for _ in range(retrieval.REPEATED_TRUNCATION_ATTEMPTS)
     ]
     client = FakeClient({selected: truncated})
-    original = retrieval.RateLimitGate.after_throttle
-
-    def immediate(self, generation, *, retry_after=None):
-        return original(self, generation, retry_after=0)
-
-    monkeypatch.setattr(
-        retrieval.RateLimitGate,
-        "after_throttle",
-        immediate,
-    )
+    make_retries_immediate(monkeypatch)
 
     summary = export.export_group(
         URLKEY,
@@ -493,35 +492,22 @@ def test_unexpected_response_format_is_fatal(tmp_path):
         )
 
 
-def test_repeated_rate_limit_eventually_writes_same_capture(
+def test_repeated_rate_limit_is_bounded_and_skips_capture(
     tmp_path,
     monkeypatch,
     capsys,
 ):
     selected = capture()
-    rate_limits = retrieval.MAX_THROTTLE_ATTEMPTS + 1
+    rate_limits = retrieval.MAX_RETRIEVAL_ATTEMPTS
     client = FakeClient(
         {
             selected: [
                 RateLimitError(None, attempt)
                 for attempt in range(1, rate_limits + 1)
             ]
-            + [memento_for(selected)]
         }
     )
-    delays = []
-    original = retrieval.RateLimitGate.after_throttle
-
-    def immediate(self, generation, *, retry_after=None):
-        delays.append(retry_after)
-        coordinated = original(self, generation, retry_after=0)
-        return None if coordinated is None else retry_after
-
-    monkeypatch.setattr(
-        retrieval.RateLimitGate,
-        "after_throttle",
-        immediate,
-    )
+    delays = make_retries_immediate(monkeypatch)
 
     target = output_path(tmp_path)
     summary = export.export_group(
@@ -531,16 +517,15 @@ def test_repeated_rate_limit_eventually_writes_same_capture(
         client,
     )
 
-    assert delays == list(range(1, rate_limits + 1))
-    assert summary.responses == 1
-    assert summary.playback_failures == 0
-    assert [record.rec_type for record in read_records(target)] == [
-        "warcinfo",
-        "response",
-    ]
+    assert delays == list(range(1, rate_limits))
+    assert summary.responses == 0
+    assert summary.playback_failures == 1
+    assert not target.exists()
     output = capsys.readouterr()
-    assert output.out.count("Rate limited by Internet Archive") == rate_limits
-    assert "WARNING skipped" not in output.err
+    assert output.out.count("Rate limited by Internet Archive") == (
+        rate_limits - 1
+    )
+    assert output.err.count("WARNING skipped") == 1
 
 
 def test_all_skipped_group_creates_no_file(tmp_path):

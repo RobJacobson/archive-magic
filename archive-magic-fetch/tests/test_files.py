@@ -210,19 +210,19 @@ def test_dual_mode_fetches_each_output_independently(tmp_path, capsys):
         include_timestamps=False,
     )
     client = FakeClient({selected: memento_for(selected, payload=b"shared-body")})
-    gate = retrieval.RateLimitGate()
+    cooldown = retrieval.RateLimitCooldown()
 
     warc_result = export.export_all(
         groups,
         warc_plan.buckets,
         client,
-        gate=gate,
+        cooldown=cooldown,
     )
     files_summary = files.write_website_files(
         groups,
         website_plan,
         client,
-        gate=gate,
+        cooldown=cooldown,
     )
 
     assert client.calls == [selected, selected]

@@ -88,9 +88,8 @@ archive-magic-fetch URL_PATTERN
 
 `--concurrency 1` restores serial memento downloads for diagnostics. Values
 above 8 mostly queue behind the Wayback client's independent 8 requests/second
-memento pacing. The value is a ceiling: adaptive admission begins at two
-in-flight requests, backs down under pressure, and ramps toward the ceiling
-after sustained success.
+memento pacing. The value directly sets the fixed worker-pool ceiling; Fetch
+does not dynamically reduce or ramp concurrency.
 
 The two axes are independent. Default behavior remains full WARC history plus
 replay CDXJ with no loose files. `--warc none --files none` exits successfully
@@ -171,32 +170,30 @@ Unspecified rate limits use the library defaults, which are process-wide shared
 `RateLimit` objects (thread-safe): **0.4/s for CDX** and **8/s for mementos**
 (one start every 125ms), matching Internet Archive guidance.
 
-Fetch adds one job-wide adaptive admission gate for memento playback:
+Fetch keeps playback scheduling deliberately small:
 
-1. It distinguishes **request rate** (the library's shared 8/s limiter) from
-   **in-flight concurrency** (this gate, initially two and capped by
-   `--concurrency`).
-2. HTTP 429 honors `Retry-After`, or 60 seconds when absent. Transient
-   connection and timeout failures use exponential backoff from 1 to 30
-   seconds.
-3. Workers from the same failure wave share one backoff deadline. They do not
-   independently multiply sleeps.
-4. Each new failure wave halves the in-flight limit (minimum one). Every eight
-   successful requests adds one slot until the configured ceiling is restored.
-5. HTTP 429 does not consume a capture attempt: one worker announces the
-   coordinated pause, every worker waits at the shared gate, and the same
-   capture remains pending until Internet Archive accepts it or the user
-   interrupts the job. Other transient failures receive at most six gate-level
-   attempts. An exhausted `WaybackRetryError` follows normal playback-failure
-   skip policy. Three consecutive failures at the same structured
-   `IncompleteRead` byte boundary stop early as a persistent truncated
-   response; changing boundaries retain the full retry budget.
-6. Memento worker sessions use one immediate in-session retry, then surface
-   the problem to the shared controller. A failed worker session resets its
-   connection adapters before trying again.
-7. A Requests `ContentDecodingError` is **not** a capacity signal. It does not
-   advance the gate generation, reduce concurrency, consume a gate-level
-   attempt, or sleep.
+1. The fixed worker pool caps **in-flight concurrency** at `--concurrency`.
+   The library's independent shared limiter continues to cap **request rate**
+   at 8 starts per second.
+2. Every worker checks one job-wide HTTP 429 cooldown before each attempt.
+   A 429 honors `Retry-After`, or 60 seconds when absent, and extends that
+   shared deadline so other workers pause too.
+3. Each capture receives at most six transport attempts, including HTTP 429,
+   connection, and timeout failures. Exhaustion raises `WaybackRetryError`,
+   which follows the normal playback-failure skip policy.
+4. Transient connection and timeout failures use per-capture exponential
+   backoff with full jitter, capped at 30 seconds. They do not alter the fixed
+   worker count. A failed worker session resets its connection adapters before
+   trying again.
+5. Three consecutive failures at the same structured `IncompleteRead` byte
+   boundary stop early as a persistent truncated response; changing boundaries
+   retain the full retry budget.
+6. Memento worker sessions use one immediate in-session retry before surfacing
+   a sustained failure to Fetch's bounded per-capture retry loop.
+7. A Requests `ContentDecodingError` is a playback representation problem, not
+   a rate-limit or transport-capacity signal. Its identity-encoding recovery
+   does not change concurrency, start a cooldown, or consume a transport
+   attempt.
 8. On the first decoding mismatch for a capture, that worker temporarily
    changes its private session from `Accept-Encoding: gzip, deflate` to
    `Accept-Encoding: identity`, resets its connection adapters, and retries.
@@ -558,7 +555,7 @@ described in section 3 handles recoverable cases without slowing unrelated
 workers or changing the normal compressed transfer path; a persistent
 mismatch warns and skips.
 
-Repeated incomplete transfers normally follow the adaptive connection retry
+Repeated incomplete transfers normally follow the bounded connection retry
 policy. When three consecutive attempts stop at the same received/expected
 byte boundary, Fetch treats the outcome as a persistent truncated Wayback
 response, skips immediately, and reports the structured byte counts. It never
@@ -693,7 +690,7 @@ The flat package contains:
 | `paths.py` | Collection normalization, safe readable WARC/website paths, collision buckets, preflight |
 | `publication.py` | Same-filesystem atomic no-replace file/directory publication |
 | `provenance.py` | Source CDX and query-manifest serialization/publication |
-| `retrieval.py` | Exact playback, adaptive transport backoff, identity-encoding recovery, bounded worker fetch |
+| `retrieval.py` | Exact playback, shared 429 cooldown, bounded transport retry, identity-encoding recovery, bounded worker fetch |
 | `export.py` | Ordered WARC response writing |
 | `files.py` | Ordered loose website-file writing under `website/` with wait-for-next |
 | `rewrite_local.py` | Optional post-write HTML/CSS/JS local-link rewrite |
@@ -730,7 +727,8 @@ Acceptance covers:
 - complete source CDX/manifest content, checksums, suffix allocation,
   concurrent publication, and cleanup;
 - shared-WARC ownership with one `warcinfo`;
-- retrieval fields, redirect/status policy, adaptive transport retry,
+- retrieval fields, redirect/status policy, fixed concurrency, shared 429
+  cooldown, bounded transport retry,
   identity-encoding recovery/restoration, and failure behavior;
 - sorted response CDXJ semantics and nested filenames;
 - exact offset/length selection of independently compressed WARC members;

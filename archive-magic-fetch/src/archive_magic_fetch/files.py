@@ -21,7 +21,7 @@ from .retrieval import (
     DEFAULT_CONCURRENCY,
     MalformedContentEncodingError,
     MementoFetchPool,
-    RateLimitGate,
+    RateLimitCooldown,
     TruncatedWaybackResponseError,
     format_playback_failure,
     format_playback_failure_summary,
@@ -140,7 +140,7 @@ def write_website_files(
     plan: WebsitePlan,
     client,
     *,
-    gate: Optional[RateLimitGate] = None,
+    cooldown: Optional[RateLimitCooldown] = None,
     client_factory=None,
     concurrency: int = DEFAULT_CONCURRENCY,
 ) -> FilesSummary:
@@ -148,7 +148,7 @@ def write_website_files(
 
     summary = FilesSummary()
     targets = list(plan.targets)
-    active_gate = gate or RateLimitGate(max_concurrency=concurrency)
+    active_cooldown = cooldown or RateLimitCooldown()
     pool = None
     fetch_window = None
     if (
@@ -163,7 +163,7 @@ def write_website_files(
             if not _is_redirect(capture.statuscode):
                 to_fetch.append(capture)
         pool = MementoFetchPool(
-            gate=active_gate,
+            cooldown=active_cooldown,
             client_factory=client_factory,
             max_workers=concurrency,
             on_fetched=print_fetched,
@@ -190,7 +190,7 @@ def write_website_files(
                     retrieved = retrieve_memento(
                         client,
                         capture,
-                        gate=active_gate,
+                        cooldown=active_cooldown,
                     )
                     print_fetched(capture)
             except (

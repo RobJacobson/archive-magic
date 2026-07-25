@@ -22,7 +22,7 @@ from .retrieval import (
     MalformedContentEncodingError,
     MementoFetchPool,
     MementoFetchWindow,
-    RateLimitGate,
+    RateLimitCooldown,
     TruncatedWaybackResponseError,
     format_playback_failure,
     format_playback_failure_summary,
@@ -160,7 +160,7 @@ def _export_group(
     client,
     writer_factory: Callable[[], object],
     *,
-    gate: RateLimitGate,
+    cooldown: RateLimitCooldown,
     client_factory: Optional[Callable] = None,
     concurrency: int = DEFAULT_CONCURRENCY,
     fetch_window: Optional[MementoFetchWindow] = None,
@@ -193,7 +193,7 @@ def _export_group(
         and concurrency > 1
     ):
         owned_pool = MementoFetchPool(
-            gate=gate,
+            cooldown=cooldown,
             client_factory=client_factory,
             max_workers=concurrency,
             on_fetched=print_fetched,
@@ -216,7 +216,7 @@ def _export_group(
                     response = retrieve_response(
                         client,
                         capture,
-                        gate=gate,
+                        cooldown=cooldown,
                     )
                 else:
                     response = retrieved.to_warc_record()
@@ -270,14 +270,14 @@ def export_group(
     path: Path,
     client,
     *,
-    gate: Optional[RateLimitGate] = None,
+    cooldown: Optional[RateLimitCooldown] = None,
     client_factory: Optional[Callable] = None,
     concurrency: int = DEFAULT_CONCURRENCY,
     fetch_window: Optional[MementoFetchWindow] = None,
 ) -> ExportSummary:
     """Export one group to one exclusively created WARC."""
 
-    active_gate = gate or RateLimitGate(max_concurrency=concurrency)
+    active_cooldown = cooldown or RateLimitCooldown()
     owner = _LazyWarc(path)
     try:
         return _export_group(
@@ -285,7 +285,7 @@ def export_group(
             captures,
             client,
             owner.get_writer,
-            gate=active_gate,
+            cooldown=active_cooldown,
             client_factory=client_factory,
             concurrency=concurrency,
             fetch_window=fetch_window,
@@ -299,7 +299,7 @@ def _export_bucket(
     capture_groups: Mapping[str, Sequence[CdxRecord]],
     client,
     *,
-    gate: RateLimitGate,
+    cooldown: RateLimitCooldown,
     fetch_window: Optional[MementoFetchWindow] = None,
 ) -> tuple[ExportSummary, bool]:
     """Export every URL-key group assigned to one lazy WARC owner."""
@@ -314,7 +314,7 @@ def _export_bucket(
                     capture_groups[urlkey],
                     client,
                     owner.get_writer,
-                    gate=gate,
+                    cooldown=cooldown,
                     fetch_window=fetch_window,
                 )
             )
@@ -328,7 +328,7 @@ def export_all(
     buckets: Sequence[WarcBucket],
     client,
     *,
-    gate: Optional[RateLimitGate] = None,
+    cooldown: Optional[RateLimitCooldown] = None,
     client_factory: Optional[Callable] = None,
     concurrency: int = DEFAULT_CONCURRENCY,
 ) -> ExportResult:
@@ -336,7 +336,7 @@ def export_all(
 
     summary = ExportSummary()
     created_warcs = []
-    active_gate = gate or RateLimitGate(max_concurrency=concurrency)
+    active_cooldown = cooldown or RateLimitCooldown()
     pool = None
     fetch_window = None
     if (
@@ -352,7 +352,7 @@ def export_all(
                     if not _is_redirect(capture.statuscode)
                 )
         pool = MementoFetchPool(
-            gate=active_gate,
+            cooldown=active_cooldown,
             client_factory=client_factory,
             max_workers=concurrency,
             on_fetched=print_fetched,
@@ -365,7 +365,7 @@ def export_all(
                 bucket,
                 capture_groups,
                 client,
-                gate=active_gate,
+                cooldown=active_cooldown,
                 fetch_window=fetch_window,
             )
             summary.add(bucket_summary)

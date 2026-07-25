@@ -408,7 +408,7 @@ def test_cli_owns_one_client_context_and_passes_same_client(monkeypatch):
         planned_buckets,
         client,
         *,
-        gate=None,
+        cooldown=None,
         client_factory=None,
         concurrency=None,
     ):
@@ -416,7 +416,7 @@ def test_cli_owns_one_client_context_and_passes_same_client(monkeypatch):
             grouped,
             planned_buckets,
             client,
-            gate,
+            cooldown,
             client_factory,
             concurrency,
         )
