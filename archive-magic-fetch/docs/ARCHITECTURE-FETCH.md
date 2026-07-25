@@ -74,17 +74,20 @@ archive-magic-fetch URL_PATTERN
   [--start DATE] [--end DATE]
   [--warc {none,latest,all}]
   [--files {none,latest,all}]
+  [--rewrite-local]
 ```
 
 | Flag | Values | Default |
 | --- | --- | --- |
 | `--warc` | `none`, `latest`, `all` | `all` |
 | `--files` | `none`, `latest`, `all` | `none` |
+| `--rewrite-local` | flag | off |
 
 The two axes are independent. Default behavior remains full WARC history plus
 replay CDXJ with no loose files. `--warc none --files none` exits successfully
 with `Nothing to do: both --warc and --files are none` and performs no
-discovery.
+discovery. `--rewrite-local` requires `--files latest` or `--files all`
+(usage error otherwise) and does not enable files mode by itself.
 
 Numeric partial dates are passed through unchanged to `WaybackClient.search()`,
 which forwards them to the Internet Archive CDX `from`/`to` parameters. Those
@@ -113,9 +116,11 @@ parse arguments and apply date defaults
     -> collapse value-equal records and group by urlkey
     -> build warc_selection and files_selection from output modes
     -> if warc enabled: allocate WARC buckets and preflight WARC/replay
-    -> if files enabled: plan and preflight website/ paths
+    -> if files enabled: plan website/ paths (query folding + newest-wins)
+         and preflight remaining targets
     -> if warc enabled: export WARCs; generate replay/index.cdxj
     -> if files enabled: write loose website bodies
+    -> if --rewrite-local and at least one file was written: rewrite under website/
     -> print aggregate summary
     -> close the client/session
 ```
@@ -278,18 +283,31 @@ spirit), with an explicit host segment so multi-host collections stay distinct:
 
 - host comes first (`www.` stripped; non-default ports use `--port-<n>`)
 - directory URLs and extension-less directory-like paths become `.../index.html`
+- **query strings are folded away** for loose-file paths only (WARC path/query
+  encoding is unchanged): `main_style.css?v=1` → `main_style.css`
 - `--files latest` writes `website/<host>/<site-path>` with no timestamp segment
 - `--files all` writes `website/<host>/<14-digit-timestamp>/<site-path>`
-- identical planned paths (for example same host/timestamp/path with different
-  digests) are disambiguated with a `--<digest8>` filename suffix
+
+**Newest-wins collisions:** After preferred paths are computed (including query
+folding), if two or more selected captures map to the same
+filesystem-equivalent website path, Fetch keeps exactly the capture with the
+newest aware UTC timestamp and drops the others from the files plan. This is
+the primary fix for `/` vs `/index.html` both mapping to `index.html`. Digest
+suffixes are retained only for true same-path/same-time leftovers with distinct
+digests; identical-digest leftovers keep the lexicographically smaller
+`(urlkey, original, digest)` tuple.
 
 Examples:
 
 ```text
 /                 -> website/example.com/index.html
+/index.html       -> website/example.com/index.html  (collides; newer wins)
 /about            -> website/example.com/about/index.html
 /a/b/             -> website/example.com/a/b/index.html
 /css/style.css    -> website/example.com/css/style.css
+/files/main_style.css?1546028705 -> website/example.com/files/main_style.css
+/files/main_style.css?1719345030 -> website/example.com/files/main_style.css
+                                 (collides; newer wins; no %3F in filename)
 
 # --files all
 /                 -> website/example.com/20060715085250/index.html
@@ -305,6 +323,36 @@ WARC paths. Planned file-vs-directory conflicts reshape a file into
 `existing-file/index.html` when that does not clobber another planned final
 path. Existing final loose-file targets remain fatal (no resume). Empty or
 failed playback bodies do not leave empty files.
+
+### 5.3 Optional `--rewrite-local`
+
+When `--rewrite-local` is set and at least one loose file was written, Fetch
+rewrites text files under `website/` with extensions `.html`, `.htm`, `.css`,
+and `.js` (case-insensitive) after writing completes. Decode failures are
+skipped with a warning.
+
+Rewrite rules (minimum viable):
+
+- Root-relative `/path`, scheme-relative `//host/path`, and absolute
+  `http(s)://host/path` references are rewritten to relative links when the
+  host normalizes to a host segment present under `website/` and the local
+  target exists (query folded when resolving; directories prefer `index.html`;
+  `/` resolves to host-root `index.html` when present).
+- `url(...)` is rewritten in `.css` and HTML inline styles only (not `.js`, so
+  JS helpers named `url` are left alone). Straightforward `srcset` and
+  `href`/`src`/`action` attributes are rewritten in HTML and JS.
+- Under `--files all`, root-relative links resolve inside the file's timestamp
+  directory; under `--files latest`, they resolve at the host root even when a
+  site path segment looks like a 14-digit timestamp.
+- Off-site hosts, `mailto:` / `tel:` / `javascript:` / `data:`, and missing
+  local targets are left unchanged.
+- Already-relative references (no scheme, not root- or scheme-relative) are
+  left unchanged so a second pass does not corrupt links.
+
+Limitations: this is best-effort for `file://` or a local static server; it does
+not download missing link targets, rewrite third-party CDNs, or guarantee
+perfect offline fidelity for JS-driven sites. Default CLI behavior without the
+flag does not rewrite file contents.
 
 ## 6. Collision buckets and preflight
 
@@ -579,6 +627,7 @@ The flat package contains:
 | `retrieval.py` | Exact Memento playback, semantic response construction, shared retrieval cache |
 | `export.py` | Redirect/status policy, per-group deduplication, bucket export, WARC aggregate result |
 | `files.py` | Loose website-file writing under `website/` |
+| `rewrite_local.py` | Optional post-write HTML/CSS/JS local-link rewrite |
 | `warc.py` | WARC dates, exclusive creation, response/revisit serialization |
 | `replay.py` | Final-WARC CDXJ generation and publication |
 
@@ -618,7 +667,8 @@ Acceptance covers:
 - exact offset/length selection of independently compressed WARC members;
 - replay publication races and indexer failures;
 - `--warc` / `--files` mode gating, latest selection preference, website path
-  layouts, and shared-capture fetch fan-out; and
+  layouts (query folding, newest-wins), `--rewrite-local` validation/rewrite,
+  and shared-capture fetch fan-out; and
 - final-summary ordering.
 
 Routine validation is:

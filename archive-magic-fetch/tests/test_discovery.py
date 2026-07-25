@@ -644,6 +644,25 @@ def test_cli_defaults_parse_to_warc_all_and_files_none():
     args = cli.parse_args(["example.com/*"])
     assert args.warc == "all"
     assert args.files == "none"
+    assert args.rewrite_local is False
+
+
+def test_cli_rewrite_local_requires_files_mode(capsys):
+    assert cli.main(
+        ["example.com/*", "--rewrite-local", "--files", "none"]
+    ) == 2
+    assert (
+        "--rewrite-local requires --files latest or --files all"
+        in capsys.readouterr().err
+    )
+
+
+def test_cli_rewrite_local_alone_does_not_enable_files(capsys):
+    assert cli.main(["example.com/*", "--rewrite-local", "--warc", "none"]) == 2
+    assert (
+        "--rewrite-local requires --files latest or --files all"
+        in capsys.readouterr().err
+    )
 
 
 def test_cli_both_none_is_successful_noop(monkeypatch, capsys):

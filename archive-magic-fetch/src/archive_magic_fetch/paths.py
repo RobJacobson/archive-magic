@@ -258,7 +258,7 @@ def _cdx_timestamp_text(timestamp: datetime) -> str:
     return timestamp.astimezone(timezone.utc).strftime("%Y%m%d%H%M%S")
 
 
-def _website_host_segment(original_url: str) -> str:
+def website_host_segment(original_url: str) -> str:
     """Return the filesystem host segment for one absolute capture URL."""
 
     if not isinstance(original_url, str) or not original_url.strip():
@@ -298,6 +298,24 @@ def _website_host_segment(original_url: str) -> str:
     return host
 
 
+def _split_site_path(path: str) -> tuple[list[str], bool]:
+    """Return decoded path segments and whether the path is directory-like.
+
+    Query strings are intentionally ignored for loose-file path planning.
+    """
+
+    path = unquote(path or "")
+    trailing_slash = path.endswith("/")
+    if path.startswith("/"):
+        path = path[1:]
+    if path.endswith("/"):
+        path = path[:-1]
+
+    segments = [segment for segment in path.split("/") if segment != ""]
+    directory_like = trailing_slash or not segments or "." not in segments[-1]
+    return segments, directory_like
+
+
 def _website_path_segments(original_url: str) -> tuple[list[str], bool]:
     """Return decoded path segments and whether the URL is directory-like."""
 
@@ -308,23 +326,7 @@ def _website_path_segments(original_url: str) -> tuple[list[str], bool]:
     if not parsed.scheme or not parsed.netloc:
         raise ValueError(f"capture URL must be absolute: {original_url}")
 
-    path = unquote(parsed.path or "")
-    trailing_slash = path.endswith("/")
-    if path.startswith("/"):
-        path = path[1:]
-    if path.endswith("/"):
-        path = path[:-1]
-
-    segments = [segment for segment in path.split("/") if segment != ""]
-    if parsed.query:
-        query = unquote(parsed.query)
-        if segments:
-            segments[-1] = f"{segments[-1]}?{query}"
-        else:
-            segments = [f"?{query}"]
-
-    directory_like = trailing_slash or not segments or "." not in segments[-1]
-    return segments, directory_like
+    return _split_site_path(parsed.path or "")
 
 
 def _website_relative_parts(
@@ -334,7 +336,7 @@ def _website_relative_parts(
 ) -> tuple[str, ...]:
     """Build safe relative parts under ``website/`` for one capture URL."""
 
-    host = _website_host_segment(original_url)
+    host = website_host_segment(original_url)
     segments, directory_like = _website_path_segments(original_url)
     parts: list[str] = [host]
     if timestamp is not None:
@@ -362,6 +364,24 @@ def preferred_website_path(
 
     return layout.website_root.joinpath(
         *_website_relative_parts(original_url, timestamp=timestamp)
+    )
+
+
+def preferred_site_file(site_root: Path, url_path: str) -> Path:
+    """Map a site-absolute path to its preferred file under one site root.
+
+    Query strings are ignored (folded), matching loose-file path planning.
+    """
+
+    segments, directory_like = _split_site_path(url_path)
+    parts = list(segments)
+    if directory_like:
+        parts.append("index.html")
+    return site_root.joinpath(
+        *(
+            _bounded_segment(segment, byte_limit=MAX_COMPONENT_BYTES)
+            for segment in parts
+        )
     )
 
 
@@ -560,6 +580,45 @@ def preflight_layout(
     return ExportPlan(layout, tuple(buckets))
 
 
+def _newest_wins_website_paths(
+    planned: list[tuple[Path, str, int, str, datetime, str, str]],
+    layout: CollectionLayout,
+) -> list[tuple[Path, str, int, str]]:
+    """Keep the newest capture per filesystem-equivalent website path.
+
+    Older timestamps at the same path are dropped. Captures that share both
+    path and newest timestamp remain for digest-suffix disambiguation, except
+    identical-digest leftovers which keep the lexicographically smaller
+    ``(urlkey, original, digest)`` tuple.
+    """
+
+    by_key: dict[
+        tuple[str, ...],
+        list[tuple[Path, str, int, str, datetime, str, str]],
+    ] = {}
+    for entry in planned:
+        key = _equivalent_path(entry[0], layout.website_root)
+        by_key.setdefault(key, []).append(entry)
+
+    survivors: list[tuple[Path, str, int, str]] = []
+    for entries in by_key.values():
+        newest_timestamp = max(entry[4] for entry in entries)
+        newest = [entry for entry in entries if entry[4] == newest_timestamp]
+        by_token: dict[
+            str,
+            list[tuple[Path, str, int, str, datetime, str, str]],
+        ] = {}
+        for entry in newest:
+            by_token.setdefault(entry[3], []).append(entry)
+        for token_entries in by_token.values():
+            winner = min(
+                token_entries,
+                key=lambda item: (item[1], item[5], item[6]),
+            )
+            survivors.append(winner[:4])
+    return survivors
+
+
 def _disambiguate_website_paths(
     planned: list[tuple[Path, str, int, str]],
     layout: CollectionLayout,
@@ -669,7 +728,7 @@ def preflight_website_layout(
 ) -> WebsitePlan:
     """Plan and inspect all final loose-file targets under ``website/``."""
 
-    planned: list[tuple[Path, str, int, str]] = []
+    planned: list[tuple[Path, str, int, str, datetime, str, str]] = []
     for urlkey, captures in capture_groups.items():
         if not captures:
             raise ValueError(f"capture group is empty: {urlkey}")
@@ -677,28 +736,30 @@ def preflight_website_layout(
             original = getattr(capture, "original", None)
             if not isinstance(original, str) or not original:
                 raise ValueError("capture URL must be a non-empty string")
-            timestamp = None
-            if include_timestamps:
-                timestamp = getattr(capture, "timestamp", None)
-                if not isinstance(timestamp, datetime):
-                    raise ValueError("capture timestamp must be a datetime")
+            capture_timestamp = getattr(capture, "timestamp", None)
+            if not isinstance(capture_timestamp, datetime):
+                raise ValueError("capture timestamp must be a datetime")
+            path_timestamp = capture_timestamp if include_timestamps else None
             path = preferred_website_path(
                 original,
                 layout,
-                timestamp=timestamp,
+                timestamp=path_timestamp,
             )
+            digest = getattr(capture, "digest", None)
+            digest_text = digest if isinstance(digest, str) else ""
             planned.append(
                 (
                     path,
                     urlkey,
                     capture_index,
-                    _digest_path_token(
-                        getattr(capture, "digest", None),
-                        capture_index=capture_index,
-                    ),
+                    _digest_path_token(digest, capture_index=capture_index),
+                    capture_timestamp,
+                    original,
+                    digest_text,
                 )
             )
 
+    planned = _newest_wins_website_paths(planned, layout)
     planned = _disambiguate_website_paths(planned, layout)
     planned = _reshape_website_paths(planned, layout)
     planned.sort(

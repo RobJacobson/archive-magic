@@ -5,6 +5,11 @@
 **Date:** 2026-07-24  
 **PR expectation:** One PR  
 
+> **Extended by** [`WEBSITE-FILES-BROWSING-PRD.md`](./WEBSITE-FILES-BROWSING-PRD.md)
+> (newest-wins path collisions, query-string folding for `website/`, optional
+> `--rewrite-local`). That document is authoritative for browsable loose-file
+> behavior; this PRD remains the source for the `--warc` / `--files` axes.
+
 ## 1. Summary
 
 Extend `archive-magic-fetch` with two independent output axes:

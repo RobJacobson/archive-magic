@@ -496,6 +496,105 @@ def test_website_paths_disambiguate_same_timestamp_by_digest(tmp_path):
     }
 
 
+def test_website_newest_wins_root_vs_index_html(tmp_path):
+    collection = layout(tmp_path)
+    older = _capture(
+        original="https://example.com/index.html",
+        captured="20260420004433",
+        urlkey="com,example)/index.html",
+        digest="A" * 32,
+    )
+    newer = _capture(
+        original="https://example.com/",
+        captured="20260511051943",
+        urlkey="com,example)/",
+        digest="B" * 32,
+    )
+    groups = {
+        older.urlkey: [older],
+        newer.urlkey: [newer],
+    }
+
+    plan = paths.preflight_website_layout(
+        groups,
+        collection,
+        include_timestamps=False,
+    )
+
+    assert len(plan.targets) == 1
+    assert plan.targets[0].urlkey == newer.urlkey
+    assert plan.targets[0].path == (
+        collection.website_root / "example.com" / "index.html"
+    )
+    assert "--" not in plan.targets[0].path.name
+
+
+def test_website_query_folding_newest_wins(tmp_path):
+    collection = layout(tmp_path)
+    older = _capture(
+        original="https://example.com/files/main_style.css?1546028705",
+        captured="20190101000000",
+        urlkey="com,example)/files/main_style.css?1546028705",
+        digest="A" * 32,
+    )
+    newer = _capture(
+        original="https://example.com/files/main_style.css?1719345030",
+        captured="20240101000000",
+        urlkey="com,example)/files/main_style.css?1719345030",
+        digest="B" * 32,
+    )
+    groups = {
+        older.urlkey: [older],
+        newer.urlkey: [newer],
+    }
+
+    assert paths.preferred_website_path(
+        older.original,
+        collection,
+    ) == (
+        collection.website_root
+        / "example.com"
+        / "files"
+        / "main_style.css"
+    )
+
+    plan = paths.preflight_website_layout(
+        groups,
+        collection,
+        include_timestamps=False,
+    )
+
+    assert len(plan.targets) == 1
+    assert plan.targets[0].urlkey == newer.urlkey
+    assert plan.targets[0].path.name == "main_style.css"
+    assert "%3F" not in plan.targets[0].path.as_posix()
+
+
+@pytest.mark.parametrize(
+    ("original", "relative"),
+    [
+        (
+            "https://example.com/page?id=1",
+            "website/example.com/page/index.html",
+        ),
+        (
+            "https://example.com/search/?q=law",
+            "website/example.com/search/index.html",
+        ),
+    ],
+)
+def test_website_query_folding_directory_like_paths(
+    tmp_path,
+    original,
+    relative,
+):
+    collection = layout(tmp_path)
+
+    result = paths.preferred_website_path(original, collection)
+
+    assert result.relative_to(collection.collection_root) == Path(relative)
+
+
 def test_website_paths_keep_multi_host_captures_distinct(tmp_path):
     collection = paths.collection_layout("*.example.com", root=tmp_path)
     groups = {

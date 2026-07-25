@@ -22,6 +22,7 @@ from .paths import (
 from .provenance import save_acquisition
 from .replay import generate_replay_index
 from .retrieval import RetrievalCache
+from .rewrite_local import rewrite_local_website
 
 
 USER_AGENT = (
@@ -59,6 +60,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         default="none",
         help="Loose website-file output mode (default: none)",
     )
+    parser.add_argument(
+        "--rewrite-local",
+        action="store_true",
+        help=(
+            "After --files writing, rewrite HTML/CSS/JS under website/ "
+            "for local relative browsing"
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -76,6 +85,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     date_end = args.end or current_utc_cdx_timestamp()
     warc_mode = args.warc
     files_mode = args.files
+    rewrite_local = args.rewrite_local
+
+    if rewrite_local and files_mode == "none":
+        print(
+            "ERROR: --rewrite-local requires --files latest or --files all",
+            file=sys.stderr,
+        )
+        return 2
 
     if warc_mode == "none" and files_mode == "none":
         print("Nothing to do: both --warc and --files are none")
@@ -155,6 +172,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     client,
                     cache=cache,
                 )
+                if rewrite_local and files_summary.written > 0:
+                    rewrite_local_website(
+                        layout.website_root,
+                        include_timestamps=(files_mode == "all"),
+                    )
 
             print_summary(warc_summary, warc_mode=warc_mode)
             if files_mode != "none":
