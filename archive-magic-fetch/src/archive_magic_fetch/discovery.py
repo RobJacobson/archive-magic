@@ -145,10 +145,9 @@ def discover(
 def group_captures(
     captures: Iterable[CdxRecord],
 ) -> dict[str, list[CdxRecord]]:
-    """Collapse literal duplicates and group captures by Wayback URL key."""
+    """Group captures by Wayback URL key and sort them by timestamp."""
 
     grouped: dict[str, list[CdxRecord]] = {}
-    seen_records: set[CdxRecord] = set()
     for capture in captures:
         if not isinstance(capture.original, str):
             raise ValueError("capture URL must be a string")
@@ -156,10 +155,6 @@ def group_captures(
         urlkey = capture.urlkey
         if not isinstance(urlkey, str) or not urlkey:
             raise ValueError("capture must include a non-empty CDX urlkey")
-
-        if capture in seen_records:
-            continue
-        seen_records.add(capture)
 
         grouped.setdefault(urlkey, []).append(capture)
 

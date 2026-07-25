@@ -193,11 +193,10 @@ def test_warc_latest_writes_one_response_and_replay(tmp_path):
 
     assert client.calls == [newer_200]
     assert result.summary.responses == 1
-    assert result.summary.revisits == 0
     assert layout.replay_index.exists()
 
 
-def test_dual_mode_fetches_shared_capture_once(tmp_path, capsys):
+def test_dual_mode_fetches_each_output_independently(tmp_path, capsys):
     selected = capture(payload=b"shared-body")
     groups = {selected.urlkey: [selected]}
     layout = paths.collection_layout(
@@ -211,27 +210,25 @@ def test_dual_mode_fetches_shared_capture_once(tmp_path, capsys):
         include_timestamps=False,
     )
     client = FakeClient({selected: memento_for(selected, payload=b"shared-body")})
-    cache = retrieval.RetrievalCache()
-    cache.preserve([selected])
+    gate = retrieval.RateLimitGate()
 
     warc_result = export.export_all(
         groups,
         warc_plan.buckets,
         client,
-        cache=cache,
+        gate=gate,
     )
     files_summary = files.write_website_files(
         groups,
         website_plan,
         client,
-        cache=cache,
+        gate=gate,
     )
 
-    assert client.calls == [selected]
-    assert cache.get(selected) is None
+    assert client.calls == [selected, selected]
     assert warc_result.summary.responses == 1
     assert files_summary.written == 1
-    assert capsys.readouterr().out.count("Fetched ") == 1
+    assert capsys.readouterr().out.count("Fetched ") == 2
     assert (
         layout.website_root / "example.com" / "index.html"
     ).read_bytes() == b"shared-body"

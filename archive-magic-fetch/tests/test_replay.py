@@ -44,17 +44,19 @@ def create_warc(
         )
         writer.write_record(response)
         digest = response.rec_headers.get_header("WARC-Payload-Digest")
-        record_id = response.rec_headers.get_header("WARC-Record-ID")
-        revisit = writer.create_revisit_record(
+        second = writer.create_warc_record(
             target,
-            digest=digest,
-            refers_to_uri=target,
-            refers_to_date=first_date,
+            "response",
+            payload=BytesIO(b"hello"),
+            http_headers=StatusAndHeaders(
+                "200 OK",
+                [("Content-Type", "text/plain")],
+                protocol="HTTP/1.1",
+            ),
             warc_headers_dict={"WARC-Date": second_date},
         )
-        revisit.rec_headers.add_header("WARC-Refers-To", record_id)
-        writer.write_record(revisit)
-    return digest, record_id
+        writer.write_record(second)
+    return digest
 
 
 def read_index(path):
@@ -68,7 +70,7 @@ def read_index(path):
 def test_replay_index_uses_warc_identity_and_real_record_ranges(tmp_path):
     selected_layout = collection(tmp_path)
     warc = selected_layout.archive_root / "posts" / "index.warc.gz"
-    digest, record_id = create_warc(warc)
+    digest = create_warc(warc)
 
     result = replay.generate_replay_index([warc], layout=selected_layout)
 
@@ -79,7 +81,7 @@ def test_replay_index_uses_warc_identity_and_real_record_ranges(tmp_path):
         ("example,played)/posts", "20200103030405"),
     ]
     response = entries[0][2]
-    revisit = entries[1][2]
+    second = entries[1][2]
     assert response == {
         "url": "https://played.example/posts/",
         "mime": "text/plain",
@@ -89,33 +91,23 @@ def test_replay_index_uses_warc_identity_and_real_record_ranges(tmp_path):
         "offset": response["offset"],
         "filename": "archive/posts/index.warc.gz",
     }
-    assert revisit == {
+    assert second == {
         "url": "https://played.example/posts/",
-        "mime": "warc/revisit",
+        "mime": "text/plain",
+        "status": "200",
         "digest": digest,
-        "length": revisit["length"],
-        "offset": revisit["offset"],
+        "length": second["length"],
+        "offset": second["offset"],
         "filename": "archive/posts/index.warc.gz",
     }
-    assert "status" not in revisit
 
-    for expected_type, (_, _, entry) in zip(
-        ("response", "revisit"),
-        entries,
-        strict=True,
-    ):
+    for _, _, entry in entries:
         with warc.open("rb") as stream:
             stream.seek(int(entry["offset"]))
             member = stream.read(int(entry["length"]))
         assert member.startswith(b"\x1f\x8b")
         records = list(ArchiveIterator(BytesIO(member)))
-        assert [record.rec_type for record in records] == [expected_type]
-        if expected_type == "revisit":
-            headers = records[0].rec_headers
-            assert headers.get_header("WARC-Payload-Digest") == digest
-            assert headers.get_header("WARC-Refers-To") == record_id
-            assert headers.get_header("WARC-Refers-To-Target-URI")
-            assert headers.get_header("WARC-Refers-To-Date")
+        assert [record.rec_type for record in records] == ["response"]
 
 
 def test_nested_index_warcs_keep_distinct_collection_relative_names(tmp_path):
@@ -291,7 +283,7 @@ def test_complete_fixture_collection_is_self_consistent(tmp_path):
     with warc.open("rb") as stream:
         assert [record.rec_type for record in ArchiveIterator(stream)] == [
             "response",
-            "revisit",
+            "response",
         ]
     assert all(
         selected_layout.collection_root.joinpath(entry["filename"]).exists()

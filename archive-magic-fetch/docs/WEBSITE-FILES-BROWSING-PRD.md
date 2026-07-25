@@ -88,8 +88,9 @@ same filesystem-equivalent website path, keep **exactly one**: the capture with
 the newest aware UTC `timestamp`. Drop the others from the files plan (do not
 fetch/write them for files mode).
 
-Ties on identical timestamps: keep the lexicographically smaller
-`(urlkey, original, digest)` tuple for determinism.
+Ties on identical timestamps remain for collision handling. Different digests
+receive suffixes; identical digests are rejected as an ambiguous output path
+rather than silently dropping a selected capture.
 
 ### 6.2 Applies to
 

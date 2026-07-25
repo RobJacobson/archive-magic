@@ -21,7 +21,7 @@ from .retrieval import (
     DEFAULT_CONCURRENCY,
     MalformedContentEncodingError,
     MementoFetchPool,
-    RetrievalCache,
+    RateLimitGate,
     TruncatedWaybackResponseError,
     format_playback_failure,
     format_playback_failure_summary,
@@ -140,7 +140,7 @@ def write_website_files(
     plan: WebsitePlan,
     client,
     *,
-    cache: Optional[RetrievalCache] = None,
+    gate: Optional[RateLimitGate] = None,
     client_factory=None,
     concurrency: int = DEFAULT_CONCURRENCY,
 ) -> FilesSummary:
@@ -148,11 +148,11 @@ def write_website_files(
 
     summary = FilesSummary()
     targets = list(plan.targets)
+    active_gate = gate or RateLimitGate(max_concurrency=concurrency)
     pool = None
     fetch_window = None
     if (
-        cache is not None
-        and client_factory is not None
+        client_factory is not None
         and concurrency > 1
         and targets
     ):
@@ -163,7 +163,7 @@ def write_website_files(
             if not _is_redirect(capture.statuscode):
                 to_fetch.append(capture)
         pool = MementoFetchPool(
-            cache=cache,
+            gate=active_gate,
             client_factory=client_factory,
             max_workers=concurrency,
             on_fetched=print_fetched,
@@ -178,22 +178,21 @@ def write_website_files(
 
             if _is_redirect(capture.statuscode):
                 summary.redirects_omitted += 1
-                if cache is not None:
-                    cache.discard(capture, force=True)
                 continue
 
-            fetched_by_worker = False
-            if fetch_window is not None:
-                fetched_by_worker = fetch_window.wait(capture)
-            was_cached = (
-                cache is not None and cache.get(capture) is not None
-            )
-
             try:
-                if cache is None:
-                    retrieved = retrieve_memento(client, capture)
-                else:
-                    retrieved = cache.retrieve(client, capture)
+                retrieved = (
+                    fetch_window.wait(capture)
+                    if fetch_window is not None
+                    else None
+                )
+                if retrieved is None:
+                    retrieved = retrieve_memento(
+                        client,
+                        capture,
+                        gate=active_gate,
+                    )
+                    print_fetched(capture)
             except (
                 MementoPlaybackError,
                 BlockedByRobotsError,
@@ -202,12 +201,7 @@ def write_website_files(
             ) as error:
                 _warn_skip(capture, error)
                 summary.record_playback_failure(error)
-                if cache is not None:
-                    cache.discard(capture, force=True)
                 continue
-
-            if not fetched_by_worker and not was_cached:
-                print_fetched(capture)
 
             if (
                 capture.statuscode is not None
@@ -215,21 +209,15 @@ def write_website_files(
             ):
                 _warn_status_substitution(capture, retrieved.status_code)
                 summary.record_playback_failure()
-                if cache is not None:
-                    cache.discard(capture, force=True)
                 continue
 
             if _is_redirect(retrieved.status_code):
                 summary.redirects_omitted += 1
-                if cache is not None:
-                    cache.discard(capture, force=True)
                 continue
 
             if not retrieved.body:
                 _warn_skip(capture, ValueError("empty playback body"))
                 summary.record_playback_failure()
-                if cache is not None:
-                    cache.discard(capture, force=True)
                 continue
 
             _write_body(target.path, retrieved.body)
@@ -238,8 +226,6 @@ def write_website_files(
                 f"Wrote {_cdx_timestamp(capture.timestamp)} "
                 f"{target.path.relative_to(plan.layout.collection_root)}"
             )
-            if cache is not None:
-                cache.discard(capture, force=True)
     finally:
         if pool is not None:
             pool.close()

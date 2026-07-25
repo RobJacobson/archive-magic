@@ -2,24 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import BinaryIO
 
 from warcio.warcwriter import WARCWriter
-
-
-CAPTURE_ID_HEADER = "WARC-Archive-Magic-Capture-ID"
-
-
-@dataclass(frozen=True)
-class CanonicalResponse:
-    """Reference to the first response for one payload/status signature."""
-
-    record_id: str
-    target_uri: str
-    capture_date: str
 
 
 def timestamp_to_warc_date(timestamp: datetime) -> str:
@@ -53,51 +40,7 @@ def open_new_warc(path: Path) -> tuple[BinaryIO, WARCWriter]:
     return stream, writer
 
 
-def open_append_warc(path: Path) -> tuple[BinaryIO, WARCWriter]:
-    """Open a validated existing WARC for concatenated-gzip appends."""
-
-    stream = path.open("ab")
-    return stream, WARCWriter(stream, gzip=True, warc_version="1.0")
-
-
-def write_response(writer: WARCWriter, record) -> CanonicalResponse:
-    """Write a response and return the reference needed by later revisits."""
-
-    record_id = record.rec_headers.get_header("WARC-Record-ID")
-    target_uri = record.rec_headers.get_header("WARC-Target-URI")
-    capture_date = record.rec_headers.get_header("WARC-Date")
-    if not record_id or not target_uri or not capture_date:
-        raise ValueError("response is missing required WARC identity headers")
+def write_response(writer: WARCWriter, record) -> None:
+    """Write one complete response record."""
 
     writer.write_record(record)
-    return CanonicalResponse(
-        record_id=record_id,
-        target_uri=target_uri,
-        capture_date=capture_date,
-    )
-
-
-def write_revisit(
-    writer: WARCWriter,
-    url: str,
-    capture_date: str,
-    digest: str,
-    canonical: CanonicalResponse,
-    *,
-    capture_id: str | None = None,
-) -> None:
-    """Write an identical-payload-digest revisit referencing its response."""
-
-    revisit = writer.create_revisit_record(
-        url,
-        digest=digest,
-        refers_to_uri=canonical.target_uri,
-        refers_to_date=canonical.capture_date,
-        warc_headers_dict={
-            "WARC-Date": capture_date,
-        },
-    )
-    revisit.rec_headers.add_header("WARC-Refers-To", canonical.record_id)
-    if capture_id is not None:
-        revisit.rec_headers.add_header(CAPTURE_ID_HEADER, capture_id)
-    writer.write_record(revisit)

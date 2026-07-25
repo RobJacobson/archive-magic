@@ -24,7 +24,7 @@ from .provenance import save_acquisition
 from .replay import generate_replay_index
 from .retrieval import (
     DEFAULT_CONCURRENCY,
-    RetrievalCache,
+    RateLimitGate,
     make_client_factory,
 )
 from .rewrite_local import rewrite_local_website
@@ -201,14 +201,7 @@ def _run(args: argparse.Namespace) -> int:
                     include_timestamps=(files_mode == "all"),
                 )
 
-            cache = RetrievalCache(max_concurrency=concurrency)
-            if warc_plan is not None and website_plan is not None:
-                cache.preserve(
-                    [
-                        files_groups[target.urlkey][target.capture_index]
-                        for target in website_plan.targets
-                    ]
-                )
+            gate = RateLimitGate(max_concurrency=concurrency)
             warc_summary = ExportSummary()
             if warc_plan is not None:
                 print(
@@ -219,7 +212,7 @@ def _run(args: argparse.Namespace) -> int:
                     warc_groups,
                     warc_plan.buckets,
                     client,
-                    cache=cache,
+                    gate=gate,
                     client_factory=client_factory,
                     concurrency=concurrency,
                 )
@@ -240,7 +233,7 @@ def _run(args: argparse.Namespace) -> int:
                     files_groups,
                     website_plan,
                     client,
-                    cache=cache,
+                    gate=gate,
                     client_factory=client_factory,
                     concurrency=concurrency,
                 )

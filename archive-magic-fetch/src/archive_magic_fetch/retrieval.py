@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 import time
+from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import timezone
@@ -18,8 +19,6 @@ from warcio.recordbuilder import RecordBuilder
 from warcio.statusandheaders import StatusAndHeaders
 from wayback import Mode, WaybackClient, WaybackSession
 from wayback.exceptions import (
-    BlockedByRobotsError,
-    BlockedSiteError,
     MementoPlaybackError,
     RateLimitError,
     WaybackRetryError,
@@ -40,13 +39,6 @@ MAX_CONNECTION_BACKOFF_SECONDS = 30
 RECOVERY_SUCCESSES_PER_STEP = 8
 PREFETCH_MULTIPLIER = 2
 _MISSING_HEADER = object()
-
-_SKIPPABLE_PLAYBACK_ERRORS = (
-    MementoPlaybackError,
-    BlockedByRobotsError,
-    BlockedSiteError,
-    WaybackRetryError,
-)
 
 _PROGRESS_LOCK = threading.Lock()
 
@@ -384,121 +376,31 @@ class RateLimitGate:
             return delay
 
 
-class RetrievalCache:
-    """Fetch each distinct capture once and fan out to multiple writers."""
-
-    def __init__(
-        self,
-        *,
-        gate: Optional[RateLimitGate] = None,
-        max_concurrency: int = DEFAULT_CONCURRENCY,
-    ) -> None:
-        self._results: dict[tuple[object, ...], object] = {}
-        self._preserved: set[tuple[object, ...]] = set()
-        self._lock = threading.Lock()
-        self._gate = (
-            gate
-            if gate is not None
-            else RateLimitGate(max_concurrency=max_concurrency)
-        )
-
-    @property
-    def gate(self) -> RateLimitGate:
-        return self._gate
-
-    @staticmethod
-    def capture_key(capture) -> tuple[object, ...]:
-        return (
-            capture.urlkey,
-            capture.original,
-            capture.timestamp,
-            capture.statuscode,
-            capture.digest,
-        )
-
-    def get(self, capture) -> Optional[object]:
-        """Return a cached result or exception without retrieving."""
-
-        with self._lock:
-            return self._results.get(self.capture_key(capture))
-
-    def preserve(self, captures: Sequence) -> None:
-        """Keep these results for a later output consumer."""
-
-        with self._lock:
-            self._preserved.update(
-                self.capture_key(capture) for capture in captures
-            )
-
-    def discard(self, capture, *, force: bool = False) -> None:
-        """Release a result unless it is reserved for a later consumer."""
-
-        key = self.capture_key(capture)
-        with self._lock:
-            if force:
-                self._preserved.discard(key)
-            if force or key not in self._preserved:
-                self._results.pop(key, None)
-
-    def retrieve(self, client, capture) -> RetrievedMemento:
-        """Return a cached memento or retrieve and remember it."""
-
-        key = self.capture_key(capture)
-        with self._lock:
-            cached = self._results.get(key)
-            if cached is not None:
-                if isinstance(cached, BaseException):
-                    raise cached
-                return cached
-
-        try:
-            result = retrieve_memento(client, capture, gate=self._gate)
-        except BaseException as error:
-            with self._lock:
-                existing = self._results.get(key)
-                if existing is not None:
-                    if isinstance(existing, BaseException):
-                        raise existing
-                    return existing
-                self._results[key] = error
-            raise
-
-        with self._lock:
-            existing = self._results.get(key)
-            if existing is not None:
-                if isinstance(existing, BaseException):
-                    raise existing
-                return existing
-            self._results[key] = result
-        return result
-
-
 class MementoFetchPool:
     """Bounded worker pool: job queue for fetches, writer waits in order.
 
     Workers reuse one Wayback client per thread and report successful fetches
-    as they complete. The writer calls ``wait`` for the next capture before
-    reading the cache, independently preserving commit order.
+    as they complete. The writer calls ``wait`` in submission order.
     """
 
     def __init__(
         self,
         *,
-        cache: RetrievalCache,
+        gate: RateLimitGate,
         client_factory: Callable[[], WaybackClient],
         max_workers: int = DEFAULT_CONCURRENCY,
         on_fetched: Optional[Callable[[object], None]] = None,
     ) -> None:
-        self._cache = cache
+        self._gate = gate
         self._client_factory = client_factory
         self._on_fetched = on_fetched
         self._max_workers = max(1, max_workers)
-        self._cache.gate.configure(self._max_workers)
+        self._gate.configure(self._max_workers)
         self._local = threading.local()
         self._clients: list = []
         self._clients_lock = threading.Lock()
         self._executor = ThreadPoolExecutor(max_workers=self._max_workers)
-        self._futures: dict[tuple[object, ...], Future] = {}
+        self._futures: deque[Future] = deque()
 
     def _thread_client(self):
         client = getattr(self._local, "client", None)
@@ -513,36 +415,30 @@ class MementoFetchPool:
             self._clients.append(client)
         return client
 
-    def _fetch(self, capture) -> None:
-        try:
-            self._cache.retrieve(self._thread_client(), capture)
-        except _SKIPPABLE_PLAYBACK_ERRORS:
-            return
+    def _fetch(self, capture) -> RetrievedMemento:
+        result = retrieve_memento(
+            self._thread_client(),
+            capture,
+            gate=self._gate,
+        )
         if self._on_fetched is not None:
             self._on_fetched(capture)
+        return result
 
     def submit(self, captures: Sequence) -> None:
-        """Enqueue distinct captures that are not already cached."""
+        """Enqueue every capture as independent work."""
 
         for capture in captures:
-            key = RetrievalCache.capture_key(capture)
-            if key in self._futures:
-                continue
-            if self._cache.get(capture) is not None:
-                continue
-            self._futures[key] = self._executor.submit(self._fetch, capture)
+            self._futures.append(
+                self._executor.submit(self._fetch, capture)
+            )
 
-    def wait(self, capture) -> bool:
-        """Wait for a submitted fetch and report whether a future existed."""
+    def wait(self, capture) -> Optional[RetrievedMemento]:
+        """Return the next submitted result for this capture, if present."""
 
-        future = self._futures.pop(
-            RetrievalCache.capture_key(capture),
-            None,
-        )
-        if future is None:
-            return False
-        future.result()
-        return True
+        if not self._futures:
+            return None
+        return self._futures.popleft().result()
 
     def window(self, captures: Sequence) -> MementoFetchWindow:
         """Return a bounded lookahead window over ordered fetch work."""
@@ -578,7 +474,6 @@ class MementoFetchWindow:
         self._pool = pool
         self._captures = iter(captures)
         self._max_pending = max_pending
-        self._planned: dict[tuple[object, ...], int] = {}
         self._pending = 0
         self._prime()
 
@@ -589,28 +484,20 @@ class MementoFetchWindow:
                 capture = next(self._captures)
             except StopIteration:
                 break
-            key = RetrievalCache.capture_key(capture)
-            self._planned[key] = self._planned.get(key, 0) + 1
             batch.append(capture)
             self._pending += 1
         if batch:
             self._pool.submit(batch)
 
-    def wait(self, capture) -> bool:
-        """Wait for a planned capture, admit one more job, and report fetching."""
+    def wait(self, capture) -> Optional[RetrievedMemento]:
+        """Return one planned result and admit one more job."""
 
-        key = RetrievalCache.capture_key(capture)
-        count = self._planned.get(key, 0)
-        if count == 0:
-            return False
-        if count == 1:
-            del self._planned[key]
-        else:
-            self._planned[key] = count - 1
-        fetched = self._pool.wait(capture)
+        if self._pending == 0:
+            return None
+        result = self._pool.wait(capture)
         self._pending -= 1
         self._prime()
-        return fetched
+        return result
 
 
 def print_fetched(capture) -> None:
@@ -845,11 +732,8 @@ def retrieve_response(
     client,
     capture,
     *,
-    cache: Optional[RetrievalCache] = None,
     gate: Optional[RateLimitGate] = None,
 ):
     """Retrieve one Memento and construct the semantic WARC response."""
 
-    if cache is None:
-        return retrieve_memento(client, capture, gate=gate).to_warc_record()
-    return cache.retrieve(client, capture).to_warc_record()
+    return retrieve_memento(client, capture, gate=gate).to_warc_record()

@@ -74,9 +74,7 @@ Existing flags unchanged:
 ## 5. Capture selection
 
 Selection happens **after** full discovery and provenance publication, and
-**after** value-equal duplicate collapse / urlkey grouping, unless an
-implementation note shows a cheaper equivalent that preserves identical
-results.
+after urlkey grouping.
 
 Date bounds remain inclusive CDX `from`/`to` semantics as today.
 
@@ -99,9 +97,6 @@ follows the redirect to store the destination page. Destination URLs are
 separate urlkeys and are selected independently if present in CDX.
 
 For `--warc latest`, write **one WARC response record per selected URL**.
-Do not write revisits for that URL in this mode (there is only one selected
-capture). Existing per-group dedup maps may remain, but with one capture they
-are effectively unused.
 
 Playback failures for a selected capture still warn/skip as today.
 
@@ -212,16 +207,15 @@ parse args + defaults
   -> print aggregate summary
 ```
 
-Retrieval should remain **one Memento fetch per distinct selected capture**.
-If the same capture is needed for both WARC and files, fetch once and fan out
-to both writers.
+WARC and loose-file output are independent. A capture selected by both stages
+is retrieved once for each output.
 
 ## 8. Summary / console
 
 Extend the aggregate summary to report both outputs, for example:
 
 ```text
-Summary: 235 selected for warc (all); 209 responses; 17 revisits; ...
+Summary: 235 selected for warc (all); 226 responses; 9 redirects omitted; ...
 Files: 180 written (latest); 2 playback failures
 ```
 
@@ -237,7 +231,7 @@ Prefer extending the existing flat package rather than a new adapter hierarchy:
 | --- | --- |
 | `cli.py` | New flags, both-none short-circuit, stage gating |
 | `discovery.py` or new small helper | `latest` selection per urlkey |
-| `export.py` / `retrieval.py` | Shared fetch fan-out; warc gated by mode |
+| `export.py` / `retrieval.py` | WARC response writing; warc gated by mode |
 | `paths.py` | `website/` layout helpers, file path planning, preflight |
 | new module optional | `files.py` for loose-file writing |
 | tests | Mode matrix, latest preference, path layouts, both-none |
@@ -251,14 +245,14 @@ Do not reintroduce `cdx_toolkit` or raw playback. Keep pinned `wayback`,
    matches current WARC+CDXJ behavior for the same inputs.
 2. `--warc none --files none` exits 0 with a clear no-op message and writes
    nothing.
-3. `--warc latest` writes one response per selected URL (prefer 200), no
-   revisits for those URLs, and builds `replay/index.cdxj`.
+3. `--warc latest` writes one response per selected URL (prefer 200) and builds
+   `replay/index.cdxj`.
 4. `--warc none` writes no `archive/` WARCs and no `replay/index.cdxj`.
 5. `--files latest` writes bodies under `website/` without timestamp segments;
    directories become `index.html`.
 6. `--files all` writes `website/<timestamp>/...` paths.
 7. `--warc all --files latest` produces both artifact trees from one discovery
-   run, fetching shared captures once.
+   run.
 8. Provenance under `sources/` still reflects the full discovery set.
 9. Existing final outputs still cause fatal preflight errors (no resume).
 10. Offline deterministic tests cover selection + path layout + mode gating.

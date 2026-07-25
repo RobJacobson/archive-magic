@@ -39,7 +39,7 @@ def generate_replay_index(
             output=str(temporary),
             inputs=[str(path) for path in created_warcs],
             sort=True,
-            records="response,revisit",
+            records="response",
             dir_root=str(layout.collection_root),
         ).process_all()
         os.replace(temporary, layout.replay_index)

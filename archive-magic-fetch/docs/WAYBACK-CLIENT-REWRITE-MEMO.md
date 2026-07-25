@@ -66,8 +66,8 @@ superseded the earlier policies concerning:
 - canonical alias redirect omission; and
 - host-wide six-second pacing.
 
-The earlier `WARC_CDX_DEDUPLICATION_RESEARCH_MEMO.md` remains historical
-research.
+The earlier WARC/CDX deduplication research memo was removed with the
+deduplication implementation.
 
 ## 3. Product contract after the rewrite
 

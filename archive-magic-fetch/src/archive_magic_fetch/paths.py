@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 import re
-import stat
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -513,25 +512,6 @@ def _inspect_target(path: Path) -> None:
     validate_path_limits(path)
 
 
-def _inspect_resumable_file(path: Path) -> None:
-    """Allow a regular final file while rejecting unsafe final entries."""
-
-    try:
-        metadata = os.lstat(path)
-    except FileNotFoundError:
-        _inspect_target(path)
-        return
-    except OSError:
-        _inspect_target(path)
-        return
-
-    if not stat.S_ISREG(metadata.st_mode):
-        raise FileExistsError(
-            f"output target already exists but is not a regular file: {path}"
-        )
-    validate_path_limits(path)
-
-
 def preflight_layout(
     capture_groups: Mapping[str, Sequence[object]],
     layout: CollectionLayout,
@@ -595,26 +575,24 @@ def preflight_layout(
         ).as_posix()
     )
     for bucket in buckets:
-        _inspect_resumable_file(bucket.path)
-    _inspect_resumable_file(layout.replay_index)
+        _inspect_target(bucket.path)
+    _inspect_target(layout.replay_index)
     return ExportPlan(layout, tuple(buckets))
 
 
 def _newest_wins_website_paths(
-    planned: list[tuple[Path, str, int, str, datetime, str, str]],
+    planned: list[tuple[Path, str, int, str, datetime]],
     layout: CollectionLayout,
 ) -> list[tuple[Path, str, int, str]]:
     """Keep the newest capture per filesystem-equivalent website path.
 
     Older timestamps at the same path are dropped. Captures that share both
-    path and newest timestamp remain for digest-suffix disambiguation, except
-    identical-digest leftovers which keep the lexicographically smaller
-    ``(urlkey, original, digest)`` tuple.
+    path and newest timestamp remain for collision handling.
     """
 
     by_key: dict[
         tuple[str, ...],
-        list[tuple[Path, str, int, str, datetime, str, str]],
+        list[tuple[Path, str, int, str, datetime]],
     ] = {}
     for entry in planned:
         key = _equivalent_path(entry[0], layout.website_root)
@@ -623,19 +601,11 @@ def _newest_wins_website_paths(
     survivors: list[tuple[Path, str, int, str]] = []
     for entries in by_key.values():
         newest_timestamp = max(entry[4] for entry in entries)
-        newest = [entry for entry in entries if entry[4] == newest_timestamp]
-        by_token: dict[
-            str,
-            list[tuple[Path, str, int, str, datetime, str, str]],
-        ] = {}
-        for entry in newest:
-            by_token.setdefault(entry[3], []).append(entry)
-        for token_entries in by_token.values():
-            winner = min(
-                token_entries,
-                key=lambda item: (item[1], item[5], item[6]),
-            )
-            survivors.append(winner[:4])
+        survivors.extend(
+            entry[:4]
+            for entry in entries
+            if entry[4] == newest_timestamp
+        )
     return survivors
 
 
@@ -748,7 +718,7 @@ def preflight_website_layout(
 ) -> WebsitePlan:
     """Plan and inspect all final loose-file targets under ``website/``."""
 
-    planned: list[tuple[Path, str, int, str, datetime, str, str]] = []
+    planned: list[tuple[Path, str, int, str, datetime]] = []
     for urlkey, captures in capture_groups.items():
         if not captures:
             raise ValueError(f"capture group is empty: {urlkey}")
@@ -765,17 +735,16 @@ def preflight_website_layout(
                 layout,
                 timestamp=path_timestamp,
             )
-            digest = getattr(capture, "digest", None)
-            digest_text = digest if isinstance(digest, str) else ""
             planned.append(
                 (
                     path,
                     urlkey,
                     capture_index,
-                    _digest_path_token(digest, capture_index=capture_index),
+                    _digest_path_token(
+                        getattr(capture, "digest", None),
+                        capture_index=capture_index,
+                    ),
                     capture_timestamp,
-                    original,
-                    digest_text,
                 )
             )
 

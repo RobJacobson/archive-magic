@@ -338,12 +338,12 @@ def test_group_captures_uses_urlkey_and_sorts_by_datetime():
     ]
 
 
-def test_group_captures_collapses_value_equal_records():
+def test_group_captures_preserves_value_equal_records():
     capture = record()
 
     grouped = discovery.group_captures([capture, record()])
 
-    assert grouped[capture.urlkey] == [capture]
+    assert grouped[capture.urlkey] == [capture, capture]
 
 
 def test_group_captures_accepts_upstream_default_port_normalization():
@@ -408,7 +408,7 @@ def test_cli_owns_one_client_context_and_passes_same_client(monkeypatch):
         planned_buckets,
         client,
         *,
-        cache=None,
+        gate=None,
         client_factory=None,
         concurrency=None,
     ):
@@ -416,7 +416,7 @@ def test_cli_owns_one_client_context_and_passes_same_client(monkeypatch):
             grouped,
             planned_buckets,
             client,
-            cache,
+            gate,
             client_factory,
             concurrency,
         )

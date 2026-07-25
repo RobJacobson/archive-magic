@@ -275,7 +275,7 @@ def test_bucket_spelling_and_order_ignore_discovery_order(tmp_path):
     ]
 
 
-def test_preflight_allows_existing_regular_warc_and_replay_targets(tmp_path):
+def test_preflight_rejects_existing_regular_warc_target(tmp_path):
     collection = layout(tmp_path)
     target = paths.preferred_warc_path("com,example)/", collection)
     target.parent.mkdir(parents=True)
@@ -284,9 +284,8 @@ def test_preflight_allows_existing_regular_warc_and_replay_targets(tmp_path):
     collection.replay_index.parent.mkdir(parents=True)
     collection.replay_index.touch()
 
-    plan = paths.preflight_layout(groups("com,example)/"), collection)
-
-    assert plan.buckets[0].path == target
+    with pytest.raises(FileExistsError, match="already exists"):
+        paths.preflight_layout(groups("com,example)/"), collection)
 
 
 def test_preflight_rejects_broken_final_symlink(tmp_path):
@@ -492,6 +491,22 @@ def test_website_paths_disambiguate_same_timestamp_by_digest(tmp_path):
         "example.com/20170101000000/index--AAAAAAAA.html",
         "example.com/20170101000000/index--BBBBBBBB.html",
     }
+
+
+def test_website_paths_reject_identical_capture_collision(tmp_path):
+    collection = layout(tmp_path)
+    duplicate = _capture(
+        original="https://example.com/",
+        captured="20170101000000",
+        digest="A" * 32,
+    )
+
+    with pytest.raises(FileExistsError, match="identical digests"):
+        paths.preflight_website_layout(
+            {"com,example)/": [duplicate, duplicate]},
+            collection,
+            include_timestamps=True,
+        )
 
 
 def test_website_newest_wins_root_vs_index_html(tmp_path):

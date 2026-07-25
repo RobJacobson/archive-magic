@@ -599,17 +599,15 @@ def test_memento_fetch_pool_reuses_thread_clients_and_waits_in_order():
         created_clients.append(client)
         return client
 
-    cache = retrieval.RetrievalCache()
     pool = retrieval.MementoFetchPool(
-        cache=cache,
+        gate=retrieval.RateLimitGate(),
         client_factory=factory,
         max_workers=2,
     )
     try:
         pool.submit(captures)
         for capture in captures:
-            pool.wait(capture)
-            retrieved = cache.retrieve(created_clients[0], capture)
+            retrieved = pool.wait(capture)
             assert retrieved.body == f"body-{id(capture)}".encode()
     finally:
         pool.close()
@@ -618,7 +616,7 @@ def test_memento_fetch_pool_reuses_thread_clients_and_waits_in_order():
     assert max_active == 2
 
 
-def test_memento_fetch_pool_skips_duplicate_capture_keys():
+def test_memento_fetch_pool_fetches_duplicate_capture_keys_independently():
     capture = type(
         "Capture",
         (),
@@ -643,19 +641,19 @@ def test_memento_fetch_pool_skips_duplicate_capture_keys():
             calls.append(selected)
             return FakeMemento()
 
-    cache = retrieval.RetrievalCache()
     pool = retrieval.MementoFetchPool(
-        cache=cache,
+        gate=retrieval.RateLimitGate(),
         client_factory=FactoryClient,
         max_workers=2,
     )
     try:
         pool.submit([capture, capture])
         pool.wait(capture)
+        pool.wait(capture)
     finally:
         pool.close()
 
-    assert len(calls) == 1
+    assert len(calls) == 2
 
 
 def test_memento_fetch_pool_reports_completion_before_ordered_wait():
@@ -688,7 +686,7 @@ def test_memento_fetch_pool_reports_completion_before_ordered_wait():
         reported.set()
 
     pool = retrieval.MementoFetchPool(
-        cache=retrieval.RetrievalCache(),
+        gate=retrieval.RateLimitGate(),
         client_factory=FactoryClient,
         max_workers=2,
         on_fetched=on_fetched,
@@ -697,7 +695,7 @@ def test_memento_fetch_pool_reports_completion_before_ordered_wait():
         pool.submit([capture])
         assert reported.wait(timeout=1)
         assert completed == [capture]
-        assert pool.wait(capture) is True
+        assert pool.wait(capture) is not None
     finally:
         pool.close()
 
