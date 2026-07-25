@@ -10,6 +10,9 @@ from typing import BinaryIO
 from warcio.warcwriter import WARCWriter
 
 
+CAPTURE_ID_HEADER = "WARC-Archive-Magic-Capture-ID"
+
+
 @dataclass(frozen=True)
 class CanonicalResponse:
     """Reference to the first response for one payload/status signature."""
@@ -50,6 +53,13 @@ def open_new_warc(path: Path) -> tuple[BinaryIO, WARCWriter]:
     return stream, writer
 
 
+def open_append_warc(path: Path) -> tuple[BinaryIO, WARCWriter]:
+    """Open a validated existing WARC for concatenated-gzip appends."""
+
+    stream = path.open("ab")
+    return stream, WARCWriter(stream, gzip=True, warc_version="1.0")
+
+
 def write_response(writer: WARCWriter, record) -> CanonicalResponse:
     """Write a response and return the reference needed by later revisits."""
 
@@ -73,6 +83,8 @@ def write_revisit(
     capture_date: str,
     digest: str,
     canonical: CanonicalResponse,
+    *,
+    capture_id: str | None = None,
 ) -> None:
     """Write an identical-payload-digest revisit referencing its response."""
 
@@ -86,4 +98,6 @@ def write_revisit(
         },
     )
     revisit.rec_headers.add_header("WARC-Refers-To", canonical.record_id)
+    if capture_id is not None:
+        revisit.rec_headers.add_header(CAPTURE_ID_HEADER, capture_id)
     writer.write_record(revisit)

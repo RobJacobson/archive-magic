@@ -12,7 +12,6 @@ from warcio.warcwriter import WARCWriter
 from wayback import CdxRecord, WaybackSession
 
 from archive_magic_fetch import paths, provenance, replay
-from archive_magic_fetch.publication import publish_file_noreplace
 
 
 def collection(tmp_path):
@@ -157,23 +156,17 @@ def test_shared_warc_entries_have_distinct_offsets(tmp_path):
     assert len({entry["offset"] for _, _, entry in entries}) == 2
 
 
-def test_replay_publication_does_not_replace_a_racing_index(
-    tmp_path,
-    monkeypatch,
-):
+def test_replay_publication_replaces_existing_index(tmp_path):
     selected_layout = collection(tmp_path)
     warc = selected_layout.archive_root / "index.warc.gz"
     create_warc(warc)
+    selected_layout.replay_index.parent.mkdir(parents=True)
+    selected_layout.replay_index.write_text("old index\n")
 
-    def race(source, destination):
-        destination.write_text("racing index\n")
-        publish_file_noreplace(source, destination)
+    result = replay.generate_replay_index([warc], layout=selected_layout)
 
-    monkeypatch.setattr(replay, "publish_file_noreplace", race)
-
-    with pytest.raises(FileExistsError):
-        replay.generate_replay_index([warc], layout=selected_layout)
-    assert selected_layout.replay_index.read_text() == "racing index\n"
+    assert result == selected_layout.replay_index
+    assert selected_layout.replay_index.read_text() != "old index\n"
     assert not list(selected_layout.replay_index.parent.glob(".index-*"))
 
 
@@ -197,6 +190,31 @@ def test_failed_indexing_leaves_no_final_or_temporary_index(
     with pytest.raises(RuntimeError, match="index failed"):
         replay.generate_replay_index([warc], layout=selected_layout)
     assert not selected_layout.replay_index.exists()
+    assert not list(selected_layout.replay_index.parent.glob(".index-*"))
+
+
+def test_failed_reindex_keeps_existing_index(tmp_path, monkeypatch):
+    selected_layout = collection(tmp_path)
+    warc = selected_layout.archive_root / "index.warc.gz"
+    create_warc(warc)
+    selected_layout.replay_index.parent.mkdir(parents=True)
+    selected_layout.replay_index.write_text("previous valid index\n")
+
+    class FailingIndexer:
+        def __init__(self, **kwargs):
+            pass
+
+        def process_all(self):
+            raise RuntimeError("index failed")
+
+    monkeypatch.setattr(replay, "CDXJIndexer", FailingIndexer)
+
+    with pytest.raises(RuntimeError, match="index failed"):
+        replay.generate_replay_index([warc], layout=selected_layout)
+    assert (
+        selected_layout.replay_index.read_text()
+        == "previous valid index\n"
+    )
     assert not list(selected_layout.replay_index.parent.glob(".index-*"))
 
 

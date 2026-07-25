@@ -275,20 +275,18 @@ def test_bucket_spelling_and_order_ignore_discovery_order(tmp_path):
     ]
 
 
-def test_preflight_rejects_existing_warc_and_replay_targets(tmp_path):
+def test_preflight_allows_existing_regular_warc_and_replay_targets(tmp_path):
     collection = layout(tmp_path)
     target = paths.preferred_warc_path("com,example)/", collection)
     target.parent.mkdir(parents=True)
     target.touch()
 
-    with pytest.raises(FileExistsError, match="already exists"):
-        paths.preflight_layout(groups("com,example)/"), collection)
-
-    target.unlink()
     collection.replay_index.parent.mkdir(parents=True)
     collection.replay_index.touch()
-    with pytest.raises(FileExistsError, match="index.cdxj"):
-        paths.preflight_layout(groups("com,example)/"), collection)
+
+    plan = paths.preflight_layout(groups("com,example)/"), collection)
+
+    assert plan.buckets[0].path == target
 
 
 def test_preflight_rejects_broken_final_symlink(tmp_path):

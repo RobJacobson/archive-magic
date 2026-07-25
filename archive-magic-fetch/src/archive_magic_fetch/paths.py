@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import stat
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -512,6 +513,25 @@ def _inspect_target(path: Path) -> None:
     validate_path_limits(path)
 
 
+def _inspect_resumable_file(path: Path) -> None:
+    """Allow a regular final file while rejecting unsafe final entries."""
+
+    try:
+        metadata = os.lstat(path)
+    except FileNotFoundError:
+        _inspect_target(path)
+        return
+    except OSError:
+        _inspect_target(path)
+        return
+
+    if not stat.S_ISREG(metadata.st_mode):
+        raise FileExistsError(
+            f"output target already exists but is not a regular file: {path}"
+        )
+    validate_path_limits(path)
+
+
 def preflight_layout(
     capture_groups: Mapping[str, Sequence[object]],
     layout: CollectionLayout,
@@ -575,8 +595,8 @@ def preflight_layout(
         ).as_posix()
     )
     for bucket in buckets:
-        _inspect_target(bucket.path)
-    _inspect_target(layout.replay_index)
+        _inspect_resumable_file(bucket.path)
+    _inspect_resumable_file(layout.replay_index)
     return ExportPlan(layout, tuple(buckets))
 
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Sequence
@@ -21,7 +22,11 @@ from .paths import (
 )
 from .provenance import save_acquisition
 from .replay import generate_replay_index
-from .retrieval import RetrievalCache
+from .retrieval import (
+    DEFAULT_CONCURRENCY,
+    RetrievalCache,
+    make_client_factory,
+)
 from .rewrite_local import rewrite_local_website
 
 
@@ -39,6 +44,14 @@ def current_utc_cdx_timestamp() -> str:
     """Return the current UTC time as a full CDX timestamp."""
 
     return datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _monotonic() -> float:
+    return time.monotonic()
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
@@ -68,6 +81,16 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
             "for local relative browsing"
         ),
     )
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=DEFAULT_CONCURRENCY,
+        metavar="N",
+        help=(
+            "Max concurrent memento downloads (default: "
+            f"{DEFAULT_CONCURRENCY}; use 1 for serial diagnostics)"
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -78,14 +101,47 @@ def _report_discovery_progress(count: int) -> None:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    """Discover captures and export them, returning a process exit status."""
+    """Run one timed fetch job and return its process exit status."""
 
     args = parse_args(argv)
+    started_at = _utc_now()
+    started_tick = _monotonic()
+    print(f"Job started: {_format_job_time(started_at)}", flush=True)
+    try:
+        return _run(args)
+    finally:
+        ended_at = _utc_now()
+        duration_minutes = (_monotonic() - started_tick) / 60
+        print(f"Job ended: {_format_job_time(ended_at)}", flush=True)
+        print(
+            f"Job duration: {duration_minutes:.1f} minutes",
+            flush=True,
+        )
+
+
+def _format_job_time(value: datetime) -> str:
+    """Format an aware time as a compact UTC ISO-8601 timestamp."""
+
+    return (
+        value.astimezone(timezone.utc)
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z")
+    )
+
+
+def _run(args: argparse.Namespace) -> int:
+    """Discover captures and export them for already-parsed arguments."""
+
     date_start = args.start or "1995"
     date_end = args.end or current_utc_cdx_timestamp()
     warc_mode = args.warc
     files_mode = args.files
     rewrite_local = args.rewrite_local
+    concurrency = args.concurrency
+
+    if concurrency < 1:
+        print("ERROR: --concurrency must be at least 1", file=sys.stderr)
+        return 2
 
     if rewrite_local and files_mode == "none":
         print(
@@ -100,6 +156,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     try:
         layout = collection_layout(args.url_pattern, root=_DEFAULT_OUTPUT_ROOT)
+        client_factory = make_client_factory(USER_AGENT)
         session = WaybackSession(user_agent=USER_AGENT)
         with WaybackClient(session=session) as client:
             print(
@@ -144,15 +201,27 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     include_timestamps=(files_mode == "all"),
                 )
 
-            cache = RetrievalCache()
+            cache = RetrievalCache(max_concurrency=concurrency)
+            if warc_plan is not None and website_plan is not None:
+                cache.preserve(
+                    [
+                        files_groups[target.urlkey][target.capture_index]
+                        for target in website_plan.targets
+                    ]
+                )
             warc_summary = ExportSummary()
             if warc_plan is not None:
-                print(f"Exporting {len(warc_groups)} URL groups to WARC...")
+                print(
+                    f"Exporting {len(warc_groups)} URL groups to WARC "
+                    f"(concurrency={concurrency})..."
+                )
                 warc_result = export_all(
                     warc_groups,
                     warc_plan.buckets,
                     client,
                     cache=cache,
+                    client_factory=client_factory,
+                    concurrency=concurrency,
                 )
                 warc_summary = warc_result.summary
                 print("Building replay index...")
@@ -164,13 +233,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             files_summary = FilesSummary()
             if website_plan is not None:
                 print(
-                    f"Writing {len(website_plan.targets)} website files..."
+                    f"Writing {len(website_plan.targets)} website files "
+                    f"(concurrency={concurrency})..."
                 )
                 files_summary = write_website_files(
                     files_groups,
                     website_plan,
                     client,
                     cache=cache,
+                    client_factory=client_factory,
+                    concurrency=concurrency,
                 )
                 if rewrite_local and files_summary.written > 0:
                     rewrite_local_website(

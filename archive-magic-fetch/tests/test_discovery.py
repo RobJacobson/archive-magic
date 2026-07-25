@@ -5,12 +5,25 @@ from wayback import CdxRecord
 from wayback.exceptions import RateLimitError, UnexpectedResponseFormat
 
 from archive_magic_fetch import cli, discovery
+from archive_magic_fetch.retrieval import DEFAULT_CONCURRENCY
 
 
 def timestamp(value):
     return datetime.strptime(value, "%Y%m%d%H%M%S").replace(
         tzinfo=timezone.utc
     )
+
+
+def install_job_clock(monkeypatch, *, elapsed_seconds=0):
+    started = datetime(2026, 7, 24, 12, 0, 0, tzinfo=timezone.utc)
+    ended = datetime.fromtimestamp(
+        started.timestamp() + elapsed_seconds,
+        tz=timezone.utc,
+    )
+    wall_times = iter((started, ended))
+    ticks = iter((100.0, 100.0 + elapsed_seconds))
+    monkeypatch.setattr(cli, "_utc_now", lambda: next(wall_times))
+    monkeypatch.setattr(cli, "_monotonic", lambda: next(ticks))
 
 
 def record(
@@ -382,8 +395,23 @@ def test_cli_owns_one_client_context_and_passes_same_client(monkeypatch):
         calls["discover"] = (client, pattern, start, end, progress)
         return [capture]
 
-    def fake_export(grouped, planned_buckets, client, *, cache=None):
-        calls["export"] = (grouped, planned_buckets, client, cache)
+    def fake_export(
+        grouped,
+        planned_buckets,
+        client,
+        *,
+        cache=None,
+        client_factory=None,
+        concurrency=None,
+    ):
+        calls["export"] = (
+            grouped,
+            planned_buckets,
+            client,
+            cache,
+            client_factory,
+            concurrency,
+        )
         return type(
             "Result",
             (),
@@ -450,6 +478,8 @@ def test_cli_owns_one_client_context_and_passes_same_client(monkeypatch):
     assert calls["export"][1] == buckets
     assert calls["export"][2] == client
     assert calls["export"][3] is not None
+    assert calls["export"][4] is not None
+    assert calls["export"][5] == DEFAULT_CONCURRENCY
     assert calls["replay"] == ((), layout)
     assert calls["summary"][0].selected == 1
     assert calls["summary"][1] == {"warc_mode": "all"}
@@ -457,6 +487,7 @@ def test_cli_owns_one_client_context_and_passes_same_client(monkeypatch):
 
 def test_cli_prints_stage_messages(monkeypatch, capsys):
     install_fake_lifecycle(monkeypatch)
+    install_job_clock(monkeypatch, elapsed_seconds=95)
     capture = record()
     groups = {capture.urlkey: [capture]}
     layout = object()
@@ -498,12 +529,15 @@ def test_cli_prints_stage_messages(monkeypatch, capsys):
     assert cli.main(["*.example.com"]) == 0
     output = capsys.readouterr().out
     assert output == (
+        "Job started: 2026-07-24T12:00:00Z\n"
         "Discovering captures for *.example.com (1995-20260722123456)\n"
         "Discovered 1 captures\n"
         "Saving source acquisition...\n"
         "Grouping 1 captures...\n"
-        "Exporting 1 URL groups to WARC...\n"
+        "Exporting 1 URL groups to WARC (concurrency=8)...\n"
         "Building replay index...\n"
+        "Job ended: 2026-07-24T12:01:35Z\n"
+        "Job duration: 1.6 minutes\n"
     )
 
 
@@ -531,6 +565,7 @@ def test_cli_passes_explicit_dates(monkeypatch):
 
 def test_cli_empty_result_is_success(monkeypatch, capsys):
     install_fake_lifecycle(monkeypatch)
+    install_job_clock(monkeypatch)
 
     def fake_discover(client, pattern, start, end, *, progress=None):
         return []
@@ -540,13 +575,17 @@ def test_cli_empty_result_is_success(monkeypatch, capsys):
 
     assert cli.main(["example.com/*"]) == 0
     assert capsys.readouterr().out == (
+        "Job started: 2026-07-24T12:00:00Z\n"
         "Discovering captures for example.com/* (1995-20260722123456)\n"
         "No captures found\n"
+        "Job ended: 2026-07-24T12:00:00Z\n"
+        "Job duration: 0.0 minutes\n"
     )
 
 
 def test_cli_fatal_error_returns_one(monkeypatch, capsys):
     install_fake_lifecycle(monkeypatch)
+    install_job_clock(monkeypatch, elapsed_seconds=30)
 
     def fail(*args, **kwargs):
         raise RuntimeError("discovery failed")
@@ -554,7 +593,12 @@ def test_cli_fatal_error_returns_one(monkeypatch, capsys):
     monkeypatch.setattr(cli, "discover", fail)
 
     assert cli.main(["example.com/*"]) == 1
-    assert capsys.readouterr().err == "ERROR: discovery failed\n"
+    output = capsys.readouterr()
+    assert output.err == "ERROR: discovery failed\n"
+    assert output.out.endswith(
+        "Job ended: 2026-07-24T12:00:30Z\n"
+        "Job duration: 0.5 minutes\n"
+    )
 
 
 def test_cli_does_not_print_summary_when_replay_indexing_fails(
@@ -645,6 +689,17 @@ def test_cli_defaults_parse_to_warc_all_and_files_none():
     assert args.warc == "all"
     assert args.files == "none"
     assert args.rewrite_local is False
+    assert args.concurrency == DEFAULT_CONCURRENCY
+
+
+def test_cli_concurrency_one_is_serial_diagnostic_mode():
+    args = cli.parse_args(["example.com/*", "--concurrency", "1"])
+    assert args.concurrency == 1
+
+
+def test_cli_rejects_concurrency_below_one(capsys):
+    assert cli.main(["example.com/*", "--concurrency", "0"]) == 2
+    assert "--concurrency must be at least 1" in capsys.readouterr().err
 
 
 def test_cli_rewrite_local_requires_files_mode(capsys):
@@ -666,6 +721,8 @@ def test_cli_rewrite_local_alone_does_not_enable_files(capsys):
 
 
 def test_cli_both_none_is_successful_noop(monkeypatch, capsys):
+    install_job_clock(monkeypatch)
+
     def fail(*args, **kwargs):
         raise AssertionError("network client should not be created")
 
@@ -675,7 +732,10 @@ def test_cli_both_none_is_successful_noop(monkeypatch, capsys):
 
     assert cli.main(["example.com/*", "--warc", "none", "--files", "none"]) == 0
     assert capsys.readouterr().out == (
+        "Job started: 2026-07-24T12:00:00Z\n"
         "Nothing to do: both --warc and --files are none\n"
+        "Job ended: 2026-07-24T12:00:00Z\n"
+        "Job duration: 0.0 minutes\n"
     )
 
 

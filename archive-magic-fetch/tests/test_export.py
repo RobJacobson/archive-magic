@@ -1,8 +1,10 @@
 import base64
 import hashlib
+import threading
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from requests.exceptions import ContentDecodingError
 from warcio.archiveiterator import ArchiveIterator
 from wayback import CdxRecord
 from wayback.exceptions import (
@@ -452,6 +454,7 @@ def test_retrieved_statusless_redirect_is_omitted(tmp_path):
 def test_skippable_wayback_errors_warn_and_unrelated_capture_continues(
     tmp_path,
     capsys,
+    monkeypatch,
 ):
     failures = [
         MementoPlaybackError("playback failed"),
@@ -474,15 +477,62 @@ def test_skippable_wayback_errors_warn_and_unrelated_capture_continues(
     outcomes[captures[-1]] = memento_for(captures[-1])
     client = FakeClient(outcomes)
     target = output_path(tmp_path)
+    original = retrieval.RateLimitGate.after_throttle
+
+    def immediate(self, generation, *, retry_after=None):
+        return original(self, generation, retry_after=0)
+
+    monkeypatch.setattr(
+        retrieval.RateLimitGate,
+        "after_throttle",
+        immediate,
+    )
 
     export.export_group(URLKEY, captures, target, client)
 
-    assert client.calls == captures
+    assert client.calls[:4] == captures[:4]
+    assert client.calls[4:-1] == [
+        captures[4]
+    ] * retrieval.MAX_THROTTLE_ATTEMPTS
+    assert client.calls[-1] == captures[-1]
     assert [record.rec_type for record in read_records(target)] == [
         "warcinfo",
         "response",
     ]
     assert capsys.readouterr().err.count("WARNING skipped") == 5
+
+
+def test_persistent_content_decoding_error_warns_once_and_skips(
+    tmp_path,
+    capsys,
+):
+    selected = capture()
+    client = FakeClient(
+        {
+            selected: [
+                ContentDecodingError("incorrect gzip header"),
+                ContentDecodingError("still incorrect under identity"),
+            ]
+        }
+    )
+    client.session = type(
+        "Session",
+        (),
+        {
+            "headers": {"Accept-Encoding": "gzip, deflate"},
+            "reset": lambda self: None,
+        },
+    )()
+    target = output_path(tmp_path)
+
+    summary = export.export_group(URLKEY, [selected], target, client)
+
+    assert client.calls == [selected, selected]
+    assert not target.exists()
+    assert summary.playback_failures == 1
+    warning = capsys.readouterr().err
+    assert warning.count("WARNING skipped") == 1
+    assert "after retrying with Accept-Encoding: identity" in warning
 
 
 def test_unexpected_response_format_is_fatal(tmp_path):
@@ -500,18 +550,34 @@ def test_unexpected_response_format_is_fatal(tmp_path):
         )
 
 
-def test_second_rate_limit_is_fatal(tmp_path, monkeypatch):
+def test_repeated_rate_limit_is_fatal_after_bounded_attempts(
+    tmp_path,
+    monkeypatch,
+):
     selected = capture()
     client = FakeClient(
         {
             selected: [
-                RateLimitError(None, 1),
-                RateLimitError(None, 2),
+                RateLimitError(None, attempt)
+                for attempt in range(
+                    1,
+                    retrieval.MAX_THROTTLE_ATTEMPTS + 1,
+                )
             ]
         }
     )
-    sleeps = []
-    monkeypatch.setattr(retrieval.time, "sleep", sleeps.append)
+    delays = []
+    original = retrieval.RateLimitGate.after_throttle
+
+    def immediate(self, generation, *, retry_after=None):
+        delays.append(retry_after)
+        return original(self, generation, retry_after=0)
+
+    monkeypatch.setattr(
+        retrieval.RateLimitGate,
+        "after_throttle",
+        immediate,
+    )
 
     with pytest.raises(RateLimitError):
         export.export_group(
@@ -520,7 +586,9 @@ def test_second_rate_limit_is_fatal(tmp_path, monkeypatch):
             output_path(tmp_path),
             client,
         )
-    assert sleeps == [1]
+    assert delays == list(
+        range(1, retrieval.MAX_THROTTLE_ATTEMPTS + 1)
+    )
 
 
 def test_all_skipped_group_creates_no_file(tmp_path):
@@ -614,7 +682,7 @@ def test_dedup_maps_are_scoped_to_each_group(tmp_path, capsys):
     export.print_summary(result.summary)
     assert capsys.readouterr().out.endswith(
         "Summary: 2 selected for warc (all); 2 responses; 0 revisits; "
-        "0 redirects omitted; 0 playback failures\n"
+        "0 already present; 0 redirects omitted; 0 playback failures\n"
     )
 
 
@@ -739,12 +807,325 @@ def test_generated_file_is_parseable_gzip_warc_1_0(tmp_path):
     ) == payload_digest(b"payload")
 
 
+def test_plan_group_fetches_omits_later_matching_cdx_signatures():
+    first = capture(captured="20170101000000", payload=b"one")
+    duplicate = capture(captured="20180101000000", payload=b"one")
+    other = capture(
+        captured="20190101000000",
+        payload=b"two",
+        digest=payload_digest(b"two").split(":", 1)[1],
+    )
+    redirect = capture(captured="20200101000000", statuscode=301)
+
+    planned = export.plan_group_fetches([first, duplicate, other, redirect])
+
+    assert planned == [first, other]
+
+
+def test_concurrent_export_preserves_write_order_and_skips_duplicate_fetch(
+    tmp_path,
+    capsys,
+):
+    first = capture(captured="20170101000000", payload=b"alpha")
+    duplicate = capture(captured="20180101000000", payload=b"alpha")
+    second = capture(
+        captured="20190101000000",
+        payload=b"beta",
+        digest=payload_digest(b"beta").split(":", 1)[1],
+    )
+    target = output_path(tmp_path)
+    created_clients = []
+    release_second = threading.Event()
+    first_started = threading.Event()
+
+    class FactoryClient:
+        def __init__(self, outcomes):
+            self.outcomes = outcomes
+            self.calls = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def get_memento(self, selected, **kwargs):
+            self.calls.append(selected)
+            if selected is first:
+                first_started.set()
+                release_second.wait(timeout=2)
+            outcome = self.outcomes[selected]
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+    outcomes = {
+        first: memento_for(first, payload=b"alpha"),
+        second: memento_for(second, payload=b"beta"),
+    }
+
+    def factory():
+        client = FactoryClient(outcomes)
+        created_clients.append(client)
+        return client
+
+    cache = retrieval.RetrievalCache()
+    main_client = FactoryClient(outcomes)
+
+    def run_export():
+        return export.export_group(
+            URLKEY,
+            [first, duplicate, second],
+            target,
+            main_client,
+            cache=cache,
+            client_factory=factory,
+            concurrency=2,
+        )
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(run_export)
+        assert first_started.wait(timeout=2)
+        # Second fetch can complete while the writer still waits on first.
+        release_second.set()
+        summary = future.result()
+
+    assert summary.responses == 2
+    assert summary.revisits == 1
+    worker_calls = [call for client in created_clients for call in client.calls]
+    assert set(worker_calls) == {first, second}
+    assert duplicate not in worker_calls
+    assert main_client.calls == []
+
+    output = capsys.readouterr().out
+    assert "fetching" not in output
+    fetched = [
+        line for line in output.splitlines() if line.startswith("Fetched ")
+    ]
+    assert set(fetched) == {
+        f"Fetched 20170101000000 {first.original}",
+        f"Fetched 20190101000000 {second.original}",
+    }
+    wrote = [
+        line for line in output.splitlines() if line.startswith("Wrote ")
+    ]
+    assert wrote == [
+        f"Wrote 20170101000000 [{payload_digest(b'alpha')[-8:]}]",
+        f"Wrote 20190101000000 [{payload_digest(b'beta')[-8:]}]",
+    ]
+
+    records = read_records(target)
+    assert [record.rec_type for record in records] == [
+        "warcinfo",
+        "response",
+        "revisit",
+        "response",
+    ]
+    assert records[1].rec_headers.get_header("WARC-Date") == "2017-01-01T00:00:00Z"
+    assert records[2].rec_headers.get_header("WARC-Date") == "2018-01-01T00:00:00Z"
+    assert records[3].rec_headers.get_header("WARC-Date") == "2019-01-01T00:00:00Z"
+
+
+def test_export_all_fetches_later_url_groups_independently(tmp_path):
+    first = capture(
+        original="https://example.com/a",
+        captured="20170101000000",
+        payload=b"alpha",
+        urlkey="com,example)/a",
+    )
+    second = capture(
+        original="https://example.com/b",
+        captured="20180101000000",
+        payload=b"beta",
+        urlkey="com,example)/b",
+    )
+    outcomes = {
+        first: memento_for(first, payload=b"alpha"),
+        second: memento_for(second, payload=b"beta"),
+    }
+    first_started = threading.Event()
+    release_first = threading.Event()
+    second_finished = threading.Event()
+    created_clients = []
+
+    class FactoryClient:
+        def __init__(self):
+            self.calls = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def get_memento(self, selected, **kwargs):
+            self.calls.append(selected)
+            if selected is first:
+                first_started.set()
+                release_first.wait(timeout=2)
+            if selected is second:
+                second_finished.set()
+            return outcomes[selected]
+
+    def factory():
+        client = FactoryClient()
+        created_clients.append(client)
+        return client
+
+    bucket = paths.WarcBucket(
+        tmp_path / "ordered.warc.gz",
+        (first.urlkey, second.urlkey),
+    )
+    groups = {
+        first.urlkey: [first],
+        second.urlkey: [second],
+    }
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(
+            export.export_all,
+            groups,
+            [bucket],
+            FactoryClient(),
+            cache=retrieval.RetrievalCache(),
+            client_factory=factory,
+            concurrency=2,
+        )
+        assert first_started.wait(timeout=2)
+        assert second_finished.wait(timeout=2)
+        assert not future.done()
+        release_first.set()
+        result = future.result(timeout=2)
+
+    assert result.summary.responses == 2
+    assert len(created_clients) == 2
+    worker_calls = [call for client in created_clients for call in client.calls]
+    assert set(worker_calls) == {first, second}
+    records = read_records(bucket.path)
+    assert [
+        record.rec_headers.get_header("WARC-Target-URI")
+        for record in records[1:]
+    ] == [first.original, second.original]
+
+
 def test_open_new_warc_exclusively_rejects_existing_target(tmp_path):
     target = tmp_path / "existing.warc.gz"
     target.write_bytes(b"existing")
 
     with pytest.raises(FileExistsError):
         warc.open_new_warc(target)
+
+
+def test_rerun_skips_committed_capture_and_appends_only_missing_capture(
+    tmp_path,
+):
+    first = capture(captured="20170101000000", payload=b"first")
+    second = capture(
+        captured="20180101000000",
+        payload=b"second",
+        digest=payload_digest(b"second").split(":", 1)[1],
+    )
+    target = output_path(tmp_path)
+
+    initial = export.export_group(
+        URLKEY,
+        [first],
+        target,
+        FakeClient({first: memento_for(first, payload=b"first")}),
+    )
+    assert initial.responses == 1
+    initial_size = target.stat().st_size
+
+    client = FakeClient(
+        {second: memento_for(second, payload=b"second")}
+    )
+    resumed = export.export_group(
+        URLKEY,
+        [first, second],
+        target,
+        client,
+    )
+
+    assert client.calls == [second]
+    assert resumed == export.ExportSummary(
+        selected=2,
+        responses=1,
+        already_present=1,
+    )
+    assert target.stat().st_size > initial_size
+    assert [record.rec_type for record in read_records(target)] == [
+        "warcinfo",
+        "response",
+        "response",
+    ]
+
+
+def test_rerun_with_every_capture_present_does_not_modify_warc(tmp_path):
+    selected = capture()
+    target = output_path(tmp_path)
+    export.export_group(
+        URLKEY,
+        [selected],
+        target,
+        FakeClient({selected: memento_for(selected)}),
+    )
+    original_bytes = target.read_bytes()
+
+    summary = export.export_group(
+        URLKEY,
+        [selected],
+        target,
+        FakeClient({}),
+    )
+
+    assert summary == export.ExportSummary(
+        selected=1,
+        already_present=1,
+    )
+    assert target.read_bytes() == original_bytes
+
+
+def test_resume_recognizes_legacy_record_without_capture_id(tmp_path):
+    selected = capture()
+    target = output_path(tmp_path)
+    stream, writer = warc.open_new_warc(target)
+    try:
+        response = retrieval.retrieve_response(
+            FakeClient({selected: memento_for(selected)}),
+            selected,
+        )
+        warc.write_response(writer, response)
+    finally:
+        stream.close()
+    assert read_records(target)[1].rec_headers.get_header(
+        warc.CAPTURE_ID_HEADER
+    ) is None
+
+    summary = export.export_group(
+        URLKEY,
+        [selected],
+        target,
+        FakeClient({}),
+    )
+
+    assert summary == export.ExportSummary(
+        selected=1,
+        already_present=1,
+    )
+
+
+def test_resume_rejects_non_warc_existing_file(tmp_path):
+    selected = capture()
+    target = output_path(tmp_path)
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"not a WARC")
+
+    with pytest.raises(ValueError, match="malformed existing WARC"):
+        export.export_group(URLKEY, [selected], target, FakeClient({}))
 
 
 def test_timestamp_to_warc_date_normalizes_aware_non_utc_datetime():

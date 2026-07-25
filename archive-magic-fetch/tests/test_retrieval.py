@@ -1,13 +1,17 @@
 import base64
 import hashlib
+import threading
+import time
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from requests.exceptions import ContentDecodingError
 from wayback import Mode
 from wayback.exceptions import (
     MementoPlaybackError,
     RateLimitError,
     UnexpectedResponseFormat,
+    WaybackRetryError,
 )
 
 from archive_magic_fetch import retrieval
@@ -64,6 +68,38 @@ class FakeClient:
         if isinstance(result, Exception):
             raise result
         return result
+
+
+class BrokenEncodingMemento:
+    def __init__(self, error):
+        self.url = "https://played.example/resource"
+        self.timestamp = datetime(
+            2020,
+            1,
+            2,
+            3,
+            4,
+            5,
+            tzinfo=timezone.utc,
+        )
+        self.status_code = 200
+        self.memento_url = (
+            "https://web.archive.org/web/20200102030405id_/"
+            "https://played.example/resource"
+        )
+        self.headers = {"Content-Type": "text/html"}
+        self.error = error
+        self.closed = False
+
+    @property
+    def content(self):
+        raise self.error
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        self.closed = True
 
 
 def test_retrieve_uses_exact_original_memento_and_maps_all_fields():
@@ -203,39 +239,389 @@ def test_memento_closes_before_warc_construction_fails(monkeypatch):
         retrieved.to_warc_record()
 
 
-def test_first_rate_limit_sleeps_and_retries_same_capture(monkeypatch):
-    sleeps = []
+def _make_backoff_immediate(monkeypatch):
+    delays = []
+    original = retrieval.RateLimitGate.after_throttle
+
+    def immediate(self, generation, *, retry_after=None):
+        delays.append(retry_after)
+        return original(self, generation, retry_after=0)
+
+    monkeypatch.setattr(
+        retrieval.RateLimitGate,
+        "after_throttle",
+        immediate,
+    )
+    return delays
+
+
+def test_rate_limit_coordinates_backoff_and_retries_same_capture(monkeypatch):
+    delays = _make_backoff_immediate(monkeypatch)
     capture = object()
     memento = FakeMemento()
     client = FakeClient([RateLimitError(None, 11), memento])
-    monkeypatch.setattr(retrieval.time, "sleep", sleeps.append)
 
     retrieval.retrieve_response(client, capture)
 
-    assert sleeps == [11]
+    assert delays == [11]
     assert [call[0] for call in client.calls] == [capture, capture]
 
 
-def test_missing_retry_after_sleeps_for_sixty_seconds(monkeypatch):
-    sleeps = []
+def test_missing_retry_after_uses_sixty_second_backoff(monkeypatch):
+    delays = _make_backoff_immediate(monkeypatch)
     client = FakeClient([RateLimitError(None, None), FakeMemento()])
-    monkeypatch.setattr(retrieval.time, "sleep", sleeps.append)
 
     retrieval.retrieve_response(client, object())
 
-    assert sleeps == [60]
+    assert delays == [60]
 
 
-def test_second_rate_limit_is_fatal(monkeypatch):
-    sleeps = []
+def test_rate_limit_is_fatal_after_bounded_attempts(monkeypatch):
+    delays = _make_backoff_immediate(monkeypatch)
     client = FakeClient(
-        [RateLimitError(None, 2), RateLimitError(None, 3)]
+        [
+            RateLimitError(None, attempt)
+            for attempt in range(1, retrieval.MAX_THROTTLE_ATTEMPTS + 1)
+        ]
     )
-    monkeypatch.setattr(retrieval.time, "sleep", sleeps.append)
 
     with pytest.raises(RateLimitError):
         retrieval.retrieve_response(client, object())
-    assert sleeps == [2]
+    assert delays == list(
+        range(1, retrieval.MAX_THROTTLE_ATTEMPTS + 1)
+    )
+
+
+def test_rate_limit_gate_reacts_once_per_concurrent_failure_wave():
+    gate = retrieval.RateLimitGate(max_concurrency=8)
+    first = gate.acquire()
+    second = gate.acquire()
+
+    gate.after_throttle(first, retry_after=0)
+    gate.after_throttle(second, retry_after=9)
+
+    assert gate.generation == 1
+    assert gate.concurrency_limit == 1
+
+
+def _connection_refused_retry_error():
+    return WaybackRetryError(
+        3,
+        8.0,
+        ConnectionError(
+            "HTTPSConnectionPool(host='web.archive.org', port=443): "
+            "Max retries exceeded with url: /web/20200101000000id_/https://example.com/ "
+            "(Caused by NewConnectionError("
+            "\"HTTPSConnection(host='web.archive.org', port=443): "
+            "Failed to establish a new connection: [Errno 61] Connection refused\"))"
+        ),
+    )
+
+
+def test_connection_failure_backs_off_and_retries(monkeypatch):
+    delays = _make_backoff_immediate(monkeypatch)
+    capture = object()
+    memento = FakeMemento()
+    client = FakeClient([_connection_refused_retry_error(), memento])
+
+    retrieval.retrieve_response(client, capture)
+
+    assert delays == [None]
+    assert [call[0] for call in client.calls] == [capture, capture]
+
+
+def test_sustained_connection_failure_exhausts_bounded_attempts(monkeypatch):
+    delays = _make_backoff_immediate(monkeypatch)
+    client = FakeClient(
+        [
+            _connection_refused_retry_error()
+            for _ in range(retrieval.MAX_THROTTLE_ATTEMPTS)
+        ]
+    )
+
+    with pytest.raises(WaybackRetryError):
+        retrieval.retrieve_response(client, object())
+    assert delays == [None] * retrieval.MAX_THROTTLE_ATTEMPTS
+
+
+def test_gate_blocks_new_admissions_until_backoff_expires():
+    gate = retrieval.RateLimitGate(max_concurrency=2)
+    token = gate.acquire()
+    gate.after_throttle(token, retry_after=0.05)
+    started = time.monotonic()
+
+    next_token = gate.acquire()
+    elapsed = time.monotonic() - started
+    gate.after_neutral()
+
+    assert next_token == 1
+    assert elapsed >= 0.04
+
+
+def test_gate_additively_recovers_after_sustained_success():
+    gate = retrieval.RateLimitGate(max_concurrency=4)
+
+    for _ in range(retrieval.RECOVERY_SUCCESSES_PER_STEP):
+        gate.acquire()
+        gate.after_success()
+    assert gate.concurrency_limit == 3
+
+    for _ in range(retrieval.RECOVERY_SUCCESSES_PER_STEP):
+        gate.acquire()
+        gate.after_success()
+    assert gate.concurrency_limit == 4
+
+
+def test_timeout_wayback_retry_uses_adaptive_retry(monkeypatch):
+    _make_backoff_immediate(monkeypatch)
+    error = WaybackRetryError(2, 1.0, TimeoutError("read timed out"))
+    client = FakeClient([error, FakeMemento()])
+
+    retrieval.retrieve_response(client, object())
+
+    assert len(client.calls) == 2
+
+
+def test_content_decoding_error_retries_once_with_identity_without_throttle():
+    capture = object()
+    broken = BrokenEncodingMemento(
+        ContentDecodingError("incorrect gzip header")
+    )
+    client = FakeClient([broken, FakeMemento(content=b"recovered")])
+    client.session = type(
+        "Session",
+        (),
+        {
+            "headers": {"Accept-Encoding": "gzip, deflate"},
+            "reset_count": 0,
+            "reset": lambda self: setattr(
+                self,
+                "reset_count",
+                self.reset_count + 1,
+            ),
+        },
+    )()
+    encodings = []
+    original_get = client.get_memento
+
+    def get_memento(selected, **kwargs):
+        encodings.append(client.session.headers["Accept-Encoding"])
+        return original_get(selected, **kwargs)
+
+    client.get_memento = get_memento
+    gate = retrieval.RateLimitGate(max_concurrency=4)
+
+    response = retrieval.retrieve_response(client, capture, gate=gate)
+
+    assert response.content_stream().read() == b"recovered"
+    assert broken.closed is True
+    assert encodings == ["gzip, deflate", "identity"]
+    assert client.session.headers["Accept-Encoding"] == "gzip, deflate"
+    assert client.session.reset_count == 1
+    assert gate.generation == 0
+    assert gate.concurrency_limit == 2
+
+
+def test_identity_decoding_failure_skips_immediately_and_restores_header():
+    first = BrokenEncodingMemento(
+        ContentDecodingError("incorrect gzip header")
+    )
+    second = BrokenEncodingMemento(
+        ContentDecodingError("still incorrect")
+    )
+    client = FakeClient([first, second])
+    client.session = type(
+        "Session",
+        (),
+        {
+            "headers": {"Accept-Encoding": "gzip, deflate"},
+            "reset": lambda self: None,
+        },
+    )()
+    gate = retrieval.RateLimitGate(max_concurrency=4)
+
+    with pytest.raises(
+        retrieval.MalformedContentEncodingError,
+        match="after retrying with Accept-Encoding: identity",
+    ):
+        retrieval.retrieve_response(client, object(), gate=gate)
+
+    assert len(client.calls) == 2
+    assert client.session.headers["Accept-Encoding"] == "gzip, deflate"
+    assert gate.generation == 0
+    assert gate.concurrency_limit == 2
+
+
+def test_make_client_factory_uses_reduced_worker_retries(monkeypatch):
+    captured = {}
+
+    class FakeSession:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    class FakeWaybackClient:
+        def __init__(self, session=None):
+            self.session = session
+
+    monkeypatch.setattr(retrieval, "WaybackSession", FakeSession)
+    monkeypatch.setattr(retrieval, "WaybackClient", FakeWaybackClient)
+
+    client = retrieval.make_client_factory("test-agent")()
+    assert captured["user_agent"] == "test-agent"
+    assert captured["retries"] == retrieval.WORKER_SESSION_RETRIES
+    assert client.session is not None
+
+
+def test_memento_fetch_pool_reuses_thread_clients_and_waits_in_order():
+    captures = []
+    for index in range(3):
+        captures.append(
+            type(
+                "Capture",
+                (),
+                {
+                    "urlkey": f"key{index}",
+                    "original": f"https://example.com/{index}",
+                    "timestamp": datetime(2020, 1, 1, tzinfo=timezone.utc),
+                    "statuscode": 200,
+                    "digest": "A" * 32,
+                },
+            )()
+        )
+
+    created_clients = []
+    active = 0
+    max_active = 0
+    lock = threading.Lock()
+
+    class FactoryClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def get_memento(self, capture, **kwargs):
+            nonlocal active, max_active
+            with lock:
+                active += 1
+                max_active = max(max_active, active)
+            try:
+                time.sleep(0.05)
+                return FakeMemento(
+                    content=f"body-{id(capture)}".encode(),
+                    url=capture.original,
+                )
+            finally:
+                with lock:
+                    active -= 1
+
+    def factory():
+        client = FactoryClient()
+        created_clients.append(client)
+        return client
+
+    cache = retrieval.RetrievalCache()
+    pool = retrieval.MementoFetchPool(
+        cache=cache,
+        client_factory=factory,
+        max_workers=2,
+    )
+    try:
+        pool.submit(captures)
+        for capture in captures:
+            pool.wait(capture)
+            retrieved = cache.retrieve(created_clients[0], capture)
+            assert retrieved.body == f"body-{id(capture)}".encode()
+    finally:
+        pool.close()
+
+    assert 1 <= len(created_clients) <= 2
+    assert max_active == 2
+
+
+def test_memento_fetch_pool_skips_duplicate_capture_keys():
+    capture = type(
+        "Capture",
+        (),
+        {
+            "urlkey": "com,example)/",
+            "original": "https://example.com/",
+            "timestamp": datetime(2020, 1, 1, tzinfo=timezone.utc),
+            "statuscode": 200,
+            "digest": "A" * 32,
+        },
+    )()
+    calls = []
+
+    class FactoryClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def get_memento(self, selected, **kwargs):
+            calls.append(selected)
+            return FakeMemento()
+
+    cache = retrieval.RetrievalCache()
+    pool = retrieval.MementoFetchPool(
+        cache=cache,
+        client_factory=FactoryClient,
+        max_workers=2,
+    )
+    try:
+        pool.submit([capture, capture])
+        pool.wait(capture)
+    finally:
+        pool.close()
+
+    assert len(calls) == 1
+
+
+def test_memento_fetch_pool_reports_completion_before_ordered_wait():
+    capture = type(
+        "Capture",
+        (),
+        {
+            "urlkey": "com,example)/",
+            "original": "https://example.com/",
+            "timestamp": datetime(2020, 1, 1, tzinfo=timezone.utc),
+            "statuscode": 200,
+            "digest": "A" * 32,
+        },
+    )()
+    reported = threading.Event()
+    completed = []
+
+    class FactoryClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def get_memento(self, selected, **kwargs):
+            return FakeMemento()
+
+    def on_fetched(selected):
+        completed.append(selected)
+        reported.set()
+
+    pool = retrieval.MementoFetchPool(
+        cache=retrieval.RetrievalCache(),
+        client_factory=FactoryClient,
+        max_workers=2,
+        on_fetched=on_fetched,
+    )
+    try:
+        pool.submit([capture])
+        assert reported.wait(timeout=1)
+        assert completed == [capture]
+        assert pool.wait(capture) is True
+    finally:
+        pool.close()
 
 
 @pytest.mark.parametrize(

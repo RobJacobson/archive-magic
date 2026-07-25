@@ -4,12 +4,17 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
+import json
+import re
 import sys
 from dataclasses import dataclass, field
 from datetime import timezone
 from pathlib import Path
 from typing import BinaryIO, Callable, Mapping, Optional, Sequence
 
+from warcio.archiveiterator import ArchiveIterator
+from warcio.exceptions import ArchiveLoadFailed
 from wayback import CdxRecord
 from wayback.exceptions import (
     BlockedByRobotsError,
@@ -19,9 +24,19 @@ from wayback.exceptions import (
 )
 
 from .paths import WarcBucket
-from .retrieval import RetrievalCache, retrieve_response
+from .retrieval import (
+    DEFAULT_CONCURRENCY,
+    MementoFetchPool,
+    MementoFetchWindow,
+    RetrievalCache,
+    print_fetched,
+    print_progress,
+    retrieve_response,
+)
 from .warc import (
+    CAPTURE_ID_HEADER,
     CanonicalResponse,
+    open_append_warc,
     open_new_warc,
     timestamp_to_warc_date,
     write_response,
@@ -30,6 +45,35 @@ from .warc import (
 
 
 SourceMatch = tuple[str, CanonicalResponse]
+_MEMENTO_TIMESTAMP = re.compile(r"/web/(\d{14})[^/]*/")
+
+
+@dataclass(frozen=True)
+class _StoredCapture:
+    """Deduplication identity recovered from one existing WARC record."""
+
+    semantic_digest: str
+    actual_status: Optional[int]
+    canonical: CanonicalResponse
+
+
+def _capture_id(urlkey: str, capture: CdxRecord) -> str:
+    """Return a stable identity for one selected source CDX capture."""
+
+    identity = json.dumps(
+        [
+            urlkey,
+            _cdx_timestamp(capture.timestamp),
+            capture.original,
+            capture.statuscode,
+            normalize_digest(capture.digest),
+            capture.mimetype,
+            capture.length,
+        ],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(identity).hexdigest()
 
 
 @dataclass
@@ -69,13 +113,14 @@ class _GroupDeduplication:
         expected: Optional[str],
         source_status: Optional[int],
         semantic_digest: str,
-        actual_status: int,
+        actual_status: Optional[int],
         canonical: CanonicalResponse,
     ) -> None:
-        self.content_by_signature.setdefault(
-            (semantic_digest, actual_status),
-            canonical,
-        )
+        if actual_status is not None:
+            self.content_by_signature.setdefault(
+                (semantic_digest, actual_status),
+                canonical,
+            )
         if expected is None:
             return
         source_match = (semantic_digest, canonical)
@@ -94,14 +139,18 @@ class _LazyWarc:
     path: Path
     stream: Optional[BinaryIO] = None
     writer: object = None
+    existed: bool = False
 
     @property
-    def created(self) -> bool:
-        return self.stream is not None
+    def available(self) -> bool:
+        return self.path.exists()
 
     def get_writer(self):
         if self.writer is None:
-            self.stream, self.writer = open_new_warc(self.path)
+            if self.existed:
+                self.stream, self.writer = open_append_warc(self.path)
+            else:
+                self.stream, self.writer = open_new_warc(self.path)
         return self.writer
 
     def close(self) -> None:
@@ -116,6 +165,7 @@ class ExportSummary:
     selected: int = 0
     responses: int = 0
     revisits: int = 0
+    already_present: int = 0
     redirects_omitted: int = 0
     playback_failures: int = 0
 
@@ -125,13 +175,14 @@ class ExportSummary:
         self.selected += other.selected
         self.responses += other.responses
         self.revisits += other.revisits
+        self.already_present += other.already_present
         self.redirects_omitted += other.redirects_omitted
         self.playback_failures += other.playback_failures
 
 
 @dataclass(frozen=True)
 class ExportResult:
-    """Aggregate export outcome and WARCs closed by this command."""
+    """Aggregate export outcome and validated WARCs in the current plan."""
 
     summary: ExportSummary
     created_warcs: tuple[Path, ...]
@@ -221,6 +272,185 @@ def _response_identity(record) -> tuple[str, str, str, int]:
     return target_uri, capture_date, digest, int(status_text)
 
 
+def _source_plan_key(
+    expected: Optional[str],
+    status: Optional[int],
+) -> Optional[tuple]:
+    """Return a planning key for CDX source-signature revisit eligibility."""
+
+    if expected is None:
+        return None
+    if status is None:
+        return ("digest", expected)
+    return ("signature", expected, status)
+
+
+def plan_group_fetches(captures: Sequence[CdxRecord]) -> list[CdxRecord]:
+    """Return captures that need network fetch assuming earlier CDX success.
+
+    Later captures that share a CDX digest/status with an earlier eligible
+    capture are omitted; if the earlier fetch fails at write time, the write
+    loop retrieves the later capture on demand.
+    """
+
+    return _plan_group_fetches(captures, {})
+
+
+def _plan_group_fetches(
+    captures: Sequence[CdxRecord],
+    existing: Mapping[CdxRecord, _StoredCapture],
+) -> list[CdxRecord]:
+    """Plan fetches while treating stored captures as successful sources."""
+
+    planned: list[CdxRecord] = []
+    seen: set[tuple] = set()
+    for capture in captures:
+        if _is_redirect(capture.statuscode):
+            continue
+        expected = normalize_digest(capture.digest)
+        key = _source_plan_key(expected, capture.statuscode)
+        if key is not None and key in seen:
+            continue
+        if key is not None:
+            seen.add(key)
+        if capture in existing:
+            continue
+        planned.append(capture)
+    return planned
+
+
+def _record_canonical(record) -> CanonicalResponse:
+    """Return the response ultimately referenced by an existing record."""
+
+    if record.rec_type == "response":
+        record_id = record.rec_headers.get_header("WARC-Record-ID")
+        target_uri = record.rec_headers.get_header("WARC-Target-URI")
+        capture_date = record.rec_headers.get_header("WARC-Date")
+    else:
+        record_id = record.rec_headers.get_header("WARC-Refers-To")
+        target_uri = record.rec_headers.get_header(
+            "WARC-Refers-To-Target-URI"
+        )
+        capture_date = record.rec_headers.get_header("WARC-Refers-To-Date")
+    if not record_id or not target_uri or not capture_date:
+        raise ValueError("existing WARC record has incomplete canonical identity")
+    return CanonicalResponse(record_id, target_uri, capture_date)
+
+
+def _legacy_record_match(
+    record,
+    captures: Sequence[CdxRecord],
+) -> Optional[CdxRecord]:
+    """Match records written before persistent capture IDs were introduced."""
+
+    target_uri = record.rec_headers.get_header("WARC-Target-URI")
+    warc_date = record.rec_headers.get_header("WARC-Date")
+    source_uri = record.rec_headers.get_header("WARC-Source-URI") or ""
+    source_match = _MEMENTO_TIMESTAMP.search(source_uri)
+    timestamp = source_match.group(1) if source_match else None
+    if timestamp is None and warc_date:
+        timestamp = "".join(
+            character for character in warc_date if character.isdigit()
+        )[:14]
+    if timestamp is None:
+        return None
+
+    candidates = [
+        capture
+        for capture in captures
+        if _cdx_timestamp(capture.timestamp) == timestamp
+    ]
+    if target_uri:
+        exact = [
+            capture
+            for capture in candidates
+            if capture.original == target_uri
+            or source_uri.endswith(capture.original)
+        ]
+        if exact:
+            candidates = exact
+
+    if record.http_headers is not None:
+        status_text = record.http_headers.get_statuscode()
+        if status_text and status_text.isdigit():
+            status = int(status_text)
+            matching_status = [
+                capture
+                for capture in candidates
+                if capture.statuscode in {None, status}
+            ]
+            if matching_status:
+                candidates = matching_status
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _load_existing_captures(
+    path: Path,
+    groups: Mapping[str, Sequence[CdxRecord]],
+) -> dict[str, dict[CdxRecord, _StoredCapture]]:
+    """Validate an existing WARC and recover captures already committed."""
+
+    recovered = {urlkey: {} for urlkey in groups}
+    if not path.exists():
+        return recovered
+
+    captures_by_id = {
+        _capture_id(urlkey, capture): (urlkey, capture)
+        for urlkey, captures in groups.items()
+        for capture in captures
+    }
+    all_captures = [
+        capture for captures in groups.values() for capture in captures
+    ]
+    saw_warcinfo = False
+    try:
+        with path.open("rb") as stream:
+            for record in ArchiveIterator(stream):
+                if record.rec_type == "warcinfo":
+                    saw_warcinfo = True
+                    continue
+                if record.rec_type not in {"response", "revisit"}:
+                    continue
+
+                capture_id = record.rec_headers.get_header(CAPTURE_ID_HEADER)
+                selected = (
+                    captures_by_id.get(capture_id) if capture_id else None
+                )
+                if selected is None:
+                    capture = _legacy_record_match(record, all_captures)
+                    if capture is None:
+                        continue
+                    selected = (capture.urlkey, capture)
+                urlkey, capture = selected
+
+                digest = normalize_digest(
+                    record.rec_headers.get_header("WARC-Payload-Digest")
+                )
+                if digest is None:
+                    raise ValueError(
+                        "existing WARC record has no usable payload digest: "
+                        f"{path}"
+                    )
+                status = capture.statuscode
+                if record.http_headers is not None:
+                    status_text = record.http_headers.get_statuscode()
+                    if status_text and status_text.isdigit():
+                        status = int(status_text)
+                recovered[urlkey][capture] = _StoredCapture(
+                    digest,
+                    status,
+                    _record_canonical(record),
+                )
+    except ArchiveLoadFailed as error:
+        raise ValueError(
+            f"cannot resume malformed existing WARC: {path}"
+        ) from error
+
+    if not saw_warcinfo:
+        raise ValueError(f"existing WARC has no warcinfo record: {path}")
+    return recovered
+
+
 def _export_group(
     urlkey: str,
     captures: Sequence[CdxRecord],
@@ -228,6 +458,10 @@ def _export_group(
     writer_factory: Callable[[], object],
     *,
     cache: Optional[RetrievalCache] = None,
+    client_factory: Optional[Callable] = None,
+    concurrency: int = DEFAULT_CONCURRENCY,
+    fetch_window: Optional[MementoFetchWindow] = None,
+    existing: Optional[Mapping[CdxRecord, _StoredCapture]] = None,
 ) -> ExportSummary:
     """Export one URL-key group using fresh payload-deduplication state."""
 
@@ -244,96 +478,158 @@ def _export_group(
     if not eligible:
         return summary
 
-    deduplication = _GroupDeduplication()
-    writer = None
-
     representative_url = eligible[0].original
     variants = len({capture.original for capture in eligible})
     suffix = f" ({variants} URL variants)" if variants != 1 else ""
-    print(f"Starting {representative_url}{suffix}")
+    print_progress(f"Starting {representative_url}{suffix}")
 
-    for capture in eligible:
-        expected = normalize_digest(capture.digest)
-        cdx_status = capture.statuscode
-
-        source_match = deduplication.find_source(expected, cdx_status)
-
-        if source_match is not None:
-            if writer is None:  # pragma: no cover - map/writer invariant
-                raise RuntimeError(
-                    "canonical response exists without an open WARC"
-                )
-            semantic_digest, canonical = source_match
-            write_revisit(
-                writer,
-                capture.original,
-                timestamp_to_warc_date(capture.timestamp),
-                semantic_digest,
-                canonical,
-            )
-            summary.revisits += 1
-            continue
-
-        try:
-            response = retrieve_response(client, capture, cache=cache)
-        except (
-            MementoPlaybackError,
-            BlockedByRobotsError,
-            BlockedSiteError,
-            WaybackRetryError,
-        ) as error:
-            _warn_skip(capture, error)
-            summary.playback_failures += 1
-            continue
-
-        (
-            target_uri,
-            capture_date,
-            semantic_digest,
-            actual_status,
-        ) = _response_identity(response)
-
-        if cdx_status is not None and actual_status != cdx_status:
-            _warn_status_substitution(capture, actual_status)
-            summary.playback_failures += 1
-            continue
-
-        if _is_redirect(actual_status):
-            summary.redirects_omitted += 1
-            continue
-
-        if writer is None:
-            writer = writer_factory()
-
-        canonical = deduplication.find_content(
-            semantic_digest,
-            actual_status,
+    existing = existing or {}
+    owned_pool = None
+    if (
+        fetch_window is None
+        and cache is not None
+        and client_factory is not None
+        and concurrency > 1
+    ):
+        owned_pool = MementoFetchPool(
+            cache=cache,
+            client_factory=client_factory,
+            max_workers=concurrency,
+            on_fetched=print_fetched,
         )
-        if canonical is None:
-            canonical = write_response(writer, response)
-            summary.responses += 1
-        else:
-            write_revisit(
-                writer,
+        fetch_window = owned_pool.window(
+            _plan_group_fetches(eligible, existing)
+        )
+
+    deduplication = _GroupDeduplication()
+    writer = None
+
+    try:
+        for capture in eligible:
+            expected = normalize_digest(capture.digest)
+            cdx_status = capture.statuscode
+            stored = existing.get(capture)
+            if stored is not None:
+                deduplication.remember(
+                    expected=expected,
+                    source_status=cdx_status,
+                    semantic_digest=stored.semantic_digest,
+                    actual_status=stored.actual_status,
+                    canonical=stored.canonical,
+                )
+                summary.already_present += 1
+                if cache is not None:
+                    cache.discard(capture)
+                print_progress(
+                    f"Skipped existing {_cdx_timestamp(capture.timestamp)}"
+                )
+                continue
+
+            source_match = deduplication.find_source(expected, cdx_status)
+
+            if source_match is not None:
+                if writer is None:
+                    writer = writer_factory()
+                semantic_digest, canonical = source_match
+                write_revisit(
+                    writer,
+                    capture.original,
+                    timestamp_to_warc_date(capture.timestamp),
+                    semantic_digest,
+                    canonical,
+                    capture_id=_capture_id(urlkey, capture),
+                )
+                summary.revisits += 1
+                if cache is not None:
+                    cache.discard(capture)
+                continue
+
+            fetched_by_worker = False
+            if fetch_window is not None:
+                fetched_by_worker = fetch_window.wait(capture)
+            was_cached = (
+                cache is not None and cache.get(capture) is not None
+            )
+
+            try:
+                response = retrieve_response(client, capture, cache=cache)
+            except (
+                MementoPlaybackError,
+                BlockedByRobotsError,
+                BlockedSiteError,
+                WaybackRetryError,
+            ) as error:
+                _warn_skip(capture, error)
+                summary.playback_failures += 1
+                if cache is not None:
+                    cache.discard(capture)
+                continue
+
+            if not fetched_by_worker and not was_cached:
+                print_fetched(capture)
+
+            (
                 target_uri,
                 capture_date,
                 semantic_digest,
-                canonical,
+                actual_status,
+            ) = _response_identity(response)
+
+            if cdx_status is not None and actual_status != cdx_status:
+                _warn_status_substitution(capture, actual_status)
+                summary.playback_failures += 1
+                if cache is not None:
+                    cache.discard(capture)
+                continue
+
+            if _is_redirect(actual_status):
+                summary.redirects_omitted += 1
+                if cache is not None:
+                    cache.discard(capture)
+                continue
+
+            if writer is None:
+                writer = writer_factory()
+
+            canonical = deduplication.find_content(
+                semantic_digest,
+                actual_status,
             )
-            summary.revisits += 1
+            if canonical is None:
+                response.rec_headers.add_header(
+                    CAPTURE_ID_HEADER,
+                    _capture_id(urlkey, capture),
+                )
+                canonical = write_response(writer, response)
+                summary.responses += 1
+            else:
+                write_revisit(
+                    writer,
+                    target_uri,
+                    capture_date,
+                    semantic_digest,
+                    canonical,
+                    capture_id=_capture_id(urlkey, capture),
+                )
+                summary.revisits += 1
 
-        print(
-            f"Downloaded {_cdx_timestamp(capture.timestamp)} "
-            f"[{semantic_digest[-8:]}]"
-        )
+            print_progress(
+                f"Wrote {_cdx_timestamp(capture.timestamp)} "
+                f"[{semantic_digest[-8:]}]"
+            )
 
-        deduplication.remember(
-            expected=expected,
-            source_status=cdx_status,
-            semantic_digest=semantic_digest,
-            actual_status=actual_status,
-            canonical=canonical,
-        )
+            deduplication.remember(
+                expected=expected,
+                source_status=cdx_status,
+                semantic_digest=semantic_digest,
+                actual_status=actual_status,
+                canonical=canonical,
+            )
+            if cache is not None:
+                cache.discard(capture)
+    finally:
+        if owned_pool is not None:
+            owned_pool.close()
 
     return summary
 
@@ -345,10 +641,15 @@ def export_group(
     client,
     *,
     cache: Optional[RetrievalCache] = None,
+    client_factory: Optional[Callable] = None,
+    concurrency: int = DEFAULT_CONCURRENCY,
+    fetch_window: Optional[MementoFetchWindow] = None,
 ) -> ExportSummary:
     """Export one group to one lazily created WARC."""
 
-    owner = _LazyWarc(path)
+    groups = {urlkey: captures}
+    recovered = _load_existing_captures(path, groups)
+    owner = _LazyWarc(path, existed=path.exists())
     try:
         return _export_group(
             urlkey,
@@ -356,6 +657,10 @@ def export_group(
             client,
             owner.get_writer,
             cache=cache,
+            client_factory=client_factory,
+            concurrency=concurrency,
+            fetch_window=fetch_window,
+            existing=recovered[urlkey],
         )
     finally:
         owner.close()
@@ -367,10 +672,14 @@ def _export_bucket(
     client,
     *,
     cache: Optional[RetrievalCache] = None,
+    client_factory: Optional[Callable] = None,
+    concurrency: int = DEFAULT_CONCURRENCY,
+    fetch_window: Optional[MementoFetchWindow] = None,
+    existing: Optional[Mapping[str, Mapping[CdxRecord, _StoredCapture]]] = None,
 ) -> tuple[ExportSummary, bool]:
     """Export every URL-key group assigned to one lazy WARC owner."""
 
-    owner = _LazyWarc(bucket.path)
+    owner = _LazyWarc(bucket.path, existed=bucket.path.exists())
     summary = ExportSummary()
     try:
         for urlkey in bucket.urlkeys:
@@ -381,11 +690,15 @@ def _export_bucket(
                     client,
                     owner.get_writer,
                     cache=cache,
+                    client_factory=client_factory,
+                    concurrency=concurrency,
+                    fetch_window=fetch_window,
+                    existing=(existing or {}).get(urlkey, {}),
                 )
             )
     finally:
         owner.close()
-    return summary, owner.created
+    return summary, owner.available
 
 
 def export_all(
@@ -394,21 +707,63 @@ def export_all(
     client,
     *,
     cache: Optional[RetrievalCache] = None,
+    client_factory: Optional[Callable] = None,
+    concurrency: int = DEFAULT_CONCURRENCY,
 ) -> ExportResult:
     """Export ordered buckets while keeping deduplication scoped to groups."""
 
     summary = ExportSummary()
     created_warcs = []
+    existing_by_bucket = {}
     for bucket in buckets:
-        bucket_summary, created = _export_bucket(
-            bucket,
-            capture_groups,
-            client,
-            cache=cache,
+        bucket_groups = {
+            urlkey: capture_groups[urlkey] for urlkey in bucket.urlkeys
+        }
+        existing_by_bucket[bucket.path] = _load_existing_captures(
+            bucket.path,
+            bucket_groups,
         )
-        summary.add(bucket_summary)
-        if created:
-            created_warcs.append(bucket.path)
+    pool = None
+    fetch_window = None
+    if (
+        cache is not None
+        and client_factory is not None
+        and concurrency > 1
+    ):
+        ordered_fetches = []
+        for bucket in buckets:
+            for urlkey in bucket.urlkeys:
+                ordered_fetches.extend(
+                    _plan_group_fetches(
+                        capture_groups[urlkey],
+                        existing_by_bucket[bucket.path][urlkey],
+                    )
+                )
+        pool = MementoFetchPool(
+            cache=cache,
+            client_factory=client_factory,
+            max_workers=concurrency,
+            on_fetched=print_fetched,
+        )
+        fetch_window = pool.window(ordered_fetches)
+
+    try:
+        for bucket in buckets:
+            bucket_summary, created = _export_bucket(
+                bucket,
+                capture_groups,
+                client,
+                cache=cache,
+                concurrency=concurrency,
+                fetch_window=fetch_window,
+                existing=existing_by_bucket[bucket.path],
+            )
+            summary.add(bucket_summary)
+            if created:
+                created_warcs.append(bucket.path)
+    finally:
+        if pool is not None:
+            pool.close()
 
     return ExportResult(summary, tuple(created_warcs))
 
@@ -428,6 +783,7 @@ def print_summary(
         f"Summary: {summary.selected} selected for warc ({warc_mode}); "
         f"{summary.responses} responses; "
         f"{summary.revisits} revisits; "
+        f"{summary.already_present} already present; "
         f"{summary.redirects_omitted} redirects omitted; "
         f"{summary.playback_failures} playback failures"
     )
