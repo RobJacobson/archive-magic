@@ -1221,6 +1221,57 @@ def test_resume_recognizes_legacy_record_without_capture_id(tmp_path):
     )
 
 
+def test_resume_indexes_legacy_candidates_once(tmp_path, monkeypatch):
+    first = capture(captured="20170101000000", payload=b"first")
+    second = capture(
+        captured="20180101000000",
+        payload=b"second",
+    )
+    target = output_path(tmp_path)
+    stream, writer = warc.open_new_warc(target)
+    try:
+        for selected, payload in (
+            (first, b"first"),
+            (second, b"second"),
+        ):
+            response = retrieval.retrieve_response(
+                FakeClient(
+                    {
+                        selected: memento_for(
+                            selected,
+                            payload=payload,
+                        )
+                    }
+                ),
+                selected,
+            )
+            warc.write_response(writer, response)
+    finally:
+        stream.close()
+
+    timestamp_calls = 0
+    original = export._cdx_timestamp
+
+    def counted_timestamp(value):
+        nonlocal timestamp_calls
+        timestamp_calls += 1
+        return original(value)
+
+    monkeypatch.setattr(export, "_cdx_timestamp", counted_timestamp)
+
+    summary = export.export_group(
+        URLKEY,
+        [first, second],
+        target,
+        FakeClient({}),
+    )
+
+    assert summary.already_present == 2
+    # Once per capture for its persistent ID and once for the legacy index;
+    # matching each WARC record performs no additional timestamp formatting.
+    assert timestamp_calls == 4
+
+
 def test_resume_rejects_non_warc_existing_file(tmp_path):
     selected = capture()
     target = output_path(tmp_path)
@@ -1244,6 +1295,20 @@ def test_timestamp_to_warc_date_normalizes_aware_non_utc_datetime():
     )
 
     assert warc.timestamp_to_warc_date(value) == "2020-01-02T03:04:05Z"
+
+
+def test_cdx_timestamp_normalizes_aware_non_utc_datetime():
+    value = datetime(
+        2020,
+        1,
+        2,
+        8,
+        34,
+        5,
+        tzinfo=timezone(timedelta(hours=5, minutes=30)),
+    )
+
+    assert export._cdx_timestamp(value) == "20200102030405"
 
 
 def test_timestamp_to_warc_date_rejects_naive_datetime():

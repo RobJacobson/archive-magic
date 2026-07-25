@@ -244,7 +244,11 @@ def normalize_digest(value: object) -> Optional[str]:
 def _cdx_timestamp(timestamp) -> str:
     """Format a Wayback timestamp for compact progress output."""
 
-    return timestamp.astimezone(timezone.utc).strftime("%Y%m%d%H%M%S")
+    value = timestamp.astimezone(timezone.utc)
+    return (
+        f"{value.year:04d}{value.month:02d}{value.day:02d}"
+        f"{value.hour:02d}{value.minute:02d}{value.second:02d}"
+    )
 
 
 def _warn_skip(capture: CdxRecord, error: Exception) -> None:
@@ -363,7 +367,7 @@ def _record_canonical(record) -> CanonicalResponse:
 
 def _legacy_record_match(
     record,
-    captures: Sequence[CdxRecord],
+    captures_by_timestamp: Mapping[str, Sequence[CdxRecord]],
 ) -> Optional[CdxRecord]:
     """Match records written before persistent capture IDs were introduced."""
 
@@ -379,11 +383,7 @@ def _legacy_record_match(
     if timestamp is None:
         return None
 
-    candidates = [
-        capture
-        for capture in captures
-        if _cdx_timestamp(capture.timestamp) == timestamp
-    ]
+    candidates = list(captures_by_timestamp.get(timestamp, ()))
     if target_uri:
         exact = [
             capture
@@ -423,9 +423,13 @@ def _load_existing_captures(
         for urlkey, captures in groups.items()
         for capture in captures
     }
-    all_captures = [
-        capture for captures in groups.values() for capture in captures
-    ]
+    captures_by_timestamp: dict[str, list[CdxRecord]] = {}
+    for captures in groups.values():
+        for capture in captures:
+            captures_by_timestamp.setdefault(
+                _cdx_timestamp(capture.timestamp),
+                [],
+            ).append(capture)
     saw_warcinfo = False
     try:
         with path.open("rb") as stream:
@@ -441,7 +445,10 @@ def _load_existing_captures(
                     captures_by_id.get(capture_id) if capture_id else None
                 )
                 if selected is None:
-                    capture = _legacy_record_match(record, all_captures)
+                    capture = _legacy_record_match(
+                        record,
+                        captures_by_timestamp,
+                    )
                     if capture is None:
                         continue
                     selected = (capture.urlkey, capture)

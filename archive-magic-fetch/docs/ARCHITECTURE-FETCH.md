@@ -640,7 +640,10 @@ Every new response or revisit carries
 selected CDX record. On reruns this permits exact record-level matching without
 network access. WARCs produced before this header was introduced are matched
 conservatively by capture timestamp, target/source URI, and HTTP status.
-Ambiguous legacy records are not guessed: their captures are fetched again.
+Resume preflight indexes candidate captures by timestamp once per WARC bucket,
+so each legacy record narrows directly to its timestamp before URL and status
+matching rather than rescanning every candidate. Ambiguous legacy records are
+not guessed: their captures are fetched again.
 
 `export_all()` returns:
 
