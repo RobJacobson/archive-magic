@@ -273,18 +273,26 @@ def test_discover_rate_limit_without_retry_after_uses_sixty_seconds(
     )
 
 
-def test_discover_second_rate_limit_is_fatal(monkeypatch):
+def test_discover_retries_repeated_rate_limits(monkeypatch, capsys):
     sleeps = []
+    attempts = 0
 
     class Client:
         def search(self, *args, **kwargs):
-            raise RateLimitError(None, 3)
+            nonlocal attempts
+            attempts += 1
+            if attempts < 4:
+                raise RateLimitError(None, 3)
+            return iter([])
 
     monkeypatch.setattr(discovery.time, "sleep", sleeps.append)
 
-    with pytest.raises(RateLimitError):
-        discovery.discover(Client(), "example.com", "1995", "2020")
-    assert sleeps == [3]
+    assert discovery.discover(Client(), "example.com", "1995", "2020") == []
+    assert attempts == 4
+    assert sleeps == [3, 3, 3]
+    assert capsys.readouterr().out == (
+        "Rate limited during discovery; retrying in 3s...\n" * 3
+    )
 
 
 def test_discover_unexpected_response_format_is_fatal():

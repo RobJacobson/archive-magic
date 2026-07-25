@@ -183,8 +183,11 @@ Fetch adds one job-wide adaptive admission gate for memento playback:
    independently multiply sleeps.
 4. Each new failure wave halves the in-flight limit (minimum one). Every eight
    successful requests adds one slot until the configured ceiling is restored.
-5. A capture receives at most six gate-level attempts. An exhausted 429 is
-   fatal; an exhausted `WaybackRetryError` follows normal playback-failure
+5. HTTP 429 does not consume a capture attempt: one worker announces the
+   coordinated pause, every worker waits at the shared gate, and the same
+   capture remains pending until Internet Archive accepts it or the user
+   interrupts the job. Other transient failures receive at most six gate-level
+   attempts. An exhausted `WaybackRetryError` follows normal playback-failure
    skip policy. Three consecutive failures at the same structured
    `IncompleteRead` byte boundary stop early as a persistent truncated
    response; changing boundaries retain the full retry budget.
@@ -586,8 +589,10 @@ unavailable-resource metadata, or broken-resource responses.
 
 Approved Wayback playback/availability failures—including a content-encoding
 mismatch that persists under identity encoding—warn, count as playback
-failures, and allow later captures to continue. Unexpected formats, exhausted
-rate limits, local filesystem errors, and serialization failures are fatal.
+failures, and allow later captures to continue. Explicit rate limits pause and
+retry the same operation during both discovery and playback; they are never
+reported as skipped captures. Unexpected formats, local filesystem errors, and
+serialization failures are fatal.
 
 Fetch completion order is unrestricted across both dates and URLs, so
 `Fetched` lines intentionally appear in completion order. Within one command,
@@ -711,12 +716,13 @@ Ordinary output remains compact:
 ```text
 Job started: 2026-07-24T19:04:12Z
 Starting https://example.com/images/logo.png
+Rate limited by Internet Archive during playback; pausing all downloads for 60s before retrying...
 Fetched 20180709183022 https://example.com/images/logo.png
 Fetched 20170604120533 https://example.com/images/logo.png
 Wrote 20170604120533 [a19f7c2e]
 Wrote 20180709183022 [c46a801d]
-Skipped existing 20190102112233
 WARNING skipped 20190812143015 https://example.com/images/logo.png: invalid Wayback replay response: Content-Encoding declares gzip, but the body could not be decoded; retrying with Accept-Encoding: identity also failed
+Skipping https://example.com/styles/site.css (already captured)
 Summary: 235 selected for warc (all); 4 responses; 1 revisits; 221 already present; 9 redirects omitted; 2 playback failures (1 invalid content encoding, 1 truncated response)
 Files: 180 written (latest); 2 playback failures (1 invalid content encoding, 1 other); 0 redirects omitted
 Job ended: 2026-07-24T19:18:24Z
@@ -726,8 +732,11 @@ Job duration: 14.2 minutes
 `Fetched` means a new network response body has landed in the bounded result
 buffer. Cache hits and source-signature revisits do not print another
 `Fetched`. `Wrote` means the ordered writer has committed that capture to its
-WARC or loose-file destination. `Skipped existing` means the capture was
-recovered from a committed WARC record and did not enter the retrieval window.
+WARC or loose-file destination. When every eligible capture for a URL group
+was recovered from committed WARC records, one
+`Skipping ... (already captured)` line replaces the per-capture output and the
+group does not enter the retrieval window. Existing captures in a partially
+complete group are silent while its missing captures are processed normally.
 
 Every parsed CLI job prints UTC start and end times in second-precision
 ISO-8601 form. A monotonic clock supplies total elapsed time, reported in

@@ -505,9 +505,20 @@ def _export_group(
     representative_url = eligible[0].original
     variants = len({capture.original for capture in eligible})
     suffix = f" ({variants} URL variants)" if variants != 1 else ""
-    print_progress(f"Starting {representative_url}{suffix}")
 
     existing = existing or {}
+    if all(capture in existing for capture in eligible):
+        summary.already_present = len(eligible)
+        if cache is not None:
+            for capture in eligible:
+                cache.discard(capture)
+        print_progress(
+            f"Skipping {representative_url}{suffix} (already captured)"
+        )
+        return summary
+
+    print_progress(f"Starting {representative_url}{suffix}")
+
     owned_pool = None
     if (
         fetch_window is None
@@ -544,9 +555,6 @@ def _export_group(
                 summary.already_present += 1
                 if cache is not None:
                     cache.discard(capture)
-                print_progress(
-                    f"Skipped existing {_cdx_timestamp(capture.timestamp)}"
-                )
                 continue
 
             source_match = deduplication.find_source(expected, cdx_status)

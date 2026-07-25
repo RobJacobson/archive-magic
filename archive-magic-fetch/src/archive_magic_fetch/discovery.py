@@ -109,7 +109,7 @@ def discover(
     When ``progress`` is provided, it is called with the capture count after
     every ``_PROGRESS_INTERVAL`` records during a successful attempt. A
     rate-limited attempt discards partial rows before retrying, so progress
-    restarts from zero on the second attempt.
+    restarts from zero on the next attempt.
     """
 
     search_url, match_type = normalize_cdx_search(url_pattern)
@@ -130,13 +130,16 @@ def discover(
                 progress(count)
         return captures
 
-    try:
-        return attempt()
-    except RateLimitError as error:
-        delay = error.retry_after or 60
-        print(f"Rate limited during discovery; retrying in {delay}s...")
-        time.sleep(delay)
-        return attempt()
+    while True:
+        try:
+            return attempt()
+        except RateLimitError as error:
+            delay = error.retry_after or 60
+            print(
+                f"Rate limited during discovery; retrying in {delay}s...",
+                flush=True,
+            )
+            time.sleep(delay)
 
 
 def group_captures(

@@ -604,20 +604,20 @@ def test_unexpected_response_format_is_fatal(tmp_path):
         )
 
 
-def test_repeated_rate_limit_is_fatal_after_bounded_attempts(
+def test_repeated_rate_limit_eventually_writes_same_capture(
     tmp_path,
     monkeypatch,
+    capsys,
 ):
     selected = capture()
+    rate_limits = retrieval.MAX_THROTTLE_ATTEMPTS + 1
     client = FakeClient(
         {
             selected: [
                 RateLimitError(None, attempt)
-                for attempt in range(
-                    1,
-                    retrieval.MAX_THROTTLE_ATTEMPTS + 1,
-                )
+                for attempt in range(1, rate_limits + 1)
             ]
+            + [memento_for(selected)]
         }
     )
     delays = []
@@ -625,7 +625,8 @@ def test_repeated_rate_limit_is_fatal_after_bounded_attempts(
 
     def immediate(self, generation, *, retry_after=None):
         delays.append(retry_after)
-        return original(self, generation, retry_after=0)
+        coordinated = original(self, generation, retry_after=0)
+        return None if coordinated is None else retry_after
 
     monkeypatch.setattr(
         retrieval.RateLimitGate,
@@ -633,16 +634,24 @@ def test_repeated_rate_limit_is_fatal_after_bounded_attempts(
         immediate,
     )
 
-    with pytest.raises(RateLimitError):
-        export.export_group(
-            URLKEY,
-            [selected],
-            output_path(tmp_path),
-            client,
-        )
-    assert delays == list(
-        range(1, retrieval.MAX_THROTTLE_ATTEMPTS + 1)
+    target = output_path(tmp_path)
+    summary = export.export_group(
+        URLKEY,
+        [selected],
+        target,
+        client,
     )
+
+    assert delays == list(range(1, rate_limits + 1))
+    assert summary.responses == 1
+    assert summary.playback_failures == 0
+    assert [record.rec_type for record in read_records(target)] == [
+        "warcinfo",
+        "response",
+    ]
+    output = capsys.readouterr()
+    assert output.out.count("Rate limited by Internet Archive") == rate_limits
+    assert "WARNING skipped" not in output.err
 
 
 def test_all_skipped_group_creates_no_file(tmp_path):
@@ -1094,6 +1103,7 @@ def test_open_new_warc_exclusively_rejects_existing_target(tmp_path):
 
 def test_rerun_skips_committed_capture_and_appends_only_missing_capture(
     tmp_path,
+    capsys,
 ):
     first = capture(captured="20170101000000", payload=b"first")
     second = capture(
@@ -1111,6 +1121,7 @@ def test_rerun_skips_committed_capture_and_appends_only_missing_capture(
     )
     assert initial.responses == 1
     initial_size = target.stat().st_size
+    capsys.readouterr()
 
     client = FakeClient(
         {second: memento_for(second, payload=b"second")}
@@ -1134,31 +1145,51 @@ def test_rerun_skips_committed_capture_and_appends_only_missing_capture(
         "response",
         "response",
     ]
+    output = capsys.readouterr().out
+    assert f"Starting {first.original}" in output
+    assert "Skipped existing" not in output
 
 
-def test_rerun_with_every_capture_present_does_not_modify_warc(tmp_path):
-    selected = capture()
+def test_rerun_with_every_capture_present_does_not_modify_warc(
+    tmp_path,
+    capsys,
+):
+    first = capture()
+    second = capture(
+        original="http://example.com/resource",
+        captured="20180101000000",
+        payload=b"second",
+    )
     target = output_path(tmp_path)
     export.export_group(
         URLKEY,
-        [selected],
+        [first, second],
         target,
-        FakeClient({selected: memento_for(selected)}),
+        FakeClient(
+            {
+                first: memento_for(first),
+                second: memento_for(second, payload=b"second"),
+            }
+        ),
     )
     original_bytes = target.read_bytes()
+    capsys.readouterr()
 
     summary = export.export_group(
         URLKEY,
-        [selected],
+        [first, second],
         target,
         FakeClient({}),
     )
 
     assert summary == export.ExportSummary(
-        selected=1,
-        already_present=1,
+        selected=2,
+        already_present=2,
     )
     assert target.read_bytes() == original_bytes
+    assert capsys.readouterr().out == (
+        f"Skipping {first.original} (2 URL variants) (already captured)\n"
+    )
 
 
 def test_resume_recognizes_legacy_record_without_capture_id(tmp_path):

@@ -357,13 +357,13 @@ class RateLimitGate:
         start_generation: int,
         *,
         retry_after: Optional[float] = None,
-    ) -> float:
-        """Release a slot and coordinate adaptive backoff for one failure wave."""
+    ) -> Optional[float]:
+        """Coordinate one backoff and return its delay to the wave leader."""
 
         with self._condition:
             self._release()
             if self._generation != start_generation:
-                return max(0.0, self._not_before - time.monotonic())
+                return None
 
             self._generation += 1
             self._failure_streak += 1
@@ -719,12 +719,20 @@ def _retrieve_memento_with_retry(
             except RateLimitError as error:
                 previous_truncation = None
                 repeated_truncations = 0
-                gate.after_throttle(
+                delay = gate.after_throttle(
                     generation,
                     retry_after=error.retry_after or 60,
                 )
-                if attempt_number == MAX_THROTTLE_ATTEMPTS:
-                    raise
+                # A rate limit is a job-level scheduling signal, not a failed
+                # capture attempt. Keep the same capture pending until IA
+                # accepts it or the user interrupts the job.
+                attempt_number -= 1
+                if delay is not None:
+                    print_progress(
+                        "Rate limited by Internet Archive during playback; "
+                        f"pausing all downloads for {delay:g}s before "
+                        "retrying..."
+                    )
             except (WaybackRetryError, RequestException) as error:
                 truncation = _incomplete_read_boundary(error)
                 if truncation is not None:

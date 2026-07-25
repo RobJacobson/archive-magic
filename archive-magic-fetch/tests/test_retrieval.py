@@ -249,7 +249,8 @@ def _make_backoff_immediate(monkeypatch):
 
     def immediate(self, generation, *, retry_after=None):
         delays.append(retry_after)
-        return original(self, generation, retry_after=0)
+        coordinated = original(self, generation, retry_after=0)
+        return None if coordinated is None else retry_after
 
     monkeypatch.setattr(
         retrieval.RateLimitGate,
@@ -259,7 +260,10 @@ def _make_backoff_immediate(monkeypatch):
     return delays
 
 
-def test_rate_limit_coordinates_backoff_and_retries_same_capture(monkeypatch):
+def test_rate_limit_coordinates_backoff_and_retries_same_capture(
+    monkeypatch,
+    capsys,
+):
     delays = _make_backoff_immediate(monkeypatch)
     capture = object()
     memento = FakeMemento()
@@ -269,6 +273,10 @@ def test_rate_limit_coordinates_backoff_and_retries_same_capture(monkeypatch):
 
     assert delays == [11]
     assert [call[0] for call in client.calls] == [capture, capture]
+    assert capsys.readouterr().out == (
+        "Rate limited by Internet Archive during playback; "
+        "pausing all downloads for 11s before retrying...\n"
+    )
 
 
 def test_missing_retry_after_uses_sixty_second_backoff(monkeypatch):
@@ -280,20 +288,21 @@ def test_missing_retry_after_uses_sixty_second_backoff(monkeypatch):
     assert delays == [60]
 
 
-def test_rate_limit_is_fatal_after_bounded_attempts(monkeypatch):
+def test_rate_limit_does_not_consume_bounded_attempts(monkeypatch):
     delays = _make_backoff_immediate(monkeypatch)
+    rate_limits = retrieval.MAX_THROTTLE_ATTEMPTS + 2
     client = FakeClient(
         [
             RateLimitError(None, attempt)
-            for attempt in range(1, retrieval.MAX_THROTTLE_ATTEMPTS + 1)
+            for attempt in range(1, rate_limits + 1)
         ]
+        + [FakeMemento()]
     )
 
-    with pytest.raises(RateLimitError):
-        retrieval.retrieve_response(client, object())
-    assert delays == list(
-        range(1, retrieval.MAX_THROTTLE_ATTEMPTS + 1)
-    )
+    retrieval.retrieve_response(client, object())
+
+    assert delays == list(range(1, rate_limits + 1))
+    assert len(client.calls) == rate_limits + 1
 
 
 def test_rate_limit_gate_reacts_once_per_concurrent_failure_wave():
@@ -301,8 +310,8 @@ def test_rate_limit_gate_reacts_once_per_concurrent_failure_wave():
     first = gate.acquire()
     second = gate.acquire()
 
-    gate.after_throttle(first, retry_after=0)
-    gate.after_throttle(second, retry_after=9)
+    assert gate.after_throttle(first, retry_after=0) == 0
+    assert gate.after_throttle(second, retry_after=9) is None
 
     assert gate.generation == 1
     assert gate.concurrency_limit == 1
