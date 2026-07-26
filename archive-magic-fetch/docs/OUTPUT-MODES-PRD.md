@@ -105,9 +105,11 @@ Collection root remains `archives/<collection>/`.
 
 ### 6.1 Provenance (`sources/`)
 
-Unchanged: always publish a new `sources/wayback/<acquisition>/` after
+Always publish a new `sources/<acquisition>/` after
 successful non-empty discovery when the command will produce at least one
-output mode. If both modes are `none`, skip discovery/provenance.
+output mode. The directory includes the source snapshot, query manifest, and
+complete console transcript in `log.txt`. If both modes are `none`, skip
+discovery/provenance.
 
 Discovery still stores the **full** CDX result for the query window, not the
 post-`latest` subset. Selection is an export transform.

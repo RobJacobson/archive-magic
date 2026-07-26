@@ -4,7 +4,7 @@ import pytest
 from wayback import CdxRecord
 from wayback.exceptions import RateLimitError, UnexpectedResponseFormat
 
-from archive_magic_fetch import cli, discovery
+from archive_magic_fetch import cli, discovery, retry
 from archive_magic_fetch.retrieval import DEFAULT_CONCURRENCY
 
 
@@ -231,7 +231,7 @@ def test_discover_discards_partial_attempt_and_rematerializes_after_rate_limit(
 
             return results()
 
-    monkeypatch.setattr(discovery.time, "sleep", sleeps.append)
+    monkeypatch.setattr(discovery, "sleep_seconds", sleeps.append)
 
     assert discovery.discover(
         Client(),
@@ -246,13 +246,12 @@ def test_discover_discards_partial_attempt_and_rematerializes_after_rate_limit(
     assert attempts == 2
     assert sleeps == [7]
     assert reported == []
-    assert (
-        capsys.readouterr().out
-        == "Rate limited during discovery; retrying in 7s...\n"
-    )
+    output = capsys.readouterr().out
+    assert "https://web.archive.org/cdx/search/cdx?" in output
+    assert "retry 1/12 in 7s" in output
 
 
-def test_discover_rate_limit_without_retry_after_uses_sixty_seconds(
+def test_discover_rate_limit_without_retry_after_uses_exponential_delay(
     monkeypatch,
     capsys,
 ):
@@ -267,14 +266,11 @@ def test_discover_rate_limit_without_retry_after_uses_sixty_seconds(
                 raise RateLimitError(None, None)
             return iter([])
 
-    monkeypatch.setattr(discovery.time, "sleep", sleeps.append)
+    monkeypatch.setattr(discovery, "sleep_seconds", sleeps.append)
 
     assert discovery.discover(Client(), "example.com", "1995", "2020") == []
-    assert sleeps == [60]
-    assert (
-        capsys.readouterr().out
-        == "Rate limited during discovery; retrying in 60s...\n"
-    )
+    assert sleeps == [2]
+    assert "retry 1/12 in 2s" in capsys.readouterr().out
 
 
 def test_discover_retries_repeated_rate_limits(monkeypatch, capsys):
@@ -289,14 +285,12 @@ def test_discover_retries_repeated_rate_limits(monkeypatch, capsys):
                 raise RateLimitError(None, 3)
             return iter([])
 
-    monkeypatch.setattr(discovery.time, "sleep", sleeps.append)
+    monkeypatch.setattr(discovery, "sleep_seconds", sleeps.append)
 
     assert discovery.discover(Client(), "example.com", "1995", "2020") == []
     assert attempts == 4
-    assert sleeps == [3, 3, 3]
-    assert capsys.readouterr().out == (
-        "Rate limited during discovery; retrying in 3s...\n" * 3
-    )
+    assert sleeps == [3, 4, 8]
+    assert capsys.readouterr().out.count(" : retry ") == 3
 
 
 def test_discover_unexpected_response_format_is_fatal():
@@ -380,18 +374,14 @@ class FakeClient:
 def install_fake_lifecycle(monkeypatch):
     created = {}
 
-    def make_session(*, user_agent):
+    def make_client_factory(user_agent):
         session = FakeSession(user_agent)
         created["session"] = session
-        return session
-
-    def make_client(*, session):
         client = FakeClient(session)
         created["client"] = client
-        return client
+        return lambda: client
 
-    monkeypatch.setattr(cli, "WaybackSession", make_session)
-    monkeypatch.setattr(cli, "WaybackClient", make_client)
+    monkeypatch.setattr(cli, "make_client_factory", make_client_factory)
     return created
 
 
@@ -403,8 +393,23 @@ def test_cli_owns_one_client_context_and_passes_same_client(monkeypatch):
     buckets = (object(),)
     calls = {}
 
-    def fake_discover(client, pattern, start, end, *, progress=None):
-        calls["discover"] = (client, pattern, start, end, progress)
+    def fake_discover(
+        client,
+        pattern,
+        start,
+        end,
+        *,
+        progress=None,
+        retries=None,
+    ):
+        calls["discover"] = (
+            client,
+            pattern,
+            start,
+            end,
+            progress,
+            retries,
+        )
         return [capture]
 
     def fake_export(
@@ -425,6 +430,7 @@ def test_cli_owns_one_client_context_and_passes_same_client(monkeypatch):
             {
                 "summary": type("Summary", (), {"selected": 1})(),
                 "created_warcs": (),
+                "failed_capture_urls": (),
                 "files_summary": type(
                     "FilesSummary",
                     (),
@@ -489,9 +495,9 @@ def test_cli_owns_one_client_context_and_passes_same_client(monkeypatch):
     assert calls["export"][0] == groups
     assert calls["export"][1] == buckets
     assert calls["export"][2] == client
-    assert calls["export"][3]["cooldown"] is not None
     assert calls["export"][3]["client_factory"] is not None
     assert calls["export"][3]["concurrency"] == DEFAULT_CONCURRENCY
+    assert calls["export"][3]["retries"] == retry.DEFAULT_RETRIES
     assert calls["export"][3]["files_mode"] == "none"
     assert calls["replay"] == ((), layout)
     assert calls["summary"][0].selected == 1
@@ -533,6 +539,7 @@ def test_cli_prints_stage_messages(monkeypatch, capsys):
             {
                 "summary": type("Summary", (), {"selected": 1})(),
                 "created_warcs": (),
+                "failed_capture_urls": (),
                 "files_summary": type(
                     "FilesSummary",
                     (),
@@ -559,12 +566,83 @@ def test_cli_prints_stage_messages(monkeypatch, capsys):
     )
 
 
+def test_cli_finishes_outputs_then_lists_failures_and_returns_one(
+    monkeypatch,
+    capsys,
+):
+    install_fake_lifecycle(monkeypatch)
+    capture = record()
+    groups = {capture.urlkey: [capture]}
+    layout = object()
+    bucket = object()
+    failed_url = capture.view_url
+    finalized = []
+
+    monkeypatch.setattr(cli, "collection_layout", lambda *args, **kwargs: layout)
+    monkeypatch.setattr(cli, "discover", lambda *args, **kwargs: [capture])
+    monkeypatch.setattr(cli, "save_acquisition", lambda *args, **kwargs: None)
+    monkeypatch.setattr(cli, "group_captures", lambda captures: groups)
+    monkeypatch.setattr(
+        cli,
+        "preflight_layout",
+        lambda *args: type(
+            "Plan",
+            (),
+            {"layout": layout, "buckets": (bucket,)},
+        )(),
+    )
+    monkeypatch.setattr(
+        cli,
+        "export_all",
+        lambda *args, **kwargs: type(
+            "Result",
+            (),
+            {
+                "summary": type("Summary", (), {})(),
+                "created_warcs": (),
+                "failed_capture_urls": (failed_url,),
+                "files_summary": type(
+                    "FilesSummary",
+                    (),
+                    {"written": 0},
+                )(),
+            },
+        )(),
+    )
+    monkeypatch.setattr(
+        cli,
+        "generate_replay_index",
+        lambda *args, **kwargs: finalized.append("index"),
+    )
+    monkeypatch.setattr(cli, "print_summary", lambda *args, **kwargs: None)
+
+    assert cli.main(["example.com/*"]) == 1
+    assert finalized == ["index"]
+    output = capsys.readouterr().out
+    assert f"Failed captures:\n{failed_url}\n" in output
+
+
 def test_cli_passes_explicit_dates(monkeypatch):
     created = install_fake_lifecycle(monkeypatch)
     calls = {}
 
-    def fake_discover(client, pattern, start, end, *, progress=None):
-        calls["discover"] = (client, pattern, start, end, progress)
+    def fake_discover(
+        client,
+        pattern,
+        start,
+        end,
+        *,
+        progress=None,
+        retries=None,
+    ):
+        calls["discover"] = (
+            client,
+            pattern,
+            start,
+            end,
+            progress,
+            retries,
+        )
         return []
 
     monkeypatch.setattr(cli, "discover", fake_discover)
@@ -585,7 +663,15 @@ def test_cli_empty_result_is_success(monkeypatch, capsys):
     install_fake_lifecycle(monkeypatch)
     install_job_clock(monkeypatch)
 
-    def fake_discover(client, pattern, start, end, *, progress=None):
+    def fake_discover(
+        client,
+        pattern,
+        start,
+        end,
+        *,
+        progress=None,
+        retries=None,
+    ):
         return []
 
     monkeypatch.setattr(cli, "discover", fake_discover)
@@ -648,6 +734,7 @@ def test_cli_does_not_print_summary_when_replay_indexing_fails(
             {
                 "summary": type("Summary", (), {})(),
                 "created_warcs": (object(),),
+                "failed_capture_urls": (),
                 "files_summary": type(
                     "FilesSummary",
                     (),
@@ -689,6 +776,7 @@ def test_cli_retains_published_provenance_after_downstream_failure(
             {
                 "summary": type("Summary", (), {})(),
                 "created_warcs": (),
+                "failed_capture_urls": (),
                 "files_summary": type(
                     "FilesSummary",
                     (),
@@ -705,11 +793,16 @@ def test_cli_retains_published_provenance_after_downstream_failure(
 
     assert cli.main(["https://example.com/*"]) == 1
     acquisitions = list(
-        (tmp_path / "archives" / "example.com" / "sources" / "wayback").iterdir()
+        (tmp_path / "archives" / "example.com" / "sources").iterdir()
     )
     assert len(acquisitions) == 1
     assert (acquisitions[0] / "captures.cdx.gz").exists()
     assert (acquisitions[0] / "query.json").exists()
+    log = (acquisitions[0] / "log.txt").read_text()
+    assert "Job started:" in log
+    assert "Saving source acquisition..." in log
+    assert "ERROR: downstream failed" in log
+    assert "Job ended:" in log
 
 
 def test_cli_defaults_parse_to_warc_all_and_files_none():
@@ -718,6 +811,7 @@ def test_cli_defaults_parse_to_warc_all_and_files_none():
     assert args.files == "none"
     assert args.rewrite_local is False
     assert args.concurrency == DEFAULT_CONCURRENCY
+    assert args.retries == retry.DEFAULT_RETRIES
 
 
 def test_cli_accepts_unique_only_for_files():
@@ -731,6 +825,27 @@ def test_cli_accepts_unique_only_for_files():
 def test_cli_concurrency_one_is_serial_diagnostic_mode():
     args = cli.parse_args(["example.com/*", "--concurrency", "1"])
     assert args.concurrency == 1
+
+
+def test_cli_accepts_zero_and_arbitrary_retry_counts():
+    assert cli.parse_args(
+        ["example.com/*", "--retries", "0"]
+    ).retries == 0
+    assert cli.parse_args(
+        ["example.com/*", "--retries", "100"]
+    ).retries == 100
+
+
+def test_cli_rejects_negative_retries(capsys):
+    assert cli.main(["example.com/*", "--retries", "-1"]) == 2
+    assert "--retries cannot be negative" in capsys.readouterr().err
+
+
+def test_cli_rejects_non_integer_retries():
+    with pytest.raises(SystemExit) as raised:
+        cli.parse_args(["example.com/*", "--retries", "1.5"])
+
+    assert raised.value.code == 2
 
 
 def test_cli_rejects_concurrency_below_one(capsys):
@@ -762,8 +877,7 @@ def test_cli_both_none_is_successful_noop(monkeypatch, capsys):
     def fail(*args, **kwargs):
         raise AssertionError("network client should not be created")
 
-    monkeypatch.setattr(cli, "WaybackSession", fail)
-    monkeypatch.setattr(cli, "WaybackClient", fail)
+    monkeypatch.setattr(cli, "make_client_factory", fail)
     monkeypatch.setattr(cli, "collection_layout", fail)
 
     assert cli.main(["example.com/*", "--warc", "none", "--files", "none"]) == 0

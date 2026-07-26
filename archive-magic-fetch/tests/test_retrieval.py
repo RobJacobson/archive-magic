@@ -1,10 +1,16 @@
 import base64
 import hashlib
-import time
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
 import pytest
-from requests.exceptions import ChunkedEncodingError, ContentDecodingError
+from requests.exceptions import (
+    ChunkedEncodingError,
+    ConnectionError,
+    ContentDecodingError,
+    ReadTimeout,
+)
 from urllib3.exceptions import IncompleteRead, ProtocolError
 from wayback import Mode
 from wayback.exceptions import (
@@ -14,7 +20,7 @@ from wayback.exceptions import (
     WaybackRetryError,
 )
 
-from archive_magic_fetch import retrieval
+from archive_magic_fetch import retrieval, retry
 
 
 def payload_digest(payload):
@@ -243,85 +249,80 @@ def test_memento_closes_before_warc_construction_fails(monkeypatch):
 
 
 def _make_retries_immediate(monkeypatch):
-    rate_limit_delays = []
-    transient_failures = []
-
-    def pause(_self, seconds):
-        rate_limit_delays.append(seconds)
-        return True
-
-    def backoff(failure_number):
-        transient_failures.append(failure_number)
-        return 0
-
-    monkeypatch.setattr(retrieval.RateLimitCooldown, "wait", lambda _self: None)
-    monkeypatch.setattr(retrieval.RateLimitCooldown, "pause", pause)
-    monkeypatch.setattr(retrieval, "_transient_backoff_seconds", backoff)
-    return rate_limit_delays, transient_failures
+    delays = []
+    monkeypatch.setattr(retrieval, "sleep_seconds", delays.append)
+    return delays
 
 
 def test_rate_limit_coordinates_backoff_and_retries_same_capture(
     monkeypatch,
     capsys,
 ):
-    rate_limit_delays, transient_failures = _make_retries_immediate(monkeypatch)
+    delays = _make_retries_immediate(monkeypatch)
     capture = object()
     memento = FakeMemento()
     client = FakeClient([RateLimitError(None, 11), memento])
 
     retrieval.retrieve_response(client, capture)
 
-    assert rate_limit_delays == [11]
-    assert transient_failures == []
+    assert delays == [11]
     assert [call[0] for call in client.calls] == [capture, capture]
-    assert capsys.readouterr().out == (
-        "Rate limited by Internet Archive during playback; "
-        "pausing all downloads for 11s before retrying...\n"
-    )
+    output = capsys.readouterr().out
+    assert "retry 1/12 in 11s" in output
+    assert str(capture) in output
 
 
-def test_missing_retry_after_uses_sixty_second_backoff(monkeypatch):
-    rate_limit_delays, _ = _make_retries_immediate(monkeypatch)
+def test_missing_retry_after_uses_exponential_backoff(monkeypatch):
+    delays = _make_retries_immediate(monkeypatch)
     client = FakeClient([RateLimitError(None, None), FakeMemento()])
 
     retrieval.retrieve_response(client, object())
 
-    assert rate_limit_delays == [60]
+    assert delays == [2]
 
 
 def test_repeated_rate_limit_exhausts_bounded_attempts(monkeypatch):
-    rate_limit_delays, _ = _make_retries_immediate(monkeypatch)
+    delays = _make_retries_immediate(monkeypatch)
     client = FakeClient(
         [
             RateLimitError(None, attempt)
-            for attempt in range(1, retrieval.MAX_RETRIEVAL_ATTEMPTS + 1)
+            for attempt in range(1, 4)
         ]
     )
 
-    with pytest.raises(WaybackRetryError):
-        retrieval.retrieve_response(client, object())
+    with pytest.raises(retry.RetryExhaustedError) as raised:
+        retrieval.retrieve_response(client, object(), retries=2)
 
-    assert rate_limit_delays == list(
-        range(1, retrieval.MAX_RETRIEVAL_ATTEMPTS)
+    assert delays == [2, 4]
+    assert len(client.calls) == 3
+    assert raised.value.attempts == 3
+
+
+def test_zero_retries_makes_one_attempt_without_sleep(monkeypatch):
+    delays = _make_retries_immediate(monkeypatch)
+    client = FakeClient([_connection_refused_retry_error()])
+
+    with pytest.raises(retry.RetryExhaustedError) as raised:
+        retrieval.retrieve_response(client, object(), retries=0)
+
+    assert len(client.calls) == 1
+    assert delays == []
+    assert raised.value.attempts == 1
+
+
+def test_retryable_service_status_uses_application_backoff(monkeypatch):
+    delays = _make_retries_immediate(monkeypatch)
+    error = retry.RetryableWaybackResponseError(
+        status_code=503,
+        url="https://web.archive.org/test",
+        retry_after=9,
     )
-    assert len(client.calls) == retrieval.MAX_RETRIEVAL_ATTEMPTS
+    client = FakeClient([error, FakeMemento()])
 
+    retrieval.retrieve_response(client, object(), retries=1)
 
-def test_rate_limit_cooldown_blocks_until_pause_expires():
-    cooldown = retrieval.RateLimitCooldown()
-    assert cooldown.pause(0.05) is True
-    started = time.monotonic()
-
-    cooldown.wait()
-
-    assert time.monotonic() - started >= 0.04
-
-
-def test_rate_limit_cooldown_reports_only_the_start_of_a_shared_pause():
-    cooldown = retrieval.RateLimitCooldown()
-
-    assert cooldown.pause(0.05) is True
-    assert cooldown.pause(0.06) is False
+    assert len(client.calls) == 2
+    assert delays == [9]
 
 
 def _connection_refused_retry_error():
@@ -352,36 +353,68 @@ def _truncated_retry_error(received=130810, remaining=144219):
 
 
 def test_connection_failure_backs_off_and_retries(monkeypatch):
-    _, transient_failures = _make_retries_immediate(monkeypatch)
+    delays = _make_retries_immediate(monkeypatch)
     capture = object()
     memento = FakeMemento()
     client = FakeClient([_connection_refused_retry_error(), memento])
 
     retrieval.retrieve_response(client, capture)
 
-    assert transient_failures == [1]
+    assert delays == [2]
     assert [call[0] for call in client.calls] == [capture, capture]
 
 
+def test_one_workers_backoff_does_not_pause_another(monkeypatch):
+    sleeping = threading.Event()
+    release = threading.Event()
+
+    def blocking_sleep(_seconds):
+        sleeping.set()
+        release.wait(timeout=2)
+
+    monkeypatch.setattr(retrieval, "sleep_seconds", blocking_sleep)
+    failing = FakeClient(
+        [_connection_refused_retry_error(), FakeMemento()]
+    )
+    healthy = FakeClient([FakeMemento(content=b"healthy")])
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        recovering = executor.submit(
+            retrieval.retrieve_memento,
+            failing,
+            object(),
+            retries=1,
+        )
+        assert sleeping.wait(timeout=1)
+        unaffected = executor.submit(
+            retrieval.retrieve_memento,
+            healthy,
+            object(),
+            retries=1,
+        )
+        assert unaffected.result(timeout=1).body == b"healthy"
+        assert not recovering.done()
+        release.set()
+        assert recovering.result(timeout=1).body == b"semantic payload"
+
+
 def test_sustained_connection_failure_exhausts_bounded_attempts(monkeypatch):
-    _, transient_failures = _make_retries_immediate(monkeypatch)
+    delays = _make_retries_immediate(monkeypatch)
     client = FakeClient(
         [
             _connection_refused_retry_error()
-            for _ in range(retrieval.MAX_RETRIEVAL_ATTEMPTS)
+            for _ in range(3)
         ]
     )
 
-    with pytest.raises(WaybackRetryError):
-        retrieval.retrieve_response(client, object())
-    assert transient_failures == list(
-        range(1, retrieval.MAX_RETRIEVAL_ATTEMPTS)
-    )
+    with pytest.raises(retry.RetryExhaustedError):
+        retrieval.retrieve_response(client, object(), retries=2)
+    assert delays == [2, 4]
 
 
 def test_timeout_wayback_retry_uses_bounded_retry(monkeypatch):
     _make_retries_immediate(monkeypatch)
-    error = WaybackRetryError(2, 1.0, TimeoutError("read timed out"))
+    error = WaybackRetryError(0, 1.0, ReadTimeout("read timed out"))
     client = FakeClient([error, FakeMemento()])
 
     retrieval.retrieve_response(client, object())
@@ -390,7 +423,7 @@ def test_timeout_wayback_retry_uses_bounded_retry(monkeypatch):
 
 
 def test_repeated_identical_incomplete_read_stops_early(monkeypatch):
-    _, transient_failures = _make_retries_immediate(monkeypatch)
+    delays = _make_retries_immediate(monkeypatch)
     client = FakeClient(
         [
             _truncated_retry_error()
@@ -406,7 +439,7 @@ def test_repeated_identical_incomplete_read_stops_early(monkeypatch):
 
     error = raised.value
     assert len(client.calls) == retrieval.REPEATED_TRUNCATION_ATTEMPTS
-    assert transient_failures == [1, 2]
+    assert delays == [2, 4]
     assert error.received_bytes == 130810
     assert error.expected_bytes == 275029
     assert error.attempts == retrieval.REPEATED_TRUNCATION_ATTEMPTS
@@ -418,7 +451,7 @@ def test_repeated_identical_incomplete_read_stops_early(monkeypatch):
 
 
 def test_changing_incomplete_read_boundaries_keep_retrying(monkeypatch):
-    _, transient_failures = _make_retries_immediate(monkeypatch)
+    delays = _make_retries_immediate(monkeypatch)
     client = FakeClient(
         [
             _truncated_retry_error(received=100, remaining=200),
@@ -431,7 +464,7 @@ def test_changing_incomplete_read_boundaries_keep_retrying(monkeypatch):
 
     assert response.content_stream().read() == b"recovered"
     assert len(client.calls) == 3
-    assert transient_failures == [1, 2]
+    assert delays == [2, 4]
 
 
 def test_content_decoding_error_retries_once_with_identity_without_throttle():
@@ -461,12 +494,9 @@ def test_content_decoding_error_retries_once_with_identity_without_throttle():
         return original_get(selected, **kwargs)
 
     client.get_memento = get_memento
-    cooldown = retrieval.RateLimitCooldown()
-
     response = retrieval.retrieve_response(
         client,
         capture,
-        cooldown=cooldown,
     )
 
     assert response.content_stream().read() == b"recovered"
@@ -492,13 +522,11 @@ def test_identity_decoding_failure_skips_immediately_and_restores_header():
             "reset": lambda self: None,
         },
     )()
-    cooldown = retrieval.RateLimitCooldown()
-
     with pytest.raises(
         retrieval.MalformedContentEncodingError,
         match="invalid Wayback replay response",
     ) as raised:
-        retrieval.retrieve_response(client, object(), cooldown=cooldown)
+        retrieval.retrieve_response(client, object())
 
     assert len(client.calls) == 2
     assert client.session.headers["Accept-Encoding"] == "gzip, deflate"
@@ -509,7 +537,7 @@ def test_identity_decoding_failure_skips_immediately_and_restores_header():
     assert "Content-Encoding declares gzip" in str(raised.value)
 
 
-def test_make_client_factory_uses_reduced_worker_retries(monkeypatch):
+def test_make_client_factory_uses_application_owned_session(monkeypatch):
     captured = {}
 
     class FakeSession:
@@ -520,12 +548,15 @@ def test_make_client_factory_uses_reduced_worker_retries(monkeypatch):
         def __init__(self, session=None):
             self.session = session
 
-    monkeypatch.setattr(retrieval, "WaybackSession", FakeSession)
+    monkeypatch.setattr(
+        retrieval,
+        "ArchiveMagicWaybackSession",
+        FakeSession,
+    )
     monkeypatch.setattr(retrieval, "WaybackClient", FakeWaybackClient)
 
     client = retrieval.make_client_factory("test-agent")()
     assert captured["user_agent"] == "test-agent"
-    assert captured["retries"] == retrieval.WORKER_SESSION_RETRIES
     assert client.session is not None
 
 

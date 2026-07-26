@@ -138,6 +138,7 @@ def test_acquisition_identifier_collision_uses_numeric_suffix(tmp_path):
     first = save(tmp_path, [record()])
     second = save(tmp_path, [record()])
 
+    assert first.path.parent == collection(tmp_path).sources_root
     assert first.path.name == "20260723T184501.123456Z"
     assert second.path.name == "20260723T184501.123456Z-2"
     assert first.captures_path.read_bytes() == second.captures_path.read_bytes()
@@ -206,7 +207,7 @@ def test_failed_publication_cleans_temporary_directory(
     with pytest.raises(OSError, match="publication failed"):
         save(tmp_path, [record()])
 
-    source_root = collection(tmp_path).wayback_sources_root
+    source_root = collection(tmp_path).sources_root
     assert list(source_root.iterdir()) == []
 
 

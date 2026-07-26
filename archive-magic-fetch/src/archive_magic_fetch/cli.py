@@ -9,8 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Sequence
 
-from wayback import WaybackClient, WaybackSession
-
+from .console import ConsoleMirror, mirror_console_output
 from .discovery import (
     FILES_MODES,
     WARC_MODES,
@@ -30,9 +29,9 @@ from .provenance import save_acquisition
 from .replay import generate_replay_index
 from .retrieval import (
     DEFAULT_CONCURRENCY,
-    RateLimitCooldown,
     make_client_factory,
 )
+from .retry import DEFAULT_RETRIES
 from .rewrite_local import rewrite_local_website
 
 
@@ -97,6 +96,16 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
             f"{DEFAULT_CONCURRENCY}; use 1 for serial diagnostics)"
         ),
     )
+    parser.add_argument(
+        "--retries",
+        type=int,
+        default=DEFAULT_RETRIES,
+        metavar="N",
+        help=(
+            "Retries after an initial IA request (default: "
+            f"{DEFAULT_RETRIES}; use 0 to disable retries)"
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -112,17 +121,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
     started_at = _utc_now()
     started_tick = _monotonic()
-    print(f"Job started: {_format_job_time(started_at)}", flush=True)
-    try:
-        return _run(args)
-    finally:
-        ended_at = _utc_now()
-        duration_minutes = (_monotonic() - started_tick) / 60
-        print(f"Job ended: {_format_job_time(ended_at)}", flush=True)
-        print(
-            f"Job duration: {duration_minutes:.1f} minutes",
-            flush=True,
-        )
+    with mirror_console_output() as console_log:
+        print(f"Job started: {_format_job_time(started_at)}", flush=True)
+        try:
+            return _run(args, console_log=console_log)
+        finally:
+            ended_at = _utc_now()
+            duration_minutes = (_monotonic() - started_tick) / 60
+            print(f"Job ended: {_format_job_time(ended_at)}", flush=True)
+            print(
+                f"Job duration: {duration_minutes:.1f} minutes",
+                flush=True,
+            )
 
 
 def _format_job_time(value: datetime) -> str:
@@ -135,7 +145,11 @@ def _format_job_time(value: datetime) -> str:
     )
 
 
-def _run(args: argparse.Namespace) -> int:
+def _run(
+    args: argparse.Namespace,
+    *,
+    console_log: Optional[ConsoleMirror] = None,
+) -> int:
     """Discover captures and export them for already-parsed arguments."""
 
     date_start = args.start or "1995"
@@ -144,9 +158,13 @@ def _run(args: argparse.Namespace) -> int:
     files_mode = args.files
     rewrite_local = args.rewrite_local
     concurrency = args.concurrency
+    retries = args.retries
 
     if concurrency < 1:
         print("ERROR: --concurrency must be at least 1", file=sys.stderr)
+        return 2
+    if retries < 0:
+        print("ERROR: --retries cannot be negative", file=sys.stderr)
         return 2
 
     if rewrite_local and files_mode == "none":
@@ -163,8 +181,7 @@ def _run(args: argparse.Namespace) -> int:
     try:
         layout = collection_layout(args.url_pattern, root=_DEFAULT_OUTPUT_ROOT)
         client_factory = make_client_factory(USER_AGENT)
-        session = WaybackSession(user_agent=USER_AGENT)
-        with WaybackClient(session=session) as client:
+        with client_factory() as client:
             print(
                 f"Discovering captures for {args.url_pattern} "
                 f"({date_start}-{date_end})"
@@ -175,6 +192,7 @@ def _run(args: argparse.Namespace) -> int:
                 date_start,
                 date_end,
                 progress=_report_discovery_progress,
+                retries=retries,
             )
             if not captures:
                 print("No captures found")
@@ -182,7 +200,7 @@ def _run(args: argparse.Namespace) -> int:
 
             print(f"Discovered {len(captures)} captures")
             print("Saving source acquisition...")
-            save_acquisition(
+            acquisition = save_acquisition(
                 captures,
                 layout=layout,
                 url_pattern=args.url_pattern,
@@ -190,6 +208,9 @@ def _run(args: argparse.Namespace) -> int:
                 date_end=date_end,
                 acquired_at=datetime.now(timezone.utc),
             )
+            acquisition_path = getattr(acquisition, "path", None)
+            if console_log is not None and acquisition_path is not None:
+                console_log.attach(acquisition_path / "log.txt")
             print(f"Grouping {len(captures)} captures...")
             capture_groups = group_captures(captures)
             warc_groups = apply_output_mode(capture_groups, warc_mode)
@@ -207,7 +228,6 @@ def _run(args: argparse.Namespace) -> int:
                     include_timestamps=(files_mode in {"unique", "all"}),
                 )
 
-            cooldown = RateLimitCooldown()
             print(
                 "Exporting "
                 f"{len(set(warc_groups).union(files_groups))} URL groups "
@@ -221,9 +241,9 @@ def _run(args: argparse.Namespace) -> int:
                 website_plan=website_plan,
                 warc_mode=warc_mode,
                 files_mode=files_mode,
-                cooldown=cooldown,
                 client_factory=client_factory,
                 concurrency=concurrency,
+                retries=retries,
             )
             warc_summary = export_result.summary
             files_summary = export_result.files_summary
@@ -245,6 +265,11 @@ def _run(args: argparse.Namespace) -> int:
             print_summary(warc_summary, warc_mode=warc_mode)
             if files_mode != "none":
                 print_files_summary(files_summary, files_mode=files_mode)
+            if export_result.failed_capture_urls:
+                print("Failed captures:")
+                for url in export_result.failed_capture_urls:
+                    print(url)
+                return 1
     except Exception as error:
         print(f"ERROR: {error}", file=sys.stderr)
         return 1

@@ -315,11 +315,8 @@ def test_complete_fixture_collection_is_self_consistent(tmp_path):
         for path in selected_layout.collection_root.rglob("*")
         if path.is_file()
     } == {
-        (
-            "sources/wayback/20260723T184501.123456Z/"
-            "captures.cdx.gz"
-        ),
-        "sources/wayback/20260723T184501.123456Z/query.json",
+        "sources/20260723T184501.123456Z/captures.cdx.gz",
+        "sources/20260723T184501.123456Z/query.json",
         "archive/index.warc.gz",
         "replay/index.cdxj",
     }

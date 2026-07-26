@@ -178,7 +178,7 @@ def save_acquisition(
         json.dumps(manifest, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
     ).encode("utf-8")
 
-    source_root = layout.wayback_sources_root
+    source_root = layout.sources_root
     source_root.mkdir(parents=True, exist_ok=True)
     temporary = Path(
         tempfile.mkdtemp(prefix=".acquisition-", dir=source_root)

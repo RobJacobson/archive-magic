@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import timezone
@@ -23,12 +24,12 @@ from .paths import WarcBucket, WebsitePlan
 from .retrieval import (
     DEFAULT_CONCURRENCY,
     MalformedContentEncodingError,
-    RateLimitCooldown,
     TruncatedWaybackResponseError,
     format_playback_failure,
     format_playback_failure_summary,
     retrieve_memento,
 )
+from .retry import DEFAULT_RETRIES, RetryExhaustedError
 from .warc import (
     RevisitReference,
     open_new_warc,
@@ -41,6 +42,7 @@ from .warc import (
 _VALID_CDX_SHA1 = re.compile(r"[A-Z2-7]{32}")
 _PLAYBACK_ERRORS = (
     MementoPlaybackError,
+    RetryExhaustedError,
     BlockedByRobotsError,
     BlockedSiteError,
     WaybackRetryError,
@@ -112,6 +114,7 @@ class ExportResult:
     summary: ExportSummary
     created_warcs: tuple[Path, ...]
     files_summary: FilesSummary = field(default_factory=FilesSummary)
+    failed_capture_urls: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -126,6 +129,7 @@ class _ExportJob:
 class _GroupResult:
     warc: ExportSummary
     files: FilesSummary
+    failed_capture_urls: list[str]
 
 
 @dataclass
@@ -144,6 +148,7 @@ class _GroupState:
     materialized_files: set[Path]
     failed_files: set[Path]
     events: dict[CdxRecord, list[str]]
+    failed_capture_urls: list[str]
 
 
 @dataclass
@@ -151,6 +156,44 @@ class _JobResult:
     warc: ExportSummary
     files: FilesSummary
     created_warc: Optional[Path]
+    failed_capture_urls: list[str]
+
+
+class _ThreadClientPool:
+    """Lazily own and reuse one Wayback client per executor thread."""
+
+    def __init__(self, factory: Callable) -> None:
+        self._factory = factory
+        self._local = threading.local()
+        self._lock = threading.Lock()
+        self._clients: list[object] = []
+
+    def get(self):
+        active = getattr(self._local, "active", None)
+        if active is not None:
+            return active
+
+        client = self._factory()
+        enter = getattr(client, "__enter__", None)
+        active = enter() if callable(enter) else client
+        if active is None:
+            active = client
+        self._local.active = active
+        with self._lock:
+            self._clients.append(client)
+        return active
+
+    def close(self) -> None:
+        """Close every client after all executor threads have stopped."""
+
+        for client in self._clients:
+            exit_fn = getattr(client, "__exit__", None)
+            if callable(exit_fn):
+                exit_fn(None, None, None)
+            else:
+                close = getattr(client, "close", None)
+                if callable(close):
+                    close()
 
 
 def _is_redirect(status: Optional[int]) -> bool:
@@ -187,6 +230,9 @@ def _failure_code(error: BaseException) -> Optional[int]:
         if identity in seen:
             continue
         seen.add(identity)
+        direct_code = getattr(current, "status_code", None)
+        if isinstance(direct_code, int):
+            return direct_code
         response = getattr(current, "response", None)
         code = getattr(response, "status_code", None)
         if isinstance(code, int):
@@ -292,6 +338,7 @@ def _group_summary_line(
 
 
 def _count_failure(
+    capture: CdxRecord,
     error: Exception,
     *,
     wants_warc: bool,
@@ -299,6 +346,7 @@ def _count_failure(
     warc_summary: ExportSummary,
     files_summary: FilesSummary,
     failed_files: set[Path],
+    failed_capture_urls: list[str],
 ) -> None:
     """Count one failed capture for every output that selected it."""
 
@@ -307,6 +355,8 @@ def _count_failure(
     if capture_paths:
         files_summary.record_playback_failure(error)
         failed_files.update(capture_paths)
+    if wants_warc or capture_paths:
+        failed_capture_urls.append(capture.view_url)
 
 
 def _write_response_record(
@@ -430,6 +480,7 @@ def _new_group_state(
         materialized_files=set(),
         failed_files=set(),
         events={capture: [] for capture in union},
+        failed_capture_urls=[],
     )
 
 
@@ -478,7 +529,7 @@ def _retrieve_validated(
     capture: CdxRecord,
     client,
     *,
-    cooldown: RateLimitCooldown,
+    retries: int,
     wants_warc: bool,
     capture_paths: Sequence[Path],
 ):
@@ -488,17 +539,19 @@ def _retrieve_validated(
         retrieved = retrieve_memento(
             client,
             capture,
-            cooldown=cooldown,
+            retries=retries,
         )
     except _PLAYBACK_ERRORS as error:
         state.events[capture].extend(_failure_lines(capture, error))
         _count_failure(
+            capture,
             error,
             wants_warc=wants_warc,
             capture_paths=capture_paths,
             warc_summary=state.warc,
             files_summary=state.files,
             failed_files=state.failed_files,
+            failed_capture_urls=state.failed_capture_urls,
         )
         return None
 
@@ -510,12 +563,14 @@ def _retrieve_validated(
             _status_failure_lines(capture, retrieved.status_code)
         )
         _count_failure(
+            capture,
             ValueError("playback status differs from CDX"),
             wants_warc=wants_warc,
             capture_paths=capture_paths,
             warc_summary=state.warc,
             files_summary=state.files,
             failed_files=state.failed_files,
+            failed_capture_urls=state.failed_capture_urls,
         )
         return None
 
@@ -531,12 +586,14 @@ def _retrieve_validated(
         error = ValueError("empty playback body")
         state.events[capture].extend(_failure_lines(capture, error))
         _count_failure(
+            capture,
             error,
             wants_warc=wants_warc,
             capture_paths=capture_paths,
             warc_summary=state.warc,
             files_summary=state.files,
             failed_files=state.failed_files,
+            failed_capture_urls=state.failed_capture_urls,
         )
         return None
     return retrieved
@@ -588,7 +645,7 @@ def _export_group(
     client,
     writer_factory: Optional[Callable[[], object]],
     *,
-    cooldown: RateLimitCooldown,
+    retries: int,
     reporter: GroupReporter,
     warc_mode: str,
     files_mode: str,
@@ -637,7 +694,7 @@ def _export_group(
             state,
             capture,
             client,
-            cooldown=cooldown,
+            retries=retries,
             wants_warc=wants_warc,
             capture_paths=capture_paths,
         )
@@ -664,7 +721,11 @@ def _export_group(
             files_mode=files_mode,
         ),
     )
-    return _GroupResult(state.warc, state.files)
+    return _GroupResult(
+        state.warc,
+        state.files,
+        state.failed_capture_urls,
+    )
 
 
 def _export_job(
@@ -673,7 +734,7 @@ def _export_job(
     file_targets: Mapping[str, Mapping[CdxRecord, Sequence[Path]]],
     client,
     *,
-    cooldown: RateLimitCooldown,
+    retries: int,
     reporter: GroupReporter,
     warc_mode: str,
     files_mode: str,
@@ -682,6 +743,7 @@ def _export_job(
     owner = _LazyWarc(job.bucket.path) if job.bucket is not None else None
     warc_summary = ExportSummary()
     files_summary = FilesSummary()
+    failed_capture_urls = []
     try:
         for urlkey in job.urlkeys:
             result = _export_group(
@@ -690,7 +752,7 @@ def _export_job(
                 file_targets.get(urlkey, {}),
                 client,
                 owner.get_writer if owner is not None else None,
-                cooldown=cooldown,
+                retries=retries,
                 reporter=reporter,
                 warc_mode=warc_mode,
                 files_mode=files_mode,
@@ -698,6 +760,7 @@ def _export_job(
             )
             warc_summary.add(result.warc)
             files_summary.add(result.files)
+            failed_capture_urls.extend(result.failed_capture_urls)
     finally:
         if owner is not None:
             owner.close()
@@ -705,27 +768,8 @@ def _export_job(
         warc_summary,
         files_summary,
         job.bucket.path if owner is not None and owner.available else None,
+        failed_capture_urls,
     )
-
-
-def _run_with_owned_client(
-    client_factory: Callable,
-    operation: Callable,
-):
-    client = client_factory()
-    enter = getattr(client, "__enter__", None)
-    if callable(enter):
-        enter()
-    try:
-        return operation(client)
-    finally:
-        exit_fn = getattr(client, "__exit__", None)
-        if callable(exit_fn):
-            exit_fn(None, None, None)
-        else:
-            close = getattr(client, "close", None)
-            if callable(close):
-                close()
 
 
 def export_all(
@@ -739,13 +783,14 @@ def export_all(
     website_plan: Optional[WebsitePlan] = None,
     warc_mode: str = "all",
     files_mode: str = "none",
-    cooldown: Optional[RateLimitCooldown] = None,
     client_factory: Optional[Callable] = None,
     concurrency: int = DEFAULT_CONCURRENCY,
+    retries: int = DEFAULT_RETRIES,
 ) -> ExportResult:
     """Export enabled WARC and file outputs through one bounded worker pool."""
 
-    active_cooldown = cooldown or RateLimitCooldown()
+    if retries < 0:
+        raise ValueError("retries cannot be negative")
     selected_file_groups = file_capture_groups or {}
     targets = _file_targets(selected_file_groups, website_plan)
     assigned_urlkeys = {
@@ -770,7 +815,7 @@ def export_all(
             capture_groups,
             targets,
             active_client,
-            cooldown=active_cooldown,
+            retries=retries,
             reporter=reporter,
             warc_mode=warc_mode,
             files_mode=files_mode,
@@ -783,32 +828,43 @@ def export_all(
 
     results = []
     if client_factory is not None and concurrency > 1 and len(jobs) > 1:
-        with ThreadPoolExecutor(max_workers=concurrency) as executor:
-            futures = [
-                executor.submit(
-                    _run_with_owned_client,
-                    client_factory,
-                    lambda active_client, job=job: run(job, active_client),
-                )
-                for job in jobs
-            ]
-            for future in as_completed(futures):
-                results.append(future.result())
+        clients = _ThreadClientPool(client_factory)
+
+        def run_with_thread_client(job: _ExportJob):
+            return run(job, clients.get())
+
+        try:
+            with ThreadPoolExecutor(max_workers=concurrency) as executor:
+                futures = [
+                    executor.submit(run_with_thread_client, job)
+                    for job in jobs
+                ]
+                for future in as_completed(futures):
+                    results.append(future.result())
+        finally:
+            clients.close()
     else:
         results = [run(job, client) for job in jobs]
 
     summary = ExportSummary()
     files_summary = FilesSummary()
     created_warcs = []
+    failed_capture_urls = []
+    seen_failed_urls = set()
     for result in results:
         summary.add(result.warc)
         files_summary.add(result.files)
         if result.created_warc is not None:
             created_warcs.append(result.created_warc)
+        for url in result.failed_capture_urls:
+            if url not in seen_failed_urls:
+                seen_failed_urls.add(url)
+                failed_capture_urls.append(url)
     return ExportResult(
         summary,
         tuple(created_warcs),
         files_summary,
+        tuple(failed_capture_urls),
     )
 
 
@@ -818,9 +874,9 @@ def export_group(
     path: Path,
     client,
     *,
-    cooldown: Optional[RateLimitCooldown] = None,
     client_factory: Optional[Callable] = None,
     concurrency: int = DEFAULT_CONCURRENCY,
+    retries: int = DEFAULT_RETRIES,
 ) -> ExportSummary:
     """Export one URL group to one exclusively created WARC."""
 
@@ -828,9 +884,9 @@ def export_group(
         {urlkey: captures},
         (WarcBucket(path, (urlkey,)),),
         client,
-        cooldown=cooldown,
         client_factory=client_factory,
         concurrency=concurrency,
+        retries=retries,
     )
     return result.summary
 

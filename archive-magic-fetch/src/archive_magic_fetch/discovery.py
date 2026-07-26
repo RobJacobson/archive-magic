@@ -4,9 +4,21 @@ from __future__ import annotations
 
 import time
 from typing import Callable, Iterable, Mapping, Optional, Sequence
+from urllib.parse import urlencode
 
 from wayback import CdxRecord
-from wayback.exceptions import RateLimitError
+from wayback.exceptions import RateLimitError, WaybackRetryError
+
+from .console import print_progress
+from .retry import (
+    DEFAULT_RETRIES,
+    RetryExhaustedError,
+    RetryableWaybackResponseError,
+    format_seconds,
+    retry_decision,
+    retry_delay_seconds,
+    sleep_seconds,
+)
 
 
 # Matches WaybackClient.search()'s default per-request limit.
@@ -105,6 +117,7 @@ def discover(
     date_end: str,
     *,
     progress: Optional[Callable[[int], None]] = None,
+    retries: int = DEFAULT_RETRIES,
 ) -> list[CdxRecord]:
     """Materialize all Internet Archive captures for the supplied selection.
 
@@ -132,16 +145,44 @@ def discover(
                 progress(count)
         return captures
 
-    while True:
+    if retries < 0:
+        raise ValueError("retries cannot be negative")
+
+    attempt_number = 0
+    started_at = time.monotonic()
+    query_url = (
+        "https://web.archive.org/cdx/search/cdx?"
+        + urlencode({"url": search_url, **search_kwargs})
+    )
+    while attempt_number <= retries:
+        attempt_number += 1
         try:
             return attempt()
-        except RateLimitError as error:
-            delay = error.retry_after or 60
-            print(
-                f"Rate limited during discovery; retrying in {delay}s...",
-                flush=True,
+        except (
+            RateLimitError,
+            RetryableWaybackResponseError,
+            WaybackRetryError,
+        ) as error:
+            decision = retry_decision(error)
+            if decision is None:
+                raise
+            if attempt_number > retries:
+                raise RetryExhaustedError(
+                    attempts=attempt_number,
+                    elapsed_seconds=time.monotonic() - started_at,
+                    cause=decision.cause,
+                ) from error
+            delay = retry_delay_seconds(
+                attempt_number,
+                retry_after=decision.retry_after,
             )
-            time.sleep(delay)
+            print_progress(
+                f"{query_url} : retry {attempt_number}/{retries} in "
+                f"{format_seconds(delay)}s after {decision.cause}"
+            )
+            sleep_seconds(delay)
+
+    raise RuntimeError("unreachable discovery retry state")  # pragma: no cover
 
 
 def group_captures(

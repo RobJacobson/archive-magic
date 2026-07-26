@@ -4,7 +4,7 @@ from pathlib import Path
 from wayback import CdxRecord
 from wayback.exceptions import MementoPlaybackError
 
-from archive_magic_fetch import export, files, paths, retrieval
+from archive_magic_fetch import export, files, paths
 from archive_magic_fetch.discovery import apply_output_mode, group_captures
 
 
@@ -226,8 +226,6 @@ def test_dual_mode_reuses_one_representative_download(tmp_path):
         include_timestamps=False,
     )
     client = FakeClient({selected: memento_for(selected, payload=b"shared-body")})
-    cooldown = retrieval.RateLimitCooldown()
-
     result = export.export_all(
         groups,
         warc_plan.buckets,
@@ -235,7 +233,6 @@ def test_dual_mode_reuses_one_representative_download(tmp_path):
         file_capture_groups=groups,
         website_plan=website_plan,
         files_mode="latest",
-        cooldown=cooldown,
     )
 
     assert client.calls == [selected]

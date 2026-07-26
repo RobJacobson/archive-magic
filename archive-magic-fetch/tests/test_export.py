@@ -1,10 +1,15 @@
 import base64
 import hashlib
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
 import pytest
-from requests.exceptions import ChunkedEncodingError, ContentDecodingError
+from requests.exceptions import (
+    ChunkedEncodingError,
+    ContentDecodingError,
+    ReadTimeout,
+)
 from urllib3.exceptions import IncompleteRead, ProtocolError
 from warcio.archiveiterator import ArchiveIterator
 from wayback import CdxRecord
@@ -100,20 +105,9 @@ class FakeClient:
 
 
 def make_retries_immediate(monkeypatch):
-    rate_limit_delays = []
-
-    def pause(_self, seconds):
-        rate_limit_delays.append(seconds)
-        return True
-
-    monkeypatch.setattr(retrieval.RateLimitCooldown, "wait", lambda _self: None)
-    monkeypatch.setattr(retrieval.RateLimitCooldown, "pause", pause)
-    monkeypatch.setattr(
-        retrieval,
-        "_transient_backoff_seconds",
-        lambda _failure_number: 0,
-    )
-    return rate_limit_delays
+    delays = []
+    monkeypatch.setattr(retrieval, "sleep_seconds", delays.append)
+    return delays
 
 
 def memento_for(
@@ -226,6 +220,24 @@ def test_failed_capture_does_not_prevent_later_capture(
         "response",
     ]
     assert "capture unavailable" in capsys.readouterr().out
+
+
+def test_export_result_lists_failed_capture_view_url(tmp_path):
+    selected = capture()
+    bucket = paths.WarcBucket(
+        tmp_path / "failed.warc.gz",
+        (selected.urlkey,),
+    )
+
+    result = export.export_all(
+        {selected.urlkey: [selected]},
+        (bucket,),
+        FakeClient(
+            {selected: MementoPlaybackError("capture unavailable")}
+        ),
+    )
+
+    assert result.failed_capture_urls == (selected.view_url,)
 
 
 def test_matching_bodies_are_stored_as_full_responses(tmp_path):
@@ -393,7 +405,7 @@ def test_skippable_wayback_errors_warn_and_unrelated_capture_continues(
         NoMementoError("no memento"),
         BlockedByRobotsError("blocked by robots"),
         BlockedSiteError("blocked site"),
-        WaybackRetryError(2, 1, RuntimeError("timeout")),
+        WaybackRetryError(0, 1, ReadTimeout("timeout")),
     ]
     captures = [
         capture(
@@ -411,12 +423,12 @@ def test_skippable_wayback_errors_warn_and_unrelated_capture_continues(
     target = output_path(tmp_path)
     make_retries_immediate(monkeypatch)
 
-    export.export_group(URLKEY, captures, target, client)
+    export.export_group(URLKEY, captures, target, client, retries=2)
 
     assert client.calls[:4] == captures[:4]
     assert client.calls[4:-1] == [
         captures[4]
-    ] * retrieval.MAX_RETRIEVAL_ATTEMPTS
+    ] * 3
     assert client.calls[-1] == captures[-1]
     assert [record.rec_type for record in read_records(target)] == [
         "warcinfo",
@@ -499,7 +511,10 @@ def test_repeated_truncated_response_warns_early_and_is_categorized(
     warning = capsys.readouterr().out
     assert "truncated Wayback response after 3 attempts over" in warning
     assert "received 130,810 of 275,029 bytes" in warning
-    assert "IncompleteRead" not in warning
+    warning_lines = [
+        line for line in warning.splitlines() if "WARNING:" in line
+    ]
+    assert all("IncompleteRead" not in line for line in warning_lines)
 
 
 def test_unexpected_response_format_is_fatal(tmp_path):
@@ -523,7 +538,7 @@ def test_repeated_rate_limit_is_bounded_and_skips_capture(
     capsys,
 ):
     selected = capture()
-    rate_limits = retrieval.MAX_RETRIEVAL_ATTEMPTS
+    rate_limits = 3
     client = FakeClient(
         {
             selected: [
@@ -540,16 +555,15 @@ def test_repeated_rate_limit_is_bounded_and_skips_capture(
         [selected],
         target,
         client,
+        retries=2,
     )
 
-    assert delays == list(range(1, rate_limits))
+    assert delays == [2, 4]
     assert summary.responses == 0
     assert summary.playback_failures == 1
     assert not target.exists()
     output = capsys.readouterr()
-    assert output.out.count("Rate limited by Internet Archive") == (
-        rate_limits - 1
-    )
+    assert output.out.count(" : retry ") == rate_limits - 1
     assert output.out.count("WARNING:") == 1
 
 
@@ -940,8 +954,6 @@ def test_export_all_runs_different_warc_buckets_concurrently(
         second.urlkey: [second],
     }
 
-    from concurrent.futures import ThreadPoolExecutor
-
     with ThreadPoolExecutor(max_workers=1) as executor:
         future = executor.submit(
             export.export_all,
@@ -961,15 +973,47 @@ def test_export_all_runs_different_warc_buckets_concurrently(
     assert len(created_clients) == 2
     worker_calls = [call for client in created_clients for call in client.calls]
     assert set(worker_calls) == {first, second}
-    assert result.created_warcs == (buckets[1].path, buckets[0].path)
+    assert set(result.created_warcs) == {
+        buckets[0].path,
+        buckets[1].path,
+    }
     output = capsys.readouterr().out
     completed = [
         line for line in output.splitlines() if line.startswith("[completed ")
     ]
-    assert completed == [
-        "[completed 1/2] example.com/b",
-        "[completed 2/2] example.com/a",
-    ]
+    assert {line.rsplit("] ", 1)[1] for line in completed} == {
+        "example.com/a",
+        "example.com/b",
+    }
+
+
+def test_thread_client_pool_reuses_and_closes_client():
+    created = []
+
+    class Client:
+        def __init__(self):
+            self.exited = False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            self.exited = True
+
+    def factory():
+        client = Client()
+        created.append(client)
+        return client
+
+    pool = export._ThreadClientPool(factory)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        first = executor.submit(pool.get).result()
+        second = executor.submit(pool.get).result()
+    pool.close()
+
+    assert first is second
+    assert created == [first]
+    assert first.exited is True
 
 
 def test_groups_sharing_one_warc_bucket_remain_serial(tmp_path):

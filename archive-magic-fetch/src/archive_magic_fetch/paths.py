@@ -44,10 +44,6 @@ class CollectionLayout:
         return self.collection_root / "sources"
 
     @property
-    def wayback_sources_root(self) -> Path:
-        return self.sources_root / "wayback"
-
-    @property
     def archive_root(self) -> Path:
         return self.collection_root / "archive"
 

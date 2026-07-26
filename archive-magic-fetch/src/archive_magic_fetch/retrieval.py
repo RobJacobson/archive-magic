@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import random
-import threading
 import time
 from dataclasses import dataclass
 from http import HTTPStatus
@@ -15,7 +13,7 @@ from requests.exceptions import ContentDecodingError, RequestException
 from urllib3.exceptions import IncompleteRead as Urllib3IncompleteRead
 from warcio.recordbuilder import RecordBuilder
 from warcio.statusandheaders import StatusAndHeaders
-from wayback import Mode, WaybackClient, WaybackSession
+from wayback import Mode, WaybackClient
 from wayback.exceptions import (
     MementoPlaybackError,
     RateLimitError,
@@ -23,18 +21,22 @@ from wayback.exceptions import (
 )
 
 from .console import print_progress
+from .retry import (
+    DEFAULT_RETRIES,
+    ArchiveMagicWaybackSession,
+    RetryExhaustedError,
+    RetryableWaybackResponseError,
+    format_seconds,
+    retry_decision,
+    retry_delay_seconds,
+    sleep_seconds,
+)
 from .warc import timestamp_to_warc_date
 
 
 DEFAULT_CONCURRENCY = 8
 
-# One in-session retry still absorbs a single dropped connection. Sustained
-# failures use the bounded per-capture retry policy below.
-WORKER_SESSION_RETRIES = 1
-MAX_RETRIEVAL_ATTEMPTS = 6
 REPEATED_TRUNCATION_ATTEMPTS = 3
-MAX_CONNECTION_BACKOFF_SECONDS = 30
-DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 60
 _MISSING_HEADER = object()
 
 _REPRESENTATION_HEADERS = {
@@ -112,7 +114,11 @@ def format_playback_failure(error: Exception) -> str:
 
     if isinstance(
         error,
-        (MalformedContentEncodingError, TruncatedWaybackResponseError),
+        (
+            MalformedContentEncodingError,
+            RetryExhaustedError,
+            TruncatedWaybackResponseError,
+        ),
     ):
         return str(error)
     if isinstance(error, WaybackRetryError):
@@ -247,56 +253,17 @@ class RetrievedMemento:
         )
 
 
-class RateLimitCooldown:
-    """Share a Wayback HTTP 429 pause across all retrieval workers."""
-
-    def __init__(self) -> None:
-        self._condition = threading.Condition()
-        self._not_before = 0.0
-
-    def wait(self) -> None:
-        """Wait until the latest shared rate-limit pause expires."""
-        with self._condition:
-            while True:
-                delay = self._not_before - time.monotonic()
-                if delay <= 0:
-                    return
-                self._condition.wait(timeout=delay)
-
-    def pause(self, seconds: float) -> bool:
-        """Extend the shared pause and return whether this starts a new pause."""
-        duration = max(0.0, seconds)
-        with self._condition:
-            now = time.monotonic()
-            starts_pause = self._not_before <= now
-            self._not_before = max(self._not_before, now + duration)
-            self._condition.notify_all()
-            return starts_pause
-
-
-def _transient_backoff_seconds(failure_number: int) -> float:
-    """Return bounded exponential backoff with full jitter."""
-    ceiling = min(
-        2 ** max(0, failure_number - 1),
-        MAX_CONNECTION_BACKOFF_SECONDS,
-    )
-    return random.uniform(0, ceiling)
-
-
 def make_client_factory(user_agent: str) -> Callable[[], WaybackClient]:
     """Return a factory of Wayback clients that share default rate limits.
 
-    Each call creates a fresh ``WaybackSession``. Unspecified rate limits use
-    the library defaults, which are shared process-wide and thread-safe.
-    Worker sessions use fewer retries so connection-refused storms surface to
-    Fetch's bounded retry loop instead of retrying in parallel for ~64s each.
+    Each call creates a fresh session with library retries disabled.
+    Unspecified rate limits remain shared process-wide and thread-safe.
     """
 
     def factory() -> WaybackClient:
         return WaybackClient(
-            session=WaybackSession(
+            session=ArchiveMagicWaybackSession(
                 user_agent=user_agent,
-                retries=WORKER_SESSION_RETRIES,
             )
         )
 
@@ -307,21 +274,19 @@ def _retrieve_memento_with_retry(
     client,
     capture,
     *,
-    cooldown: RateLimitCooldown,
+    retries: int,
 ) -> RetrievedMemento:
-    """Retrieve and fully consume one Memento with bounded transport retries."""
+    """Retrieve and consume one Memento with application-owned retries."""
 
     started_at = time.monotonic()
     attempt_number = 0
-    transient_failures = 0
     identity_retry = False
     identity_headers = None
     previous_accept_encoding = _MISSING_HEADER
     previous_truncation = None
     repeated_truncations = 0
     try:
-        while attempt_number < MAX_RETRIEVAL_ATTEMPTS:
-            cooldown.wait()
+        while attempt_number <= retries:
             attempt_number += 1
             memento = None
             try:
@@ -370,27 +335,15 @@ def _retrieve_memento_with_retry(
                 reset = getattr(session, "reset", None)
                 if callable(reset):
                     reset()
-            except RateLimitError as error:
-                previous_truncation = None
-                repeated_truncations = 0
-                transient_failures = 0
-                if attempt_number == MAX_RETRIEVAL_ATTEMPTS:
-                    raise WaybackRetryError(
-                        attempt_number,
-                        time.monotonic() - started_at,
-                        error,
-                    ) from error
-                delay = (
-                    error.retry_after
-                    or DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS
-                )
-                if cooldown.pause(delay):
-                    print_progress(
-                        "Rate limited by Internet Archive during playback; "
-                        f"pausing all downloads for {delay:g}s before "
-                        "retrying..."
-                    )
-            except (WaybackRetryError, RequestException) as error:
+            except (
+                RateLimitError,
+                RetryableWaybackResponseError,
+                WaybackRetryError,
+                RequestException,
+            ) as error:
+                decision = retry_decision(error)
+                if decision is None:
+                    raise
                 truncation = _incomplete_read_boundary(error)
                 if truncation is not None:
                     if truncation == previous_truncation:
@@ -401,11 +354,6 @@ def _retrieve_memento_with_retry(
                 else:
                     previous_truncation = None
                     repeated_truncations = 0
-
-                session = getattr(client, "session", None)
-                reset = getattr(session, "reset", None)
-                if callable(reset):
-                    reset()
 
                 repeated_boundary = (
                     truncation is not None
@@ -421,8 +369,7 @@ def _retrieve_memento_with_retry(
                         elapsed_seconds=time.monotonic() - started_at,
                     ) from error
 
-                transient_failures += 1
-                if attempt_number == MAX_RETRIEVAL_ATTEMPTS:
+                if attempt_number > retries:
                     if truncation is not None:
                         received, expected = truncation
                         raise TruncatedWaybackResponseError(
@@ -431,16 +378,28 @@ def _retrieve_memento_with_retry(
                             attempts=attempt_number,
                             elapsed_seconds=time.monotonic() - started_at,
                         ) from error
-                    if isinstance(error, RequestException):
-                        raise WaybackRetryError(
-                            attempt_number,
-                            time.monotonic() - started_at,
-                            error,
-                        ) from error
-                    raise
-                time.sleep(
-                    _transient_backoff_seconds(transient_failures)
+                    raise RetryExhaustedError(
+                        attempts=attempt_number,
+                        elapsed_seconds=time.monotonic() - started_at,
+                        cause=decision.cause,
+                    ) from error
+
+                if isinstance(decision.cause, RequestException):
+                    session = getattr(client, "session", None)
+                    reset = getattr(session, "reset", None)
+                    if callable(reset):
+                        reset()
+
+                delay = retry_delay_seconds(
+                    attempt_number,
+                    retry_after=decision.retry_after,
                 )
+                view_url = getattr(capture, "view_url", str(capture))
+                print_progress(
+                    f"{view_url} : retry {attempt_number}/{retries} in "
+                    f"{format_seconds(delay)}s after {decision.cause}"
+                )
+                sleep_seconds(delay)
             else:
                 return result
     finally:
@@ -484,17 +443,16 @@ def retrieve_memento(
     client,
     capture,
     *,
-    cooldown: Optional[RateLimitCooldown] = None,
+    retries: int = DEFAULT_RETRIES,
 ) -> RetrievedMemento:
     """Retrieve one Memento as reusable semantic body and metadata."""
 
-    active_cooldown = (
-        cooldown if cooldown is not None else RateLimitCooldown()
-    )
+    if retries < 0:
+        raise ValueError("retries cannot be negative")
     return _retrieve_memento_with_retry(
         client,
         capture,
-        cooldown=active_cooldown,
+        retries=retries,
     )
 
 
@@ -502,12 +460,12 @@ def retrieve_response(
     client,
     capture,
     *,
-    cooldown: Optional[RateLimitCooldown] = None,
+    retries: int = DEFAULT_RETRIES,
 ):
     """Retrieve one Memento and construct the semantic WARC response."""
 
     return retrieve_memento(
         client,
         capture,
-        cooldown=cooldown,
+        retries=retries,
     ).to_warc_record()
