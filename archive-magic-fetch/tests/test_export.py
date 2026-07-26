@@ -154,7 +154,7 @@ def output_path(tmp_path, urlkey=URLKEY):
     return paths.preferred_warc_path(urlkey, layout)
 
 
-def test_matching_captures_are_fetched_and_written_independently(tmp_path):
+def test_matching_cdx_digests_write_one_response_and_one_revisit(tmp_path):
     first = capture(
         original="https://cdx.example/first",
         captured="20170101000000",
@@ -181,14 +181,27 @@ def test_matching_captures_are_fetched_and_written_independently(tmp_path):
 
     summary = export.export_group(URLKEY, [first, second], target, client)
 
-    assert client.calls == [first, second]
+    assert client.calls == [first]
     records = read_records(target)
     assert [record.rec_type for record in records] == [
         "warcinfo",
         "response",
-        "response",
+        "revisit",
     ]
-    assert summary == export.ExportSummary(selected=2, responses=2)
+    assert summary == export.ExportSummary(
+        selected=2,
+        responses=1,
+        revisits=1,
+    )
+    assert records[1].rec_headers.get_header(
+        "WARC-Target-URI"
+    ) == first.original
+    assert records[2].rec_headers.get_header(
+        "WARC-Target-URI"
+    ) == second.original
+    assert records[2].rec_headers.get_header(
+        "WARC-Refers-To"
+    ) == records[1].rec_headers.get_header("WARC-Record-ID")
 
 
 def test_failed_capture_does_not_prevent_later_capture(
@@ -212,7 +225,7 @@ def test_failed_capture_does_not_prevent_later_capture(
         "warcinfo",
         "response",
     ]
-    assert "capture unavailable" in capsys.readouterr().err
+    assert "capture unavailable" in capsys.readouterr().out
 
 
 def test_matching_bodies_are_stored_as_full_responses(tmp_path):
@@ -249,12 +262,12 @@ def test_distinct_statuses_are_preserved(tmp_path):
 
     export.export_group(URLKEY, [first, second], target, client)
 
-    assert client.calls == [first, second]
+    assert client.calls == [first]
     records = read_records(target)
     assert [record.rec_type for record in records] == [
         "warcinfo",
         "response",
-        "response",
+        "revisit",
     ]
     assert [
         record.http_headers.get_statuscode() for record in records[1:]
@@ -265,14 +278,26 @@ def test_status_substitution_is_skipped(
     tmp_path,
     capsys,
 ):
-    first = capture(captured="20170101000000", statuscode=200)
-    second = capture(captured="20180101000000", statuscode=201)
-    third = capture(captured="20190101000000", statuscode=201)
+    first = capture(
+        captured="20170101000000",
+        statuscode=200,
+        payload=b"first",
+    )
+    second = capture(
+        captured="20180101000000",
+        statuscode=201,
+        payload=b"second",
+    )
+    third = capture(
+        captured="20190101000000",
+        statuscode=201,
+        payload=b"third",
+    )
     client = FakeClient(
         {
-            first: memento_for(first, payload=b"same", status_code=200),
-            second: memento_for(second, payload=b"same", status_code=200),
-            third: memento_for(third, payload=b"different", status_code=201),
+            first: memento_for(first, payload=b"first", status_code=200),
+            second: memento_for(second, payload=b"second", status_code=200),
+            third: memento_for(third, payload=b"third", status_code=201),
         }
     )
     target = output_path(tmp_path)
@@ -292,10 +317,10 @@ def test_status_substitution_is_skipped(
     ]
     assert summary.responses == 2
     assert summary.playback_failures == 1
-    assert "CDX status 201 but playback returned 200" in capsys.readouterr().err
+    assert "CDX status 201 but playback returned 200" in capsys.readouterr().out
 
 
-def test_statusless_captures_are_retrieved_independently(tmp_path):
+def test_statusless_captures_with_matching_digest_use_revisit(tmp_path):
     first = capture(captured="20170101000000", statuscode=None)
     second = capture(captured="20180101000000", statuscode=None)
     client = FakeClient(
@@ -308,7 +333,7 @@ def test_statusless_captures_are_retrieved_independently(tmp_path):
 
     export.export_group(URLKEY, [first, second], target, client)
 
-    assert client.calls == [first, second]
+    assert client.calls == [first]
     records = read_records(target)
     assert records[1].http_headers.get_statuscode() == "204"
     assert records[2].http_headers.get_statuscode() == "204"
@@ -397,7 +422,7 @@ def test_skippable_wayback_errors_warn_and_unrelated_capture_continues(
         "warcinfo",
         "response",
     ]
-    assert capsys.readouterr().err.count("WARNING skipped") == 5
+    assert capsys.readouterr().out.count("WARNING:") == 5
 
 
 def test_persistent_content_decoding_error_warns_once_and_skips(
@@ -429,8 +454,8 @@ def test_persistent_content_decoding_error_warns_once_and_skips(
     assert not target.exists()
     assert summary.playback_failures == 1
     assert summary.invalid_content_encoding_failures == 1
-    warning = capsys.readouterr().err
-    assert warning.count("WARNING skipped") == 1
+    warning = capsys.readouterr().out
+    assert warning.count("WARNING:") == 1
     assert "invalid Wayback replay response" in warning
     assert (
         "retrying with Accept-Encoding: identity also failed"
@@ -471,7 +496,7 @@ def test_repeated_truncated_response_warns_early_and_is_categorized(
     assert len(client.calls) == retrieval.REPEATED_TRUNCATION_ATTEMPTS
     assert summary.playback_failures == 1
     assert summary.truncated_response_failures == 1
-    warning = capsys.readouterr().err
+    warning = capsys.readouterr().out
     assert "truncated Wayback response after 3 attempts over" in warning
     assert "received 130,810 of 275,029 bytes" in warning
     assert "IncompleteRead" not in warning
@@ -525,7 +550,7 @@ def test_repeated_rate_limit_is_bounded_and_skips_capture(
     assert output.out.count("Rate limited by Internet Archive") == (
         rate_limits - 1
     )
-    assert output.err.count("WARNING skipped") == 1
+    assert output.out.count("WARNING:") == 1
 
 
 def test_all_skipped_group_creates_no_file(tmp_path):
@@ -615,10 +640,11 @@ def test_groups_are_exported_independently(tmp_path, capsys):
         == ["warcinfo", "response"]
         for path in result.created_warcs
     )
-    assert "Summary:" not in capsys.readouterr().out
+    assert capsys.readouterr().out.count("[completed ") == 2
     export.print_summary(result.summary)
     assert capsys.readouterr().out.endswith(
         "Summary: 2 selected for warc (all); 2 responses; "
+        "0 revisits; "
         "0 redirects omitted; 0 playback failures\n"
     )
 
@@ -636,6 +662,7 @@ def test_summary_includes_playback_failure_categories(capsys):
 
     assert capsys.readouterr().out == (
         "Summary: 8 selected for warc (all); 5 responses; "
+        "0 revisits; "
         "0 redirects omitted; 3 playback failures "
         "(1 invalid content encoding, 1 truncated response, 1 other)\n"
     )
@@ -762,7 +789,50 @@ def test_generated_file_is_parseable_gzip_warc_1_0(tmp_path):
     ) == payload_digest(b"payload")
 
 
-def test_concurrent_export_fetches_every_capture_and_preserves_write_order(
+def test_original_percent_escapes_are_preserved_in_warc_and_output(
+    tmp_path,
+    capsys,
+):
+    selected = capture(
+        original=(
+            "http://www.wecanstopthehate.org/"
+            "%7Bfiledir_2%7DIB_9.pdf"
+        ),
+    )
+    target = output_path(tmp_path)
+
+    export.export_group(
+        URLKEY,
+        [selected],
+        target,
+        FakeClient(
+            {
+                selected: memento_for(
+                    selected,
+                    url=(
+                        "http://www.wecanstopthehate.org/"
+                        "%257Bfiledir_2%257DIB_9.pdf"
+                    ),
+                )
+            }
+        ),
+    )
+
+    response = read_records(target)[1]
+    assert response.rec_headers.get_header(
+        "WARC-Target-URI"
+    ) == selected.original
+    assert "%257B" not in response.rec_headers.get_header(
+        "WARC-Target-URI"
+    )
+    output = capsys.readouterr().out
+    assert (
+        "[completed 1/1] "
+        "wecanstopthehate.org/%7Bfiledir_2%7DIB_9.pdf"
+    ) in output
+
+
+def test_group_fetches_unique_representatives_and_preserves_write_order(
     tmp_path,
     capsys,
 ):
@@ -774,92 +844,37 @@ def test_concurrent_export_fetches_every_capture_and_preserves_write_order(
         digest=payload_digest(b"beta").split(":", 1)[1],
     )
     target = output_path(tmp_path)
-    created_clients = []
-    release_second = threading.Event()
-    first_started = threading.Event()
-
-    class FactoryClient:
-        def __init__(self, outcomes):
-            self.outcomes = outcomes
-            self.calls = []
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args):
-            return False
-
-        def get_memento(self, selected, **kwargs):
-            self.calls.append(selected)
-            if selected is first:
-                first_started.set()
-                release_second.wait(timeout=2)
-            outcome = self.outcomes[selected]
-            if isinstance(outcome, Exception):
-                raise outcome
-            return outcome
-
     outcomes = {
         first: memento_for(first, payload=b"alpha"),
         duplicate: memento_for(duplicate, payload=b"alpha"),
         second: memento_for(second, payload=b"beta"),
     }
+    client = FakeClient(outcomes)
 
-    def factory():
-        client = FactoryClient(outcomes)
-        created_clients.append(client)
-        return client
+    summary = export.export_group(
+        URLKEY,
+        [first, duplicate, second],
+        target,
+        client,
+    )
 
-    main_client = FactoryClient(outcomes)
-
-    def run_export():
-        return export.export_group(
-            URLKEY,
-            [first, duplicate, second],
-            target,
-            main_client,
-            client_factory=factory,
-            concurrency=2,
-        )
-
-    from concurrent.futures import ThreadPoolExecutor
-
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        future = executor.submit(run_export)
-        assert first_started.wait(timeout=2)
-        # Second fetch can complete while the writer still waits on first.
-        release_second.set()
-        summary = future.result()
-
-    assert summary.responses == 3
-    worker_calls = [call for client in created_clients for call in client.calls]
-    assert set(worker_calls) == {first, duplicate, second}
-    assert main_client.calls == []
+    assert summary.responses == 2
+    assert summary.revisits == 1
+    assert client.calls == [first, second]
 
     output = capsys.readouterr().out
-    assert "fetching" not in output
-    fetched = [
-        line for line in output.splitlines() if line.startswith("Fetched ")
+    outcomes = [
+        line.rsplit(" : ", 1)[1]
+        for line in output.splitlines()
+        if line.startswith("https://web.archive.org/")
     ]
-    assert set(fetched) == {
-        f"Fetched 20170101000000 {first.original}",
-        f"Fetched 20180101000000 {duplicate.original}",
-        f"Fetched 20190101000000 {second.original}",
-    }
-    wrote = [
-        line for line in output.splitlines() if line.startswith("Wrote ")
-    ]
-    assert wrote == [
-        f"Wrote 20170101000000 [{payload_digest(b'alpha')[-8:]}]",
-        f"Wrote 20180101000000 [{payload_digest(b'alpha')[-8:]}]",
-        f"Wrote 20190101000000 [{payload_digest(b'beta')[-8:]}]",
-    ]
+    assert outcomes == ["wrote response", "wrote revisit", "wrote response"]
 
     records = read_records(target)
     assert [record.rec_type for record in records] == [
         "warcinfo",
         "response",
-        "response",
+        "revisit",
         "response",
     ]
     assert records[1].rec_headers.get_header("WARC-Date") == "2017-01-01T00:00:00Z"
@@ -867,7 +882,10 @@ def test_concurrent_export_fetches_every_capture_and_preserves_write_order(
     assert records[3].rec_headers.get_header("WARC-Date") == "2019-01-01T00:00:00Z"
 
 
-def test_export_all_fetches_later_url_groups_independently(tmp_path):
+def test_export_all_runs_different_warc_buckets_concurrently(
+    tmp_path,
+    capsys,
+):
     first = capture(
         original="https://example.com/a",
         captured="20170101000000",
@@ -903,7 +921,7 @@ def test_export_all_fetches_later_url_groups_independently(tmp_path):
             self.calls.append(selected)
             if selected is first:
                 first_started.set()
-                release_first.wait(timeout=2)
+                release_first.wait(timeout=10)
             if selected is second:
                 second_finished.set()
             return outcomes[selected]
@@ -913,9 +931,9 @@ def test_export_all_fetches_later_url_groups_independently(tmp_path):
         created_clients.append(client)
         return client
 
-    bucket = paths.WarcBucket(
-        tmp_path / "ordered.warc.gz",
-        (first.urlkey, second.urlkey),
+    buckets = (
+        paths.WarcBucket(tmp_path / "a.warc.gz", (first.urlkey,)),
+        paths.WarcBucket(tmp_path / "b.warc.gz", (second.urlkey,)),
     )
     groups = {
         first.urlkey: [first],
@@ -928,7 +946,7 @@ def test_export_all_fetches_later_url_groups_independently(tmp_path):
         future = executor.submit(
             export.export_all,
             groups,
-            [bucket],
+            buckets,
             FactoryClient(),
             client_factory=factory,
             concurrency=2,
@@ -943,11 +961,56 @@ def test_export_all_fetches_later_url_groups_independently(tmp_path):
     assert len(created_clients) == 2
     worker_calls = [call for client in created_clients for call in client.calls]
     assert set(worker_calls) == {first, second}
-    records = read_records(bucket.path)
-    assert [
-        record.rec_headers.get_header("WARC-Target-URI")
-        for record in records[1:]
-    ] == [first.original, second.original]
+    assert result.created_warcs == (buckets[1].path, buckets[0].path)
+    output = capsys.readouterr().out
+    completed = [
+        line for line in output.splitlines() if line.startswith("[completed ")
+    ]
+    assert completed == [
+        "[completed 1/2] example.com/b",
+        "[completed 2/2] example.com/a",
+    ]
+
+
+def test_groups_sharing_one_warc_bucket_remain_serial(tmp_path):
+    first = capture(
+        original="https://example.com/a",
+        urlkey="com,example)/a",
+    )
+    second = capture(
+        original="https://example.com/b",
+        urlkey="com,example)/b",
+    )
+    first_finished = threading.Event()
+
+    class OrderedClient(FakeClient):
+        def get_memento(self, selected, **kwargs):
+            if selected is second:
+                assert first_finished.is_set()
+            result = super().get_memento(selected, **kwargs)
+            if selected is first:
+                first_finished.set()
+            return result
+
+    bucket = paths.WarcBucket(
+        tmp_path / "shared.warc.gz",
+        (first.urlkey, second.urlkey),
+    )
+    client = OrderedClient(
+        {
+            first: memento_for(first),
+            second: memento_for(second),
+        }
+    )
+
+    export.export_all(
+        {first.urlkey: [first], second.urlkey: [second]},
+        (bucket,),
+        client,
+        concurrency=8,
+    )
+
+    assert client.calls == [first, second]
 
 
 def test_open_new_warc_exclusively_rejects_existing_target(tmp_path):

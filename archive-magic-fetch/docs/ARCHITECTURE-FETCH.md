@@ -74,7 +74,7 @@ The public command is:
 archive-magic-fetch URL_PATTERN
   [--start DATE] [--end DATE]
   [--warc {none,latest,all}]
-  [--files {none,latest,all}]
+  [--files {none,latest,unique,all}]
   [--rewrite-local]
   [--concurrency N]
 ```
@@ -82,11 +82,11 @@ archive-magic-fetch URL_PATTERN
 | Flag | Values | Default |
 | --- | --- | --- |
 | `--warc` | `none`, `latest`, `all` | `all` |
-| `--files` | `none`, `latest`, `all` | `none` |
+| `--files` | `none`, `latest`, `unique`, `all` | `none` |
 | `--rewrite-local` | flag | off |
 | `--concurrency` | integer ≥ 1 | `8` |
 
-`--concurrency 1` restores serial memento downloads for diagnostics. Values
+`--concurrency 1` restores serial URL-group workers for diagnostics. Values
 above 8 mostly queue behind the Wayback client's independent 8 requests/second
 memento pacing. The value directly sets the fixed worker-pool ceiling; Fetch
 does not dynamically reduce or ramp concurrency.
@@ -94,7 +94,7 @@ does not dynamically reduce or ramp concurrency.
 The two axes are independent. Default behavior remains full WARC history plus
 replay CDXJ with no loose files. `--warc none --files none` exits successfully
 with `Nothing to do: both --warc and --files are none` and performs no
-discovery. `--rewrite-local` requires `--files latest` or `--files all`
+discovery. `--rewrite-local` requires `--files latest`, `unique`, or `all`
 (usage error otherwise) and does not enable files mode by itself.
 
 Numeric partial dates are passed through unchanged to `WaybackClient.search()`,
@@ -126,8 +126,8 @@ parse arguments and apply date defaults
     -> if warc enabled: allocate WARC buckets and preflight WARC/replay
     -> if files enabled: plan website/ paths (query folding + newest-wins)
          and preflight remaining targets
-    -> if warc enabled: export WARCs; generate replay/index.cdxj
-    -> if files enabled: write loose website bodies
+    -> export enabled WARC and loose-file outputs in one worker pass
+    -> if warc enabled: generate replay/index.cdxj
     -> if --rewrite-local and at least one file was written: rewrite under website/
     -> print aggregate summary
     -> close the client/session
@@ -142,8 +142,8 @@ for the query window, not the post-`latest` subset.
 2. newest capture whose status is present and not `3xx`; else
 3. omit the group.
 
-WARC and loose-file output are independent stages. If both select the same
-capture, each stage retrieves it for its own output.
+WARC and loose-file selection remain independent, but one URL-group worker
+writes both outputs. A capture selected by both axes is retrieved once.
 
 The aggregate summary is printed only after enabled output stages succeed. A
 fatal indexing or replay-publication error therefore cannot follow an apparently
@@ -172,9 +172,10 @@ Unspecified rate limits use the library defaults, which are process-wide shared
 
 Fetch keeps playback scheduling deliberately small:
 
-1. The fixed worker pool caps **in-flight concurrency** at `--concurrency`.
-   The library's independent shared limiter continues to cap **request rate**
-   at 8 starts per second.
+1. The fixed worker pool runs at most `--concurrency` WARC-bucket or standalone
+   file-group tasks. One task exclusively owns its WARC, processes assigned URL
+   groups serially, and uses one client. The library's independent shared
+   limiter continues to cap **request rate** at 8 starts per second.
 2. Every worker checks one job-wide HTTP 429 cooldown before each attempt.
    A 429 honors `Retry-After`, or 60 seconds when absent, and extends that
    shared deadline so other workers pause too.
@@ -319,7 +320,7 @@ component checks do not replace `PATH_MAX`.
 
 ### 5.2 Loose website paths
 
-When `--files` is `latest` or `all`, Fetch writes decoded semantic bodies under
+When `--files` is enabled, Fetch writes decoded semantic bodies under
 `website/`. Paths follow the original site URL (Ruby wayback-machine-downloader
 spirit), with an explicit host segment so multi-host collections stay distinct:
 
@@ -328,6 +329,8 @@ spirit), with an explicit host segment so multi-host collections stay distinct:
 - **query strings are folded away** for loose-file paths only (WARC path/query
   encoding is unchanged): `main_style.css?v=1` → `main_style.css`
 - `--files latest` writes `website/<host>/<site-path>` with no timestamp segment
+- `--files unique` writes one timestamped file per full response and skips
+  captures represented as WARC revisits
 - `--files all` writes `website/<host>/<14-digit-timestamp>/<site-path>`
 
 **Newest-wins collisions:** After preferred paths are computed (including query
@@ -573,22 +576,35 @@ retry the same operation during both discovery and playback; they are never
 reported as skipped captures. Unexpected formats, local filesystem errors, and
 serialization failures are fatal.
 
-Fetch completion order is unrestricted, so `Fetched` lines appear in
-completion order. `Wrote` lines and WARC records follow the sorted commit
-cursor. The bounded window prevents queued work and buffered bodies from
-growing with the complete discovery result.
+Workers may finish in any order. WARC records remain timestamp-ordered within
+each URL group, while completed console blocks are emitted atomically in
+completion order.
 
 ## 9. WARC export
 
-One collision bucket owns one lazily opened WARC stream:
+One worker task owns one lazily opened collision-bucket WARC stream:
 
 1. Iterate its URL-key groups in sorted order.
 2. Process captures in timestamp order.
-3. Retrieve every selected non-redirect capture.
-4. Validate its playback status and complete body.
-5. Lazily create the WARC when the first response is ready.
-6. Write every successful capture as a full `response` record.
-7. Close the WARC after all assigned groups finish.
+3. Keep one private dictionary of valid CDX SHA-1 digests for the current URL
+   group only.
+4. Fetch and validate the first playable representative for each digest.
+5. Lazily create the WARC and write the representative as a full `response`.
+6. Write later matching captures as identical-payload-digest `revisit`
+   records without fetching them.
+7. Materialize enabled loose files from the same downloaded body: `unique`
+   writes representatives only, while `all` writes every timestamp.
+8. Release group state before starting the next URL group and close the WARC
+   after all assigned groups finish.
+
+Digest identity is scoped to one URL key, so matching bodies at different URLs
+each retain a full response. Missing or malformed CDX digests are fetched and
+written independently. CDX digests are not compared byte-for-byte with
+playback bodies because Wayback may transform stored content encoding.
+
+Every response and revisit uses the CDX `capture.original` value as
+`WARC-Target-URI`. Existing percent escapes such as `%7B` remain unchanged;
+the playback URL is retained separately as `WARC-Source-URI`.
 
 Every created WARC receives one `warcinfo` record. If every assigned capture is
 omitted or fails playback, no WARC is created. Existing final WARC and replay
@@ -597,11 +613,11 @@ targets are fatal during preflight; Fetch neither scans nor appends to them.
 `export_all()` returns:
 
 ```text
-ExportResult(summary, created_warcs)
+ExportResult(summary, created_warcs, files_summary)
 ```
 
-It does not print the aggregate summary. `created_warcs` contains only WARCs
-created by the current command and is the complete input to replay indexing.
+`created_warcs` contains only WARCs created by the current command, in worker
+completion order, and is the complete input to replay indexing.
 
 ## 10. Replay CDXJ
 
@@ -612,7 +628,7 @@ CDXJIndexer(
     output=temporary_index,
     inputs=created_warcs,
     sort=True,
-    records="response",
+    records="response,revisit",
     dir_root=collection_root,
 ).process_all()
 ```
@@ -627,7 +643,7 @@ The resulting `replay/index.cdxj`:
 - includes collection-relative filenames such as
   `archive/posts/index.warc.gz`;
 - records true compressed offsets and member lengths; and
-- indexes response records only.
+- indexes both response and revisit records.
 
 The Internet Archive source `urlkey` is not copied into replay entries.
 
@@ -646,22 +662,23 @@ Ordinary output remains compact:
 
 ```text
 Job started: 2026-07-24T19:04:12Z
-Starting https://example.com/images/logo.png
 Rate limited by Internet Archive during playback; pausing all downloads for 60s before retrying...
-Fetched 20180709183022 https://example.com/images/logo.png
-Fetched 20170604120533 https://example.com/images/logo.png
-Wrote 20170604120533 [a19f7c2e]
-Wrote 20180709183022 [c46a801d]
-WARNING skipped 20190812143015 https://example.com/images/logo.png: invalid Wayback replay response: Content-Encoding declares gzip, but the body could not be decoded; retrying with Accept-Encoding: identity also failed
-Summary: 235 selected for warc (all); 224 responses; 9 redirects omitted; 2 playback failures (1 invalid content encoding, 1 truncated response)
+[completed 1/235] example.com/images/logo.png
+https://web.archive.org/web/20170604120533/https://example.com/images/logo.png : wrote response
+https://web.archive.org/web/20180709183022/https://example.com/images/logo.png : wrote revisit
+https://web.archive.org/web/20190812143015/https://example.com/images/logo.png : failed during playback
+  WARNING: invalid Wayback replay response: Content-Encoding declares gzip, but the body could not be decoded; retrying with Accept-Encoding: identity also failed
+Summary: warc 1 response, 1 revisit, 1 failed
+Summary: 235 selected for warc (all); 180 responses; 44 revisits; 9 redirects omitted; 2 playback failures (1 invalid content encoding, 1 truncated response)
 Files: 180 written (latest); 2 playback failures (1 invalid content encoding, 1 other); 0 redirects omitted
 Job ended: 2026-07-24T19:18:24Z
 Job duration: 14.2 minutes
 ```
 
-`Fetched` means a network response body has landed in the bounded result
-buffer. `Wrote` means the ordered writer committed that capture to its WARC or
-loose-file destination.
+Each completed URL group is buffered and printed with one locked console write.
+Blocks appear in completion order without line interleaving. Their headers use
+readable original URLs rather than CDX SURT keys, and capture lines begin with
+clickable Wayback view URLs.
 
 Every parsed CLI job prints UTC start and end times in second-precision
 ISO-8601 form. A monotonic clock supplies total elapsed time, reported in

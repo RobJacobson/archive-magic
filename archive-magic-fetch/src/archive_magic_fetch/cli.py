@@ -11,9 +11,15 @@ from typing import Optional, Sequence
 
 from wayback import WaybackClient, WaybackSession
 
-from .discovery import OUTPUT_MODES, apply_output_mode, discover, group_captures
-from .export import ExportSummary, export_all, print_summary
-from .files import FilesSummary, print_files_summary, write_website_files
+from .discovery import (
+    FILES_MODES,
+    WARC_MODES,
+    apply_output_mode,
+    discover,
+    group_captures,
+)
+from .export import export_all, print_summary
+from .files import print_files_summary
 from .paths import (
     DEFAULT_OUTPUT_ROOT,
     collection_layout,
@@ -63,13 +69,13 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--end", metavar="DATE")
     parser.add_argument(
         "--warc",
-        choices=OUTPUT_MODES,
+        choices=WARC_MODES,
         default="all",
         help="WARC + replay CDXJ output mode (default: all)",
     )
     parser.add_argument(
         "--files",
-        choices=OUTPUT_MODES,
+        choices=FILES_MODES,
         default="none",
         help="Loose website-file output mode (default: none)",
     )
@@ -87,7 +93,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         default=DEFAULT_CONCURRENCY,
         metavar="N",
         help=(
-            "Max concurrent memento downloads (default: "
+            "Max concurrent WARC/group workers (default: "
             f"{DEFAULT_CONCURRENCY}; use 1 for serial diagnostics)"
         ),
     )
@@ -145,7 +151,7 @@ def _run(args: argparse.Namespace) -> int:
 
     if rewrite_local and files_mode == "none":
         print(
-            "ERROR: --rewrite-local requires --files latest or --files all",
+            "ERROR: --rewrite-local requires --files latest, unique, or all",
             file=sys.stderr,
         )
         return 2
@@ -198,49 +204,42 @@ def _run(args: argparse.Namespace) -> int:
                 website_plan = preflight_website_layout(
                     files_groups,
                     layout,
-                    include_timestamps=(files_mode == "all"),
+                    include_timestamps=(files_mode in {"unique", "all"}),
                 )
 
             cooldown = RateLimitCooldown()
-            warc_summary = ExportSummary()
+            print(
+                "Exporting "
+                f"{len(set(warc_groups).union(files_groups))} URL groups "
+                f"(concurrency={concurrency})..."
+            )
+            export_result = export_all(
+                warc_groups,
+                warc_plan.buckets if warc_plan is not None else (),
+                client,
+                file_capture_groups=files_groups,
+                website_plan=website_plan,
+                warc_mode=warc_mode,
+                files_mode=files_mode,
+                cooldown=cooldown,
+                client_factory=client_factory,
+                concurrency=concurrency,
+            )
+            warc_summary = export_result.summary
+            files_summary = export_result.files_summary
             if warc_plan is not None:
-                print(
-                    f"Exporting {len(warc_groups)} URL groups to WARC "
-                    f"(concurrency={concurrency})..."
-                )
-                warc_result = export_all(
-                    warc_groups,
-                    warc_plan.buckets,
-                    client,
-                    cooldown=cooldown,
-                    client_factory=client_factory,
-                    concurrency=concurrency,
-                )
-                warc_summary = warc_result.summary
                 print("Building replay index...")
                 generate_replay_index(
-                    warc_result.created_warcs,
+                    export_result.created_warcs,
                     layout=warc_plan.layout,
                 )
-
-            files_summary = FilesSummary()
             if website_plan is not None:
-                print(
-                    f"Writing {len(website_plan.targets)} website files "
-                    f"(concurrency={concurrency})..."
-                )
-                files_summary = write_website_files(
-                    files_groups,
-                    website_plan,
-                    client,
-                    cooldown=cooldown,
-                    client_factory=client_factory,
-                    concurrency=concurrency,
-                )
                 if rewrite_local and files_summary.written > 0:
                     rewrite_local_website(
                         layout.website_root,
-                        include_timestamps=(files_mode == "all"),
+                        include_timestamps=(
+                            files_mode in {"unique", "all"}
+                        ),
                     )
 
             print_summary(warc_summary, warc_mode=warc_mode)

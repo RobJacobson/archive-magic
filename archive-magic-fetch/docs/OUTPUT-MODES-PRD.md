@@ -15,7 +15,7 @@
 Extend `archive-magic-fetch` with two independent output axes:
 
 1. **WARC + replay CDXJ** — `none` | `latest` | `all` (default **`all`**)
-2. **Loose website files** — `none` (default) | `latest` | `all`
+2. **Loose website files** — `none` (default) | `latest` | `unique` | `all`
 
 Default behavior remains: discover IA captures in the date window, write full
 WARC history + `replay/index.cdxj`. Loose files are opt-in.
@@ -38,7 +38,6 @@ mode, skip-existing / resume.
 - Include/exclude URL filters.
 - List-only / dry-run JSON mode.
 - WACZ packaging.
-- Concurrent retrieval.
 - Saving HTTP headers/status sidecars next to loose files (bodies only).
 - Changing collection naming, date defaults, or output root.
 
@@ -48,13 +47,13 @@ mode, skip-existing / resume.
 archive-magic-fetch URL_PATTERN
   [--start DATE] [--end DATE]
   [--warc {none,latest,all}]
-  [--files {none,latest,all}]
+  [--files {none,latest,unique,all}]
 ```
 
 | Flag | Values | Default |
 | --- | --- | --- |
 | `--warc` | `none`, `latest`, `all` | `all` |
-| `--files` | `none`, `latest`, `all` | `none` |
+| `--files` | `none`, `latest`, `unique`, `all` | `none` |
 
 Existing flags unchanged:
 
@@ -132,7 +131,7 @@ When `--warc none`:
 
 ### 6.3 Loose files (`website/`)
 
-When `--files` is `latest` or `all`, write bodies under:
+When `--files` is enabled, write bodies under:
 
 ```text
 archives/example.com/website/
@@ -167,6 +166,12 @@ website/example.com/20051120005053/index.html
 Identical planned paths with distinct digests append `--<digest8>` before the
 filename extension.
 
+#### Unique (`--files unique`)
+
+Use the timestamped layout from `all`, but write only the first full response
+for each valid digest within a URL group. Captures represented as WARC revisits
+do not receive loose files. Missing or malformed digests remain independent.
+
 #### Path rules for loose files
 
 - Bodies only (decoded semantic payload from `get_memento` / same bytes that
@@ -199,16 +204,17 @@ parse args + defaults
   -> publish sources/ acquisition (full discovery)
   -> group by urlkey
   -> build warc_selection from --warc (all|latest|none)
-  -> build files_selection from --files (all|latest|none)
+  -> build files_selection from --files (all|unique|latest|none)
   -> if warc enabled: preflight WARC/replay targets
   -> if files enabled: preflight website targets for planned paths
-  -> if warc enabled: export WARCs from warc_selection; build replay CDXJ
-  -> if files enabled: write loose files from files_selection
+  -> export WARC and loose-file selections in one URL-group worker pass
+  -> if warc enabled: build replay CDXJ
   -> print aggregate summary
 ```
 
-WARC and loose-file output are independent. A capture selected by both stages
-is retrieved once for each output.
+WARC and loose-file selections are independent, but their writes share one
+retrieval. `unique` exposes the same response/revisit classification used by
+WARC export; `all` also materializes revisit bodies at every timestamp.
 
 ## 8. Summary / console
 

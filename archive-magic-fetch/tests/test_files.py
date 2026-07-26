@@ -105,7 +105,15 @@ def test_files_latest_writes_website_without_timestamps(tmp_path):
         }
     )
 
-    summary = files.write_website_files(groups, plan, client)
+    summary = export.export_all(
+        {},
+        (),
+        client,
+        file_capture_groups=groups,
+        website_plan=plan,
+        warc_mode="none",
+        files_mode="latest",
+    ).files_summary
 
     assert summary.written == 2
     assert (
@@ -147,7 +155,15 @@ def test_files_all_writes_timestamp_directories(tmp_path):
         }
     )
 
-    summary = files.write_website_files(groups, plan, client)
+    summary = export.export_all(
+        {},
+        (),
+        client,
+        file_capture_groups=groups,
+        website_plan=plan,
+        warc_mode="none",
+        files_mode="all",
+    ).files_summary
 
     assert summary.written == 2
     assert (
@@ -196,7 +212,7 @@ def test_warc_latest_writes_one_response_and_replay(tmp_path):
     assert layout.replay_index.exists()
 
 
-def test_dual_mode_fetches_each_output_independently(tmp_path, capsys):
+def test_dual_mode_reuses_one_representative_download(tmp_path):
     selected = capture(payload=b"shared-body")
     groups = {selected.urlkey: [selected]}
     layout = paths.collection_layout(
@@ -212,26 +228,129 @@ def test_dual_mode_fetches_each_output_independently(tmp_path, capsys):
     client = FakeClient({selected: memento_for(selected, payload=b"shared-body")})
     cooldown = retrieval.RateLimitCooldown()
 
-    warc_result = export.export_all(
+    result = export.export_all(
         groups,
         warc_plan.buckets,
         client,
-        cooldown=cooldown,
-    )
-    files_summary = files.write_website_files(
-        groups,
-        website_plan,
-        client,
+        file_capture_groups=groups,
+        website_plan=website_plan,
+        files_mode="latest",
         cooldown=cooldown,
     )
 
-    assert client.calls == [selected, selected]
-    assert warc_result.summary.responses == 1
-    assert files_summary.written == 1
-    assert capsys.readouterr().out.count("Fetched ") == 2
+    assert client.calls == [selected]
+    assert result.summary.responses == 1
+    assert result.files_summary.written == 1
     assert (
         layout.website_root / "example.com" / "index.html"
     ).read_bytes() == b"shared-body"
+
+
+def test_files_unique_writes_responses_and_skips_revisits(tmp_path):
+    first = capture(captured="20170101000000", payload=b"same")
+    duplicate = capture(captured="20180101000000", payload=b"same")
+    groups = {first.urlkey: [first, duplicate]}
+    layout = paths.collection_layout(
+        "https://example.com/*",
+        root=tmp_path / "archives",
+    )
+    warc_plan = paths.preflight_layout(groups, layout)
+    website_plan = paths.preflight_website_layout(
+        groups,
+        layout,
+        include_timestamps=True,
+    )
+    client = FakeClient({first: memento_for(first, payload=b"same")})
+
+    result = export.export_all(
+        groups,
+        warc_plan.buckets,
+        client,
+        file_capture_groups=groups,
+        website_plan=website_plan,
+        files_mode="unique",
+    )
+
+    assert client.calls == [first]
+    assert result.summary.responses == 1
+    assert result.summary.revisits == 1
+    assert result.files_summary.written == 1
+    assert (
+        layout.website_root
+        / "example.com"
+        / "20170101000000"
+        / "index.html"
+    ).read_bytes() == b"same"
+    assert not (
+        layout.website_root
+        / "example.com"
+        / "20180101000000"
+        / "index.html"
+    ).exists()
+
+
+def test_files_unique_without_warc_uses_same_digest_policy(tmp_path):
+    first = capture(captured="20170101000000", payload=b"same")
+    duplicate = capture(captured="20180101000000", payload=b"same")
+    groups = {first.urlkey: [first, duplicate]}
+    layout = paths.collection_layout(
+        "https://example.com/*",
+        root=tmp_path / "archives",
+    )
+    website_plan = paths.preflight_website_layout(
+        groups,
+        layout,
+        include_timestamps=True,
+    )
+    client = FakeClient({first: memento_for(first, payload=b"same")})
+
+    result = export.export_all(
+        {},
+        (),
+        client,
+        file_capture_groups=groups,
+        website_plan=website_plan,
+        warc_mode="none",
+        files_mode="unique",
+    )
+
+    assert client.calls == [first]
+    assert result.created_warcs == ()
+    assert result.files_summary.written == 1
+
+
+def test_files_all_materializes_revisit_body_without_refetch(tmp_path):
+    first = capture(captured="20170101000000", payload=b"same")
+    duplicate = capture(captured="20180101000000", payload=b"same")
+    groups = {first.urlkey: [first, duplicate]}
+    layout = paths.collection_layout(
+        "https://example.com/*",
+        root=tmp_path / "archives",
+    )
+    warc_plan = paths.preflight_layout(groups, layout)
+    website_plan = paths.preflight_website_layout(
+        groups,
+        layout,
+        include_timestamps=True,
+    )
+    client = FakeClient({first: memento_for(first, payload=b"same")})
+
+    result = export.export_all(
+        groups,
+        warc_plan.buckets,
+        client,
+        file_capture_groups=groups,
+        website_plan=website_plan,
+        files_mode="all",
+    )
+
+    assert client.calls == [first]
+    assert result.files_summary.written == 2
+    assert {
+        path.read_bytes()
+        for path in layout.website_root.rglob("index.html")
+    } == {b"same"}
+    assert len(list(layout.website_root.rglob("index.html"))) == 2
 
 
 def test_empty_playback_body_counts_as_failure(tmp_path, capsys):
@@ -248,12 +367,20 @@ def test_empty_playback_body_counts_as_failure(tmp_path, capsys):
     )
     client = FakeClient({selected: memento_for(selected, payload=b"")})
 
-    summary = files.write_website_files(groups, plan, client)
+    summary = export.export_all(
+        {},
+        (),
+        client,
+        file_capture_groups=groups,
+        website_plan=plan,
+        warc_mode="none",
+        files_mode="latest",
+    ).files_summary
 
     assert summary.written == 0
     assert summary.playback_failures == 1
     assert not any(layout.website_root.rglob("*"))
-    assert "empty playback body" in capsys.readouterr().err
+    assert "empty playback body" in capsys.readouterr().out
 
 
 def test_playback_failure_does_not_create_file(tmp_path):
@@ -270,7 +397,15 @@ def test_playback_failure_does_not_create_file(tmp_path):
     )
     client = FakeClient({selected: MementoPlaybackError("unavailable")})
 
-    summary = files.write_website_files(groups, plan, client)
+    summary = export.export_all(
+        {},
+        (),
+        client,
+        file_capture_groups=groups,
+        website_plan=plan,
+        warc_mode="none",
+        files_mode="latest",
+    ).files_summary
 
     assert summary.playback_failures == 1
     assert summary.written == 0

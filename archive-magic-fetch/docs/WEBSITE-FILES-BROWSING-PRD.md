@@ -62,7 +62,7 @@ With `--files latest`:
 archive-magic-fetch URL_PATTERN
   [--start DATE] [--end DATE]
   [--warc {none,latest,all}]
-  [--files {none,latest,all}]
+  [--files {none,latest,unique,all}]
   [--rewrite-local]
 ```
 
@@ -73,7 +73,8 @@ archive-magic-fetch URL_PATTERN
 Validation:
 
 - `--rewrite-local` with `--files none` → exit 2 (usage error) with a clear
-  message: rewrite requires `--files latest` or `--files all`.
+  message: rewrite requires `--files latest`, `--files unique`, or
+  `--files all`.
 - `--rewrite-local` alone does not enable files mode.
 
 ## 6. Newest-wins path collisions

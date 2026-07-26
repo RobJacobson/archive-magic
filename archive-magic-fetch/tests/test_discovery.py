@@ -110,6 +110,10 @@ def test_apply_output_mode_latest_and_none():
         first.urlkey: [first, second],
         third.urlkey: [third],
     }
+    assert discovery.apply_output_mode(groups, "unique") == {
+        first.urlkey: [first, second],
+        third.urlkey: [third],
+    }
 
 
 def test_normalize_cdx_search_rewrites_trailing_star_to_explicit_prefix():
@@ -407,18 +411,13 @@ def test_cli_owns_one_client_context_and_passes_same_client(monkeypatch):
         grouped,
         planned_buckets,
         client,
-        *,
-        cooldown=None,
-        client_factory=None,
-        concurrency=None,
+        **kwargs,
     ):
         calls["export"] = (
             grouped,
             planned_buckets,
             client,
-            cooldown,
-            client_factory,
-            concurrency,
+            kwargs,
         )
         return type(
             "Result",
@@ -426,6 +425,11 @@ def test_cli_owns_one_client_context_and_passes_same_client(monkeypatch):
             {
                 "summary": type("Summary", (), {"selected": 1})(),
                 "created_warcs": (),
+                "files_summary": type(
+                    "FilesSummary",
+                    (),
+                    {"written": 0},
+                )(),
             },
         )()
 
@@ -485,9 +489,10 @@ def test_cli_owns_one_client_context_and_passes_same_client(monkeypatch):
     assert calls["export"][0] == groups
     assert calls["export"][1] == buckets
     assert calls["export"][2] == client
-    assert calls["export"][3] is not None
-    assert calls["export"][4] is not None
-    assert calls["export"][5] == DEFAULT_CONCURRENCY
+    assert calls["export"][3]["cooldown"] is not None
+    assert calls["export"][3]["client_factory"] is not None
+    assert calls["export"][3]["concurrency"] == DEFAULT_CONCURRENCY
+    assert calls["export"][3]["files_mode"] == "none"
     assert calls["replay"] == ((), layout)
     assert calls["summary"][0].selected == 1
     assert calls["summary"][1] == {"warc_mode": "all"}
@@ -528,6 +533,11 @@ def test_cli_prints_stage_messages(monkeypatch, capsys):
             {
                 "summary": type("Summary", (), {"selected": 1})(),
                 "created_warcs": (),
+                "files_summary": type(
+                    "FilesSummary",
+                    (),
+                    {"written": 0},
+                )(),
             },
         )(),
     )
@@ -542,7 +552,7 @@ def test_cli_prints_stage_messages(monkeypatch, capsys):
         "Discovered 1 captures\n"
         "Saving source acquisition...\n"
         "Grouping 1 captures...\n"
-        "Exporting 1 URL groups to WARC (concurrency=8)...\n"
+        "Exporting 1 URL groups (concurrency=8)...\n"
         "Building replay index...\n"
         "Job ended: 2026-07-24T12:01:35Z\n"
         "Job duration: 1.6 minutes\n"
@@ -638,6 +648,11 @@ def test_cli_does_not_print_summary_when_replay_indexing_fails(
             {
                 "summary": type("Summary", (), {})(),
                 "created_warcs": (object(),),
+                "files_summary": type(
+                    "FilesSummary",
+                    (),
+                    {"written": 0},
+                )(),
             },
         )(),
     )
@@ -674,6 +689,11 @@ def test_cli_retains_published_provenance_after_downstream_failure(
             {
                 "summary": type("Summary", (), {})(),
                 "created_warcs": (),
+                "files_summary": type(
+                    "FilesSummary",
+                    (),
+                    {"written": 0},
+                )(),
             },
         )(),
     )
@@ -700,6 +720,14 @@ def test_cli_defaults_parse_to_warc_all_and_files_none():
     assert args.concurrency == DEFAULT_CONCURRENCY
 
 
+def test_cli_accepts_unique_only_for_files():
+    assert cli.parse_args(
+        ["example.com/*", "--files", "unique"]
+    ).files == "unique"
+    with pytest.raises(SystemExit):
+        cli.parse_args(["example.com/*", "--warc", "unique"])
+
+
 def test_cli_concurrency_one_is_serial_diagnostic_mode():
     args = cli.parse_args(["example.com/*", "--concurrency", "1"])
     assert args.concurrency == 1
@@ -715,7 +743,7 @@ def test_cli_rewrite_local_requires_files_mode(capsys):
         ["example.com/*", "--rewrite-local", "--files", "none"]
     ) == 2
     assert (
-        "--rewrite-local requires --files latest or --files all"
+        "--rewrite-local requires --files latest, unique, or all"
         in capsys.readouterr().err
     )
 
@@ -723,7 +751,7 @@ def test_cli_rewrite_local_requires_files_mode(capsys):
 def test_cli_rewrite_local_alone_does_not_enable_files(capsys):
     assert cli.main(["example.com/*", "--rewrite-local", "--warc", "none"]) == 2
     assert (
-        "--rewrite-local requires --files latest or --files all"
+        "--rewrite-local requires --files latest, unique, or all"
         in capsys.readouterr().err
     )
 

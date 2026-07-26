@@ -5,14 +5,11 @@ from __future__ import annotations
 import random
 import threading
 import time
-from collections import deque
-from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
-from datetime import timezone
 from http import HTTPStatus
 from http.client import IncompleteRead as HttpIncompleteRead
 from io import BytesIO
-from typing import Callable, Mapping, Optional, Sequence
+from typing import Callable, Mapping, Optional
 
 from requests.exceptions import ContentDecodingError, RequestException
 from urllib3.exceptions import IncompleteRead as Urllib3IncompleteRead
@@ -25,6 +22,7 @@ from wayback.exceptions import (
     WaybackRetryError,
 )
 
+from .console import print_progress
 from .warc import timestamp_to_warc_date
 
 
@@ -37,10 +35,7 @@ MAX_RETRIEVAL_ATTEMPTS = 6
 REPEATED_TRUNCATION_ATTEMPTS = 3
 MAX_CONNECTION_BACKOFF_SECONDS = 30
 DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 60
-PREFETCH_MULTIPLIER = 2
 _MISSING_HEADER = object()
-
-_PROGRESS_LOCK = threading.Lock()
 
 _REPRESENTATION_HEADERS = {
     "content-digest",
@@ -230,7 +225,7 @@ class RetrievedMemento:
     status_code: int
     headers: tuple[tuple[str, str], ...]
 
-    def to_warc_record(self):
+    def to_warc_record(self, *, target_url: Optional[str] = None):
         """Build a fresh WARC response record over the semantic body."""
 
         http_headers = StatusAndHeaders(
@@ -240,7 +235,7 @@ class RetrievedMemento:
         )
         builder = RecordBuilder(warc_version="1.0")
         return builder.create_warc_record(
-            self.url,
+            target_url or self.url,
             "response",
             payload=BytesIO(self.body),
             length=len(self.body),
@@ -286,145 +281,6 @@ def _transient_backoff_seconds(failure_number: int) -> float:
         MAX_CONNECTION_BACKOFF_SECONDS,
     )
     return random.uniform(0, ceiling)
-
-
-class MementoFetchPool:
-    """Bounded worker pool: job queue for fetches, writer waits in order.
-
-    Workers reuse one Wayback client per thread and report successful fetches
-    as they complete. The writer calls ``wait`` in submission order.
-    """
-
-    def __init__(
-        self,
-        *,
-        cooldown: RateLimitCooldown,
-        client_factory: Callable[[], WaybackClient],
-        max_workers: int = DEFAULT_CONCURRENCY,
-        on_fetched: Optional[Callable[[object], None]] = None,
-    ) -> None:
-        self._cooldown = cooldown
-        self._client_factory = client_factory
-        self._on_fetched = on_fetched
-        self._max_workers = max(1, max_workers)
-        self._local = threading.local()
-        self._clients: list = []
-        self._clients_lock = threading.Lock()
-        self._executor = ThreadPoolExecutor(max_workers=self._max_workers)
-        self._futures: deque[Future] = deque()
-
-    def _thread_client(self):
-        client = getattr(self._local, "client", None)
-        if client is not None:
-            return client
-        client = self._client_factory()
-        enter = getattr(client, "__enter__", None)
-        if callable(enter):
-            enter()
-        self._local.client = client
-        with self._clients_lock:
-            self._clients.append(client)
-        return client
-
-    def _fetch(self, capture) -> RetrievedMemento:
-        result = retrieve_memento(
-            self._thread_client(),
-            capture,
-            cooldown=self._cooldown,
-        )
-        if self._on_fetched is not None:
-            self._on_fetched(capture)
-        return result
-
-    def submit(self, captures: Sequence) -> None:
-        """Enqueue every capture as independent work."""
-
-        for capture in captures:
-            self._futures.append(
-                self._executor.submit(self._fetch, capture)
-            )
-
-    def wait(self, capture) -> Optional[RetrievedMemento]:
-        """Return the next submitted result for this capture, if present."""
-
-        if not self._futures:
-            return None
-        return self._futures.popleft().result()
-
-    def window(self, captures: Sequence) -> MementoFetchWindow:
-        """Return a bounded lookahead window over ordered fetch work."""
-
-        return MementoFetchWindow(
-            self,
-            captures,
-            max_pending=max(1, self._max_workers * PREFETCH_MULTIPLIER),
-        )
-
-    def close(self) -> None:
-        self._executor.shutdown(wait=True)
-        for client in self._clients:
-            exit_fn = getattr(client, "__exit__", None)
-            if callable(exit_fn):
-                exit_fn(None, None, None)
-                continue
-            close = getattr(client, "close", None)
-            if callable(close):
-                close()
-
-
-class MementoFetchWindow:
-    """Keep only a bounded number of ordered fetch results outstanding."""
-
-    def __init__(
-        self,
-        pool: MementoFetchPool,
-        captures: Sequence,
-        *,
-        max_pending: int,
-    ) -> None:
-        self._pool = pool
-        self._captures = iter(captures)
-        self._max_pending = max_pending
-        self._pending = 0
-        self._prime()
-
-    def _prime(self) -> None:
-        batch = []
-        while self._pending < self._max_pending:
-            try:
-                capture = next(self._captures)
-            except StopIteration:
-                break
-            batch.append(capture)
-            self._pending += 1
-        if batch:
-            self._pool.submit(batch)
-
-    def wait(self, capture) -> Optional[RetrievedMemento]:
-        """Return one planned result and admit one more job."""
-
-        if self._pending == 0:
-            return None
-        result = self._pool.wait(capture)
-        self._pending -= 1
-        self._prime()
-        return result
-
-
-def print_fetched(capture) -> None:
-    """Report network completion immediately, independent of write order."""
-
-    timestamp = capture.timestamp.astimezone(timezone.utc).strftime(
-        "%Y%m%d%H%M%S"
-    )
-    print_progress(f"Fetched {timestamp} {capture.original}")
-
-
-def print_progress(message: str) -> None:
-    """Print one complete progress line safely across worker threads."""
-
-    with _PROGRESS_LOCK:
-        print(message, flush=True)
 
 
 def make_client_factory(user_agent: str) -> Callable[[], WaybackClient]:

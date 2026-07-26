@@ -148,6 +148,51 @@ def test_shared_warc_entries_have_distinct_offsets(tmp_path):
     assert len({entry["offset"] for _, _, entry in entries}) == 2
 
 
+def test_replay_index_includes_revisit_records(tmp_path):
+    selected_layout = collection(tmp_path)
+    warc = selected_layout.archive_root / "revisits.warc.gz"
+    warc.parent.mkdir(parents=True)
+    target = "https://example.com/document.pdf"
+    with warc.open("xb") as stream:
+        writer = WARCWriter(stream, gzip=True, warc_version="1.0")
+        response = writer.create_warc_record(
+            target,
+            "response",
+            payload=BytesIO(b"same"),
+            http_headers=StatusAndHeaders(
+                "200 OK",
+                [("Content-Type", "application/pdf")],
+                protocol="HTTP/1.1",
+            ),
+            warc_headers_dict={"WARC-Date": "2020-01-01T00:00:00Z"},
+        )
+        writer.write_record(response)
+        revisit = writer.create_revisit_record(
+            target,
+            response.rec_headers.get_header("WARC-Payload-Digest"),
+            target,
+            "2020-01-01T00:00:00Z",
+            http_headers=StatusAndHeaders(
+                "200 OK",
+                [("Content-Type", "application/pdf")],
+                protocol="HTTP/1.1",
+            ),
+            warc_headers_dict={"WARC-Date": "2020-01-02T00:00:00Z"},
+        )
+        writer.write_record(revisit)
+
+    result = replay.generate_replay_index([warc], layout=selected_layout)
+    entries = read_index(result)
+
+    assert [timestamp for _, timestamp, _ in entries] == [
+        "20200101000000",
+        "20200102000000",
+    ]
+    assert entries[0][2]["mime"] == "application/pdf"
+    assert entries[1][2]["mime"] == "warc/revisit"
+    assert entries[0][2]["digest"] == entries[1][2]["digest"]
+
+
 def test_replay_publication_replaces_existing_index(tmp_path):
     selected_layout = collection(tmp_path)
     warc = selected_layout.archive_root / "index.warc.gz"

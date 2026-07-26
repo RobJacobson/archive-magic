@@ -13,7 +13,9 @@ from wayback.exceptions import RateLimitError
 _PROGRESS_INTERVAL = 1000
 
 OutputMode = str
-OUTPUT_MODES = ("none", "latest", "all")
+WARC_MODES = ("none", "latest", "all")
+FILES_MODES = ("none", "latest", "unique", "all")
+OUTPUT_MODES = WARC_MODES
 
 
 def _is_redirect_status(status: Optional[int]) -> bool:
@@ -62,11 +64,11 @@ def apply_output_mode(
 ) -> dict[str, list[CdxRecord]]:
     """Transform grouped captures into the selection for one output axis."""
 
-    if mode not in OUTPUT_MODES:
+    if mode not in FILES_MODES:
         raise ValueError(f"unsupported output mode: {mode}")
     if mode == "none":
         return {}
-    if mode == "all":
+    if mode in {"all", "unique"}:
         return {
             urlkey: list(captures)
             for urlkey, captures in capture_groups.items()
