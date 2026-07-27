@@ -18,7 +18,7 @@ from wayback.exceptions import (
     WaybackRetryError,
 )
 
-from .console import GroupReporter
+from .console import GroupReporter, capture_result_line
 from .files import FilesSummary, write_body
 from .paths import WarcBucket, WebsitePlan
 from .retrieval import (
@@ -258,7 +258,7 @@ def _failure_lines(capture: CdxRecord, error: Exception) -> list[str]:
         else "failed during playback"
     )
     return [
-        f"{capture.view_url} : {outcome}",
+        capture_result_line(capture, outcome),
         f"  WARNING: {format_playback_failure(error)}",
     ]
 
@@ -268,7 +268,7 @@ def _status_failure_lines(
     actual_status: int,
 ) -> list[str]:
     return [
-        f"{capture.view_url} : failed with code {actual_status}",
+        capture_result_line(capture, f"failed with code {actual_status}"),
         (
             f"  WARNING: CDX status {capture.statuscode} but playback "
             f"returned {actual_status}"
@@ -434,7 +434,7 @@ def _write_group_files(
             else path
         )
         events.setdefault(target_capture, []).append(
-            f"{target_capture.view_url} : wrote file {relative}"
+            capture_result_line(target_capture, f"wrote file {relative}")
         )
 
 
@@ -520,7 +520,7 @@ def _use_known_representative(
         )
         state.warc.revisits += 1
         state.events[capture].append(
-            f"{capture.view_url} : wrote revisit"
+            capture_result_line(capture, "wrote revisit")
         )
     return True
 
@@ -624,7 +624,7 @@ def _commit_representative(
         )
         state.warc.responses += 1
         state.events[capture].append(
-            f"{capture.view_url} : wrote response"
+            capture_result_line(capture, "wrote response")
         )
     if digest is not None:
         state.representatives[digest] = reference

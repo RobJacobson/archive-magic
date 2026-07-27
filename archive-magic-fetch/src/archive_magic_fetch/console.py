@@ -118,6 +118,20 @@ def readable_url(original_url: str) -> str:
     return f"{host}{path}{query}"
 
 
+def capture_result_line(capture: object, result: str) -> str:
+    """Format a capture URL and its result with scheme-aware alignment."""
+
+    view_url = getattr(capture, "view_url", str(capture))
+    original_url = getattr(capture, "original", "")
+    scheme = (
+        urlsplit(original_url).scheme.lower()
+        if isinstance(original_url, str)
+        else ""
+    )
+    separator = "  : " if scheme == "http" else " : "
+    return f"{view_url}{separator}{result}"
+
+
 def print_progress(message: str) -> None:
     """Print one immediate line without interleaving another output block."""
 

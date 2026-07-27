@@ -20,7 +20,7 @@ from wayback.exceptions import (
     WaybackRetryError,
 )
 
-from .console import print_progress
+from .console import capture_result_line, print_progress
 from .retry import (
     DEFAULT_RETRIES,
     ArchiveMagicWaybackSession,
@@ -354,10 +354,12 @@ def _retrieve_memento_with_retry(
                 attempt_number,
                 retry_after=decision.retry_after,
             )
-            view_url = getattr(capture, "view_url", str(capture))
             print_progress(
-                f"{view_url} : retry {attempt_number}/{retries} in "
-                f"{format_seconds(delay)}s after {decision.cause}"
+                capture_result_line(
+                    capture,
+                    f"retry {attempt_number}/{retries} in "
+                    f"{format_seconds(delay)}s after {decision.cause}",
+                )
             )
             sleep_seconds(delay)
         else:
