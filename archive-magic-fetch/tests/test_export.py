@@ -476,7 +476,7 @@ def test_skippable_wayback_errors_warn_and_unrelated_capture_continues(
     assert capsys.readouterr().out.count("WARNING:") == 5
 
 
-def test_content_decoding_error_warns_once_and_skips_without_retry(
+def test_content_decoding_error_warns_once_when_raw_recovery_is_unavailable(
     tmp_path,
     capsys,
 ):
@@ -499,7 +499,7 @@ def test_content_decoding_error_warns_once_and_skips_without_retry(
         in warning
     )
     assert (
-        "capture discarded without retry"
+        "raw recovery was not verified by the CDX digest"
         in warning
     )
     assert "incorrect gzip header" in warning
@@ -923,6 +923,43 @@ def test_group_fetches_unique_representatives_and_preserves_write_order(
     assert records[1].rec_headers.get_header("WARC-Date") == "2017-01-01T00:00:00Z"
     assert records[2].rec_headers.get_header("WARC-Date") == "2018-01-01T00:00:00Z"
     assert records[3].rec_headers.get_header("WARC-Date") == "2019-01-01T00:00:00Z"
+
+
+def test_group_reports_digest_verified_content_encoding_recovery(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    selected = capture(payload=b"recovered")
+    retrieved = retrieval.RetrievedMemento(
+        body=b"recovered",
+        url=selected.original,
+        capture_date="2017-01-01T00:00:00Z",
+        source_uri=selected.raw_url,
+        status_code=200,
+        headers=(
+            ("Content-Type", "text/plain"),
+            ("Content-Length", "9"),
+        ),
+        recovered_content_encoding=True,
+    )
+    monkeypatch.setattr(
+        export,
+        "retrieve_memento",
+        lambda *_args, **_kwargs: retrieved,
+    )
+
+    summary = export.export_group(
+        URLKEY,
+        [selected],
+        output_path(tmp_path),
+        FakeClient({}),
+    )
+
+    assert summary.responses == 1
+    output = capsys.readouterr().out
+    assert "recovered invalid content encoding via CDX digest" in output
+    assert "wrote response" in output
 
 
 def test_export_all_runs_different_warc_buckets_concurrently(

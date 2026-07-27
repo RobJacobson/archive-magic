@@ -3,6 +3,7 @@ import hashlib
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
 from requests.exceptions import (
@@ -64,9 +65,10 @@ class FakeMemento:
 
 
 class FakeClient:
-    def __init__(self, results):
+    def __init__(self, results, *, session=None):
         self.results = iter(results)
         self.calls = []
+        self.session = session
 
     def get_memento(self, capture, **kwargs):
         self.calls.append((capture, kwargs))
@@ -109,6 +111,51 @@ class BrokenEncodingMemento:
 
     def __exit__(self, *_args):
         self.closed = True
+
+
+class FakeRawBody:
+    def __init__(self, payload):
+        self.payload = payload
+        self.calls = []
+
+    def read(self, *, decode_content):
+        self.calls.append(decode_content)
+        return self.payload
+
+
+class FakeRawResponse:
+    def __init__(
+        self,
+        payload,
+        *,
+        status_code=200,
+        headers=None,
+    ):
+        self.status_code = status_code
+        self.headers = headers or {
+            "Memento-Datetime": "Thu, 02 Jan 2020 03:04:05 GMT",
+            "Content-Encoding": "gzip",
+        }
+        self.raw = FakeRawBody(payload)
+        self.closed = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        self.closed = True
+
+
+class FakeRawSession:
+    def __init__(self, outcome):
+        self.outcome = outcome
+        self.calls = []
+
+    def request(self, method, url, **kwargs):
+        self.calls.append((method, url, kwargs))
+        if isinstance(self.outcome, Exception):
+            raise self.outcome
+        return self.outcome
 
 
 def test_retrieve_uses_exact_original_memento_and_maps_all_fields():
@@ -476,7 +523,58 @@ def test_changing_incomplete_read_boundaries_keep_retrying(monkeypatch):
     assert delays == [2, 4]
 
 
-def test_content_decoding_error_closes_and_discards_without_retry():
+def test_content_decoding_error_recovers_one_digest_verified_raw_replay():
+    payload = b"<html>faithful archived payload</html>"
+    raw_response = FakeRawResponse(payload)
+    session = FakeRawSession(raw_response)
+    broken = BrokenEncodingMemento(
+        ContentDecodingError("incorrect gzip header")
+    )
+    client = FakeClient([broken], session=session)
+    capture = SimpleNamespace(digest=payload_digest(payload))
+
+    retrieved = retrieval.retrieve_memento(client, capture)
+
+    assert retrieved.body == payload
+    assert retrieved.recovered_content_encoding is True
+    assert broken.closed is True
+    assert len(client.calls) == 1
+    assert session.calls == [
+        (
+            "GET",
+            broken.memento_url,
+            {"allow_redirects": False},
+        )
+    ]
+    assert raw_response.raw.calls == [False]
+    assert raw_response.closed is True
+    assert ("Content-Encoding", "gzip") not in retrieved.headers
+    assert ("Content-Length", str(len(payload))) in retrieved.headers
+
+
+def test_content_decoding_error_discards_raw_digest_mismatch():
+    expected = b"<html>complete archived payload</html>"
+    clipped = b"<html>complete archived"
+    raw_response = FakeRawResponse(clipped)
+    session = FakeRawSession(raw_response)
+    broken = BrokenEncodingMemento(
+        ContentDecodingError("incorrect gzip header")
+    )
+    client = FakeClient([broken, FakeMemento(content=b"unused")], session=session)
+    capture = SimpleNamespace(digest=payload_digest(expected))
+
+    with pytest.raises(
+        retrieval.MalformedContentEncodingError,
+        match="raw recovery was not verified by the CDX digest",
+    ):
+        retrieval.retrieve_response(client, capture)
+
+    assert len(client.calls) == 1
+    assert len(session.calls) == 1
+    assert raw_response.closed is True
+
+
+def test_content_decoding_error_discards_without_valid_cdx_digest():
     broken = BrokenEncodingMemento(
         ContentDecodingError("incorrect gzip header")
     )
@@ -494,11 +592,31 @@ def test_content_decoding_error_closes_and_discards_without_retry():
     assert len(client.calls) == 1
     assert broken.closed is True
     assert (
-        "capture discarded without retry"
+        "raw recovery was not verified by the CDX digest"
         in str(raised.value)
     )
     assert "(Content-Encoding: gzip)" in str(raised.value)
     assert "incorrect gzip header" in str(raised.value)
+
+
+def test_content_decoding_raw_recovery_does_not_retry_transport_failure(
+    monkeypatch,
+):
+    delays = _make_retries_immediate(monkeypatch)
+    payload = b"expected"
+    broken = BrokenEncodingMemento(
+        ContentDecodingError("incorrect gzip header")
+    )
+    session = FakeRawSession(ConnectionError("recovery unavailable"))
+    client = FakeClient([broken, FakeMemento(content=b"unused")], session=session)
+    capture = SimpleNamespace(digest=payload_digest(payload))
+
+    with pytest.raises(retrieval.MalformedContentEncodingError):
+        retrieval.retrieve_response(client, capture)
+
+    assert len(client.calls) == 1
+    assert len(session.calls) == 1
+    assert delays == []
 
 
 def test_make_client_factory_uses_application_owned_session(monkeypatch):

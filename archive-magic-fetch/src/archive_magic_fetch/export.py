@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -27,6 +26,7 @@ from .retrieval import (
     TruncatedWaybackResponseError,
     format_playback_failure,
     format_playback_failure_summary,
+    normalize_cdx_digest,
     retrieve_memento,
 )
 from .retry import DEFAULT_RETRIES, RetryExhaustedError
@@ -39,7 +39,6 @@ from .warc import (
 )
 
 
-_VALID_CDX_SHA1 = re.compile(r"[A-Z2-7]{32}")
 _EMPTY_PAYLOAD_DIGEST = "sha1:3I42H3S6NNFQ2MSVX7XZKYAYSCX5QBYJ"
 _PLAYBACK_ERRORS = (
     MementoPlaybackError,
@@ -205,19 +204,6 @@ def _cdx_timestamp(timestamp) -> str:
     """Format an aware timestamp as a 14-digit UTC CDX value."""
 
     return timestamp.astimezone(timezone.utc).strftime("%Y%m%d%H%M%S")
-
-
-def _normalized_cdx_digest(digest: object) -> Optional[str]:
-    """Return a canonical CDX SHA-1 payload digest when valid."""
-
-    if not isinstance(digest, str):
-        return None
-    value = digest.strip().upper()
-    if value.startswith("SHA1:"):
-        value = value[5:]
-    if not _VALID_CDX_SHA1.fullmatch(value):
-        return None
-    return f"sha1:{value}"
 
 
 def _failure_code(error: BaseException) -> Optional[int]:
@@ -447,7 +433,7 @@ def _targets_by_digest(
     for capture, paths in file_paths.items():
         if _is_redirect(capture.statuscode):
             continue
-        digest = _normalized_cdx_digest(capture.digest)
+        digest = normalize_cdx_digest(capture.digest)
         if digest is None:
             continue
         for path in paths:
@@ -585,7 +571,7 @@ def _retrieve_validated(
 
     if (
         not retrieved.body
-        and _normalized_cdx_digest(capture.digest)
+        and normalize_cdx_digest(capture.digest)
         != _EMPTY_PAYLOAD_DIGEST
     ):
         error = ValueError("empty playback body")
@@ -615,6 +601,13 @@ def _commit_representative(
 ) -> None:
     """Commit one successful representative to every selected output."""
 
+    if retrieved.recovered_content_encoding:
+        state.events[capture].append(
+            capture_result_line(
+                capture,
+                "recovered invalid content encoding via CDX digest",
+            )
+        )
     reference = None
     if wants_warc:
         reference = _write_response_record(
@@ -686,7 +679,7 @@ def _export_group(
             )
             continue
 
-        digest = _normalized_cdx_digest(capture.digest)
+        digest = normalize_cdx_digest(capture.digest)
         if _use_known_representative(
             state,
             capture,

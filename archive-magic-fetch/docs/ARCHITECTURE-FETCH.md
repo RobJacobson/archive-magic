@@ -4,7 +4,7 @@
 
 **Scope:** `archive-magic-fetch` only
 
-**Updated:** July 25, 2026
+**Updated:** July 27, 2026
 
 ## 1. Decision
 
@@ -203,11 +203,18 @@ Fetch keeps playback scheduling deliberately small:
 7. Playback response bodies are streamed so the Memento context owns response
    closure and connection-pool cleanup.
 8. A Requests `ContentDecodingError` is a playback representation problem, not
-   a rate-limit or transport-capacity signal. The first mismatch raises
-   `MalformedContentEncodingError`, warns, counts as a playback failure, and
-   skips immediately without backoff, another request, or a connection-pool
-   reset. Fetch never guesses whether contradictory bytes should be
-   decompressed or silently strips a replay header.
+   a rate-limit or transport-capacity signal. Fetch makes at most one
+   additional exact request for undecoded replay bytes. This is a bounded
+   integrity-recovery request, not a transport retry: it has no backoff and
+   never enters the application retry loop.
+9. Raw recovery succeeds only when the second response is a Memento with the
+   expected HTTP status and its complete raw body exactly matches the selected
+   capture's valid CDX SHA-1 payload digest. Fetch then removes contradictory
+   representation headers and records the recovery in console output.
+10. A missing or malformed CDX digest, non-Memento response, status mismatch,
+    incomplete transfer, request error, or digest mismatch raises
+    `MalformedContentEncodingError`, warns, counts as a playback failure, and
+    skips the capture without further requests or connection-pool resets.
 
 Discovery uses the same `--retries` count and deterministic pacing. A
 retryable failure discards partial rows and restarts the complete search.
@@ -563,14 +570,45 @@ Wayback occasionally returns a replay response that declares
 The raw response may be an already-decoded body or only a clipped decoded
 prefix bounded by stale compressed-representation metadata, so stripping the
 header is not a safe recovery. Requests raises `ContentDecodingError` before
-Fetch receives trustworthy semantic bytes. Fetch warns and skips the capture
-immediately rather than retrying the same malformed representation. A future
-format-aware recovery policy can be added separately if evidence justifies it.
+Fetch receives trustworthy semantic bytes.
+
+Fetch handles this specific contradiction with one conservative, format-free
+recovery:
+
+1. Close the failed streamed Memento response.
+2. Require a syntactically valid SHA-1 digest from the selected CDX row.
+3. Request the same exact original-mode replay once more, without following
+   redirects or asking Requests to decode its content representation.
+4. Require the raw response to remain a Memento with the same historical HTTP
+   status.
+5. Compute SHA-1 over the raw body and require an exact CDX digest match.
+6. Treat a matching body as the semantic archived payload, remove stale
+   content/transfer encoding, length, range, ETag, and representation-digest
+   headers, and write a newly computed semantic `Content-Length`.
+7. Report `recovered invalid content encoding via CDX digest` before reporting
+   the enabled WARC/file writes.
+
+The digest match is the recovery boundary. It proves that the accepted bytes
+are the payload identified by the archive index; it does not prove that the
+original crawler captured a syntactically complete document. Fetch therefore
+does not inspect URL extensions, MIME signatures, closing HTML tags, or other
+format-specific completeness signals.
+
+Fetch cannot safely recover a raw body that differs from the CDX digest.
+Length agreement is insufficient because a decoded body can be clipped at a
+stale compressed `Content-Length`. `Accept-Encoding: identity`, repeated
+playback, recognizable HTML/PDF prefixes, and blindly removing
+`Content-Encoding` do not establish fidelity. Missing/invalid CDX digests,
+raw-request errors, incomplete raw transfers, non-Memento responses, status
+mismatches, and digest mismatches remain categorized playback failures. Fetch
+does not attempt source ARC/WARC extraction or substitute a nearby capture.
 
 Repeated incomplete transfers normally follow the bounded connection retry
 policy. When three consecutive attempts stop at the same received/expected
 byte boundary, Fetch treats the outcome as a persistent truncated Wayback
-response, skips immediately, and reports the structured byte counts. It never
+response, skips immediately, and reports the structured byte counts. Range
+stitching is not attempted because a stable boundary can represent missing
+source bytes rather than a resumable transport interruption. Fetch never
 writes a partial response as a successful capture.
 
 Known CDX 3xx rows are counted and omitted before playback. A statusless row
@@ -607,8 +645,10 @@ One worker task owns one lazily opened collision-bucket WARC stream:
 
 Digest identity is scoped to one URL key, so matching bodies at different URLs
 each retain a full response. Missing or malformed CDX digests are fetched and
-written independently. CDX digests are not compared byte-for-byte with
-playback bodies because Wayback may transform stored content encoding.
+written independently. Normally decoded playback bodies are not compared
+byte-for-byte with CDX digests because Wayback may legitimately transform a
+stored content representation. The comparison is mandatory only for the raw
+fallback after automatic content decoding has already failed.
 
 Every response and revisit uses the CDX `capture.original` value as
 `WARC-Target-URI`. Existing percent escapes such as `%7B` remain unchanged;
@@ -674,8 +714,10 @@ https://web.archive.org/web/20190812143015/https://example.com/images/logo.png :
 [completed 1/235] example.com/images/logo.png
 https://web.archive.org/web/20170604120533/https://example.com/images/logo.png : wrote response
 https://web.archive.org/web/20180709183022/https://example.com/images/logo.png : wrote revisit
+https://web.archive.org/web/20190110102030/https://example.com/about : recovered invalid content encoding via CDX digest
+https://web.archive.org/web/20190110102030/https://example.com/about : wrote response
 https://web.archive.org/web/20190812143015/https://example.com/images/logo.png : failed during playback
-  WARNING: original Wayback replay could not be decoded by the HTTP client (Content-Encoding: gzip): incorrect header check; capture discarded without retry
+  WARNING: original Wayback replay could not be decoded by the HTTP client (Content-Encoding: gzip): incorrect header check; raw recovery was not verified by the CDX digest, so the capture was discarded
 Summary: warc 1 response, 1 revisit, 1 failed
 Summary: 235 selected for warc (all); 180 responses; 44 revisits; 9 redirects omitted; 2 playback failures (1 invalid content encoding, 1 truncated response)
 Files: 180 written (latest); 2 playback failures (1 invalid content encoding, 1 other); 0 redirects omitted
@@ -720,7 +762,7 @@ The flat package contains:
 | `publication.py` | Same-filesystem atomic no-replace file/directory publication |
 | `provenance.py` | Source CDX and query-manifest serialization/publication |
 | `retry.py` | Retry classification, deterministic delays, structured transient IA responses |
-| `retrieval.py` | Exact playback, application retry, identity-encoding recovery |
+| `retrieval.py` | Exact playback, application retry, CDX-gated raw recovery |
 | `export.py` | Concurrent bucket ownership, response/revisit/file writing, thread clients |
 | `files.py` | Loose website-file writing under `website/` |
 | `rewrite_local.py` | Optional post-write HTML/CSS/JS local-link rewrite |
@@ -758,8 +800,8 @@ Acceptance covers:
   concurrent publication, and cleanup;
 - shared-WARC ownership with one `warcinfo`;
 - retrieval fields, redirect/status policy, per-operation exponential retry,
-  independent worker backoff, thread-client reuse, identity-encoding
-  recovery/restoration, and final failed-URL behavior;
+  independent worker backoff, thread-client reuse, CDX-digest-gated raw
+  content-encoding recovery, and final failed-URL behavior;
 - sorted response CDXJ semantics and nested filenames;
 - exact offset/length selection of independently compressed WARC members;
 - replay-index replacement and indexer failures;
