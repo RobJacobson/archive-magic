@@ -73,7 +73,7 @@ The source CDX and replay CDXJ serve different purposes:
 
 ```text
 Wayback CDX discovery
-    -> sources/wayback/<acquisition>/captures.cdx.gz
+    -> sources/<acquisition>/captures.cdx.gz
        (upstream selection and provenance)
 
 successful playback and WARC serialization
@@ -496,7 +496,7 @@ parse arguments and apply date defaults
     -> create shared Wayback session/client
     -> completely materialize discovery
     -> if empty: print "No captures found" and exit successfully
-    -> save sources/wayback/<acquisition>/{captures.cdx.gz,query.json}
+    -> save sources/<acquisition>/{captures.cdx.gz,query.json,log.txt}
     -> collapse value-equal records and group by urlkey
     -> allocate and preflight WARC buckets plus replay/index.cdxj
     -> export buckets

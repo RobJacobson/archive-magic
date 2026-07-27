@@ -10,7 +10,6 @@ from typing import Sequence
 from cdxj_indexer.main import CDXJIndexer
 
 from .paths import CollectionLayout, validate_path_limits
-from .publication import publish_file_noreplace
 
 
 def generate_replay_index(
@@ -43,7 +42,7 @@ def generate_replay_index(
             records="response,revisit",
             dir_root=str(layout.collection_root),
         ).process_all()
-        publish_file_noreplace(temporary, layout.replay_index)
+        os.replace(temporary, layout.replay_index)
         return layout.replay_index
     finally:
         if temporary.exists():

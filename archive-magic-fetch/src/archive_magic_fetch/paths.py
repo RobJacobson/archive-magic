@@ -5,9 +5,10 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Mapping, Sequence, Union
-from urllib.parse import quote, urlsplit
+from typing import Mapping, Optional, Sequence, Union
+from urllib.parse import quote, unquote, urlsplit
 
 
 DEFAULT_OUTPUT_ROOT = Path("../archives")
@@ -43,12 +44,12 @@ class CollectionLayout:
         return self.collection_root / "sources"
 
     @property
-    def wayback_sources_root(self) -> Path:
-        return self.sources_root / "wayback"
-
-    @property
     def archive_root(self) -> Path:
         return self.collection_root / "archive"
+
+    @property
+    def website_root(self) -> Path:
+        return self.collection_root / "website"
 
     @property
     def replay_index(self) -> Path:
@@ -69,6 +70,23 @@ class ExportPlan:
 
     layout: CollectionLayout
     buckets: tuple[WarcBucket, ...]
+
+
+@dataclass(frozen=True)
+class WebsiteFileTarget:
+    """One planned loose-file destination for a selected capture."""
+
+    path: Path
+    urlkey: str
+    capture_index: int
+
+
+@dataclass(frozen=True)
+class WebsitePlan:
+    """Preflighted loose-file destinations under ``website/``."""
+
+    layout: CollectionLayout
+    targets: tuple[WebsiteFileTarget, ...]
 
 
 def _safe_segment(component: str) -> str:
@@ -103,14 +121,12 @@ def _bounded_segment(component: str, *, byte_limit: int) -> str:
         return encoded
 
     encoded = _truncate_escape_safe(encoded, byte_limit)
-    trailing_dots = len(encoded) - len(encoded.rstrip("."))
-    if trailing_dots:
-        replacement = "%2E" * trailing_dots
+    if encoded.endswith("."):
         prefix = _truncate_escape_safe(
-            encoded[:-trailing_dots],
-            byte_limit - len(replacement),
+            encoded[:-1],
+            byte_limit - len("%2E"),
         )
-        encoded = prefix + replacement
+        encoded = prefix + "%2E"
     if not encoded:  # pragma: no cover - byte limits are deliberately large
         raise ValueError("filesystem component limit is too small")
     return encoded
@@ -227,6 +243,169 @@ def preferred_warc_path(urlkey: str, layout: CollectionLayout) -> Path:
             for segment in directory_segments
         ),
         filename,
+    )
+
+
+def _cdx_timestamp_text(timestamp: datetime) -> str:
+    """Format an aware capture timestamp as a 14-digit CDX UTC value."""
+
+    if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+        raise ValueError("capture timestamp must include a timezone")
+    return timestamp.astimezone(timezone.utc).strftime("%Y%m%d%H%M%S")
+
+
+def website_host_segment(original_url: str) -> str:
+    """Return the filesystem host segment for one absolute capture URL."""
+
+    if not isinstance(original_url, str) or not original_url.strip():
+        raise ValueError("capture URL must be a non-empty string")
+
+    parsed = urlsplit(original_url.strip())
+    if not parsed.scheme or not parsed.netloc:
+        raise ValueError(f"capture URL must be absolute: {original_url}")
+
+    host = parsed.hostname
+    if not host:
+        raise ValueError(f"capture URL must include a host: {original_url}")
+
+    host = host.rstrip(".").lower()
+    try:
+        host = host.encode("idna").decode("ascii").lower()
+    except UnicodeError as error:
+        raise ValueError(f"capture URL host is not valid IDNA: {host}") from error
+
+    if host.startswith("www."):
+        host = host[4:]
+    if not host:
+        raise ValueError(f"capture URL host cannot be only www: {original_url}")
+
+    try:
+        port = parsed.port
+    except ValueError as error:
+        raise ValueError(f"capture URL has an invalid port: {original_url}") from error
+
+    scheme = parsed.scheme.lower()
+    if port is not None and not (
+        (scheme == "http" and port == 80)
+        or (scheme == "https" and port == 443)
+    ):
+        host = f"{host}--port-{port}"
+
+    return host
+
+
+def _split_site_path(path: str) -> tuple[list[str], bool]:
+    """Return decoded path segments and whether the path is directory-like.
+
+    Query strings are intentionally ignored for loose-file path planning.
+    """
+
+    path = unquote(path or "")
+    trailing_slash = path.endswith("/")
+    if path.startswith("/"):
+        path = path[1:]
+    if path.endswith("/"):
+        path = path[:-1]
+
+    segments = [segment for segment in path.split("/") if segment != ""]
+    directory_like = trailing_slash or not segments or "." not in segments[-1]
+    return segments, directory_like
+
+
+def _website_path_segments(original_url: str) -> tuple[list[str], bool]:
+    """Return decoded path segments and whether the URL is directory-like."""
+
+    if not isinstance(original_url, str) or not original_url.strip():
+        raise ValueError("capture URL must be a non-empty string")
+
+    parsed = urlsplit(original_url.strip())
+    if not parsed.scheme or not parsed.netloc:
+        raise ValueError(f"capture URL must be absolute: {original_url}")
+
+    return _split_site_path(parsed.path or "")
+
+
+def _website_relative_parts(
+    original_url: str,
+    *,
+    timestamp: Optional[datetime] = None,
+) -> tuple[str, ...]:
+    """Build safe relative parts under ``website/`` for one capture URL."""
+
+    host = website_host_segment(original_url)
+    segments, directory_like = _website_path_segments(original_url)
+    parts: list[str] = [host]
+    if timestamp is not None:
+        parts.append(_cdx_timestamp_text(timestamp))
+
+    if directory_like:
+        parts.extend(segments)
+        parts.append("index.html")
+    else:
+        parts.extend(segments)
+
+    return tuple(
+        _bounded_segment(segment, byte_limit=MAX_COMPONENT_BYTES)
+        for segment in parts
+    )
+
+
+def preferred_website_path(
+    original_url: str,
+    layout: CollectionLayout,
+    *,
+    timestamp: Optional[datetime] = None,
+) -> Path:
+    """Map one original URL to its preferred loose-file path under website/."""
+
+    return layout.website_root.joinpath(
+        *_website_relative_parts(original_url, timestamp=timestamp)
+    )
+
+
+def preferred_site_file(site_root: Path, url_path: str) -> Path:
+    """Map a site-absolute path to its preferred file under one site root.
+
+    Query strings are ignored (folded), matching loose-file path planning.
+    """
+
+    segments, directory_like = _split_site_path(url_path)
+    parts = list(segments)
+    if directory_like:
+        parts.append("index.html")
+    return site_root.joinpath(
+        *(
+            _bounded_segment(segment, byte_limit=MAX_COMPONENT_BYTES)
+            for segment in parts
+        )
+    )
+
+
+def _digest_path_token(digest: object, *, capture_index: int) -> str:
+    """Return a short stable token for disambiguating colliding website paths."""
+
+    if isinstance(digest, str):
+        token = digest.strip()
+        if token and token != "-":
+            if ":" in token:
+                _algorithm, token = token.split(":", 1)
+            cleaned = re.sub(r"[^A-Za-z0-9]", "", token).upper()
+            if cleaned:
+                return cleaned[:8]
+    return f"I{capture_index:04d}"
+
+
+def _with_filename_token(path: Path, token: str) -> Path:
+    """Insert ``--TOKEN`` before the final filename extension."""
+
+    name = path.name
+    if "." in name:
+        stem, extension = name.rsplit(".", 1)
+        filename = f"{stem}--{token}.{extension}"
+    else:
+        filename = f"{name}--{token}"
+    return path.with_name(
+        _bounded_segment(filename, byte_limit=MAX_COMPONENT_BYTES)
     )
 
 
@@ -395,3 +574,195 @@ def preflight_layout(
         _inspect_target(bucket.path)
     _inspect_target(layout.replay_index)
     return ExportPlan(layout, tuple(buckets))
+
+
+def _newest_wins_website_paths(
+    planned: list[tuple[Path, str, int, str, datetime]],
+    layout: CollectionLayout,
+) -> list[tuple[Path, str, int, str]]:
+    """Keep the newest capture per filesystem-equivalent website path.
+
+    Older timestamps at the same path are dropped. Captures that share both
+    path and newest timestamp remain for collision handling.
+    """
+
+    by_key: dict[
+        tuple[str, ...],
+        list[tuple[Path, str, int, str, datetime]],
+    ] = {}
+    for entry in planned:
+        key = _equivalent_path(entry[0], layout.website_root)
+        by_key.setdefault(key, []).append(entry)
+
+    survivors: list[tuple[Path, str, int, str]] = []
+    for entries in by_key.values():
+        newest_timestamp = max(entry[4] for entry in entries)
+        survivors.extend(
+            entry[:4]
+            for entry in entries
+            if entry[4] == newest_timestamp
+        )
+    return survivors
+
+
+def _disambiguate_website_paths(
+    planned: list[tuple[Path, str, int, str]],
+    layout: CollectionLayout,
+) -> list[tuple[Path, str, int, str]]:
+    """Give colliding website paths distinct digest-suffixed filenames."""
+
+    by_key: dict[tuple[str, ...], list[tuple[Path, str, int, str]]] = {}
+    for entry in planned:
+        key = _equivalent_path(entry[0], layout.website_root)
+        by_key.setdefault(key, []).append(entry)
+
+    disambiguated: list[tuple[Path, str, int, str]] = []
+    for entries in by_key.values():
+        if len(entries) == 1:
+            disambiguated.append(entries[0])
+            continue
+
+        tokens = {token for _path, _urlkey, _index, token in entries}
+        if len(tokens) != len(entries):
+            spellings = sorted(
+                {
+                    path.relative_to(layout.website_root).as_posix()
+                    for path, _, _, _ in entries
+                }
+            )
+            raise FileExistsError(
+                "multiple captures map to the same website path with "
+                "identical digests: " + ", ".join(spellings)
+            )
+
+        for path, urlkey, capture_index, token in entries:
+            disambiguated.append(
+                (
+                    _with_filename_token(path, token),
+                    urlkey,
+                    capture_index,
+                    token,
+                )
+            )
+    return disambiguated
+
+
+def _reshape_website_paths(
+    planned: list[tuple[Path, str, int, str]],
+    layout: CollectionLayout,
+) -> list[tuple[Path, str, int, str]]:
+    """Resolve file-vs-directory conflicts by reshaping files to index.html."""
+
+    # Repeat until stable: reshaping one file can expose another conflict.
+    while True:
+        by_key: dict[tuple[str, ...], list[tuple[Path, str, int, str]]] = {}
+        for entry in planned:
+            key = _equivalent_path(entry[0], layout.website_root)
+            by_key.setdefault(key, []).append(entry)
+
+        for key, entries in by_key.items():
+            if len(entries) > 1:
+                spellings = sorted(
+                    {
+                        path.relative_to(layout.website_root).as_posix()
+                        for path, _, _, _ in entries
+                    }
+                )
+                raise FileExistsError(
+                    "multiple captures map to the same website path: "
+                    + ", ".join(spellings)
+                )
+
+        keys = sorted(by_key, key=len)
+        reshaped: list[tuple[Path, str, int, str]] = []
+        changed = False
+        for key, entries in ((key, by_key[key]) for key in keys):
+            path, urlkey, capture_index, token = entries[0]
+            descendant = next(
+                (
+                    other_key
+                    for other_key in keys
+                    if len(other_key) > len(key)
+                    and other_key[: len(key)] == key
+                ),
+                None,
+            )
+            if descendant is None:
+                reshaped.append((path, urlkey, capture_index, token))
+                continue
+
+            reshaped_path = path / "index.html"
+            conflict_key = _equivalent_path(reshaped_path, layout.website_root)
+            if conflict_key in by_key:
+                raise FileExistsError(
+                    "cannot reshape website file to directory without "
+                    f"clobbering: {reshaped_path}"
+                )
+            reshaped.append((reshaped_path, urlkey, capture_index, token))
+            changed = True
+
+        planned = reshaped
+        if not changed:
+            return planned
+
+
+def preflight_website_layout(
+    capture_groups: Mapping[str, Sequence[object]],
+    layout: CollectionLayout,
+    *,
+    include_timestamps: bool,
+) -> WebsitePlan:
+    """Plan and inspect all final loose-file targets under ``website/``."""
+
+    planned: list[tuple[Path, str, int, str, datetime]] = []
+    for urlkey, captures in capture_groups.items():
+        if not captures:
+            raise ValueError(f"capture group is empty: {urlkey}")
+        for capture_index, capture in enumerate(captures):
+            original = getattr(capture, "original", None)
+            if not isinstance(original, str) or not original:
+                raise ValueError("capture URL must be a non-empty string")
+            capture_timestamp = getattr(capture, "timestamp", None)
+            if not isinstance(capture_timestamp, datetime):
+                raise ValueError("capture timestamp must be a datetime")
+            path_timestamp = capture_timestamp if include_timestamps else None
+            path = preferred_website_path(
+                original,
+                layout,
+                timestamp=path_timestamp,
+            )
+            planned.append(
+                (
+                    path,
+                    urlkey,
+                    capture_index,
+                    _digest_path_token(
+                        getattr(capture, "digest", None),
+                        capture_index=capture_index,
+                    ),
+                    capture_timestamp,
+                )
+            )
+
+    planned = _newest_wins_website_paths(planned, layout)
+    planned = _disambiguate_website_paths(planned, layout)
+    planned = _reshape_website_paths(planned, layout)
+    planned.sort(
+        key=lambda item: (
+            item[0].relative_to(layout.website_root).as_posix(),
+            item[1],
+            item[2],
+        )
+    )
+
+    targets = []
+    for path, urlkey, capture_index, _token in planned:
+        _inspect_target(path)
+        targets.append(
+            WebsiteFileTarget(
+                path=path,
+                urlkey=urlkey,
+                capture_index=capture_index,
+            )
+        )
+    return WebsitePlan(layout, tuple(targets))

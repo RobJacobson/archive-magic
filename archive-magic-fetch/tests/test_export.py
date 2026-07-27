@@ -1,8 +1,16 @@
 import base64
 import hashlib
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from requests.exceptions import (
+    ChunkedEncodingError,
+    ContentDecodingError,
+    ReadTimeout,
+)
+from urllib3.exceptions import IncompleteRead, ProtocolError
 from warcio.archiveiterator import ArchiveIterator
 from wayback import CdxRecord
 from wayback.exceptions import (
@@ -96,6 +104,12 @@ class FakeClient:
         return outcome
 
 
+def make_retries_immediate(monkeypatch):
+    delays = []
+    monkeypatch.setattr(retrieval, "sleep_seconds", delays.append)
+    return delays
+
+
 def memento_for(
     selected,
     *,
@@ -134,22 +148,7 @@ def output_path(tmp_path, urlkey=URLKEY):
     return paths.preferred_warc_path(urlkey, layout)
 
 
-def test_normalize_digest_accepts_raw_and_prefixed_sha1():
-    raw = payload_digest(b"payload").split(":", 1)[1]
-
-    assert export.normalize_digest(raw.lower()) == f"sha1:{raw}"
-    assert export.normalize_digest(f"SHA1:{raw.lower()}") == f"sha1:{raw}"
-
-
-@pytest.mark.parametrize(
-    "value",
-    [None, "", "-", "md5:AAAAAAAA", "sha1:short", "!" * 32],
-)
-def test_normalize_digest_rejects_unusable_values(value):
-    assert export.normalize_digest(value) is None
-
-
-def test_source_signature_shortcut_uses_cdx_identity(tmp_path):
+def test_matching_cdx_digests_write_one_response_and_one_revisit(tmp_path):
     first = capture(
         original="https://cdx.example/first",
         captured="20170101000000",
@@ -158,15 +157,23 @@ def test_source_signature_shortcut_uses_cdx_identity(tmp_path):
         original="https://cdx.example/second",
         captured="20180101000000",
     )
-    first_memento = memento_for(
-        first,
-        url="https://played.example/first",
-        captured="20170102030405",
+    client = FakeClient(
+        {
+            first: memento_for(
+                first,
+                url="https://played.example/first",
+                captured="20170102030405",
+            ),
+            second: memento_for(
+                second,
+                url="https://played.example/second",
+                captured="20180102030405",
+            ),
+        }
     )
-    client = FakeClient({first: first_memento})
     target = output_path(tmp_path)
 
-    export.export_group(URLKEY, [first, second], target, client)
+    summary = export.export_group(URLKEY, [first, second], target, client)
 
     assert client.calls == [first]
     records = read_records(target)
@@ -175,103 +182,62 @@ def test_source_signature_shortcut_uses_cdx_identity(tmp_path):
         "response",
         "revisit",
     ]
-    response, revisit = records[1:]
-    assert response.rec_headers.get_header(
-        "WARC-Target-URI"
-    ) == "https://played.example/first"
-    assert (
-        response.rec_headers.get_header("WARC-Date")
-        == "2017-01-02T03:04:05Z"
+    assert summary == export.ExportSummary(
+        selected=2,
+        responses=1,
+        revisits=1,
     )
-    assert revisit.rec_headers.get_header(
+    assert records[1].rec_headers.get_header(
+        "WARC-Target-URI"
+    ) == first.original
+    assert records[2].rec_headers.get_header(
         "WARC-Target-URI"
     ) == second.original
-    assert (
-        revisit.rec_headers.get_header("WARC-Date")
-        == "2018-01-01T00:00:00Z"
-    )
-    assert revisit.rec_headers.get_header(
+    assert records[2].rec_headers.get_header(
         "WARC-Refers-To"
-    ) == response.rec_headers.get_header("WARC-Record-ID")
-    assert revisit.rec_headers.get_header(
-        "WARC-Refers-To-Target-URI"
-    ) == "https://played.example/first"
-    assert (
-        revisit.rec_headers.get_header("WARC-Refers-To-Date")
-        == "2017-01-02T03:04:05Z"
-    )
-    assert revisit.content_stream().read() == b""
+    ) == records[1].rec_headers.get_header("WARC-Record-ID")
 
 
-def test_semantic_duplicate_uses_memento_identity_and_original_canonical(
-    tmp_path,
-):
-    first = capture(
-        original="https://cdx.example/a",
-        captured="20170101000000",
-        digest=payload_digest(b"stored-a"),
-    )
-    second = capture(
-        original="https://cdx.example/b",
-        captured="20180101000000",
-        digest=payload_digest(b"stored-b"),
-    )
-    third = capture(
-        original="https://cdx.example/c",
-        captured="20190101000000",
-        digest=payload_digest(b"stored-b"),
-    )
-    client = FakeClient(
-        {
-            first: memento_for(
-                first,
-                url="https://played.example/a",
-                captured="20170102000000",
-                payload=b"same semantic body",
-            ),
-            second: memento_for(
-                second,
-                url="https://played.example/b",
-                captured="20180102000000",
-                payload=b"same semantic body",
-            ),
-        }
-    )
+def test_empty_playback_body_writes_zero_length_response(tmp_path, capsys):
+    selected = capture(payload=b"")
     target = output_path(tmp_path)
+    client = FakeClient(
+        {selected: memento_for(selected, payload=b"")}
+    )
 
-    export.export_group(URLKEY, [first, second, third], target, client)
+    summary = export.export_group(URLKEY, [selected], target, client)
 
-    assert client.calls == [first, second]
     records = read_records(target)
     assert [record.rec_type for record in records] == [
         "warcinfo",
         "response",
-        "revisit",
-        "revisit",
     ]
-    response, semantic_revisit, source_revisit = records[1:]
-    assert semantic_revisit.rec_headers.get_header(
-        "WARC-Target-URI"
-    ) == "https://played.example/b"
-    assert (
-        semantic_revisit.rec_headers.get_header("WARC-Date")
-        == "2018-01-02T00:00:00Z"
-    )
-    assert source_revisit.rec_headers.get_header(
-        "WARC-Target-URI"
-    ) == third.original
-    assert (
-        source_revisit.rec_headers.get_header("WARC-Date")
-        == "2019-01-01T00:00:00Z"
-    )
-    canonical_id = response.rec_headers.get_header("WARC-Record-ID")
-    assert {
-        semantic_revisit.rec_headers.get_header("WARC-Refers-To"),
-        source_revisit.rec_headers.get_header("WARC-Refers-To"),
-    } == {canonical_id}
+    assert summary == export.ExportSummary(selected=1, responses=1)
+    assert records[1].content_stream().read() == b""
+    assert records[1].rec_headers.get_header(
+        "WARC-Payload-Digest"
+    ) == payload_digest(b"")
+    assert "empty playback body" not in capsys.readouterr().out
 
 
-def test_failed_first_occurrence_does_not_seed_source_map(
+def test_unexpected_empty_playback_body_remains_failure(tmp_path, capsys):
+    selected = capture(payload=b"expected")
+    target = output_path(tmp_path)
+    client = FakeClient(
+        {selected: memento_for(selected, payload=b"")}
+    )
+
+    summary = export.export_group(URLKEY, [selected], target, client)
+
+    assert summary == export.ExportSummary(
+        selected=1,
+        playback_failures=1,
+    )
+    assert not target.exists()
+    assert "empty playback body" in capsys.readouterr().out
+
+
+def test_failed_capture_does_not_prevent_later_capture(
     tmp_path,
     capsys,
 ):
@@ -292,10 +258,28 @@ def test_failed_first_occurrence_does_not_seed_source_map(
         "warcinfo",
         "response",
     ]
-    assert "capture unavailable" in capsys.readouterr().err
+    assert "capture unavailable" in capsys.readouterr().out
 
 
-def test_missing_digests_still_participate_in_semantic_dedup(tmp_path):
+def test_export_result_lists_failed_capture_view_url(tmp_path):
+    selected = capture()
+    bucket = paths.WarcBucket(
+        tmp_path / "failed.warc.gz",
+        (selected.urlkey,),
+    )
+
+    result = export.export_all(
+        {selected.urlkey: [selected]},
+        (bucket,),
+        FakeClient(
+            {selected: MementoPlaybackError("capture unavailable")}
+        ),
+    )
+
+    assert result.failed_capture_urls == (selected.view_url,)
+
+
+def test_matching_bodies_are_stored_as_full_responses(tmp_path):
     first = capture(captured="20170101000000", digest="-")
     second = capture(captured="20180101000000", digest="malformed")
     client = FakeClient(
@@ -312,11 +296,11 @@ def test_missing_digests_still_participate_in_semantic_dedup(tmp_path):
     assert [record.rec_type for record in read_records(target)] == [
         "warcinfo",
         "response",
-        "revisit",
+        "response",
     ]
 
 
-def test_cdx_status_and_actual_status_are_integer_dedup_keys(tmp_path):
+def test_distinct_statuses_are_preserved(tmp_path):
     first = capture(captured="20170101000000", statuscode=200)
     second = capture(captured="20180101000000", statuscode=404)
     client = FakeClient(
@@ -329,30 +313,42 @@ def test_cdx_status_and_actual_status_are_integer_dedup_keys(tmp_path):
 
     export.export_group(URLKEY, [first, second], target, client)
 
-    assert client.calls == [first, second]
+    assert client.calls == [first]
     records = read_records(target)
     assert [record.rec_type for record in records] == [
         "warcinfo",
         "response",
-        "response",
+        "revisit",
     ]
     assert [
         record.http_headers.get_statuscode() for record in records[1:]
     ] == ["200", "404"]
 
 
-def test_status_substitution_is_skipped_and_does_not_seed_dedup(
+def test_status_substitution_is_skipped(
     tmp_path,
     capsys,
 ):
-    first = capture(captured="20170101000000", statuscode=200)
-    second = capture(captured="20180101000000", statuscode=201)
-    third = capture(captured="20190101000000", statuscode=201)
+    first = capture(
+        captured="20170101000000",
+        statuscode=200,
+        payload=b"first",
+    )
+    second = capture(
+        captured="20180101000000",
+        statuscode=201,
+        payload=b"second",
+    )
+    third = capture(
+        captured="20190101000000",
+        statuscode=201,
+        payload=b"third",
+    )
     client = FakeClient(
         {
-            first: memento_for(first, payload=b"same", status_code=200),
-            second: memento_for(second, payload=b"same", status_code=200),
-            third: memento_for(third, payload=b"different", status_code=201),
+            first: memento_for(first, payload=b"first", status_code=200),
+            second: memento_for(second, payload=b"second", status_code=200),
+            third: memento_for(third, payload=b"third", status_code=201),
         }
     )
     target = output_path(tmp_path)
@@ -372,29 +368,18 @@ def test_status_substitution_is_skipped_and_does_not_seed_dedup(
     ]
     assert summary.responses == 2
     assert summary.playback_failures == 1
-    assert "CDX status 201 but playback returned 200" in capsys.readouterr().err
+    assert "CDX status 201 but playback returned 200" in capsys.readouterr().out
 
 
-def test_statusless_revisit_reuses_successful_digest(tmp_path):
-    first = capture(captured="20170101000000", statuscode=200)
-    revisit = capture(captured="20180101000000", statuscode=None)
-    client = FakeClient({first: memento_for(first)})
-    target = output_path(tmp_path)
-
-    export.export_group(URLKEY, [first, revisit], target, client)
-
-    assert client.calls == [first]
-    assert [record.rec_type for record in read_records(target)] == [
-        "warcinfo",
-        "response",
-        "revisit",
-    ]
-
-
-def test_statusless_first_occurrence_is_retrieved(tmp_path):
+def test_statusless_captures_with_matching_digest_use_revisit(tmp_path):
     first = capture(captured="20170101000000", statuscode=None)
     second = capture(captured="20180101000000", statuscode=None)
-    client = FakeClient({first: memento_for(first, status_code=204)})
+    client = FakeClient(
+        {
+            first: memento_for(first, status_code=204),
+            second: memento_for(second, status_code=204),
+        }
+    )
     target = output_path(tmp_path)
 
     export.export_group(URLKEY, [first, second], target, client)
@@ -402,7 +387,7 @@ def test_statusless_first_occurrence_is_retrieved(tmp_path):
     assert client.calls == [first]
     records = read_records(target)
     assert records[1].http_headers.get_statuscode() == "204"
-    assert records[2].rec_type == "revisit"
+    assert records[2].http_headers.get_statuscode() == "204"
 
 
 @pytest.mark.parametrize("statuscode", [300, 301, 308, 399])
@@ -452,13 +437,14 @@ def test_retrieved_statusless_redirect_is_omitted(tmp_path):
 def test_skippable_wayback_errors_warn_and_unrelated_capture_continues(
     tmp_path,
     capsys,
+    monkeypatch,
 ):
     failures = [
         MementoPlaybackError("playback failed"),
         NoMementoError("no memento"),
         BlockedByRobotsError("blocked by robots"),
         BlockedSiteError("blocked site"),
-        WaybackRetryError(2, 1, RuntimeError("timeout")),
+        WaybackRetryError(0, 1, ReadTimeout("timeout")),
     ]
     captures = [
         capture(
@@ -474,15 +460,90 @@ def test_skippable_wayback_errors_warn_and_unrelated_capture_continues(
     outcomes[captures[-1]] = memento_for(captures[-1])
     client = FakeClient(outcomes)
     target = output_path(tmp_path)
+    make_retries_immediate(monkeypatch)
 
-    export.export_group(URLKEY, captures, target, client)
+    export.export_group(URLKEY, captures, target, client, retries=2)
 
-    assert client.calls == captures
+    assert client.calls[:4] == captures[:4]
+    assert client.calls[4:-1] == [
+        captures[4]
+    ] * 3
+    assert client.calls[-1] == captures[-1]
     assert [record.rec_type for record in read_records(target)] == [
         "warcinfo",
         "response",
     ]
-    assert capsys.readouterr().err.count("WARNING skipped") == 5
+    assert capsys.readouterr().out.count("WARNING:") == 5
+
+
+def test_content_decoding_error_warns_once_and_skips_without_retry(
+    tmp_path,
+    capsys,
+):
+    selected = capture()
+    client = FakeClient(
+        {selected: ContentDecodingError("incorrect gzip header")}
+    )
+    target = output_path(tmp_path)
+
+    summary = export.export_group(URLKEY, [selected], target, client)
+
+    assert client.calls == [selected]
+    assert not target.exists()
+    assert summary.playback_failures == 1
+    assert summary.invalid_content_encoding_failures == 1
+    warning = capsys.readouterr().out
+    assert warning.count("WARNING:") == 1
+    assert (
+        "original Wayback replay could not be decoded by the HTTP client"
+        in warning
+    )
+    assert (
+        "capture discarded without retry"
+        in warning
+    )
+    assert "incorrect gzip header" in warning
+
+
+def test_repeated_truncated_response_warns_early_and_is_categorized(
+    tmp_path,
+    capsys,
+    monkeypatch,
+):
+    selected = capture()
+    truncated = [
+        WaybackRetryError(
+            1,
+            0.2,
+            ChunkedEncodingError(
+                ProtocolError(
+                    "Connection broken",
+                    IncompleteRead(130810, 144219),
+                )
+            ),
+        )
+        for _ in range(retrieval.REPEATED_TRUNCATION_ATTEMPTS)
+    ]
+    client = FakeClient({selected: truncated})
+    make_retries_immediate(monkeypatch)
+
+    summary = export.export_group(
+        URLKEY,
+        [selected],
+        output_path(tmp_path),
+        client,
+    )
+
+    assert len(client.calls) == retrieval.REPEATED_TRUNCATION_ATTEMPTS
+    assert summary.playback_failures == 1
+    assert summary.truncated_response_failures == 1
+    warning = capsys.readouterr().out
+    assert "truncated Wayback response after 3 attempts over" in warning
+    assert "received 130,810 of 275,029 bytes" in warning
+    warning_lines = [
+        line for line in warning.splitlines() if "WARNING:" in line
+    ]
+    assert all("IncompleteRead" not in line for line in warning_lines)
 
 
 def test_unexpected_response_format_is_fatal(tmp_path):
@@ -500,27 +561,39 @@ def test_unexpected_response_format_is_fatal(tmp_path):
         )
 
 
-def test_second_rate_limit_is_fatal(tmp_path, monkeypatch):
+def test_repeated_rate_limit_is_bounded_and_skips_capture(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
     selected = capture()
+    rate_limits = 3
     client = FakeClient(
         {
             selected: [
-                RateLimitError(None, 1),
-                RateLimitError(None, 2),
+                RateLimitError(None, attempt)
+                for attempt in range(1, rate_limits + 1)
             ]
         }
     )
-    sleeps = []
-    monkeypatch.setattr(retrieval.time, "sleep", sleeps.append)
+    delays = make_retries_immediate(monkeypatch)
 
-    with pytest.raises(RateLimitError):
-        export.export_group(
-            URLKEY,
-            [selected],
-            output_path(tmp_path),
-            client,
-        )
-    assert sleeps == [1]
+    target = output_path(tmp_path)
+    summary = export.export_group(
+        URLKEY,
+        [selected],
+        target,
+        client,
+        retries=2,
+    )
+
+    assert delays == [2, 4]
+    assert summary.responses == 0
+    assert summary.playback_failures == 1
+    assert not target.exists()
+    output = capsys.readouterr()
+    assert output.out.count(" : retry ") == rate_limits - 1
+    assert output.out.count("WARNING:") == 1
 
 
 def test_all_skipped_group_creates_no_file(tmp_path):
@@ -573,7 +646,7 @@ def test_warc_serialization_failure_is_fatal(tmp_path, monkeypatch):
         )
 
 
-def test_dedup_maps_are_scoped_to_each_group(tmp_path, capsys):
+def test_groups_are_exported_independently(tmp_path, capsys):
     first = capture(
         original="https://example.com/a",
         urlkey="com,example)/a",
@@ -610,15 +683,35 @@ def test_dedup_maps_are_scoped_to_each_group(tmp_path, capsys):
         == ["warcinfo", "response"]
         for path in result.created_warcs
     )
-    assert "Summary:" not in capsys.readouterr().out
+    assert capsys.readouterr().out.count("[completed ") == 2
     export.print_summary(result.summary)
     assert capsys.readouterr().out.endswith(
-        "Summary: 2 selected; 2 responses; 0 revisits; "
+        "Summary: 2 selected for warc (all); 2 responses; "
+        "0 revisits; "
         "0 redirects omitted; 0 playback failures\n"
     )
 
 
-def test_colliding_groups_share_one_warc_but_not_deduplication(tmp_path):
+def test_summary_includes_playback_failure_categories(capsys):
+    summary = export.ExportSummary(
+        selected=8,
+        responses=5,
+        playback_failures=3,
+        invalid_content_encoding_failures=1,
+        truncated_response_failures=1,
+    )
+
+    export.print_summary(summary)
+
+    assert capsys.readouterr().out == (
+        "Summary: 8 selected for warc (all); 5 responses; "
+        "0 revisits; "
+        "0 redirects omitted; 3 playback failures "
+        "(1 invalid content encoding, 1 truncated response, 1 other)\n"
+    )
+
+
+def test_colliding_groups_share_one_warc(tmp_path):
     trailing = capture(
         original="https://example.com/posts/",
         urlkey="com,example)/posts/",
@@ -739,12 +832,281 @@ def test_generated_file_is_parseable_gzip_warc_1_0(tmp_path):
     ) == payload_digest(b"payload")
 
 
+def test_original_percent_escapes_are_preserved_in_warc_and_output(
+    tmp_path,
+    capsys,
+):
+    selected = capture(
+        original=(
+            "http://www.wecanstopthehate.org/"
+            "%7Bfiledir_2%7DIB_9.pdf"
+        ),
+    )
+    target = output_path(tmp_path)
+
+    export.export_group(
+        URLKEY,
+        [selected],
+        target,
+        FakeClient(
+            {
+                selected: memento_for(
+                    selected,
+                    url=(
+                        "http://www.wecanstopthehate.org/"
+                        "%257Bfiledir_2%257DIB_9.pdf"
+                    ),
+                )
+            }
+        ),
+    )
+
+    response = read_records(target)[1]
+    assert response.rec_headers.get_header(
+        "WARC-Target-URI"
+    ) == selected.original
+    assert "%257B" not in response.rec_headers.get_header(
+        "WARC-Target-URI"
+    )
+    output = capsys.readouterr().out
+    assert (
+        "[completed 1/1] "
+        "wecanstopthehate.org/%7Bfiledir_2%7DIB_9.pdf"
+    ) in output
+
+
+def test_group_fetches_unique_representatives_and_preserves_write_order(
+    tmp_path,
+    capsys,
+):
+    first = capture(captured="20170101000000", payload=b"alpha")
+    duplicate = capture(captured="20180101000000", payload=b"alpha")
+    second = capture(
+        captured="20190101000000",
+        payload=b"beta",
+        digest=payload_digest(b"beta").split(":", 1)[1],
+    )
+    target = output_path(tmp_path)
+    outcomes = {
+        first: memento_for(first, payload=b"alpha"),
+        duplicate: memento_for(duplicate, payload=b"alpha"),
+        second: memento_for(second, payload=b"beta"),
+    }
+    client = FakeClient(outcomes)
+
+    summary = export.export_group(
+        URLKEY,
+        [first, duplicate, second],
+        target,
+        client,
+    )
+
+    assert summary.responses == 2
+    assert summary.revisits == 1
+    assert client.calls == [first, second]
+
+    output = capsys.readouterr().out
+    outcomes = [
+        line.rsplit(" : ", 1)[1]
+        for line in output.splitlines()
+        if line.startswith("https://web.archive.org/")
+    ]
+    assert outcomes == ["wrote response", "wrote revisit", "wrote response"]
+
+    records = read_records(target)
+    assert [record.rec_type for record in records] == [
+        "warcinfo",
+        "response",
+        "revisit",
+        "response",
+    ]
+    assert records[1].rec_headers.get_header("WARC-Date") == "2017-01-01T00:00:00Z"
+    assert records[2].rec_headers.get_header("WARC-Date") == "2018-01-01T00:00:00Z"
+    assert records[3].rec_headers.get_header("WARC-Date") == "2019-01-01T00:00:00Z"
+
+
+def test_export_all_runs_different_warc_buckets_concurrently(
+    tmp_path,
+    capsys,
+):
+    first = capture(
+        original="https://example.com/a",
+        captured="20170101000000",
+        payload=b"alpha",
+        urlkey="com,example)/a",
+    )
+    second = capture(
+        original="https://example.com/b",
+        captured="20180101000000",
+        payload=b"beta",
+        urlkey="com,example)/b",
+    )
+    outcomes = {
+        first: memento_for(first, payload=b"alpha"),
+        second: memento_for(second, payload=b"beta"),
+    }
+    first_started = threading.Event()
+    release_first = threading.Event()
+    second_finished = threading.Event()
+    created_clients = []
+
+    class FactoryClient:
+        def __init__(self):
+            self.calls = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def get_memento(self, selected, **kwargs):
+            self.calls.append(selected)
+            if selected is first:
+                first_started.set()
+                release_first.wait(timeout=10)
+            if selected is second:
+                second_finished.set()
+            return outcomes[selected]
+
+    def factory():
+        client = FactoryClient()
+        created_clients.append(client)
+        return client
+
+    buckets = (
+        paths.WarcBucket(tmp_path / "a.warc.gz", (first.urlkey,)),
+        paths.WarcBucket(tmp_path / "b.warc.gz", (second.urlkey,)),
+    )
+    groups = {
+        first.urlkey: [first],
+        second.urlkey: [second],
+    }
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(
+            export.export_all,
+            groups,
+            buckets,
+            FactoryClient(),
+            client_factory=factory,
+            concurrency=2,
+        )
+        assert first_started.wait(timeout=2)
+        assert second_finished.wait(timeout=2)
+        assert not future.done()
+        release_first.set()
+        result = future.result(timeout=2)
+
+    assert result.summary.responses == 2
+    assert len(created_clients) == 2
+    worker_calls = [call for client in created_clients for call in client.calls]
+    assert set(worker_calls) == {first, second}
+    assert set(result.created_warcs) == {
+        buckets[0].path,
+        buckets[1].path,
+    }
+    output = capsys.readouterr().out
+    completed = [
+        line for line in output.splitlines() if line.startswith("[completed ")
+    ]
+    assert {line.rsplit("] ", 1)[1] for line in completed} == {
+        "example.com/a",
+        "example.com/b",
+    }
+
+
+def test_thread_client_pool_reuses_and_closes_client():
+    created = []
+
+    class Client:
+        def __init__(self):
+            self.exited = False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            self.exited = True
+
+    def factory():
+        client = Client()
+        created.append(client)
+        return client
+
+    pool = export._ThreadClientPool(factory)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        first = executor.submit(pool.get).result()
+        second = executor.submit(pool.get).result()
+    pool.close()
+
+    assert first is second
+    assert created == [first]
+    assert first.exited is True
+
+
+def test_groups_sharing_one_warc_bucket_remain_serial(tmp_path):
+    first = capture(
+        original="https://example.com/a",
+        urlkey="com,example)/a",
+    )
+    second = capture(
+        original="https://example.com/b",
+        urlkey="com,example)/b",
+    )
+    first_finished = threading.Event()
+
+    class OrderedClient(FakeClient):
+        def get_memento(self, selected, **kwargs):
+            if selected is second:
+                assert first_finished.is_set()
+            result = super().get_memento(selected, **kwargs)
+            if selected is first:
+                first_finished.set()
+            return result
+
+    bucket = paths.WarcBucket(
+        tmp_path / "shared.warc.gz",
+        (first.urlkey, second.urlkey),
+    )
+    client = OrderedClient(
+        {
+            first: memento_for(first),
+            second: memento_for(second),
+        }
+    )
+
+    export.export_all(
+        {first.urlkey: [first], second.urlkey: [second]},
+        (bucket,),
+        client,
+        concurrency=8,
+    )
+
+    assert client.calls == [first, second]
+
+
 def test_open_new_warc_exclusively_rejects_existing_target(tmp_path):
     target = tmp_path / "existing.warc.gz"
     target.write_bytes(b"existing")
 
     with pytest.raises(FileExistsError):
         warc.open_new_warc(target)
+
+
+def test_export_rejects_existing_target(tmp_path):
+    selected = capture()
+    target = output_path(tmp_path)
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"existing")
+
+    with pytest.raises(FileExistsError):
+        export.export_group(
+            URLKEY,
+            [selected],
+            target,
+            FakeClient({selected: memento_for(selected)}),
+        )
 
 
 def test_timestamp_to_warc_date_normalizes_aware_non_utc_datetime():
@@ -760,6 +1122,20 @@ def test_timestamp_to_warc_date_normalizes_aware_non_utc_datetime():
     )
 
     assert warc.timestamp_to_warc_date(value) == "2020-01-02T03:04:05Z"
+
+
+def test_cdx_timestamp_normalizes_aware_non_utc_datetime():
+    value = datetime(
+        2020,
+        1,
+        2,
+        8,
+        34,
+        5,
+        tzinfo=timezone(timedelta(hours=5, minutes=30)),
+    )
+
+    assert export._cdx_timestamp(value) == "20200102030405"
 
 
 def test_timestamp_to_warc_date_rejects_naive_datetime():
