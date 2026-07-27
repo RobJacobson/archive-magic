@@ -44,14 +44,20 @@ class FakeResponse:
 
 
 def test_application_session_exposes_retryable_service_response(monkeypatch):
+    sent = {}
     response = FakeResponse(
         status_code=503,
         headers={"Retry-After": "17"},
     )
+
+    def send(_self, _request, **kwargs):
+        sent.update(kwargs)
+        return response
+
     monkeypatch.setattr(
         WaybackSession,
         "send",
-        lambda _self, _request, **_kwargs: response,
+        send,
     )
     session = retry.ArchiveMagicWaybackSession()
 
@@ -64,6 +70,7 @@ def test_application_session_exposes_retryable_service_response(monkeypatch):
     assert raised.value.retry_after == 17
     assert response.closed is True
     assert session.retries == 0
+    assert sent["stream"] is True
 
 
 def test_application_session_preserves_historical_503_memento(monkeypatch):

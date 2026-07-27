@@ -476,32 +476,19 @@ def test_skippable_wayback_errors_warn_and_unrelated_capture_continues(
     assert capsys.readouterr().out.count("WARNING:") == 5
 
 
-def test_persistent_content_decoding_error_warns_once_and_skips(
+def test_content_decoding_error_warns_once_and_skips_without_retry(
     tmp_path,
     capsys,
 ):
     selected = capture()
     client = FakeClient(
-        {
-            selected: [
-                ContentDecodingError("incorrect gzip header"),
-                ContentDecodingError("still incorrect under identity"),
-            ]
-        }
+        {selected: ContentDecodingError("incorrect gzip header")}
     )
-    client.session = type(
-        "Session",
-        (),
-        {
-            "headers": {"Accept-Encoding": "gzip, deflate"},
-            "reset": lambda self: None,
-        },
-    )()
     target = output_path(tmp_path)
 
     summary = export.export_group(URLKEY, [selected], target, client)
 
-    assert client.calls == [selected, selected]
+    assert client.calls == [selected]
     assert not target.exists()
     assert summary.playback_failures == 1
     assert summary.invalid_content_encoding_failures == 1
@@ -512,10 +499,10 @@ def test_persistent_content_decoding_error_warns_once_and_skips(
         in warning
     )
     assert (
-        "retrying with Accept-Encoding: identity also failed"
+        "capture discarded without retry"
         in warning
     )
-    assert "still incorrect under identity" in warning
+    assert "incorrect gzip header" in warning
 
 
 def test_repeated_truncated_response_warns_early_and_is_categorized(

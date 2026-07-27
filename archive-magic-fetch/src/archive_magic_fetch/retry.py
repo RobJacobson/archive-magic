@@ -94,6 +94,7 @@ class ArchiveMagicWaybackSession(WaybackSession):
         super().__init__(*args, **kwargs)
 
     def send(self, request, **kwargs):
+        kwargs["stream"] = True
         response = super().send(request, **kwargs)
         if (
             response.status_code in RETRYABLE_HTTP_STATUSES

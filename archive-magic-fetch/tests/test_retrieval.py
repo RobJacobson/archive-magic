@@ -357,6 +357,15 @@ def test_connection_failure_backs_off_and_retries(monkeypatch):
     capture = object()
     memento = FakeMemento()
     client = FakeClient([_connection_refused_retry_error(), memento])
+    client.session = type(
+        "Session",
+        (),
+        {
+            "reset": lambda _self: pytest.fail(
+                "transport retry reset the connection pool"
+            )
+        },
+    )()
 
     retrieval.retrieve_response(client, capture)
 
@@ -467,61 +476,12 @@ def test_changing_incomplete_read_boundaries_keep_retrying(monkeypatch):
     assert delays == [2, 4]
 
 
-def test_content_decoding_error_retries_once_with_identity_without_throttle():
-    capture = object()
+def test_content_decoding_error_closes_and_discards_without_retry():
     broken = BrokenEncodingMemento(
         ContentDecodingError("incorrect gzip header")
     )
-    client = FakeClient([broken, FakeMemento(content=b"recovered")])
-    client.session = type(
-        "Session",
-        (),
-        {
-            "headers": {"Accept-Encoding": "gzip, deflate"},
-            "reset_count": 0,
-            "reset": lambda self: setattr(
-                self,
-                "reset_count",
-                self.reset_count + 1,
-            ),
-        },
-    )()
-    encodings = []
-    original_get = client.get_memento
+    client = FakeClient([broken, FakeMemento(content=b"unused")])
 
-    def get_memento(selected, **kwargs):
-        encodings.append(client.session.headers["Accept-Encoding"])
-        return original_get(selected, **kwargs)
-
-    client.get_memento = get_memento
-    response = retrieval.retrieve_response(
-        client,
-        capture,
-    )
-
-    assert response.content_stream().read() == b"recovered"
-    assert broken.closed is True
-    assert encodings == ["gzip, deflate", "identity"]
-    assert client.session.headers["Accept-Encoding"] == "gzip, deflate"
-    assert client.session.reset_count == 1
-
-
-def test_identity_decoding_failure_skips_immediately_and_restores_header():
-    first = BrokenEncodingMemento(
-        ContentDecodingError("incorrect gzip header")
-    )
-    second = BrokenEncodingMemento(
-        ContentDecodingError("still incorrect")
-    )
-    client = FakeClient([first, second])
-    client.session = type(
-        "Session",
-        (),
-        {
-            "headers": {"Accept-Encoding": "gzip, deflate"},
-            "reset": lambda self: None,
-        },
-    )()
     with pytest.raises(
         retrieval.MalformedContentEncodingError,
         match=(
@@ -531,14 +491,14 @@ def test_identity_decoding_failure_skips_immediately_and_restores_header():
     ) as raised:
         retrieval.retrieve_response(client, object())
 
-    assert len(client.calls) == 2
-    assert client.session.headers["Accept-Encoding"] == "gzip, deflate"
+    assert len(client.calls) == 1
+    assert broken.closed is True
     assert (
-        "retrying with Accept-Encoding: identity also failed"
+        "capture discarded without retry"
         in str(raised.value)
     )
     assert "(Content-Encoding: gzip)" in str(raised.value)
-    assert "still incorrect" in str(raised.value)
+    assert "incorrect gzip header" in str(raised.value)
 
 
 def test_make_client_factory_uses_application_owned_session(monkeypatch):

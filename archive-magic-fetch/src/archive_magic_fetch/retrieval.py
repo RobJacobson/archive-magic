@@ -37,7 +37,6 @@ from .warc import timestamp_to_warc_date
 DEFAULT_CONCURRENCY = 8
 
 REPEATED_TRUNCATION_ATTEMPTS = 3
-_MISSING_HEADER = object()
 
 _REPRESENTATION_HEADERS = {
     "content-digest",
@@ -59,11 +58,9 @@ class MalformedContentEncodingError(MementoPlaybackError):
         self,
         encoding: Optional[str] = None,
         *,
-        identity_retry_failed: bool = True,
         cause: Optional[Exception] = None,
     ) -> None:
         self.encoding = encoding
-        self.identity_retry_failed = identity_retry_failed
         self.cause = cause
         if encoding:
             encoding_detail = f" (Content-Encoding: {encoding})"
@@ -71,18 +68,9 @@ class MalformedContentEncodingError(MementoPlaybackError):
             encoding_detail = ""
         cause_text = str(cause).strip() if cause is not None else ""
         cause_detail = f": {cause_text}" if cause_text else ""
-        if identity_retry_failed:
-            retry_detail = (
-                "retrying with Accept-Encoding: identity also failed"
-            )
-        else:
-            retry_detail = (
-                "the client session could not retry with "
-                "Accept-Encoding: identity"
-            )
         super().__init__(
             "original Wayback replay could not be decoded by the HTTP client"
-            f"{encoding_detail}{cause_detail}; {retry_detail}"
+            f"{encoding_detail}{cause_detail}; capture discarded without retry"
         )
 
 
@@ -281,89 +269,74 @@ def _retrieve_memento_with_retry(
 
     started_at = time.monotonic()
     attempt_number = 0
-    identity_retry = False
-    identity_headers = None
-    previous_accept_encoding = _MISSING_HEADER
     previous_truncation = None
     repeated_truncations = 0
-    try:
-        while attempt_number <= retries:
-            attempt_number += 1
-            memento = None
-            try:
-                memento = client.get_memento(
-                    capture,
-                    mode=Mode.original,
-                    exact=True,
-                    follow_redirects=False,
+    while attempt_number <= retries:
+        attempt_number += 1
+        memento = None
+        try:
+            memento = client.get_memento(
+                capture,
+                mode=Mode.original,
+                exact=True,
+                follow_redirects=False,
+            )
+            with memento:
+                payload = memento.content
+                headers = tuple(
+                    _semantic_headers(memento.headers, len(payload))
                 )
-                with memento:
-                    payload = memento.content
-                    headers = tuple(
-                        _semantic_headers(memento.headers, len(payload))
-                    )
-                    result = RetrievedMemento(
-                        body=payload,
-                        url=memento.url,
-                        capture_date=timestamp_to_warc_date(
-                            memento.timestamp
-                        ),
-                        source_uri=memento.memento_url,
-                        status_code=memento.status_code,
-                        headers=headers,
-                    )
-            except ContentDecodingError as error:
-                if identity_retry:
-                    raise MalformedContentEncodingError(
-                        _content_encoding(memento),
-                        cause=error,
-                    ) from error
-
-                session = getattr(client, "session", None)
-                identity_headers = getattr(session, "headers", None)
-                if identity_headers is None:
-                    raise MalformedContentEncodingError(
-                        _content_encoding(memento),
-                        identity_retry_failed=False,
-                        cause=error,
-                    ) from error
-
-                identity_retry = True
-                attempt_number -= 1
-                previous_accept_encoding = identity_headers.get(
-                    "Accept-Encoding",
-                    _MISSING_HEADER,
+                result = RetrievedMemento(
+                    body=payload,
+                    url=memento.url,
+                    capture_date=timestamp_to_warc_date(
+                        memento.timestamp
+                    ),
+                    source_uri=memento.memento_url,
+                    status_code=memento.status_code,
+                    headers=headers,
                 )
-                identity_headers["Accept-Encoding"] = "identity"
-                reset = getattr(session, "reset", None)
-                if callable(reset):
-                    reset()
-            except (
-                RateLimitError,
-                RetryableWaybackResponseError,
-                WaybackRetryError,
-                RequestException,
-            ) as error:
-                decision = retry_decision(error)
-                if decision is None:
-                    raise
-                truncation = _incomplete_read_boundary(error)
-                if truncation is not None:
-                    if truncation == previous_truncation:
-                        repeated_truncations += 1
-                    else:
-                        previous_truncation = truncation
-                        repeated_truncations = 1
+        except ContentDecodingError as error:
+            raise MalformedContentEncodingError(
+                _content_encoding(memento),
+                cause=error,
+            ) from error
+        except (
+            RateLimitError,
+            RetryableWaybackResponseError,
+            WaybackRetryError,
+            RequestException,
+        ) as error:
+            decision = retry_decision(error)
+            if decision is None:
+                raise
+            truncation = _incomplete_read_boundary(error)
+            if truncation is not None:
+                if truncation == previous_truncation:
+                    repeated_truncations += 1
                 else:
-                    previous_truncation = None
-                    repeated_truncations = 0
+                    previous_truncation = truncation
+                    repeated_truncations = 1
+            else:
+                previous_truncation = None
+                repeated_truncations = 0
 
-                repeated_boundary = (
-                    truncation is not None
-                    and repeated_truncations
-                    >= REPEATED_TRUNCATION_ATTEMPTS
-                )
-                if repeated_boundary:
+            repeated_boundary = (
+                truncation is not None
+                and repeated_truncations
+                >= REPEATED_TRUNCATION_ATTEMPTS
+            )
+            if repeated_boundary:
+                received, expected = truncation
+                raise TruncatedWaybackResponseError(
+                    received_bytes=received,
+                    expected_bytes=expected,
+                    attempts=attempt_number,
+                    elapsed_seconds=time.monotonic() - started_at,
+                ) from error
+
+            if attempt_number > retries:
+                if truncation is not None:
                     received, expected = truncation
                     raise TruncatedWaybackResponseError(
                         received_bytes=received,
@@ -371,48 +344,24 @@ def _retrieve_memento_with_retry(
                         attempts=attempt_number,
                         elapsed_seconds=time.monotonic() - started_at,
                     ) from error
+                raise RetryExhaustedError(
+                    attempts=attempt_number,
+                    elapsed_seconds=time.monotonic() - started_at,
+                    cause=decision.cause,
+                ) from error
 
-                if attempt_number > retries:
-                    if truncation is not None:
-                        received, expected = truncation
-                        raise TruncatedWaybackResponseError(
-                            received_bytes=received,
-                            expected_bytes=expected,
-                            attempts=attempt_number,
-                            elapsed_seconds=time.monotonic() - started_at,
-                        ) from error
-                    raise RetryExhaustedError(
-                        attempts=attempt_number,
-                        elapsed_seconds=time.monotonic() - started_at,
-                        cause=decision.cause,
-                    ) from error
-
-                if isinstance(decision.cause, RequestException):
-                    session = getattr(client, "session", None)
-                    reset = getattr(session, "reset", None)
-                    if callable(reset):
-                        reset()
-
-                delay = retry_delay_seconds(
-                    attempt_number,
-                    retry_after=decision.retry_after,
-                )
-                view_url = getattr(capture, "view_url", str(capture))
-                print_progress(
-                    f"{view_url} : retry {attempt_number}/{retries} in "
-                    f"{format_seconds(delay)}s after {decision.cause}"
-                )
-                sleep_seconds(delay)
-            else:
-                return result
-    finally:
-        if identity_headers is not None:
-            if previous_accept_encoding is _MISSING_HEADER:
-                identity_headers.pop("Accept-Encoding", None)
-            else:
-                identity_headers["Accept-Encoding"] = (
-                    previous_accept_encoding
-                )
+            delay = retry_delay_seconds(
+                attempt_number,
+                retry_after=decision.retry_after,
+            )
+            view_url = getattr(capture, "view_url", str(capture))
+            print_progress(
+                f"{view_url} : retry {attempt_number}/{retries} in "
+                f"{format_seconds(delay)}s after {decision.cause}"
+            )
+            sleep_seconds(delay)
+        else:
+            return result
 
     raise RuntimeError("unreachable memento retry state")  # pragma: no cover
 

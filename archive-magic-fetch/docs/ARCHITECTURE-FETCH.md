@@ -200,18 +200,14 @@ Fetch keeps playback scheduling deliberately small:
    retain the full retry budget.
 6. The `wayback` library performs no retries; its process-wide baseline CDX
    and Memento request-start limiters remain enabled.
-7. A Requests `ContentDecodingError` is a playback representation problem, not
-   a rate-limit or transport-capacity signal. Its identity-encoding recovery
-   does not change concurrency, start exponential backoff, or consume a transport
-   attempt.
-8. On the first decoding mismatch for a capture, that worker temporarily
-   changes its private session from `Accept-Encoding: gzip, deflate` to
-   `Accept-Encoding: identity`, resets its connection adapters, and retries.
-   The previous header is restored when retrieval succeeds or exits.
-9. A second mismatch under identity encoding raises
+7. Playback response bodies are streamed so the Memento context owns response
+   closure and connection-pool cleanup.
+8. A Requests `ContentDecodingError` is a playback representation problem, not
+   a rate-limit or transport-capacity signal. The first mismatch raises
    `MalformedContentEncodingError`, warns, counts as a playback failure, and
-   skips immediately. Fetch never guesses whether contradictory bytes should
-   be decompressed or silently strips a replay header.
+   skips immediately without backoff, another request, or a connection-pool
+   reset. Fetch never guesses whether contradictory bytes should be
+   decompressed or silently strips a replay header.
 
 Discovery uses the same `--retries` count and deterministic pacing. A
 retryable failure discards partial rows and restarts the complete search.
@@ -567,10 +563,9 @@ Wayback occasionally returns a replay response that declares
 The raw response may be an already-decoded body or only a clipped decoded
 prefix bounded by stale compressed-representation metadata, so stripping the
 header is not a safe recovery. Requests raises `ContentDecodingError` before
-Fetch receives trustworthy semantic bytes. The identity-encoding retry
-described in section 3 handles recoverable cases without slowing unrelated
-workers or changing the normal compressed transfer path; a persistent
-mismatch warns and skips.
+Fetch receives trustworthy semantic bytes. Fetch warns and skips the capture
+immediately rather than retrying the same malformed representation. A future
+format-aware recovery policy can be added separately if evidence justifies it.
 
 Repeated incomplete transfers normally follow the bounded connection retry
 policy. When three consecutive attempts stop at the same received/expected
@@ -584,11 +579,10 @@ mismatch warns and skips the capture. Fetch does not synthesize redirects,
 unavailable-resource metadata, or broken-resource responses.
 
 Approved Wayback playback/availability failures—including a content-encoding
-mismatch that persists under identity encoding—warn, count as playback
-failures, and allow later captures to continue. Explicit rate limits pause and
-retry only the operation that encountered them during discovery or playback.
-Unexpected formats, local filesystem errors, and serialization failures are
-fatal.
+mismatch—warn, count as playback failures, and allow later captures to
+continue. Explicit rate limits pause and retry only the operation that
+encountered them during discovery or playback. Unexpected formats, local
+filesystem errors, and serialization failures are fatal.
 
 Workers may finish in any order. WARC records remain timestamp-ordered within
 each URL group, while completed console blocks are emitted atomically in
@@ -681,7 +675,7 @@ https://web.archive.org/web/20190812143015/https://example.com/images/logo.png :
 https://web.archive.org/web/20170604120533/https://example.com/images/logo.png : wrote response
 https://web.archive.org/web/20180709183022/https://example.com/images/logo.png : wrote revisit
 https://web.archive.org/web/20190812143015/https://example.com/images/logo.png : failed during playback
-  WARNING: invalid Wayback replay response: Content-Encoding declares gzip, but the body could not be decoded; retrying with Accept-Encoding: identity also failed
+  WARNING: original Wayback replay could not be decoded by the HTTP client (Content-Encoding: gzip): incorrect header check; capture discarded without retry
 Summary: warc 1 response, 1 revisit, 1 failed
 Summary: 235 selected for warc (all); 180 responses; 44 revisits; 9 redirects omitted; 2 playback failures (1 invalid content encoding, 1 truncated response)
 Files: 180 written (latest); 2 playback failures (1 invalid content encoding, 1 other); 0 redirects omitted
