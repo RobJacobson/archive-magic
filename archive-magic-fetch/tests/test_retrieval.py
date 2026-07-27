@@ -524,7 +524,10 @@ def test_identity_decoding_failure_skips_immediately_and_restores_header():
     )()
     with pytest.raises(
         retrieval.MalformedContentEncodingError,
-        match="invalid Wayback replay response",
+        match=(
+            "original Wayback replay could not be decoded "
+            "by the HTTP client"
+        ),
     ) as raised:
         retrieval.retrieve_response(client, object())
 
@@ -534,7 +537,8 @@ def test_identity_decoding_failure_skips_immediately_and_restores_header():
         "retrying with Accept-Encoding: identity also failed"
         in str(raised.value)
     )
-    assert "Content-Encoding declares gzip" in str(raised.value)
+    assert "(Content-Encoding: gzip)" in str(raised.value)
+    assert "still incorrect" in str(raised.value)
 
 
 def test_make_client_factory_uses_application_owned_session(monkeypatch):

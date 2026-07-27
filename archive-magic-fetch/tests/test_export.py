@@ -198,6 +198,45 @@ def test_matching_cdx_digests_write_one_response_and_one_revisit(tmp_path):
     ) == records[1].rec_headers.get_header("WARC-Record-ID")
 
 
+def test_empty_playback_body_writes_zero_length_response(tmp_path, capsys):
+    selected = capture(payload=b"")
+    target = output_path(tmp_path)
+    client = FakeClient(
+        {selected: memento_for(selected, payload=b"")}
+    )
+
+    summary = export.export_group(URLKEY, [selected], target, client)
+
+    records = read_records(target)
+    assert [record.rec_type for record in records] == [
+        "warcinfo",
+        "response",
+    ]
+    assert summary == export.ExportSummary(selected=1, responses=1)
+    assert records[1].content_stream().read() == b""
+    assert records[1].rec_headers.get_header(
+        "WARC-Payload-Digest"
+    ) == payload_digest(b"")
+    assert "empty playback body" not in capsys.readouterr().out
+
+
+def test_unexpected_empty_playback_body_remains_failure(tmp_path, capsys):
+    selected = capture(payload=b"expected")
+    target = output_path(tmp_path)
+    client = FakeClient(
+        {selected: memento_for(selected, payload=b"")}
+    )
+
+    summary = export.export_group(URLKEY, [selected], target, client)
+
+    assert summary == export.ExportSummary(
+        selected=1,
+        playback_failures=1,
+    )
+    assert not target.exists()
+    assert "empty playback body" in capsys.readouterr().out
+
+
 def test_failed_capture_does_not_prevent_later_capture(
     tmp_path,
     capsys,
@@ -468,12 +507,15 @@ def test_persistent_content_decoding_error_warns_once_and_skips(
     assert summary.invalid_content_encoding_failures == 1
     warning = capsys.readouterr().out
     assert warning.count("WARNING:") == 1
-    assert "invalid Wayback replay response" in warning
+    assert (
+        "original Wayback replay could not be decoded by the HTTP client"
+        in warning
+    )
     assert (
         "retrying with Accept-Encoding: identity also failed"
         in warning
     )
-    assert "incorrect gzip header" not in warning
+    assert "still incorrect under identity" in warning
 
 
 def test_repeated_truncated_response_warns_early_and_is_categorized(

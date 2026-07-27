@@ -40,6 +40,7 @@ from .warc import (
 
 
 _VALID_CDX_SHA1 = re.compile(r"[A-Z2-7]{32}")
+_EMPTY_PAYLOAD_DIGEST = "sha1:3I42H3S6NNFQ2MSVX7XZKYAYSCX5QBYJ"
 _PLAYBACK_ERRORS = (
     MementoPlaybackError,
     RetryExhaustedError,
@@ -582,7 +583,11 @@ def _retrieve_validated(
         )
         return None
 
-    if not retrieved.body:
+    if (
+        not retrieved.body
+        and _normalized_cdx_digest(capture.digest)
+        != _EMPTY_PAYLOAD_DIGEST
+    ):
         error = ValueError("empty playback body")
         state.events[capture].extend(_failure_lines(capture, error))
         _count_failure(

@@ -350,8 +350,11 @@ def test_files_all_materializes_revisit_body_without_refetch(tmp_path):
     assert len(list(layout.website_root.rglob("index.html"))) == 2
 
 
-def test_empty_playback_body_counts_as_failure(tmp_path, capsys):
-    selected = capture(payload=b"")
+def test_empty_playback_body_writes_zero_byte_file(tmp_path, capsys):
+    selected = capture(
+        payload=b"",
+        digest="3I42H3S6NNFQ2MSVX7XZKYAYSCX5QBYJ",
+    )
     groups = {selected.urlkey: [selected]}
     layout = paths.collection_layout(
         "https://example.com/*",
@@ -374,10 +377,12 @@ def test_empty_playback_body_counts_as_failure(tmp_path, capsys):
         files_mode="latest",
     ).files_summary
 
-    assert summary.written == 0
-    assert summary.playback_failures == 1
-    assert not any(layout.website_root.rglob("*"))
-    assert "empty playback body" in capsys.readouterr().out
+    target = layout.website_root / "example.com" / "index.html"
+    assert summary.written == 1
+    assert summary.playback_failures == 0
+    assert target.exists()
+    assert target.read_bytes() == b""
+    assert "empty playback body" not in capsys.readouterr().out
 
 
 def test_playback_failure_does_not_create_file(tmp_path):

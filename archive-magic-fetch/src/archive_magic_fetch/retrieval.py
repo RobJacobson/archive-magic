@@ -53,26 +53,24 @@ _REPRESENTATION_HEADERS = {
 
 
 class MalformedContentEncodingError(MementoPlaybackError):
-    """Wayback's declared content encoding does not match its response body."""
+    """The HTTP client could not decode an original Wayback replay."""
 
     def __init__(
         self,
         encoding: Optional[str] = None,
         *,
         identity_retry_failed: bool = True,
+        cause: Optional[Exception] = None,
     ) -> None:
         self.encoding = encoding
         self.identity_retry_failed = identity_retry_failed
+        self.cause = cause
         if encoding:
-            detail = (
-                f"Content-Encoding declares {encoding}, but the body could "
-                "not be decoded"
-            )
+            encoding_detail = f" (Content-Encoding: {encoding})"
         else:
-            detail = (
-                "the body could not be decoded according to its declared "
-                "Content-Encoding"
-            )
+            encoding_detail = ""
+        cause_text = str(cause).strip() if cause is not None else ""
+        cause_detail = f": {cause_text}" if cause_text else ""
         if identity_retry_failed:
             retry_detail = (
                 "retrying with Accept-Encoding: identity also failed"
@@ -83,7 +81,8 @@ class MalformedContentEncodingError(MementoPlaybackError):
                 "Accept-Encoding: identity"
             )
         super().__init__(
-            f"invalid Wayback replay response: {detail}; {retry_detail}"
+            "original Wayback replay could not be decoded by the HTTP client"
+            f"{encoding_detail}{cause_detail}; {retry_detail}"
         )
 
 
@@ -163,16 +162,18 @@ def format_playback_failure_summary(
 
 
 def _content_encoding(memento) -> Optional[str]:
-    """Return the historical content encoding involved in a decode failure."""
+    """Return the replay response encoding involved in a decode failure."""
 
-    headers = getattr(memento, "headers", None)
-    if headers is None:
-        return None
-    value = headers.get("Content-Encoding")
-    if value is None:
-        return None
-    encoding = str(value).strip()
-    return encoding or None
+    for attribute in ("raw_headers", "headers"):
+        headers = getattr(memento, attribute, None)
+        if headers is None:
+            continue
+        value = headers.get("Content-Encoding")
+        if value is not None:
+            encoding = str(value).strip()
+            if encoding:
+                return encoding
+    return None
 
 
 def _incomplete_read_boundary(
@@ -314,7 +315,8 @@ def _retrieve_memento_with_retry(
             except ContentDecodingError as error:
                 if identity_retry:
                     raise MalformedContentEncodingError(
-                        _content_encoding(memento)
+                        _content_encoding(memento),
+                        cause=error,
                     ) from error
 
                 session = getattr(client, "session", None)
@@ -323,6 +325,7 @@ def _retrieve_memento_with_retry(
                     raise MalformedContentEncodingError(
                         _content_encoding(memento),
                         identity_retry_failed=False,
+                        cause=error,
                     ) from error
 
                 identity_retry = True

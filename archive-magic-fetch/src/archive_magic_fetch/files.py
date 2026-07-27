@@ -96,10 +96,8 @@ def _ensure_parent_directory(path: Path) -> None:
 
 
 def write_body(path: Path, body: bytes) -> None:
-    """Exclusively create one loose file with a non-empty body."""
+    """Exclusively create one loose file with its complete response body."""
 
-    if not body:
-        raise ValueError("refusing to write an empty website file")
     _ensure_parent_directory(path)
     with path.open("xb") as handle:
         handle.write(body)
