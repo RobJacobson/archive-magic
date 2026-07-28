@@ -88,7 +88,8 @@ For each urlkey group, keep **exactly one** capture:
 
 1. Prefer the newest capture whose CDX status is `200`.
 2. Else prefer the newest capture whose status is present and not `3xx`.
-3. Else omit the group (do not select a redirect-only URL).
+3. Else prefer the newest capture whose status is `3xx`.
+4. Else omit the statusless-only group.
 
 **Redirect clarification:** “Include redirects” means whether a `301`/`302`
 **record** may be chosen as the capture for that URL — not whether Fetch
@@ -223,7 +224,7 @@ WARC export; `all` also materializes revisit bodies at every timestamp.
 Extend the aggregate summary to report both outputs, for example:
 
 ```text
-Summary: 235 selected for warc (all); 226 responses; 9 redirects omitted; ...
+Summary: 235 selected for warc (all); 235 responses; 0 redirects omitted; ...
 Files: 180 written (latest); 2 playback failures
 ```
 
@@ -275,7 +276,7 @@ Do not reintroduce `cdx_toolkit` or raw playback. Keep pinned `wayback`,
 | Files default | `none` |
 | Axes | Independent |
 | Both none | Successful no-op with message |
-| Latest status policy | Prefer newest 200; else newest non-3xx; else omit |
+| Latest status policy | Prefer newest 200; else newest non-3xx; else newest 3xx |
 | WARC latest records | One response per URL |
 | Loose file contents | Bodies only |
 | Loose file root | `archives/<collection>/website/` |

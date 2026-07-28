@@ -391,7 +391,7 @@ def test_statusless_captures_with_matching_digest_use_revisit(tmp_path):
 
 
 @pytest.mark.parametrize("statuscode", [300, 301, 308, 399])
-def test_known_cdx_3xx_is_omitted_without_playback(
+def test_known_cdx_3xx_is_written_as_response(
     tmp_path,
     statuscode,
 ):
@@ -400,18 +400,39 @@ def test_known_cdx_3xx_is_omitted_without_playback(
         statuscode=statuscode,
         payload=b"redirect",
     )
-    client = FakeClient({})
+    client = FakeClient(
+        {
+            selected: memento_for(
+                selected,
+                payload=b"redirect",
+                status_code=statuscode,
+                headers={"Location": "https://example.com/"},
+            )
+        }
+    )
     target = output_path(tmp_path)
 
     summary = export.export_group(URLKEY, [selected], target, client)
 
-    assert client.calls == []
-    assert not target.exists()
-    assert summary.selected == 1
-    assert summary.redirects_omitted == 1
+    assert client.calls == [selected]
+    records = read_records(target)
+    assert [record.rec_type for record in records] == [
+        "warcinfo",
+        "response",
+    ]
+    assert records[1].http_headers.get_statuscode() == str(statuscode)
+    assert (
+        records[1].http_headers.get_header("Location")
+        == "https://example.com/"
+    )
+    with target.open("rb") as stream:
+        iterator = iter(ArchiveIterator(stream))
+        next(iterator)
+        assert next(iterator).content_stream().read() == b"redirect"
+    assert summary == export.ExportSummary(selected=1, responses=1)
 
 
-def test_retrieved_statusless_redirect_is_omitted(tmp_path):
+def test_retrieved_statusless_redirect_is_written_as_response(tmp_path):
     selected = capture(statuscode=None, payload=b"redirect")
     client = FakeClient(
         {
@@ -428,10 +449,67 @@ def test_retrieved_statusless_redirect_is_omitted(tmp_path):
     summary = export.export_group(URLKEY, [selected], target, client)
 
     assert client.calls == [selected]
-    assert not target.exists()
-    assert summary.selected == 1
-    assert summary.redirects_omitted == 1
-    assert summary.playback_failures == 0
+    records = read_records(target)
+    assert [record.rec_type for record in records] == [
+        "warcinfo",
+        "response",
+    ]
+    assert records[1].http_headers.get_statuscode() == "301"
+    assert (
+        records[1].http_headers.get_header("Location")
+        == "https://example.com/"
+    )
+    assert summary == export.ExportSummary(selected=1, responses=1)
+
+
+def test_matching_cdx_redirect_digests_write_full_responses(tmp_path):
+    first = capture(
+        original="https://example.com/first",
+        captured="20170101000000",
+        statuscode=301,
+        payload=b"redirect",
+    )
+    second = capture(
+        original="https://example.com/second",
+        captured="20180101000000",
+        statuscode=301,
+        payload=b"redirect",
+    )
+    client = FakeClient(
+        {
+            first: memento_for(
+                first,
+                payload=b"redirect",
+                headers={"Location": "https://example.com/one"},
+            ),
+            second: memento_for(
+                second,
+                payload=b"redirect",
+                headers={"Location": "https://example.com/two"},
+            ),
+        }
+    )
+    target = output_path(tmp_path)
+
+    summary = export.export_group(
+        URLKEY,
+        [first, second],
+        target,
+        client,
+    )
+
+    assert client.calls == [first, second]
+    records = read_records(target)
+    assert [record.rec_type for record in records] == [
+        "warcinfo",
+        "response",
+        "response",
+    ]
+    assert [
+        record.http_headers.get_header("Location")
+        for record in records[1:]
+    ] == ["https://example.com/one", "https://example.com/two"]
+    assert summary == export.ExportSummary(selected=2, responses=2)
 
 
 def test_skippable_wayback_errors_warn_and_unrelated_capture_continues(
@@ -813,8 +891,8 @@ def test_file_directory_conflict_is_exported_to_ancestor_warc(tmp_path):
     ]
 
 
-def test_all_skipped_bucket_returns_no_final_warc(tmp_path):
-    selected = capture(statuscode=301)
+def test_all_failed_bucket_returns_no_final_warc(tmp_path):
+    selected = capture()
     groups = {selected.urlkey: [selected]}
     layout = paths.collection_layout(
         "https://example.com/*",
@@ -822,12 +900,18 @@ def test_all_skipped_bucket_returns_no_final_warc(tmp_path):
     )
     plan = paths.preflight_layout(groups, layout)
 
-    result = export.export_all(groups, plan.buckets, FakeClient({}))
+    result = export.export_all(
+        groups,
+        plan.buckets,
+        FakeClient(
+            {selected: MementoPlaybackError("capture unavailable")}
+        ),
+    )
 
     assert result.final_warcs == ()
     assert result.summary == export.ExportSummary(
         selected=1,
-        redirects_omitted=1,
+        playback_failures=1,
     )
     assert not plan.buckets[0].path.exists()
 

@@ -180,6 +180,36 @@ def test_files_all_writes_timestamp_directories(tmp_path):
     ).read_bytes() == b"new"
 
 
+def test_files_only_omits_known_redirect_without_playback(tmp_path):
+    redirect = capture(statuscode=301, payload=b"redirect")
+    groups = {redirect.urlkey: [redirect]}
+    layout = paths.collection_layout(
+        "https://example.com/*",
+        root=tmp_path / "archives",
+    )
+    plan = paths.preflight_website_layout(
+        groups,
+        layout,
+        include_timestamps=False,
+    )
+    client = FakeClient({})
+
+    summary = export.export_all(
+        {},
+        (),
+        client,
+        file_capture_groups=groups,
+        website_plan=plan,
+        warc_mode="none",
+        files_mode="latest",
+    ).files_summary
+
+    assert client.calls == []
+    assert summary.written == 0
+    assert summary.redirects_omitted == 1
+    assert not layout.website_root.exists()
+
+
 def test_warc_latest_writes_one_response_and_replay(tmp_path):
     older = capture(captured="20100101000000", statuscode=404, payload=b"old")
     newer_200 = capture(

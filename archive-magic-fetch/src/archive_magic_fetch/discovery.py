@@ -43,7 +43,8 @@ def select_latest_capture(
     Preference order:
     1. newest capture with CDX status ``200``
     2. newest capture whose status is present and not ``3xx``
-    3. omit the group (redirect-only / statusless-only)
+    3. newest capture whose status is ``3xx``
+    4. omit the group (statusless-only)
 
     “Newest” is determined by ``capture.timestamp``, not input order.
     """
@@ -59,12 +60,24 @@ def select_latest_capture(
     if newest_200 is not None:
         return newest_200
 
-    return max(
+    newest_non_redirect = max(
         (
             capture
             for capture in captures
             if capture.statuscode is not None
             and not _is_redirect_status(capture.statuscode)
+        ),
+        key=lambda capture: capture.timestamp,
+        default=None,
+    )
+    if newest_non_redirect is not None:
+        return newest_non_redirect
+
+    return max(
+        (
+            capture
+            for capture in captures
+            if _is_redirect_status(capture.statuscode)
         ),
         key=lambda capture: capture.timestamp,
         default=None,

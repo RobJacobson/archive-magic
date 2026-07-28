@@ -73,11 +73,13 @@ def test_select_latest_prefers_newest_non_redirect_when_no_200():
     assert discovery.select_latest_capture([newer_301, older_404]) is older_404
 
 
-def test_select_latest_omits_redirect_only_groups():
+def test_select_latest_uses_newest_redirect_for_redirect_only_groups():
     only_301 = record(captured="20200101000000", statuscode=301)
     only_302 = record(captured="20210101000000", statuscode=302)
 
-    assert discovery.select_latest_capture([only_301, only_302]) is None
+    assert (
+        discovery.select_latest_capture([only_301, only_302]) is only_302
+    )
 
 
 def test_apply_output_mode_latest_and_none():
@@ -105,6 +107,7 @@ def test_apply_output_mode_latest_and_none():
     assert discovery.apply_output_mode(groups, "none") == {}
     assert discovery.apply_output_mode(groups, "latest") == {
         first.urlkey: [second],
+        third.urlkey: [third],
     }
     assert discovery.apply_output_mode(groups, "all") == {
         first.urlkey: [first, second],

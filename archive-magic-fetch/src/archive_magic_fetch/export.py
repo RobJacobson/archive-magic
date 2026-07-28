@@ -627,10 +627,11 @@ def _retrieve_validated(
     if _is_redirect(retrieved.status_code):
         _omit_redirect(
             state,
-            wants_warc=wants_warc,
+            wants_warc=False,
             capture_paths=capture_paths,
         )
-        return None
+        if not wants_warc:
+            return None
 
     if (
         not retrieved.body
@@ -690,8 +691,10 @@ def _commit_representative(
                 ),
             )
         )
-    if digest is not None:
+    if digest is not None and not _is_redirect(retrieved.status_code):
         state.representatives[digest] = reference
+    if _is_redirect(retrieved.status_code):
+        capture_paths = ()
     _write_group_files(
         capture,
         retrieved.body,
@@ -744,16 +747,17 @@ def _export_group(
     for capture in union:
         wants_warc = capture in state.warc_set
         capture_paths = list(file_capture_paths.get(capture, ()))
-        if _is_redirect(capture.statuscode):
+        known_redirect = _is_redirect(capture.statuscode)
+        if known_redirect and not wants_warc:
             _omit_redirect(
                 state,
-                wants_warc=wants_warc,
+                wants_warc=False,
                 capture_paths=capture_paths,
             )
             continue
 
         digest = normalize_cdx_digest(capture.digest)
-        if _use_known_representative(
+        if not known_redirect and _use_known_representative(
             state,
             capture,
             digest,

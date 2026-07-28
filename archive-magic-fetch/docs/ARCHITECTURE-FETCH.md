@@ -148,7 +148,8 @@ for the query window, not the post-`latest` subset.
 
 1. newest capture whose CDX status is `200`; else
 2. newest capture whose status is present and not `3xx`; else
-3. omit the group.
+3. newest capture whose status is `3xx`; else
+4. omit the statusless-only group.
 
 WARC and loose-file selection remain independent, but one URL-group worker
 writes both outputs. A capture selected by both axes is retrieved once.
@@ -621,10 +622,11 @@ Range stitching is not attempted because a stable boundary can represent
 missing source bytes rather than a resumable transport interruption. Fetch
 never writes a partial response as a successful capture.
 
-Known CDX 3xx rows are counted and omitted before playback. A statusless row
-that plays back as 3xx is also counted and omitted. A known CDX/Memento status
-mismatch warns and skips the capture. Fetch does not synthesize redirects,
-unavailable-resource metadata, or broken-resource responses.
+Selected 3xx rows are played back exactly without following their redirects
+and are stored as full WARC responses. Redirect bodies remain omitted from
+loose-file output. A known CDX/Memento status mismatch warns and skips the
+capture. Fetch does not synthesize redirects, unavailable-resource metadata,
+or broken-resource responses.
 
 Approved Wayback playback/availability failures—including a content-encoding
 mismatch—warn, count as playback failures, and allow later captures to
@@ -753,7 +755,7 @@ https://web.archive.org/web/20190110102030/https://example.com/about : wrote res
 https://web.archive.org/web/20190812143015/https://example.com/images/logo.png : failed during playback
   WARNING: original Wayback replay could not be decoded by the HTTP client (Content-Encoding: gzip): incorrect header check; raw recovery was not verified by the CDX digest, so the capture was discarded
 Summary: warc 1 response, 1 revisit, 1 failed
-Summary: 235 selected for warc (all); 180 responses; 44 revisits; 9 redirects omitted; 2 playback failures (1 invalid content encoding, 1 truncated response)
+Summary: 235 selected for warc (all); 189 responses; 44 revisits; 0 redirects omitted; 2 playback failures (1 invalid content encoding, 1 truncated response)
 Files: 180 written (latest); 2 playback failures (1 invalid content encoding, 1 other); 0 redirects omitted
 Failed captures:
 https://web.archive.org/web/20190812143015/https://example.com/images/logo.png
@@ -773,10 +775,10 @@ lines are emitted from the outer job boundary on success, no-op/empty results,
 usage validation failures, and caught runtime failures. Argument-parser exits
 such as `--help` occur before a job begins.
 
-The WARC summary reports selected rows, written responses, deliberately
-omitted redirects, and playback failures for the active `--warc` mode. When
-`--files` is enabled, a second line reports written bodies and failures for
-that mode.
+The WARC summary reports selected rows, written responses, revisits, and
+playback failures for the active `--warc` mode. The legacy redirect-omission
+count remains zero for WARC output. When `--files` is enabled, a second line
+reports written bodies, omitted redirects, and failures for that mode.
 
 The CLI catches fatal errors, prints `ERROR: ...` to stderr, and returns 1.
 It also returns 1 after finalizing otherwise usable outputs when selected
