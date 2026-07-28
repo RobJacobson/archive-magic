@@ -32,6 +32,33 @@ def test_rewrite_root_relative_href_to_relative(tmp_path):
     )
 
 
+def test_rewrite_uses_mime_derived_route_map(tmp_path):
+    website = tmp_path / "website"
+    report = website / "example.com" / "download" / "report.pdf"
+    _write_tree(
+        website,
+        {
+            "example.com/index.html": (
+                '<a href="/download/report/">Report</a>'
+            ),
+            "example.com/download/report.pdf": "pdf",
+        },
+    )
+
+    summary = rewrite_local.rewrite_local_website(
+        website,
+        routes={
+            ("example.com", "/"): website / "example.com" / "index.html",
+            ("example.com", "/download/report"): report,
+        },
+    )
+
+    assert summary.rewritten == 1
+    assert (website / "example.com" / "index.html").read_text() == (
+        '<a href="download/report.pdf">Report</a>'
+    )
+
+
 def test_rewrite_leaves_offsite_and_missing_unchanged(tmp_path):
     website = tmp_path / "website"
     original = (

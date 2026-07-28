@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from archive_magic_fetch.console import (
     capture_result_line,
     mirror_console_output,
+    readable_url,
 )
 
 
@@ -52,6 +53,22 @@ def test_capture_result_line_aligns_scheme_and_www_variants():
     assert lines[2].endswith("resource      : wrote response")
     assert lines[3].endswith("resource     : wrote response")
     assert len({line.index(": wrote response") for line in lines}) == 1
+
+
+def test_readable_url_normalizes_scheme_www_and_default_ports():
+    assert {
+        readable_url(url)
+        for url in (
+            "http://domain.com/posts/",
+            "https://domain.com/posts/",
+            "http://www.domain.com:80/posts/",
+            "https://www.domain.com:443/posts/",
+        )
+    } == {"domain.com/posts/"}
+    assert (
+        readable_url("https://blog.domain.com:8443/posts/")
+        == "blog.domain.com:8443/posts/"
+    )
 
 
 def test_console_mirror_logs_stdout_and_stderr_before_and_after_attach(

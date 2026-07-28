@@ -198,6 +198,28 @@ def test_matching_cdx_digests_write_one_response_and_one_revisit(tmp_path):
     ) == records[1].rec_headers.get_header("WARC-Record-ID")
 
 
+def test_value_equal_source_rows_remain_distinct_warc_records(tmp_path):
+    first = capture()
+    second = capture()
+    target = output_path(tmp_path)
+
+    summary = export.export_group(
+        URLKEY,
+        [first, second],
+        target,
+        FakeClient({first: memento_for(first)}),
+    )
+
+    assert first == second
+    assert first is not second
+    assert summary.selected == 2
+    assert [record.rec_type for record in read_records(target)] == [
+        "warcinfo",
+        "response",
+        "revisit",
+    ]
+
+
 def test_empty_playback_body_writes_zero_length_response(tmp_path, capsys):
     selected = capture(payload=b"")
     target = output_path(tmp_path)
@@ -263,17 +285,17 @@ def test_failed_capture_does_not_prevent_later_capture(
 
 def test_export_result_lists_failed_capture_view_url(tmp_path):
     selected = capture()
-    bucket = paths.WarcBucket(
-        tmp_path / "failed.warc.gz",
-        (selected.urlkey,),
+    layout = paths.collection_layout(
+        "https://example.com/*",
+        root=tmp_path / "archives",
     )
 
     result = export.export_all(
         {selected.urlkey: [selected]},
-        (bucket,),
         FakeClient(
             {selected: MementoPlaybackError("capture unavailable")}
         ),
+        layout=layout,
     )
 
     assert result.failed_capture_urls == (selected.view_url,)
@@ -760,7 +782,6 @@ def test_groups_are_exported_independently(tmp_path, capsys):
         "https://example.com/*",
         root=tmp_path / "archives",
     )
-    plan = paths.preflight_layout(groups, layout)
     client = FakeClient(
         {
             first: memento_for(first),
@@ -768,7 +789,7 @@ def test_groups_are_exported_independently(tmp_path, capsys):
         }
     )
 
-    result = export.export_all(groups, plan.buckets, client)
+    result = export.export_all(groups, client, layout=layout)
 
     assert client.calls == [first, second]
     assert result.summary == export.ExportSummary(
@@ -827,7 +848,6 @@ def test_colliding_groups_share_one_warc(tmp_path):
         "https://example.com/*",
         root=tmp_path / "archives",
     )
-    plan = paths.preflight_layout(groups, layout)
     client = FakeClient(
         {
             trailing: memento_for(trailing, payload=b"same"),
@@ -835,9 +855,9 @@ def test_colliding_groups_share_one_warc(tmp_path):
         }
     )
 
-    result = export.export_all(groups, plan.buckets, client)
+    result = export.export_all(groups, client, layout=layout)
 
-    assert len(plan.buckets) == 1
+    assert len(paths.allocate_warc_paths(groups, layout)) == 1
     assert client.calls == [trailing, explicit]
     assert result.final_warcs == (
         layout.archive_root / "posts" / "index.warc.gz",
@@ -870,17 +890,15 @@ def test_file_directory_conflict_is_exported_to_ancestor_warc(tmp_path):
         "https://example.com/*",
         root=tmp_path / "archives",
     )
-    plan = paths.preflight_layout(groups, layout)
-
     result = export.export_all(
         groups,
-        plan.buckets,
         FakeClient(
             {
                 parent: memento_for(parent),
                 descendant: memento_for(descendant),
             }
         ),
+        layout=layout,
     )
 
     assert result.final_warcs == (layout.archive_root / "foo.warc.gz",)
@@ -898,14 +916,12 @@ def test_all_failed_bucket_returns_no_final_warc(tmp_path):
         "https://example.com/*",
         root=tmp_path / "archives",
     )
-    plan = paths.preflight_layout(groups, layout)
-
     result = export.export_all(
         groups,
-        plan.buckets,
         FakeClient(
             {selected: MementoPlaybackError("capture unavailable")}
         ),
+        layout=layout,
     )
 
     assert result.final_warcs == ()
@@ -913,7 +929,7 @@ def test_all_failed_bucket_returns_no_final_warc(tmp_path):
         selected=1,
         playback_failures=1,
     )
-    assert not plan.buckets[0].path.exists()
+    assert not paths.preferred_warc_path(selected.urlkey, layout).exists()
 
 
 def test_generated_file_is_parseable_gzip_warc_1_0(tmp_path):
@@ -1114,9 +1130,9 @@ def test_export_all_runs_different_warc_buckets_concurrently(
         created_clients.append(client)
         return client
 
-    buckets = (
-        paths.WarcBucket(tmp_path / "a.warc.gz", (first.urlkey,)),
-        paths.WarcBucket(tmp_path / "b.warc.gz", (second.urlkey,)),
+    layout = paths.collection_layout(
+        "https://example.com/*",
+        root=tmp_path / "archives",
     )
     groups = {
         first.urlkey: [first],
@@ -1127,8 +1143,8 @@ def test_export_all_runs_different_warc_buckets_concurrently(
         future = executor.submit(
             export.export_all,
             groups,
-            buckets,
             FactoryClient(),
+            layout=layout,
             client_factory=factory,
             concurrency=2,
         )
@@ -1142,7 +1158,10 @@ def test_export_all_runs_different_warc_buckets_concurrently(
     assert len(created_clients) == 2
     worker_calls = [call for client in created_clients for call in client.calls]
     assert set(worker_calls) == {first, second}
-    assert result.final_warcs == tuple(bucket.path for bucket in buckets)
+    assert result.final_warcs == (
+        layout.archive_root / "a.warc.gz",
+        layout.archive_root / "b.warc.gz",
+    )
     output = capsys.readouterr().out
     completed = [
         line for line in output.splitlines() if line.startswith("[completed ")
@@ -1184,12 +1203,12 @@ def test_thread_client_pool_reuses_and_closes_client():
 
 def test_groups_sharing_one_warc_bucket_remain_serial(tmp_path):
     first = capture(
-        original="https://example.com/a",
-        urlkey="com,example)/a",
+        original="https://example.com/posts/",
+        urlkey="com,example)/posts/",
     )
     second = capture(
-        original="https://example.com/b",
-        urlkey="com,example)/b",
+        original="https://example.com/posts/index",
+        urlkey="com,example)/posts/index",
     )
     first_finished = threading.Event()
 
@@ -1202,9 +1221,9 @@ def test_groups_sharing_one_warc_bucket_remain_serial(tmp_path):
                 first_finished.set()
             return result
 
-    bucket = paths.WarcBucket(
-        tmp_path / "shared.warc.gz",
-        (first.urlkey, second.urlkey),
+    layout = paths.collection_layout(
+        "https://example.com/*",
+        root=tmp_path / "archives",
     )
     client = OrderedClient(
         {
@@ -1215,8 +1234,8 @@ def test_groups_sharing_one_warc_bucket_remain_serial(tmp_path):
 
     export.export_all(
         {first.urlkey: [first], second.urlkey: [second]},
-        (bucket,),
         client,
+        layout=layout,
         concurrency=8,
     )
 
@@ -1393,14 +1412,17 @@ def test_all_failed_rebuild_preserves_and_reports_existing_final(
         ),
     )
     original = target.read_bytes()
-    bucket = paths.WarcBucket(target, (URLKEY,))
+    layout = paths.collection_layout(
+        "https://example.com/*",
+        root=tmp_path / "archives",
+    )
 
     result = export.export_all(
         {URLKEY: [selected]},
-        (bucket,),
         FakeClient(
             {selected: MementoPlaybackError("temporarily unavailable")}
         ),
+        layout=layout,
     )
 
     assert result.final_warcs == (target,)

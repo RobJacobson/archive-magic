@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import Iterator, Optional, TextIO
 from urllib.parse import urlsplit
 
+from .paths import normalize_url_authority
+
 
 _OUTPUT_LOCK = threading.Lock()
 
@@ -99,18 +101,8 @@ def readable_url(original_url: str) -> str:
     """Return a compact, non-SURT URL label for one capture group."""
 
     parsed = urlsplit(original_url)
-    host = parsed.hostname or parsed.netloc
-    if host.lower().startswith("www."):
-        host = host[4:]
-
-    try:
-        port = parsed.port
-    except ValueError:
-        port = None
-    if port is not None and not (
-        (parsed.scheme.lower() == "http" and port == 80)
-        or (parsed.scheme.lower() == "https" and port == 443)
-    ):
+    host, port = normalize_url_authority(original_url)
+    if port is not None:
         host = f"{host}:{port}"
 
     path = parsed.path or "/"

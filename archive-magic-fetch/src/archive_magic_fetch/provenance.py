@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import gzip
 import hashlib
-import io
 import json
 import shutil
 import tempfile
@@ -59,36 +58,44 @@ def _token(value: object, *, field: str) -> str:
     return value
 
 
-def _cdx_bytes(captures: Sequence[CdxRecord]) -> bytes:
-    lines = [CDX_HEADER]
-    for capture in captures:
-        timestamp = _utc_datetime(capture.timestamp).strftime("%Y%m%d%H%M%S")
-        lines.append(
-            " ".join(
-                (
-                    _token(capture.urlkey, field="urlkey"),
-                    timestamp,
-                    _token(capture.original, field="original"),
-                    _token(capture.mimetype, field="mimetype"),
-                    _token(capture.statuscode, field="statuscode"),
-                    _token(capture.digest, field="digest"),
-                    _token(capture.length, field="length"),
-                )
+def _cdx_line(capture: CdxRecord) -> bytes:
+    timestamp = _utc_datetime(capture.timestamp).strftime("%Y%m%d%H%M%S")
+    return (
+        " ".join(
+            (
+                _token(capture.urlkey, field="urlkey"),
+                timestamp,
+                _token(capture.original, field="original"),
+                _token(capture.mimetype, field="mimetype"),
+                _token(capture.statuscode, field="statuscode"),
+                _token(capture.digest, field="digest"),
+                _token(capture.length, field="length"),
             )
         )
-    return ("\n".join(lines) + "\n").encode("utf-8")
+        + "\n"
+    ).encode("utf-8")
 
 
-def _gzip_bytes(content: bytes, acquired_at: datetime) -> bytes:
-    output = io.BytesIO()
-    with gzip.GzipFile(
-        filename="",
-        mode="wb",
-        fileobj=output,
-        mtime=int(acquired_at.timestamp()),
-    ) as compressed:
-        compressed.write(content)
-    return output.getvalue()
+def _write_cdx_gzip(
+    path: Path,
+    captures: Sequence[CdxRecord],
+    acquired_at: datetime,
+) -> int:
+    """Stream one deterministic CDX gzip and return its record count."""
+
+    count = 0
+    with path.open("xb") as output:
+        with gzip.GzipFile(
+            filename="",
+            mode="wb",
+            fileobj=output,
+            mtime=int(acquired_at.timestamp()),
+        ) as compressed:
+            compressed.write(f"{CDX_HEADER}\n".encode("ascii"))
+            for capture in captures:
+                compressed.write(_cdx_line(capture))
+                count += 1
+    return count
 
 
 def _acquisition_id(acquired_at: datetime) -> str:
@@ -101,8 +108,8 @@ def _iso_timestamp(acquired_at: datetime) -> str:
 
 def _build_manifest(
     *,
-    captures: Sequence[CdxRecord],
-    cdx_gzip: bytes,
+    record_count: int,
+    cdx_sha256: str,
     url_pattern: str,
     date_start: str,
     date_end: str,
@@ -117,8 +124,8 @@ def _build_manifest(
             "fields": list(CDX_FIELDS),
             "file": "captures.cdx.gz",
             "format": CDX_HEADER,
-            "record_count": len(captures),
-            "sha256": hashlib.sha256(cdx_gzip).hexdigest(),
+            "record_count": record_count,
+            "sha256": cdx_sha256,
         },
         "date_end": date_end,
         "date_start": date_start,
@@ -165,26 +172,32 @@ def save_acquisition(
         raise ValueError("cannot save an empty source acquisition")
 
     acquired_at = _utc_datetime(acquired_at)
-    cdx_gzip = _gzip_bytes(_cdx_bytes(captures), acquired_at)
-    manifest = _build_manifest(
-        captures=captures,
-        cdx_gzip=cdx_gzip,
-        url_pattern=url_pattern,
-        date_start=date_start,
-        date_end=date_end,
-        acquired_at=acquired_at,
-    )
-    query_json = (
-        json.dumps(manifest, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
-    ).encode("utf-8")
-
     source_root = layout.sources_root
     source_root.mkdir(parents=True, exist_ok=True)
     temporary = Path(
         tempfile.mkdtemp(prefix=".acquisition-", dir=source_root)
     )
     try:
-        (temporary / "captures.cdx.gz").write_bytes(cdx_gzip)
+        captures_path = temporary / "captures.cdx.gz"
+        record_count = _write_cdx_gzip(
+            captures_path,
+            captures,
+            acquired_at,
+        )
+        with captures_path.open("rb") as completed:
+            cdx_sha256 = hashlib.file_digest(completed, "sha256").hexdigest()
+        manifest = _build_manifest(
+            record_count=record_count,
+            cdx_sha256=cdx_sha256,
+            url_pattern=url_pattern,
+            date_start=date_start,
+            date_end=date_end,
+            acquired_at=acquired_at,
+        )
+        query_json = (
+            json.dumps(manifest, indent=2, sort_keys=True, ensure_ascii=False)
+            + "\n"
+        ).encode("utf-8")
         (temporary / "query.json").write_bytes(query_json)
 
         final = _publish_acquisition(

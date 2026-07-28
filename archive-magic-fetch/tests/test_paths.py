@@ -193,7 +193,7 @@ def test_overlong_collection_name_is_rejected_instead_of_merged():
 
 def test_intentional_and_case_equivalent_paths_share_buckets(tmp_path):
     collection = layout(tmp_path)
-    plan = paths.preflight_layout(
+    allocated = paths.allocate_warc_paths(
         groups(
             "com,example)/posts/",
             "com,example)/posts/index",
@@ -202,16 +202,30 @@ def test_intentional_and_case_equivalent_paths_share_buckets(tmp_path):
         collection,
     )
 
-    assert plan.buckets == (
-        paths.WarcBucket(
-            collection.archive_root / "Posts" / "index.warc.gz",
-            (
-                "com,example)/Posts/index",
-                "com,example)/posts/",
-                "com,example)/posts/index",
-            ),
-        ),
+    assert allocated == {
+        collection.archive_root / "Posts" / "index.warc.gz": (
+            "com,example)/Posts/index",
+            "com,example)/posts/",
+            "com,example)/posts/index",
+        )
+    }
+
+
+def test_scheme_www_and_authority_do_not_shape_warc_bucket(tmp_path):
+    collection = layout(tmp_path)
+    keys = (
+        "com,domain)/posts/",
+        "com,domain,www)/posts/",
+        "com,domain,blog)/posts/",
     )
+
+    allocated = paths.allocate_warc_paths(groups(*keys), collection)
+
+    assert allocated == {
+        collection.archive_root / "posts" / "index.warc.gz": tuple(
+            sorted(keys)
+        )
+    }
 
 
 @pytest.mark.parametrize(
@@ -238,17 +252,16 @@ def test_planned_file_directory_conflicts_share_ancestor_bucket(
 ):
     collection = layout(tmp_path)
 
-    plan = paths.preflight_layout(
+    allocated = paths.allocate_warc_paths(
         groups(descendant, parent),
         collection,
     )
 
-    assert len(plan.buckets) == 1
-    assert plan.buckets[0].path == paths.preferred_warc_path(
-        parent,
-        collection,
-    )
-    assert plan.buckets[0].urlkeys == tuple(sorted((parent, descendant)))
+    assert allocated == {
+        paths.preferred_warc_path(parent, collection): tuple(
+            sorted((parent, descendant))
+        )
+    }
 
 
 def test_bucket_spelling_and_order_ignore_discovery_order(tmp_path):
@@ -256,82 +269,57 @@ def test_bucket_spelling_and_order_ignore_discovery_order(tmp_path):
     second_layout = layout(tmp_path / "second")
     keys = ("com,example)/b", "com,example)/A", "com,example)/a")
 
-    first = paths.preflight_layout(groups(*keys), first_layout)
-    second = paths.preflight_layout(groups(*reversed(keys)), second_layout)
+    first = paths.allocate_warc_paths(groups(*keys), first_layout)
+    second = paths.allocate_warc_paths(groups(*reversed(keys)), second_layout)
 
     assert [
-        bucket.path.relative_to(first_layout.collection_root)
-        for bucket in first.buckets
+        path.relative_to(first_layout.collection_root)
+        for path in first
     ] == [Path("archive/A.warc.gz"), Path("archive/b.warc.gz")]
     assert [
         (
-            bucket.path.relative_to(second_layout.collection_root),
-            bucket.urlkeys,
+            path.relative_to(second_layout.collection_root),
+            urlkeys,
         )
-        for bucket in second.buckets
+        for path, urlkeys in second.items()
     ] == [
         (Path("archive/A.warc.gz"), ("com,example)/A", "com,example)/a")),
         (Path("archive/b.warc.gz"), ("com,example)/b",)),
     ]
 
 
-def test_preflight_accepts_existing_regular_warc_and_replay_targets(tmp_path):
+def test_warc_allocation_does_not_inspect_output_filesystem(tmp_path):
     collection = layout(tmp_path)
     target = paths.preferred_warc_path("com,example)/", collection)
     target.parent.mkdir(parents=True)
     target.touch()
-
     collection.replay_index.parent.mkdir(parents=True)
     collection.replay_index.touch()
+    target.with_name(target.name + ".tmp").touch()
 
-    plan = paths.preflight_layout(groups("com,example)/"), collection)
+    assert paths.allocate_warc_paths(
+        groups("com,example)/"),
+        collection,
+    ) == {target: ("com,example)/",)}
 
-    assert plan.buckets[0].path == target
 
-
-def test_preflight_rejects_existing_warc_temporary(tmp_path):
+def test_warc_allocation_constructs_one_path_per_group(tmp_path, monkeypatch):
     collection = layout(tmp_path)
-    target = paths.preferred_warc_path("com,example)/", collection)
-    temporary = target.with_name(target.name + ".tmp")
-    temporary.parent.mkdir(parents=True)
-    temporary.touch()
+    selected = groups(*(f"com,example)/resource-{index}" for index in range(5000)))
+    original = paths.preferred_warc_path
+    calls = 0
 
-    with pytest.raises(FileExistsError, match="already exists"):
-        paths.preflight_layout(groups("com,example)/"), collection)
+    def counted(urlkey, selected_layout):
+        nonlocal calls
+        calls += 1
+        return original(urlkey, selected_layout)
 
+    monkeypatch.setattr(paths, "preferred_warc_path", counted)
 
-def test_preflight_rejects_broken_final_symlink(tmp_path):
-    collection = layout(tmp_path)
-    target = paths.preferred_warc_path("com,example)/", collection)
-    target.parent.mkdir(parents=True)
-    target.symlink_to(tmp_path / "missing")
+    allocated = paths.allocate_warc_paths(selected, collection)
 
-    with pytest.raises(FileExistsError, match="already exists"):
-        paths.preflight_layout(groups("com,example)/"), collection)
-
-
-def test_preflight_allows_symlinked_output_ancestor(tmp_path):
-    real_root = tmp_path / "real-archives"
-    real_root.mkdir()
-    linked_root = tmp_path / "archives"
-    linked_root.symlink_to(real_root, target_is_directory=True)
-    collection = paths.collection_layout(
-        "https://example.com/",
-        root=linked_root,
-    )
-
-    plan = paths.preflight_layout(groups("com,example)/"), collection)
-
-    assert plan.buckets[0].path.is_relative_to(linked_root)
-
-
-def test_preflight_reports_non_directory_ancestor(tmp_path):
-    root = tmp_path / "archives"
-    root.write_text("not a directory")
-    collection = paths.CollectionLayout(root, "example.com")
-
-    with pytest.raises(OSError, match="not a directory"):
-        paths.preflight_layout(groups("com,example)/"), collection)
+    assert len(allocated) == len(selected)
+    assert calls == len(selected)
 
 
 def test_name_max_and_path_max_are_validated_independently(
@@ -401,7 +389,11 @@ def test_malformed_urlkeys_fail_before_export(tmp_path, urlkey):
 def test_website_latest_paths(tmp_path, original, relative):
     collection = layout(tmp_path)
 
-    result = paths.preferred_website_path(original, collection)
+    result = paths.preferred_website_path(
+        original,
+        collection,
+        mimetype="text/html",
+    )
 
     assert result.relative_to(collection.collection_root) == Path(relative)
 
@@ -413,6 +405,7 @@ def test_website_all_paths_include_timestamp_directory(tmp_path):
     result = paths.preferred_website_path(
         "https://example.com/css/style.css",
         collection,
+        mimetype="text/css",
         timestamp=stamp,
     )
 
@@ -421,9 +414,60 @@ def test_website_all_paths_include_timestamp_directory(tmp_path):
     )
 
 
+@pytest.mark.parametrize(
+    ("original", "mimetype", "relative"),
+    [
+        (
+            "https://example.com/about",
+            "text/html",
+            "website/example.com/about/index.html",
+        ),
+        (
+            "https://example.com/download/annual-report",
+            "application/pdf",
+            "website/example.com/download/annual-report.pdf",
+        ),
+        (
+            "https://example.com/download/report/",
+            "application/pdf",
+            "website/example.com/download/report.pdf",
+        ),
+        (
+            "https://example.com/",
+            "application/pdf",
+            "website/example.com/index.pdf",
+        ),
+        (
+            "https://example.com/download/report",
+            "application/octet-stream",
+            "website/example.com/download/report",
+        ),
+    ],
+)
+def test_website_paths_follow_mime_semantics(
+    tmp_path,
+    original,
+    mimetype,
+    relative,
+):
+    collection = layout(tmp_path)
+
+    result = paths.preferred_website_path(
+        original,
+        collection,
+        mimetype=mimetype,
+    )
+
+    assert result.relative_to(collection.collection_root) == Path(relative)
+
+
 def test_website_preflight_rejects_existing_file(tmp_path):
     collection = layout(tmp_path)
-    target = paths.preferred_website_path("https://example.com/", collection)
+    target = paths.preferred_website_path(
+        "https://example.com/",
+        collection,
+        mimetype="text/html",
+    )
     target.parent.mkdir(parents=True)
     target.write_bytes(b"existing")
 
@@ -576,6 +620,7 @@ def test_website_query_folding_newest_wins(tmp_path):
     assert paths.preferred_website_path(
         older.original,
         collection,
+        mimetype=older.mimetype,
     ) == (
         collection.website_root
         / "example.com"
@@ -615,7 +660,11 @@ def test_website_query_folding_directory_like_paths(
 ):
     collection = layout(tmp_path)
 
-    result = paths.preferred_website_path(original, collection)
+    result = paths.preferred_website_path(
+        original,
+        collection,
+        mimetype="text/html",
+    )
 
     assert result.relative_to(collection.collection_root) == Path(relative)
 

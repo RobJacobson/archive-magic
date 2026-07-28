@@ -117,6 +117,8 @@ def test_apply_output_mode_latest_and_none():
         first.urlkey: [first, second],
         third.urlkey: [third],
     }
+    assert discovery.apply_output_mode(groups, "all") is groups
+    assert discovery.apply_output_mode(groups, "unique") is groups
 
 
 def test_normalize_cdx_search_rewrites_trailing_star_to_explicit_prefix():
@@ -347,10 +349,13 @@ def test_group_captures_uses_urlkey_and_sorts_by_datetime():
 
 def test_group_captures_preserves_value_equal_records():
     capture = record()
+    equal_capture = record()
 
-    grouped = discovery.group_captures([capture, record()])
+    grouped = discovery.group_captures([capture, equal_capture])
 
-    assert grouped[capture.urlkey] == [capture, capture]
+    assert grouped[capture.urlkey] == [capture, equal_capture]
+    assert grouped[capture.urlkey][0] is capture
+    assert grouped[capture.urlkey][1] is equal_capture
 
 
 def test_group_captures_accepts_upstream_default_port_normalization():
@@ -399,7 +404,6 @@ def test_cli_owns_one_client_context_and_passes_same_client(monkeypatch):
     capture = record()
     groups = {capture.urlkey: [capture]}
     layout = object()
-    buckets = (object(),)
     calls = {}
 
     def fake_discover(
@@ -423,13 +427,11 @@ def test_cli_owns_one_client_context_and_passes_same_client(monkeypatch):
 
     def fake_export(
         grouped,
-        planned_buckets,
         client,
         **kwargs,
     ):
         calls["export"] = (
             grouped,
-            planned_buckets,
             client,
             kwargs,
         )
@@ -460,15 +462,6 @@ def test_cli_owns_one_client_context_and_passes_same_client(monkeypatch):
         ),
     )
     monkeypatch.setattr(cli, "group_captures", lambda captures: groups)
-    monkeypatch.setattr(
-        cli,
-        "preflight_layout",
-        lambda grouped, selected_layout: type(
-            "Plan",
-            (),
-            {"layout": selected_layout, "buckets": buckets},
-        )(),
-    )
     monkeypatch.setattr(cli, "export_all", fake_export)
     monkeypatch.setattr(
         cli,
@@ -502,12 +495,12 @@ def test_cli_owns_one_client_context_and_passes_same_client(monkeypatch):
     assert calls["discover"][4] is cli._report_discovery_progress
     assert calls["provenance"][0] == [capture]
     assert calls["export"][0] == groups
-    assert calls["export"][1] == buckets
-    assert calls["export"][2] == client
-    assert calls["export"][3]["client_factory"] is not None
-    assert calls["export"][3]["concurrency"] == DEFAULT_CONCURRENCY
-    assert calls["export"][3]["retries"] == retry.DEFAULT_RETRIES
-    assert calls["export"][3]["files_mode"] == "none"
+    assert calls["export"][1] == client
+    assert calls["export"][2]["layout"] is layout
+    assert calls["export"][2]["client_factory"] is not None
+    assert calls["export"][2]["concurrency"] == DEFAULT_CONCURRENCY
+    assert calls["export"][2]["retries"] == retry.DEFAULT_RETRIES
+    assert calls["export"][2]["files_mode"] == "none"
     assert calls["replay"] == ((), layout)
     assert calls["summary"][0].selected == 1
     assert calls["summary"][1] == {"warc_mode": "all"}
@@ -519,7 +512,6 @@ def test_cli_prints_stage_messages(monkeypatch, capsys):
     capture = record()
     groups = {capture.urlkey: [capture]}
     layout = object()
-    buckets = (object(),)
 
     monkeypatch.setattr(cli, "current_utc_cdx_timestamp", lambda: "20260722123456")
     monkeypatch.setattr(cli, "collection_layout", lambda *args, **kwargs: layout)
@@ -530,15 +522,6 @@ def test_cli_prints_stage_messages(monkeypatch, capsys):
     )
     monkeypatch.setattr(cli, "save_acquisition", lambda *args, **kwargs: None)
     monkeypatch.setattr(cli, "group_captures", lambda captures: groups)
-    monkeypatch.setattr(
-        cli,
-        "preflight_layout",
-        lambda grouped, selected_layout: type(
-            "Plan",
-            (),
-            {"layout": selected_layout, "buckets": buckets},
-        )(),
-    )
     monkeypatch.setattr(
         cli,
         "export_all",
@@ -583,7 +566,6 @@ def test_cli_finishes_outputs_then_lists_failures_and_returns_one(
     capture = record()
     groups = {capture.urlkey: [capture]}
     layout = object()
-    bucket = object()
     failed_url = capture.view_url
     finalized = []
 
@@ -591,15 +573,6 @@ def test_cli_finishes_outputs_then_lists_failures_and_returns_one(
     monkeypatch.setattr(cli, "discover", lambda *args, **kwargs: [capture])
     monkeypatch.setattr(cli, "save_acquisition", lambda *args, **kwargs: None)
     monkeypatch.setattr(cli, "group_captures", lambda captures: groups)
-    monkeypatch.setattr(
-        cli,
-        "preflight_layout",
-        lambda *args: type(
-            "Plan",
-            (),
-            {"layout": layout, "buckets": (bucket,)},
-        )(),
-    )
     monkeypatch.setattr(
         cli,
         "export_all",
@@ -721,19 +694,9 @@ def test_cli_does_not_print_summary_when_replay_indexing_fails(
     install_fake_lifecycle(monkeypatch)
     selected = record()
     layout = object()
-    bucket = object()
     monkeypatch.setattr(cli, "collection_layout", lambda *args, **kwargs: layout)
     monkeypatch.setattr(cli, "discover", lambda *args, **kwargs: [selected])
     monkeypatch.setattr(cli, "save_acquisition", lambda *args, **kwargs: None)
-    monkeypatch.setattr(
-        cli,
-        "preflight_layout",
-        lambda *args: type(
-            "Plan",
-            (),
-            {"layout": layout, "buckets": (bucket,)},
-        )(),
-    )
     monkeypatch.setattr(
         cli,
         "export_all",

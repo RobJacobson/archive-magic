@@ -7,6 +7,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import timezone
+from heapq import merge
 from pathlib import Path
 from typing import BinaryIO, Callable, Mapping, Optional, Sequence
 
@@ -20,7 +21,12 @@ from wayback.exceptions import (
 
 from .console import GroupReporter, capture_result_line, print_progress
 from .files import FilesSummary, write_body
-from .paths import WarcBucket, WebsitePlan
+from .paths import (
+    CollectionLayout,
+    WebsitePlan,
+    allocate_warc_paths,
+    website_relative_parts,
+)
 from .retrieval import (
     DEFAULT_CONCURRENCY,
     MalformedContentEncodingError,
@@ -146,7 +152,7 @@ class ExportResult:
 class _ExportJob:
     """One exclusive WARC owner, or one standalone file-only URL group."""
 
-    bucket: Optional[WarcBucket]
+    warc_path: Optional[Path]
     urlkeys: tuple[str, ...]
 
 
@@ -161,8 +167,7 @@ class _GroupResult:
 class _GroupState:
     """All mutable state whose lifetime is exactly one URL group."""
 
-    warc_set: set[CdxRecord]
-    file_paths: Mapping[CdxRecord, Sequence[Path]]
+    warc_ids: set[int]
     writer_factory: Optional[Callable[[], object]]
     existing_warc: Optional[ExistingWarcCache]
     files_mode: str
@@ -173,7 +178,7 @@ class _GroupState:
     targets_by_digest: dict[str, list[tuple[CdxRecord, Path]]]
     materialized_files: set[Path]
     failed_files: set[Path]
-    events: dict[CdxRecord, list[str]]
+    events: dict[int, list[str]]
     failed_capture_urls: list[str]
 
 
@@ -291,38 +296,43 @@ def _status_failure_lines(
 def _file_targets(
     capture_groups: Mapping[str, Sequence[CdxRecord]],
     plan: Optional[WebsitePlan],
-) -> dict[str, dict[CdxRecord, list[Path]]]:
+) -> dict[str, dict[int, tuple[CdxRecord, list[Path]]]]:
     """Index preflighted loose-file targets by URL key and capture."""
 
-    indexed: dict[str, dict[CdxRecord, list[Path]]] = {}
+    indexed: dict[str, dict[int, tuple[CdxRecord, list[Path]]]] = {}
     if plan is None:
         return indexed
     for target in plan.targets:
         capture = capture_groups[target.urlkey][target.capture_index]
-        indexed.setdefault(target.urlkey, {}).setdefault(
-            capture,
-            [],
-        ).append(target.path)
+        identity = id(capture)
+        group_targets = indexed.setdefault(target.urlkey, {})
+        entry = group_targets.get(identity)
+        if entry is None:
+            entry = (capture, [])
+            group_targets[identity] = entry
+        entry[1].append(target.path)
     return indexed
 
 
 def _ordered_union(
     warc_captures: Sequence[CdxRecord],
     file_captures: Sequence[CdxRecord],
-    *,
-    warc_mode: str,
 ) -> list[CdxRecord]:
-    """Return one processing order without duplicate capture values."""
+    """Merge two sorted selections, coalescing only shared objects."""
 
-    ordered = sorted(
-        set(warc_captures).union(file_captures),
+    ordered: list[CdxRecord] = []
+    seen: set[int] = set()
+    captures = merge(
+        warc_captures,
+        file_captures,
         key=lambda capture: capture.timestamp,
     )
-    if warc_mode != "latest" or not warc_captures:
-        return ordered
-
-    selected = warc_captures[0]
-    return [selected, *(capture for capture in ordered if capture != selected)]
+    for capture in captures:
+        identity = id(capture)
+        if identity not in seen:
+            seen.add(identity)
+            ordered.append(capture)
+    return ordered
 
 
 def _group_summary_line(
@@ -345,7 +355,8 @@ def _group_summary_line(
     if files_mode != "none":
         parts.append(
             f"files {files.written} written ({files_mode}), "
-            f"{files.playback_failures} failed"
+            f"{files.playback_failures} failed, "
+            f"{files.content_type_mismatches} content-type mismatches"
         )
     return f"Summary: {'; '.join(parts)}"
 
@@ -414,6 +425,7 @@ def _write_group_files(
     capture_paths: Sequence[Path],
     digest: Optional[str],
     *,
+    actual_mimetype: Optional[str],
     files_mode: str,
     targets_by_digest: Mapping[
         str,
@@ -422,7 +434,7 @@ def _write_group_files(
     materialized_files: set[Path],
     failed_files: set[Path],
     files_summary: FilesSummary,
-    events: dict[CdxRecord, list[str]],
+    events: dict[int, list[str]],
     collection_root: Optional[Path],
 ) -> None:
     """Materialize every loose-file target served by one downloaded body."""
@@ -437,6 +449,31 @@ def _write_group_files(
     for target_capture, path in targets:
         if path in materialized_files or path in failed_files:
             continue
+        timestamp = (
+            target_capture.timestamp
+            if files_mode in {"unique", "all"}
+            else None
+        )
+        planned_parts = website_relative_parts(
+            target_capture.original,
+            mimetype=target_capture.mimetype,
+            timestamp=timestamp,
+        )
+        actual_parts = website_relative_parts(
+            target_capture.original,
+            mimetype=actual_mimetype,
+            timestamp=timestamp,
+        )
+        if planned_parts != actual_parts:
+            failed_files.add(path)
+            files_summary.content_type_mismatches += 1
+            events.setdefault(id(target_capture), []).append(
+                capture_result_line(
+                    target_capture,
+                    "skipped file: response Content-Type changes path",
+                )
+            )
+            continue
         write_body(path, body)
         materialized_files.add(path)
         files_summary.written += 1
@@ -445,18 +482,18 @@ def _write_group_files(
             if collection_root is not None
             else path
         )
-        events.setdefault(target_capture, []).append(
+        events.setdefault(id(target_capture), []).append(
             capture_result_line(target_capture, f"wrote file {relative}")
         )
 
 
 def _targets_by_digest(
-    file_paths: Mapping[CdxRecord, Sequence[Path]],
+    file_paths: Mapping[int, tuple[CdxRecord, Sequence[Path]]],
 ) -> dict[str, list[tuple[CdxRecord, Path]]]:
     """Group non-redirect file destinations by valid CDX digest."""
 
     grouped: dict[str, list[tuple[CdxRecord, Path]]] = {}
-    for capture, paths in file_paths.items():
+    for capture, paths in file_paths.values():
         if _is_redirect(capture.statuscode):
             continue
         digest = normalize_cdx_digest(capture.digest)
@@ -467,10 +504,19 @@ def _targets_by_digest(
     return grouped
 
 
+def _response_mimetype(
+    headers: Sequence[tuple[str, str]],
+) -> Optional[str]:
+    for name, value in headers:
+        if name.lower() == "content-type":
+            return value
+    return None
+
+
 def _new_group_state(
     union: Sequence[CdxRecord],
     warc_captures: Sequence[CdxRecord],
-    file_paths: Mapping[CdxRecord, Sequence[Path]],
+    file_paths: Mapping[int, tuple[CdxRecord, Sequence[Path]]],
     writer_factory: Optional[Callable[[], object]],
     existing_warc: Optional[ExistingWarcCache],
     *,
@@ -480,21 +526,20 @@ def _new_group_state(
     """Initialize isolated mutable state for one URL group."""
 
     return _GroupState(
-        warc_set=set(warc_captures),
-        file_paths=file_paths,
+        warc_ids={id(capture) for capture in warc_captures},
         writer_factory=writer_factory,
         existing_warc=existing_warc,
         files_mode=files_mode,
         collection_root=collection_root,
         warc=ExportSummary(selected=len(warc_captures)),
         files=FilesSummary(
-            selected=sum(len(paths) for paths in file_paths.values())
+            selected=sum(len(paths) for _capture, paths in file_paths.values())
         ),
         representatives={},
         targets_by_digest=_targets_by_digest(file_paths),
         materialized_files=set(),
         failed_files=set(),
-        events={capture: [] for capture in union},
+        events={id(capture): [] for capture in union},
         failed_capture_urls=[],
     )
 
@@ -533,7 +578,7 @@ def _use_known_representative(
             state.writer_factory,
         )
         state.warc.revisits += 1
-        state.events[capture].append(
+        state.events[id(capture)].append(
             capture_result_line(capture, "wrote revisit")
         )
     return True
@@ -556,7 +601,7 @@ def _retrieve_validated(
         try:
             cached = state.existing_warc.get(capture)
         except ValueError as error:
-            state.events[capture].append(
+            state.events[id(capture)].append(
                 "  WARNING: existing WARC cache entry could not be reused; "
                 f"fetching from Wayback: {error}"
             )
@@ -567,7 +612,7 @@ def _retrieve_validated(
                     and normalize_cdx_digest(capture.digest)
                     != _EMPTY_PAYLOAD_DIGEST
                 ):
-                    state.events[capture].append(
+                    state.events[id(capture)].append(
                         "  WARNING: existing WARC cache entry has an "
                         "unexpected empty payload; fetching from Wayback"
                     )
@@ -592,7 +637,7 @@ def _retrieve_validated(
                 retries=retries,
             )
         except _PLAYBACK_ERRORS as error:
-            state.events[capture].extend(_failure_lines(capture, error))
+            state.events[id(capture)].extend(_failure_lines(capture, error))
             _count_failure(
                 capture,
                 error,
@@ -609,7 +654,7 @@ def _retrieve_validated(
         capture.statuscode is not None
         and retrieved.status_code != capture.statuscode
     ):
-        state.events[capture].extend(
+        state.events[id(capture)].extend(
             _status_failure_lines(capture, retrieved.status_code)
         )
         _count_failure(
@@ -639,7 +684,7 @@ def _retrieve_validated(
         != _EMPTY_PAYLOAD_DIGEST
     ):
         error = ValueError("empty playback body")
-        state.events[capture].extend(_failure_lines(capture, error))
+        state.events[id(capture)].extend(_failure_lines(capture, error))
         _count_failure(
             capture,
             error,
@@ -667,7 +712,7 @@ def _commit_representative(
     """Commit one successful representative to every selected output."""
 
     if retrieved.recovered_content_encoding:
-        state.events[capture].append(
+        state.events[id(capture)].append(
             capture_result_line(
                 capture,
                 "recovered invalid content encoding via CDX digest",
@@ -681,7 +726,7 @@ def _commit_representative(
             state.writer_factory,
         )
         state.warc.responses += 1
-        state.events[capture].append(
+        state.events[id(capture)].append(
             capture_result_line(
                 capture,
                 (
@@ -700,6 +745,7 @@ def _commit_representative(
         retrieved.body,
         capture_paths,
         digest,
+        actual_mimetype=_response_mimetype(retrieved.headers),
         files_mode=state.files_mode,
         targets_by_digest=state.targets_by_digest,
         materialized_files=state.materialized_files,
@@ -713,7 +759,10 @@ def _commit_representative(
 def _export_group(
     urlkey: str,
     warc_captures: Sequence[CdxRecord],
-    file_capture_paths: Mapping[CdxRecord, Sequence[Path]],
+    file_capture_paths: Mapping[
+        int,
+        tuple[CdxRecord, Sequence[Path]],
+    ],
     client,
     writer_factory: Optional[Callable[[], object]],
     existing_warc: Optional[ExistingWarcCache],
@@ -726,16 +775,26 @@ def _export_group(
 ) -> _GroupResult:
     """Process one URL group with a private representative dictionary."""
 
-    union = _ordered_union(
+    chronological = _ordered_union(
         warc_captures,
-        tuple(file_capture_paths),
-        warc_mode=warc_mode,
+        tuple(capture for capture, _paths in file_capture_paths.values()),
     )
-    if not union:
+    if not chronological:
         raise ValueError(f"capture group is empty: {urlkey}")
+    processing = chronological
+    if warc_mode == "latest" and warc_captures:
+        selected = warc_captures[0]
+        processing = [
+            selected,
+            *(
+                capture
+                for capture in chronological
+                if capture is not selected
+            ),
+        ]
 
     state = _new_group_state(
-        union,
+        chronological,
         warc_captures,
         file_capture_paths,
         writer_factory,
@@ -744,9 +803,10 @@ def _export_group(
         collection_root=collection_root,
     )
 
-    for capture in union:
-        wants_warc = capture in state.warc_set
-        capture_paths = list(file_capture_paths.get(capture, ()))
+    for capture in processing:
+        wants_warc = id(capture) in state.warc_ids
+        target = file_capture_paths.get(id(capture))
+        capture_paths = list(target[1] if target is not None else ())
         known_redirect = _is_redirect(capture.statuscode)
         if known_redirect and not wants_warc:
             _omit_redirect(
@@ -786,10 +846,10 @@ def _export_group(
             )
 
     lines = []
-    for capture in sorted(union, key=lambda item: item.timestamp):
-        lines.extend(state.events.get(capture, ()))
+    for capture in chronological:
+        lines.extend(state.events.get(id(capture), ()))
     reporter.emit(
-        union[0].original,
+        chronological[0].original,
         lines,
         _group_summary_line(
             state.warc,
@@ -808,7 +868,10 @@ def _export_group(
 def _export_job(
     job: _ExportJob,
     warc_groups: Mapping[str, Sequence[CdxRecord]],
-    file_targets: Mapping[str, Mapping[CdxRecord, Sequence[Path]]],
+    file_targets: Mapping[
+        str,
+        Mapping[int, tuple[CdxRecord, Sequence[Path]]],
+    ],
     client,
     *,
     retries: int,
@@ -818,8 +881,8 @@ def _export_job(
     collection_root: Optional[Path],
 ) -> _JobResult:
     owner = (
-        _WarcRebuilder.open(job.bucket.path)
-        if job.bucket is not None
+        _WarcRebuilder.open(job.warc_path)
+        if job.warc_path is not None
         else None
     )
     existing_warc = None
@@ -875,9 +938,9 @@ def _export_job(
 
 def export_all(
     capture_groups: Mapping[str, Sequence[CdxRecord]],
-    buckets: Sequence[WarcBucket],
     client,
     *,
+    layout: CollectionLayout,
     file_capture_groups: Optional[
         Mapping[str, Sequence[CdxRecord]]
     ] = None,
@@ -894,12 +957,13 @@ def export_all(
         raise ValueError("retries cannot be negative")
     selected_file_groups = file_capture_groups or {}
     targets = _file_targets(selected_file_groups, website_plan)
+    warc_paths = allocate_warc_paths(capture_groups, layout)
     assigned_urlkeys = {
-        urlkey for bucket in buckets for urlkey in bucket.urlkeys
+        urlkey for urlkeys in warc_paths.values() for urlkey in urlkeys
     }
     jobs = [
-        _ExportJob(bucket, bucket.urlkeys)
-        for bucket in buckets
+        _ExportJob(path, urlkeys)
+        for path, urlkeys in warc_paths.items()
     ]
     jobs.extend(
         _ExportJob(None, (urlkey,))
@@ -964,9 +1028,9 @@ def export_all(
     return ExportResult(
         summary,
         tuple(
-            bucket.path
-            for bucket in buckets
-            if bucket.path in available_warcs
+            path
+            for path in warc_paths
+            if path in available_warcs
         ),
         files_summary,
         tuple(failed_capture_urls),
@@ -985,15 +1049,18 @@ def export_group(
 ) -> ExportSummary:
     """Rebuild one URL group into one atomically replaced WARC."""
 
-    result = export_all(
+    result = _export_job(
+        _ExportJob(path, (urlkey,)),
         {urlkey: captures},
-        (WarcBucket(path, (urlkey,)),),
+        {},
         client,
-        client_factory=client_factory,
-        concurrency=concurrency,
+        reporter=GroupReporter(1),
+        warc_mode="all",
+        files_mode="none",
+        collection_root=None,
         retries=retries,
     )
-    return result.summary
+    return result.warc
 
 
 def print_summary(

@@ -123,14 +123,14 @@ When `--warc` is `all` or `latest`:
   rules.
 - After successful WARC export, generate and publish `replay/index.cdxj` as
   today.
-- Preflight remains fatal on existing final WARC/replay targets (no resume in
-  this PR).
+- Build buckets directly from canonical resource paths. Temporary WARCs are
+  reserved lazily and published atomically; existing finals remain reusable.
 
 When `--warc none`:
 
 - Do not create/open WARCs.
 - Do not create `replay/index.cdxj`.
-- Skip WARC preflight / replay indexing stages.
+- Skip WARC allocation / replay indexing stages.
 
 ### 6.3 Loose files (`website/`)
 
@@ -140,8 +140,9 @@ When `--files` is enabled, write bodies under:
 archives/example.com/website/
 ```
 
-Not under `archive/`. Paths mirror the original site path (Ruby-style), with
-directory-like URLs materialized as `index.html`.
+Not under `archive/`. Paths mirror the original site path. Extensionless HTML
+uses `index.html`; known non-HTML endpoints use conventional suffixes, so
+`/download/report/` with `application/pdf` becomes `download/report.pdf`.
 
 #### Latest (`--files latest`)
 
@@ -180,8 +181,11 @@ do not receive loose files. Missing or malformed digests remain independent.
 - Bodies only (decoded semantic payload from `get_memento` / same bytes that
   would feed a WARC response body).
 - No header/status sidecar files in this PR.
-- Directory URLs and extension-less directory-like paths → `.../index.html`
-  (same heuristic spirit as the Ruby tool).
+- Preserve explicit URL extensions. Use `.../index.html` only for
+  extensionless HTML/XHTML; map the supported PDF/CSS/JS/JSON/image MIME types
+  to conventional suffixes and leave unknown MIME extensionless.
+- Validate MIME-derived destinations against the response `Content-Type`.
+  A destination-changing mismatch skips only the loose file and is reported.
 - Apply the same safety encoding / filesystem limit mindset used for readable
   archive paths so path components cannot escape `website/`.
 - File-vs-directory conflicts: reshape like the Ruby tool when a file path
@@ -208,7 +212,6 @@ parse args + defaults
   -> group by urlkey
   -> build warc_selection from --warc (all|latest|none)
   -> build files_selection from --files (all|unique|latest|none)
-  -> if warc enabled: preflight WARC/replay targets
   -> if files enabled: preflight website targets for planned paths
   -> export WARC and loose-file selections in one URL-group worker pass
   -> if warc enabled: build replay CDXJ

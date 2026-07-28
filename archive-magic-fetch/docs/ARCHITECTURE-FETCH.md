@@ -131,9 +131,7 @@ parse arguments and apply date defaults
     -> atomically publish the source acquisition (full discovery set)
     -> group records by urlkey
     -> build warc_selection and files_selection from output modes
-    -> if warc enabled: allocate WARC buckets and preflight WARC/replay
-    -> if files enabled: plan website/ paths (query folding + newest-wins)
-         and preflight remaining targets
+    -> if files enabled: plan website/ paths (MIME + query folding + newest-wins)
     -> export enabled outputs with one reusable Wayback client per worker thread
     -> if warc enabled: generate replay/index.cdxj
     -> if --rewrite-local and at least one file was written: rewrite under website/
@@ -152,7 +150,8 @@ for the query window, not the post-`latest` subset.
 4. omit the statusless-only group.
 
 WARC and loose-file selection remain independent, but one URL-group worker
-writes both outputs. A capture selected by both axes is retrieved once.
+writes both outputs. A capture selected by both axes is retrieved once by
+object identity; distinct value-equal CDX rows remain distinct.
 
 The aggregate summary is printed only after enabled output stages succeed. A
 fatal indexing or replay-publication error therefore cannot follow an apparently
@@ -320,22 +319,9 @@ cutting a `%XX` escape or appending a digest. Truncation collisions are safe
 because filenames identify buckets, not records. Safety encoding is reapplied
 after truncation so a cutoff cannot expose a literal trailing dot.
 
-Preflight checks two independent filesystem limits using the nearest existing
-ancestor:
-
-- `PC_NAME_MAX` for every complete path component; and
-- `PC_PATH_MAX` for the absolute path, including terminator space where
-  applicable.
-
-Unavailable, unlimited, or invalid platform values use conservative defaults:
-
-```text
-POSIX:   NAME_MAX 255 bytes, PATH_MAX 1024 bytes
-Windows: NAME_MAX 255 ASCII characters, PATH_MAX 260 characters
-```
-
-The 240-byte application cap does not replace the actual `NAME_MAX` check, and
-component checks do not replace `PATH_MAX`.
+The collection boundary is validated up front. Individual WARC targets are
+created lazily, so the filesystem reports any target-specific path or ancestor
+failure when the bucket is first written.
 
 ### 5.2 Loose website paths
 
@@ -344,7 +330,12 @@ When `--files` is enabled, Fetch writes decoded semantic bodies under
 spirit), with an explicit host segment so multi-host collections stay distinct:
 
 - host comes first (`www.` stripped; non-default ports use `--port-<n>`)
-- directory URLs and extension-less directory-like paths become `.../index.html`
+- explicit URL filename extensions are preserved
+- extensionless HTML/XHTML becomes `.../index.html`
+- known extensionless non-HTML content uses a conventional terminal suffix;
+  for example `/download/report/` with `application/pdf` becomes
+  `download/report.pdf`
+- unknown MIME remains extensionless and is never guessed to be HTML
 - **query strings are folded away** for loose-file paths only (WARC path/query
   encoding is unchanged): `main_style.css?v=1` → `main_style.css`
 - `--files latest` writes `website/<host>/<site-path>` with no timestamp segment
@@ -367,6 +358,7 @@ Examples:
 /                 -> website/example.com/index.html
 /index.html       -> website/example.com/index.html  (collides; newer wins)
 /about            -> website/example.com/about/index.html
+/download/report/ (PDF) -> website/example.com/download/report.pdf
 /a/b/             -> website/example.com/a/b/index.html
 /css/style.css    -> website/example.com/css/style.css
 /files/main_style.css?1546028705 -> website/example.com/files/main_style.css
@@ -388,6 +380,10 @@ WARC paths. Planned file-vs-directory conflicts reshape a file into
 path. Existing final loose-file targets remain fatal (no resume). Empty or
 failed playback bodies do not leave empty files.
 
+CDX MIME plans the destination. The retrieved response `Content-Type` is
+normalized without parameters and must produce the same destination. A
+mismatch skips and reports only the loose-file write; WARC export continues.
+
 ### 5.3 Optional `--rewrite-local`
 
 When `--rewrite-local` is set and at least one loose file was written, Fetch
@@ -400,8 +396,8 @@ Rewrite rules (minimum viable):
 - Root-relative `/path`, scheme-relative `//host/path`, and absolute
   `http(s)://host/path` references are rewritten to relative links when the
   host normalizes to a host segment present under `website/` and the local
-  target exists (query folded when resolving; directories prefer `index.html`;
-  `/` resolves to host-root `index.html` when present).
+  target exists. Resolution uses the planned route map, so MIME-derived files
+  such as `/download/report/` → `report.pdf` are found correctly.
 - `url(...)` is rewritten in `.css` and HTML inline styles only (not `.js`, so
   JS helpers named `url` are left alone). Straightforward `srcset` and
   `href`/`src`/`action` attributes are rewritten in HTML and JS.
@@ -418,10 +414,7 @@ not download missing link targets, rewrite third-party CDNs, or guarantee
 perfect offline fidelity for JS-driven sites. Default CLI behavior without the
 flag does not rewrite file contents.
 
-## 6. Collision buckets and preflight
-
-`preflight_layout()` produces an ordered `ExportPlan` containing
-`WarcBucket(path, urlkeys)` values.
+## 6. Direct WARC bucket allocation
 
 Candidate paths are compared conservatively using:
 
@@ -437,10 +430,11 @@ Filesystem-equivalent candidates share one WARC:
 /posts/index  -> archive/posts/index.warc.gz
 ```
 
-Preflight also detects when one planned WARC path would become the directory
-ancestor of another, including after case folding or truncation. Descendant
-groups are assigned to the ancestor WARC so a file/directory conflict cannot
-surface after playback begins.
+Allocation is a dictionary pass. Each URL key constructs one preferred path.
+For file/directory conflicts, each normalized key walks its strict component
+prefixes in a set and assigns itself to the shortest planned prefix. Work is
+proportional to total path depth; there is no pairwise bucket or filesystem
+ancestor scan.
 
 The lexically smallest safe candidate supplies the displayed bucket spelling.
 Buckets sort by collection-relative path; URL keys within a bucket sort
@@ -450,18 +444,13 @@ Collision buckets retain resource identity through WARC metadata and distinct
 CDXJ offsets. Sharing storage avoids arbitrary filename suffixes and prevents
 rare naming collisions from aborting unattended exports.
 
-Before playback, preflight checks every planned WARC, its `.tmp` sibling, and
-`replay/index.cdxj` when `--warc` is enabled, and every planned `website/`
-target when `--files` is enabled. Existing regular final WARCs and replay
-indexes are accepted as rebuild inputs. Existing `.tmp` files, final
-symlinks/directories, broken final symlinks, non-directory ancestors,
-component/path-limit violations, and other uninspectable targets are fatal.
-Valid directory-symlink ancestors remain supported. A stale `.tmp` must be
-removed explicitly; Fetch does not guess whether it belongs to an active
-concurrent process.
+Each WARC owns one lazily created `.tmp` opened with exclusive creation.
+Existing final WARCs may supply exact cached responses. Completed temporary
+WARCs are validated and atomically replace the readable final path. A stale
+`.tmp` or invalid ancestor fails only when that bucket actually needs a writer.
 
-When `--warc none`, Fetch skips WARC allocation, WARC/replay preflight, WARC
-export, and replay indexing entirely.
+When `--warc none`, Fetch skips WARC allocation, WARC export, and replay
+indexing entirely.
 
 ## 7. Source provenance
 
@@ -501,8 +490,10 @@ value-equal duplicates, redirects, statusless rows, and non-ASCII URLs are
 preserved. Whitespace-bearing tokens are rejected rather than serialized
 ambiguously.
 
-The gzip header has no temporary filename and uses the acquisition time as
-its explicit `mtime`.
+Rows are streamed directly into gzip while being counted. The completed gzip
+is hashed for the manifest; no uncompressed or compressed whole-file byte
+buffer is built. The gzip header has no temporary filename and uses the
+acquisition time as its explicit `mtime`.
 
 ### 7.2 Query manifest
 

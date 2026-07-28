@@ -7,10 +7,14 @@ import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Optional
+from typing import Mapping, Optional
 from urllib.parse import urlsplit
 
-from .paths import preferred_site_file, website_host_segment
+from .paths import (
+    normalized_site_path,
+    preferred_site_file,
+    website_host_segment,
+)
 
 
 _REWRITE_EXTENSIONS = {".html", ".htm", ".css", ".js"}
@@ -73,7 +77,18 @@ def _site_context(
     return host, website_root / host
 
 
-def _existing_local_target(site_root: Path, url_path: str) -> Optional[Path]:
+def _existing_local_target(
+    site_root: Path,
+    url_path: str,
+    *,
+    website_root: Path,
+    routes: Optional[Mapping[tuple[str, str], Path]],
+) -> Optional[Path]:
+    if routes is not None:
+        site = site_root.relative_to(website_root).as_posix()
+        target = routes.get((site, normalized_site_path(url_path)))
+        return target if target is not None and target.is_file() else None
+
     candidate = preferred_site_file(site_root, url_path)
     if candidate.is_file():
         return candidate
@@ -123,6 +138,7 @@ def rewrite_reference(
     current_file: Path,
     website_root: Path,
     known_hosts: set[str],
+    routes: Optional[Mapping[tuple[str, str], Path]] = None,
     include_timestamps: bool = False,
 ) -> str:
     """Rewrite one URL reference when a same-collection local target exists."""
@@ -150,7 +166,12 @@ def rewrite_reference(
                 current_file,
                 include_timestamps=include_timestamps,
             )
-            target = _existing_local_target(site_root, parsed.path or "/")
+            target = _existing_local_target(
+                site_root,
+                parsed.path or "/",
+                website_root=website_root,
+                routes=routes,
+            )
             if target is None:
                 return reference
             return _relative_link(
@@ -177,7 +198,12 @@ def rewrite_reference(
         # resolve under that host's non-timestamp root.
         site_root = website_root / host_segment
 
-    target = _existing_local_target(site_root, parsed.path or "/")
+    target = _existing_local_target(
+        site_root,
+        parsed.path or "/",
+        website_root=website_root,
+        routes=routes,
+    )
     if target is None:
         return reference
     return _relative_link(
@@ -194,6 +220,7 @@ def _rewrite_srcset(
     current_file: Path,
     website_root: Path,
     known_hosts: set[str],
+    routes: Optional[Mapping[tuple[str, str], Path]],
     include_timestamps: bool,
 ) -> str:
     parts = []
@@ -209,6 +236,7 @@ def _rewrite_srcset(
             current_file=current_file,
             website_root=website_root,
             known_hosts=known_hosts,
+            routes=routes,
             include_timestamps=include_timestamps,
         )
         if len(pieces) == 1:
@@ -225,6 +253,7 @@ def rewrite_text(
     current_file: Path,
     website_root: Path,
     known_hosts: set[str],
+    routes: Optional[Mapping[tuple[str, str], Path]] = None,
     include_timestamps: bool = False,
 ) -> str:
     """Rewrite HTML/CSS/JS URL references in one text document."""
@@ -237,6 +266,7 @@ def rewrite_text(
             current_file=current_file,
             website_root=website_root,
             known_hosts=known_hosts,
+            routes=routes,
             include_timestamps=include_timestamps,
         )
         return (
@@ -250,6 +280,7 @@ def rewrite_text(
             current_file=current_file,
             website_root=website_root,
             known_hosts=known_hosts,
+            routes=routes,
             include_timestamps=include_timestamps,
         )
         return (
@@ -263,6 +294,7 @@ def rewrite_text(
             current_file=current_file,
             website_root=website_root,
             known_hosts=known_hosts,
+            routes=routes,
             include_timestamps=include_timestamps,
         )
         quote = match.group("quote")
@@ -292,6 +324,7 @@ def _write_replaced(path: Path, text: str) -> None:
 def rewrite_local_website(
     website_root: Path,
     *,
+    routes: Optional[Mapping[tuple[str, str], Path]] = None,
     include_timestamps: bool = False,
 ) -> RewriteSummary:
     """Rewrite HTML/CSS/JS under ``website/`` for local relative browsing."""
@@ -326,6 +359,7 @@ def rewrite_local_website(
             current_file=path,
             website_root=website_root,
             known_hosts=known_hosts,
+            routes=routes,
             include_timestamps=include_timestamps,
         )
         if rewritten == original:

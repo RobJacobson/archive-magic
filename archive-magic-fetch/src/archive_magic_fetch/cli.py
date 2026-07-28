@@ -22,8 +22,8 @@ from .files import print_files_summary
 from .paths import (
     DEFAULT_OUTPUT_ROOT,
     collection_layout,
-    preflight_layout,
     preflight_website_layout,
+    website_route_map,
 )
 from .provenance import save_acquisition
 from .replay import generate_replay_index
@@ -216,12 +216,9 @@ def _run(
             warc_groups = apply_output_mode(capture_groups, warc_mode)
             files_groups = apply_output_mode(capture_groups, files_mode)
 
-            warc_plan = None
-            if warc_mode != "none":
-                warc_plan = preflight_layout(warc_groups, layout)
-
             website_plan = None
             if files_mode != "none":
+                print("Planning website files...")
                 website_plan = preflight_website_layout(
                     files_groups,
                     layout,
@@ -235,8 +232,8 @@ def _run(
             )
             export_result = export_all(
                 warc_groups,
-                warc_plan.buckets if warc_plan is not None else (),
                 client,
+                layout=layout,
                 file_capture_groups=files_groups,
                 website_plan=website_plan,
                 warc_mode=warc_mode,
@@ -247,16 +244,20 @@ def _run(
             )
             warc_summary = export_result.summary
             files_summary = export_result.files_summary
-            if warc_plan is not None:
+            if warc_mode != "none":
                 print("Building replay index...")
                 generate_replay_index(
                     export_result.final_warcs,
-                    layout=warc_plan.layout,
+                    layout=layout,
                 )
             if website_plan is not None:
                 if rewrite_local and files_summary.written > 0:
                     rewrite_local_website(
                         layout.website_root,
+                        routes=website_route_map(
+                            files_groups,
+                            website_plan,
+                        ),
                         include_timestamps=(
                             files_mode in {"unique", "all"}
                         ),

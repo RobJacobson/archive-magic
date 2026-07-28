@@ -22,12 +22,13 @@ def capture(
     urlkey="com,example)/",
     payload=b"payload",
     digest=None,
+    mimetype="text/html",
 ):
     return CdxRecord(
         urlkey=urlkey,
         timestamp=timestamp(captured),
         original=original,
-        mimetype="text/html",
+        mimetype=mimetype,
         statuscode=statuscode,
         digest=digest or ("A" * 32),
         length=len(payload),
@@ -35,12 +36,20 @@ def capture(
 
 
 class FakeMemento:
-    def __init__(self, *, url, captured, payload=b"payload", status_code=200):
+    def __init__(
+        self,
+        *,
+        url,
+        captured,
+        payload=b"payload",
+        status_code=200,
+        content_type="text/html",
+    ):
         self.url = url
         self.timestamp = timestamp(captured)
         self.status_code = status_code
         self.memento_url = f"https://web.archive.org/web/{captured}id_/{url}"
-        self.headers = {"Content-Type": "text/html"}
+        self.headers = {"Content-Type": content_type}
         self.content = payload
 
     def __enter__(self):
@@ -63,13 +72,20 @@ class FakeClient:
         return outcome
 
 
-def memento_for(selected, *, payload=b"payload", status_code=None):
+def memento_for(
+    selected,
+    *,
+    payload=b"payload",
+    status_code=None,
+    content_type="text/html",
+):
     return FakeMemento(
         url=selected.original,
         captured=selected.timestamp.astimezone(timezone.utc).strftime(
             "%Y%m%d%H%M%S"
         ),
         payload=payload,
+        content_type=content_type,
         status_code=(
             status_code
             if status_code is not None
@@ -107,8 +123,8 @@ def test_files_latest_writes_website_without_timestamps(tmp_path):
 
     summary = export.export_all(
         {},
-        (),
         client,
+        layout=layout,
         file_capture_groups=groups,
         website_plan=plan,
         warc_mode="none",
@@ -157,8 +173,8 @@ def test_files_all_writes_timestamp_directories(tmp_path):
 
     summary = export.export_all(
         {},
-        (),
         client,
+        layout=layout,
         file_capture_groups=groups,
         website_plan=plan,
         warc_mode="none",
@@ -196,8 +212,8 @@ def test_files_only_omits_known_redirect_without_playback(tmp_path):
 
     summary = export.export_all(
         {},
-        (),
         client,
+        layout=layout,
         file_capture_groups=groups,
         website_plan=plan,
         warc_mode="none",
@@ -229,10 +245,9 @@ def test_warc_latest_writes_one_response_and_replay(tmp_path):
         "https://example.com/*",
         root=tmp_path / "archives",
     )
-    plan = paths.preflight_layout(selected, layout)
     client = FakeClient({newer_200: memento_for(newer_200, payload=b"ok")})
 
-    result = export.export_all(selected, plan.buckets, client)
+    result = export.export_all(selected, client, layout=layout)
     from archive_magic_fetch.replay import generate_replay_index
 
     generate_replay_index(result.final_warcs, layout=layout)
@@ -249,7 +264,6 @@ def test_dual_mode_reuses_one_representative_download(tmp_path):
         "https://example.com/*",
         root=tmp_path / "archives",
     )
-    warc_plan = paths.preflight_layout(groups, layout)
     website_plan = paths.preflight_website_layout(
         groups,
         layout,
@@ -258,8 +272,8 @@ def test_dual_mode_reuses_one_representative_download(tmp_path):
     client = FakeClient({selected: memento_for(selected, payload=b"shared-body")})
     result = export.export_all(
         groups,
-        warc_plan.buckets,
         client,
+        layout=layout,
         file_capture_groups=groups,
         website_plan=website_plan,
         files_mode="latest",
@@ -281,7 +295,6 @@ def test_files_unique_writes_responses_and_skips_revisits(tmp_path):
         "https://example.com/*",
         root=tmp_path / "archives",
     )
-    warc_plan = paths.preflight_layout(groups, layout)
     website_plan = paths.preflight_website_layout(
         groups,
         layout,
@@ -291,8 +304,8 @@ def test_files_unique_writes_responses_and_skips_revisits(tmp_path):
 
     result = export.export_all(
         groups,
-        warc_plan.buckets,
         client,
+        layout=layout,
         file_capture_groups=groups,
         website_plan=website_plan,
         files_mode="unique",
@@ -333,8 +346,8 @@ def test_files_unique_without_warc_uses_same_digest_policy(tmp_path):
 
     result = export.export_all(
         {},
-        (),
         client,
+        layout=layout,
         file_capture_groups=groups,
         website_plan=website_plan,
         warc_mode="none",
@@ -354,7 +367,6 @@ def test_files_all_materializes_revisit_body_without_refetch(tmp_path):
         "https://example.com/*",
         root=tmp_path / "archives",
     )
-    warc_plan = paths.preflight_layout(groups, layout)
     website_plan = paths.preflight_website_layout(
         groups,
         layout,
@@ -364,8 +376,8 @@ def test_files_all_materializes_revisit_body_without_refetch(tmp_path):
 
     result = export.export_all(
         groups,
-        warc_plan.buckets,
         client,
+        layout=layout,
         file_capture_groups=groups,
         website_plan=website_plan,
         files_mode="all",
@@ -399,8 +411,8 @@ def test_empty_playback_body_writes_zero_byte_file(tmp_path, capsys):
 
     summary = export.export_all(
         {},
-        (),
         client,
+        layout=layout,
         file_capture_groups=groups,
         website_plan=plan,
         warc_mode="none",
@@ -431,8 +443,8 @@ def test_playback_failure_does_not_create_file(tmp_path):
 
     summary = export.export_all(
         {},
-        (),
         client,
+        layout=layout,
         file_capture_groups=groups,
         website_plan=plan,
         warc_mode="none",
@@ -442,6 +454,87 @@ def test_playback_failure_does_not_create_file(tmp_path):
     assert summary.playback_failures == 1
     assert summary.written == 0
     assert list(Path(layout.website_root).rglob("*")) == []
+
+
+def test_content_type_path_mismatch_skips_only_loose_file(tmp_path):
+    selected = capture(
+        original="https://example.com/download/report",
+        urlkey="com,example)/download/report",
+        mimetype="text/html",
+    )
+    groups = {selected.urlkey: [selected]}
+    layout = paths.collection_layout(
+        "https://example.com/*",
+        root=tmp_path / "archives",
+    )
+    plan = paths.preflight_website_layout(
+        groups,
+        layout,
+        include_timestamps=False,
+    )
+
+    result = export.export_all(
+        groups,
+        FakeClient(
+            {
+                selected: memento_for(
+                    selected,
+                    content_type="application/pdf; charset=binary",
+                )
+            }
+        ),
+        layout=layout,
+        file_capture_groups=groups,
+        website_plan=plan,
+        files_mode="latest",
+    )
+
+    assert result.summary.responses == 1
+    assert result.files_summary.written == 0
+    assert result.files_summary.content_type_mismatches == 1
+    assert not layout.website_root.exists()
+
+
+def test_explicit_extension_is_mime_independent(tmp_path):
+    selected = capture(
+        original="https://example.com/download/report.pdf",
+        urlkey="com,example)/download/report.pdf",
+        mimetype="application/pdf",
+        payload=b"pdf",
+    )
+    groups = {selected.urlkey: [selected]}
+    layout = paths.collection_layout(
+        "https://example.com/*",
+        root=tmp_path / "archives",
+    )
+    plan = paths.preflight_website_layout(
+        groups,
+        layout,
+        include_timestamps=False,
+    )
+
+    result = export.export_all(
+        {},
+        FakeClient(
+            {
+                selected: memento_for(
+                    selected,
+                    payload=b"pdf",
+                    content_type="application/octet-stream",
+                )
+            }
+        ),
+        layout=layout,
+        file_capture_groups=groups,
+        website_plan=plan,
+        warc_mode="none",
+        files_mode="latest",
+    )
+
+    assert result.files_summary.written == 1
+    assert (
+        layout.website_root / "example.com" / "download" / "report.pdf"
+    ).read_bytes() == b"pdf"
 
 
 def test_files_summary_includes_playback_failure_categories(capsys):
@@ -457,5 +550,6 @@ def test_files_summary_includes_playback_failure_categories(capsys):
     assert capsys.readouterr().out == (
         "Files: 4 written (all); 3 playback failures "
         "(1 invalid content encoding, 1 truncated response, 1 other); "
+        "0 content-type mismatches; "
         "0 redirects omitted\n"
     )

@@ -87,7 +87,7 @@ def select_latest_capture(
 def apply_output_mode(
     capture_groups: Mapping[str, Sequence[CdxRecord]],
     mode: OutputMode,
-) -> dict[str, list[CdxRecord]]:
+) -> Mapping[str, Sequence[CdxRecord]]:
     """Transform grouped captures into the selection for one output axis."""
 
     if mode not in FILES_MODES:
@@ -95,10 +95,7 @@ def apply_output_mode(
     if mode == "none":
         return {}
     if mode in {"all", "unique"}:
-        return {
-            urlkey: list(captures)
-            for urlkey, captures in capture_groups.items()
-        }
+        return capture_groups
 
     selected: dict[str, list[CdxRecord]] = {}
     for urlkey, captures in capture_groups.items():
