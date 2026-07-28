@@ -399,9 +399,11 @@ The latest run also has:
 - 10 generic unplayable Mementos, all involving `favicon.ico` or `robots.txt`.
 
 The fixed truncation boundary is a separate transport or replay-source issue
-and should not be folded into invalid-gzip recovery. The existing repeated
-boundary rule limits most of these to three attempts, although one mixed
-connection-refusal/truncation sequence reached six attempts and 64.9 seconds.
+and should not be folded into invalid-gzip recovery. The repeated-boundary
+rule permits one retry, then stops after two consecutive attempts reach the
+same received/expected byte counts. The incomplete-response retry is immediate
+and does not use exponential backoff. Intervening transport errors reset the
+consecutive-boundary count and can still extend a mixed failure sequence.
 
 ## Relevant implementation areas
 

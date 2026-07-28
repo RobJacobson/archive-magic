@@ -42,7 +42,7 @@ from .warc import timestamp_to_warc_date
 
 DEFAULT_CONCURRENCY = 8
 
-REPEATED_TRUNCATION_ATTEMPTS = 3
+REPEATED_TRUNCATION_ATTEMPTS = 2
 
 _VALID_CDX_SHA1 = re.compile(r"[A-Z2-7]{32}")
 
@@ -444,6 +444,15 @@ def _retrieve_memento_with_retry(
                     elapsed_seconds=time.monotonic() - started_at,
                     cause=decision.cause,
                 ) from error
+
+            if truncation is not None:
+                print_progress(
+                    capture_result_line(
+                        capture,
+                        "retrying after incomplete response",
+                    )
+                )
+                continue
 
             delay = retry_delay_seconds(
                 attempt_number,

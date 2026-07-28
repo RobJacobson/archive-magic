@@ -205,7 +205,7 @@ def test_warc_latest_writes_one_response_and_replay(tmp_path):
     result = export.export_all(selected, plan.buckets, client)
     from archive_magic_fetch.replay import generate_replay_index
 
-    generate_replay_index(result.created_warcs, layout=layout)
+    generate_replay_index(result.final_warcs, layout=layout)
 
     assert client.calls == [newer_200]
     assert result.summary.responses == 1
@@ -312,7 +312,7 @@ def test_files_unique_without_warc_uses_same_digest_policy(tmp_path):
     )
 
     assert client.calls == [first]
-    assert result.created_warcs == ()
+    assert result.final_warcs == ()
     assert result.files_summary.written == 1
 
 

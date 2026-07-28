@@ -86,7 +86,7 @@ archive-magic-fetch URL_PATTERN
 | `--files` | `none`, `latest`, `unique`, `all` | `none` |
 | `--rewrite-local` | flag | off |
 | `--concurrency` | integer ≥ 1 | `8` |
-| `--retries` | integer ≥ 0 | `12` |
+| `--retries` | integer ≥ 0 | `8` |
 
 `--concurrency 1` restores serial URL-group workers for diagnostics. Values
 above 8 mostly queue behind the Wayback client's independent 8 requests/second
@@ -94,7 +94,8 @@ memento pacing. The value directly sets the fixed worker-pool ceiling; Fetch
 does not dynamically reduce or ramp concurrency.
 
 `--retries N` controls application-owned retries after the initial Internet
-Archive request. Retry `n` waits exactly `2^n` seconds. Zero disables retries;
+Archive request. Retry `n` waits exactly `5 * (2^n)` seconds. Zero disables
+retries;
 values are otherwise uncapped. Exceptionally large waits are slept in bounded
 chunks to avoid platform timeout overflow.
 
@@ -185,9 +186,10 @@ Fetch keeps playback scheduling deliberately small:
    file-group tasks. One task exclusively owns its WARC, processes assigned URL
    groups serially, and uses one client. The library's independent shared
    limiter continues to cap **request rate** at 8 starts per second.
-2. Archive Magic owns one retry loop per capture. Retry `n` waits `2^n`
-   seconds, or the larger server `Retry-After` value. A sleeping worker does
-   not pause or change another worker.
+2. Archive Magic owns one retry loop per capture. Except for incomplete
+   responses, retry `n` waits `5 * (2^n)` seconds, or the larger server
+   `Retry-After` value. A sleeping worker does not pause or change another
+   worker.
 3. Transient connection/reset/timeout failures and non-Memento Internet
    Archive statuses 413, 421, 429, 500, 502, 503, 504, and 599 retry. A
    response with `Memento-Datetime` remains a genuine historical capture even
@@ -195,9 +197,10 @@ Fetch keeps playback scheduling deliberately small:
 4. Exhaustion after `--retries N` means `N+1` total attempts. The capture is
    skipped, later work continues, and the completed command reports every
    failed capture URL before exiting nonzero.
-5. Three consecutive failures at the same structured `IncompleteRead` byte
-   boundary stop early as a persistent truncated response; changing boundaries
-   retain the full retry budget.
+5. An incomplete response retries immediately. Two consecutive failures at
+   the same structured `IncompleteRead` byte boundary stop early as a
+   persistent truncated response; changing boundaries retain the full retry
+   budget.
 6. The `wayback` library performs no retries; its process-wide baseline CDX
    and Memento request-start limiters remain enabled.
 7. Playback response bodies are streamed so the Memento context owns response
@@ -227,6 +230,7 @@ client.search(
     url_pattern,
     from_date=date_start,
     to_date=date_end,
+    limit=10_000,
     resolve_revisits=False,
 )
 ```
@@ -445,12 +449,15 @@ Collision buckets retain resource identity through WARC metadata and distinct
 CDXJ offsets. Sharing storage avoids arbitrary filename suffixes and prevents
 rare naming collisions from aborting unattended exports.
 
-Before playback, preflight checks every planned WARC and
+Before playback, preflight checks every planned WARC, its `.tmp` sibling, and
 `replay/index.cdxj` when `--warc` is enabled, and every planned `website/`
-target when `--files` is enabled. Existing final entries, broken final
-symlinks, non-directory ancestors, component/path-limit violations, and other
-uninspectable targets are fatal. Valid directory-symlink ancestors remain
-supported.
+target when `--files` is enabled. Existing regular final WARCs and replay
+indexes are accepted as rebuild inputs. Existing `.tmp` files, final
+symlinks/directories, broken final symlinks, non-directory ancestors,
+component/path-limit violations, and other uninspectable targets are fatal.
+Valid directory-symlink ancestors remain supported. A stale `.tmp` must be
+removed explicitly; Fetch does not guess whether it belongs to an active
+concurrent process.
 
 When `--warc none`, Fetch skips WARC allocation, WARC/replay preflight, WARC
 export, and replay indexing entirely.
@@ -604,12 +611,15 @@ mismatches, and digest mismatches remain categorized playback failures. Fetch
 does not attempt source ARC/WARC extraction or substitute a nearby capture.
 
 Repeated incomplete transfers normally follow the bounded connection retry
-policy. When three consecutive attempts stop at the same received/expected
-byte boundary, Fetch treats the outcome as a persistent truncated Wayback
-response, skips immediately, and reports the structured byte counts. Range
-stitching is not attempted because a stable boundary can represent missing
-source bytes rather than a resumable transport interruption. Fetch never
-writes a partial response as a successful capture.
+policy. When two consecutive attempts stop at the same received/expected byte
+boundary, Fetch treats the outcome as a persistent truncated Wayback response,
+skips immediately, and reports the structured byte counts. This permits one
+immediate retry for a transient incomplete transfer without repeatedly
+requesting a deterministically truncated archive record. The retry is reported
+as `retrying after incomplete response` and does not use exponential backoff.
+Range stitching is not attempted because a stable boundary can represent
+missing source bytes rather than a resumable transport interruption. Fetch
+never writes a partial response as a successful capture.
 
 Known CDX 3xx rows are counted and omitted before playback. A statusless row
 that plays back as 3xx is also counted and omitted. A known CDX/Memento status
@@ -622,26 +632,42 @@ continue. Explicit rate limits pause and retry only the operation that
 encountered them during discovery or playback. Unexpected formats, local
 filesystem errors, and serialization failures are fatal.
 
+An existing final WARC is an untrusted local response cache. A structural
+inventory failure warns once for the bucket and disables that cache; Fetch
+continues through Wayback. An invalid exact cached response warns for its
+capture and also falls back to Wayback without counting the cache problem as a
+playback failure.
+
 Workers may finish in any order. WARC records remain timestamp-ordered within
 each URL group, while completed console blocks are emitted atomically in
 completion order.
 
 ## 9. WARC export
 
-One worker task owns one lazily opened collision-bucket WARC stream:
+One worker task owns one collision-bucket rebuild:
 
-1. Iterate its URL-key groups in sorted order.
-2. Process captures in timestamp order.
+1. Inventory full `response` records in an existing final WARC by exact target
+   URI, WARC date, and source replay URI. Store compressed member offsets and
+   lengths, not bodies; duplicate or incomplete identities are unusable.
+2. Iterate assigned URL-key groups in sorted order and process each group's
+   captures in timestamp order.
 3. Keep one private dictionary of valid CDX SHA-1 digests for the current URL
    group only.
-4. Fetch and validate the first playable representative for each digest.
-5. Lazily create the WARC and write the representative as a full `response`.
-6. Write later matching captures as identical-payload-digest `revisit`
-   records without fetching them.
-7. Materialize enabled loose files from the same downloaded body: `unique`
-   writes representatives only, while `all` writes every timestamp.
-8. Release group state before starting the next URL group and close the WARC
-   after all assigned groups finish.
+4. If the digest already has a representative in the new WARC, write an
+   identical-payload-digest `revisit` without consulting the old WARC or
+   Wayback.
+5. Otherwise, try the exact old full response. Validate its WARC payload digest
+   and known status while loading its independently compressed member.
+6. If the exact response is absent, ambiguous, invalid, or only a revisit,
+   fetch and validate it from Wayback. Fetch does not search the old WARC for a
+   different record with the same digest.
+7. Lazily create `<final>.tmp`, using the final filename in `warcinfo`, and
+   write the locally reused or downloaded representative as a full `response`.
+8. Materialize enabled loose files from the same body: `unique` writes
+   representatives only, while `all` writes every timestamp.
+9. Release group state before the next URL group. After the bucket finishes,
+   close and fully validate the temporary WARC, then atomically replace the
+   final WARC with `os.replace()`.
 
 Digest identity is scoped to one URL key, so matching bodies at different URLs
 each retain a full response. Missing or malformed CDX digests are fetched and
@@ -654,18 +680,24 @@ Every response and revisit uses the CDX `capture.original` value as
 `WARC-Target-URI`. Existing percent escapes such as `%7B` remain unchanged;
 the playback URL is retained separately as `WARC-Source-URI`.
 
-Every created WARC receives one `warcinfo` record. If every assigned capture is
-omitted or fails playback, no WARC is created. Existing final WARC and replay
-targets are fatal during preflight; Fetch neither scans nor appends to them.
+Every rebuilt WARC receives one `warcinfo` record. A normal run publishes a
+structurally valid partial WARC after individual playback failures so a later
+run can reuse its successes and retry its gaps. If every assigned capture is
+omitted or fails, Fetch removes its temporary and preserves an existing final
+WARC, or creates no final WARC when none existed. Caught fatal errors clean the
+owned temporary and preserve the final; abrupt termination can leave the
+exclusive `.tmp` marker. Fetch never modifies or appends to a final WARC in
+place.
 
 `export_all()` returns:
 
 ```text
-ExportResult(summary, created_warcs, files_summary)
+ExportResult(summary, final_warcs, files_summary)
 ```
 
-`created_warcs` contains only WARCs created by the current command, in worker
-completion order, and is the complete input to replay indexing.
+`final_warcs` contains every available WARC in deterministic export-plan order,
+including atomically replaced and preserved finals, and is the complete input
+to replay indexing.
 
 ## 10. Replay CDXJ
 
@@ -674,15 +706,17 @@ Fetch pins `cdxj-indexer==1.4.6` and invokes its Python API with:
 ```python
 CDXJIndexer(
     output=temporary_index,
-    inputs=created_warcs,
+    inputs=final_warcs,
     sort=True,
     records="response,revisit",
     dir_root=collection_root,
 ).process_all()
 ```
 
-Only WARCs created by the current deterministic export plan are indexed. Other
-files beneath `archives/` are never discovered recursively.
+Every available WARC in the current deterministic export plan is indexed.
+Other files beneath `archives/` are never discovered recursively. An existing
+regular replay index is accepted and atomically replaced; a failed rebuild
+leaves the previous index intact.
 
 The resulting `replay/index.cdxj`:
 
@@ -710,7 +744,7 @@ Ordinary output remains compact:
 
 ```text
 Job started: 2026-07-24T19:04:12Z
-https://web.archive.org/web/20190812143015/https://example.com/images/logo.png : retry 1/12 in 2s after Internet Archive returned retryable HTTP 503
+https://web.archive.org/web/20190812143015/https://example.com/images/logo.png : retry 1/8 in 10s after Internet Archive returned retryable HTTP 503
 [completed 1/235] example.com/images/logo.png
 https://web.archive.org/web/20170604120533/https://example.com/images/logo.png : wrote response
 https://web.archive.org/web/20180709183022/https://example.com/images/logo.png : wrote revisit
@@ -766,7 +800,7 @@ The flat package contains:
 | `export.py` | Concurrent bucket ownership, response/revisit/file writing, thread clients |
 | `files.py` | Loose website-file writing under `website/` |
 | `rewrite_local.py` | Optional post-write HTML/CSS/JS local-link rewrite |
-| `warc.py` | WARC dates, exclusive creation, response serialization |
+| `warc.py` | WARC dates, exact-response cache, validation, serialization |
 | `replay.py` | Final-WARC CDXJ generation and atomic replacement |
 
 Fetch supports Python 3.12 or newer; local development selects Python 3.14.
@@ -795,14 +829,17 @@ Acceptance covers:
 - safe readable paths, query retention, component truncation, and collision
   allocation;
 - independent `NAME_MAX` and `PATH_MAX` checks and fallbacks;
-- rejected existing or unsafe targets, broken symlinks, and invalid ancestors;
+- accepted existing regular WARC/replay targets; rejected `.tmp`, unsafe
+  targets, broken symlinks, and invalid ancestors;
 - complete source CDX/manifest content, checksums, suffix allocation,
   concurrent publication, and cleanup;
-- shared-WARC ownership with one `warcinfo`;
+- shared-WARC ownership with one final-named `warcinfo`, cache-first rebuilding,
+  exact response reuse, revisit fallback, partial backfill, temporary cleanup,
+  validation, and atomic replacement;
 - retrieval fields, redirect/status policy, per-operation exponential retry,
   independent worker backoff, thread-client reuse, CDX-digest-gated raw
   content-encoding recovery, and final failed-URL behavior;
-- sorted response CDXJ semantics and nested filenames;
+- complete-plan sorted response CDXJ semantics and nested filenames;
 - exact offset/length selection of independently compressed WARC members;
 - replay-index replacement and indexer failures;
 - `--warc` / `--files` mode gating, latest selection preference, website path

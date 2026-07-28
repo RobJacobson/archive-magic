@@ -13,13 +13,13 @@ from .paths import CollectionLayout, validate_path_limits
 
 
 def generate_replay_index(
-    created_warcs: Sequence[Path],
+    final_warcs: Sequence[Path],
     *,
     layout: CollectionLayout,
 ) -> Path | None:
     """Build and atomically publish one sorted site-level CDXJ."""
 
-    if not created_warcs:
+    if not final_warcs:
         return None
 
     replay_dir = layout.replay_index.parent
@@ -37,7 +37,7 @@ def generate_replay_index(
         os.close(descriptor)
         CDXJIndexer(
             output=str(temporary),
-            inputs=[str(path) for path in created_warcs],
+            inputs=[str(path) for path in final_warcs],
             sort=True,
             records="response,revisit",
             dir_root=str(layout.collection_root),

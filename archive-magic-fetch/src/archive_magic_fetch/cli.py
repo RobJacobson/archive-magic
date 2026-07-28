@@ -250,7 +250,7 @@ def _run(
             if warc_plan is not None:
                 print("Building replay index...")
                 generate_replay_index(
-                    export_result.created_warcs,
+                    export_result.final_warcs,
                     layout=warc_plan.layout,
                 )
             if website_plan is not None:

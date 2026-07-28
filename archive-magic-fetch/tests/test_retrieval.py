@@ -315,7 +315,7 @@ def test_rate_limit_coordinates_backoff_and_retries_same_capture(
     assert delays == [11]
     assert [call[0] for call in client.calls] == [capture, capture]
     output = capsys.readouterr().out
-    assert "retry 1/12 in 11s" in output
+    assert "retry 1/8 in 11s" in output
     assert str(capture) in output
 
 
@@ -325,7 +325,7 @@ def test_missing_retry_after_uses_exponential_backoff(monkeypatch):
 
     retrieval.retrieve_response(client, object())
 
-    assert delays == [2]
+    assert delays == [10]
 
 
 def test_repeated_rate_limit_exhausts_bounded_attempts(monkeypatch):
@@ -340,7 +340,7 @@ def test_repeated_rate_limit_exhausts_bounded_attempts(monkeypatch):
     with pytest.raises(retry.RetryExhaustedError) as raised:
         retrieval.retrieve_response(client, object(), retries=2)
 
-    assert delays == [2, 4]
+    assert delays == [10, 20]
     assert len(client.calls) == 3
     assert raised.value.attempts == 3
 
@@ -369,7 +369,7 @@ def test_retryable_service_status_uses_application_backoff(monkeypatch):
     retrieval.retrieve_response(client, object(), retries=1)
 
     assert len(client.calls) == 2
-    assert delays == [9]
+    assert delays == [10]
 
 
 def _connection_refused_retry_error():
@@ -416,7 +416,7 @@ def test_connection_failure_backs_off_and_retries(monkeypatch):
 
     retrieval.retrieve_response(client, capture)
 
-    assert delays == [2]
+    assert delays == [10]
     assert [call[0] for call in client.calls] == [capture, capture]
 
 
@@ -465,7 +465,7 @@ def test_sustained_connection_failure_exhausts_bounded_attempts(monkeypatch):
 
     with pytest.raises(retry.RetryExhaustedError):
         retrieval.retrieve_response(client, object(), retries=2)
-    assert delays == [2, 4]
+    assert delays == [10, 20]
 
 
 def test_timeout_wayback_retry_uses_bounded_retry(monkeypatch):
@@ -478,7 +478,10 @@ def test_timeout_wayback_retry_uses_bounded_retry(monkeypatch):
     assert len(client.calls) == 2
 
 
-def test_repeated_identical_incomplete_read_stops_early(monkeypatch):
+def test_repeated_identical_incomplete_read_stops_early(
+    monkeypatch,
+    capsys,
+):
     delays = _make_retries_immediate(monkeypatch)
     client = FakeClient(
         [
@@ -495,15 +498,18 @@ def test_repeated_identical_incomplete_read_stops_early(monkeypatch):
 
     error = raised.value
     assert len(client.calls) == retrieval.REPEATED_TRUNCATION_ATTEMPTS
-    assert delays == [2, 4]
+    assert delays == []
     assert error.received_bytes == 130810
     assert error.expected_bytes == 275029
     assert error.attempts == retrieval.REPEATED_TRUNCATION_ATTEMPTS
     assert (
-        "truncated Wayback response after 3 attempts over "
+        "truncated Wayback response after 2 attempts over "
         in str(error)
     )
     assert "received 130,810 of 275,029 bytes" in str(error)
+    output = capsys.readouterr().out
+    assert "retrying after incomplete response" in output
+    assert "retry 1/8" not in output
 
 
 def test_changing_incomplete_read_boundaries_keep_retrying(monkeypatch):
@@ -520,7 +526,7 @@ def test_changing_incomplete_read_boundaries_keep_retrying(monkeypatch):
 
     assert response.content_stream().read() == b"recovered"
     assert len(client.calls) == 3
-    assert delays == [2, 4]
+    assert delays == []
 
 
 def test_content_decoding_error_recovers_one_digest_verified_raw_replay():

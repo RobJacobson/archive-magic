@@ -156,6 +156,7 @@ def test_discover_materializes_search_with_explicit_bounds():
             {
                 "from_date": "1995",
                 "to_date": "2020",
+                "limit": 10_000,
                 "resolve_revisits": False,
                 "match_type": "prefix",
             },
@@ -181,18 +182,22 @@ def test_discover_passes_exact_patterns_without_match_type():
             {
                 "from_date": "2002",
                 "to_date": "2002",
+                "limit": 10_000,
                 "resolve_revisits": False,
             },
         )
     ]
 
 
-def test_discover_reports_progress_every_thousand_captures():
-    expected = [record() for _ in range(2500)]
+def test_discover_reports_progress_after_each_request_limit(monkeypatch):
+    monkeypatch.setattr(discovery, "_CDX_REQUEST_LIMIT", 2)
+    expected = [record() for _ in range(5)]
     reported = []
+    limits = []
 
     class Client:
         def search(self, *args, **kwargs):
+            limits.append(kwargs["limit"])
             return iter(expected)
 
     assert (
@@ -205,7 +210,8 @@ def test_discover_reports_progress_every_thousand_captures():
         )
         == expected
     )
-    assert reported == [1000, 2000]
+    assert limits == [2]
+    assert reported == [2, 4]
 
 
 def test_discover_discards_partial_attempt_and_rematerializes_after_rate_limit(
@@ -244,11 +250,11 @@ def test_discover_discards_partial_attempt_and_rematerializes_after_rate_limit(
         second,
     ]
     assert attempts == 2
-    assert sleeps == [7]
+    assert sleeps == [10]
     assert reported == []
     output = capsys.readouterr().out
     assert "https://web.archive.org/cdx/search/cdx?" in output
-    assert "retry 1/12 in 7s" in output
+    assert "retry 1/8 in 10s" in output
 
 
 def test_discover_rate_limit_without_retry_after_uses_exponential_delay(
@@ -269,8 +275,8 @@ def test_discover_rate_limit_without_retry_after_uses_exponential_delay(
     monkeypatch.setattr(discovery, "sleep_seconds", sleeps.append)
 
     assert discovery.discover(Client(), "example.com", "1995", "2020") == []
-    assert sleeps == [2]
-    assert "retry 1/12 in 2s" in capsys.readouterr().out
+    assert sleeps == [10]
+    assert "retry 1/8 in 10s" in capsys.readouterr().out
 
 
 def test_discover_retries_repeated_rate_limits(monkeypatch, capsys):
@@ -289,7 +295,7 @@ def test_discover_retries_repeated_rate_limits(monkeypatch, capsys):
 
     assert discovery.discover(Client(), "example.com", "1995", "2020") == []
     assert attempts == 4
-    assert sleeps == [3, 4, 8]
+    assert sleeps == [10, 20, 40]
     assert capsys.readouterr().out.count(" : retry ") == 3
 
 
@@ -429,7 +435,7 @@ def test_cli_owns_one_client_context_and_passes_same_client(monkeypatch):
             (),
             {
                 "summary": type("Summary", (), {"selected": 1})(),
-                "created_warcs": (),
+                "final_warcs": (),
                 "failed_capture_urls": (),
                 "files_summary": type(
                     "FilesSummary",
@@ -538,7 +544,7 @@ def test_cli_prints_stage_messages(monkeypatch, capsys):
             (),
             {
                 "summary": type("Summary", (), {"selected": 1})(),
-                "created_warcs": (),
+                "final_warcs": (),
                 "failed_capture_urls": (),
                 "files_summary": type(
                     "FilesSummary",
@@ -599,7 +605,7 @@ def test_cli_finishes_outputs_then_lists_failures_and_returns_one(
             (),
             {
                 "summary": type("Summary", (), {})(),
-                "created_warcs": (),
+                "final_warcs": (),
                 "failed_capture_urls": (failed_url,),
                 "files_summary": type(
                     "FilesSummary",
@@ -733,7 +739,7 @@ def test_cli_does_not_print_summary_when_replay_indexing_fails(
             (),
             {
                 "summary": type("Summary", (), {})(),
-                "created_warcs": (object(),),
+                "final_warcs": (object(),),
                 "failed_capture_urls": (),
                 "files_summary": type(
                     "FilesSummary",
@@ -775,7 +781,7 @@ def test_cli_retains_published_provenance_after_downstream_failure(
             (),
             {
                 "summary": type("Summary", (), {})(),
-                "created_warcs": (),
+                "final_warcs": (),
                 "failed_capture_urls": (),
                 "files_summary": type(
                     "FilesSummary",

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import stat
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -480,18 +481,25 @@ def validate_path_limits(path: Path) -> None:
         )
 
 
-def _inspect_target(path: Path) -> None:
-    """Reject an existing final target or an unusable ancestor."""
+def _inspect_target(
+    path: Path,
+    *,
+    allow_existing_regular: bool = False,
+) -> None:
+    """Inspect one output target and its nearest existing ancestor."""
 
     inspect_error = None
+    target_stat = None
     try:
-        os.lstat(path)
+        target_stat = os.lstat(path)
     except FileNotFoundError:
         pass
     except OSError as error:
         inspect_error = error
     else:
-        raise FileExistsError(f"output file already exists: {path}")
+        mode = target_stat.st_mode
+        if not allow_existing_regular or not stat.S_ISREG(mode):
+            raise FileExistsError(f"output file already exists: {path}")
 
     ancestor = path.parent
     while ancestor != ancestor.parent:
@@ -571,8 +579,15 @@ def preflight_layout(
         ).as_posix()
     )
     for bucket in buckets:
-        _inspect_target(bucket.path)
-    _inspect_target(layout.replay_index)
+        _inspect_target(
+            bucket.path,
+            allow_existing_regular=True,
+        )
+        _inspect_target(bucket.path.with_name(bucket.path.name + ".tmp"))
+    _inspect_target(
+        layout.replay_index,
+        allow_existing_regular=True,
+    )
     return ExportPlan(layout, tuple(buckets))
 
 
