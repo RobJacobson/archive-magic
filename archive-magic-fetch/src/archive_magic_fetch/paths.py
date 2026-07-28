@@ -85,7 +85,6 @@ class WebsitePlan:
 
     layout: CollectionLayout
     targets: tuple[WebsiteFileTarget, ...]
-    include_timestamps: bool = False
 
 
 def _safe_segment(component: str) -> str:
@@ -388,36 +387,6 @@ def preferred_site_file(site_root: Path, url_path: str) -> Path:
             for segment in parts
         )
     )
-
-
-def normalized_site_path(url_path: str) -> str:
-    """Return the query-folded route identity for one site path."""
-
-    segments, _explicit_suffix = _split_site_path(url_path)
-    return "/" + "/".join(segments)
-
-
-def website_route_map(
-    capture_groups: Mapping[str, Sequence[object]],
-    plan: WebsitePlan,
-) -> dict[tuple[str, str], Path]:
-    """Map planned source routes to their loose-file destinations."""
-
-    routes: dict[tuple[str, str], Path] = {}
-    for target in plan.targets:
-        capture = capture_groups[target.urlkey][target.capture_index]
-        original = getattr(capture, "original", None)
-        timestamp = getattr(capture, "timestamp", None)
-        if not isinstance(original, str):
-            raise ValueError("capture URL must be a string")
-        parsed = urlsplit(original)
-        site = website_host_segment(original)
-        if plan.include_timestamps:
-            if not isinstance(timestamp, datetime):
-                raise ValueError("capture timestamp must be a datetime")
-            site = f"{site}/{_cdx_timestamp_text(timestamp)}"
-        routes[(site, normalized_site_path(parsed.path or "/"))] = target.path
-    return routes
 
 
 def _digest_path_token(digest: object, *, capture_index: int) -> str:
@@ -784,4 +753,4 @@ def preflight_website_layout(
                 capture_index=capture_index,
             )
         )
-    return WebsitePlan(layout, tuple(targets), include_timestamps)
+    return WebsitePlan(layout, tuple(targets))

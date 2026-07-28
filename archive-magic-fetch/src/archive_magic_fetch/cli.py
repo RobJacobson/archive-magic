@@ -23,7 +23,6 @@ from .paths import (
     DEFAULT_OUTPUT_ROOT,
     collection_layout,
     preflight_website_layout,
-    website_route_map,
 )
 from .provenance import save_acquisition
 from .replay import generate_replay_index
@@ -254,10 +253,6 @@ def _run(
                 if rewrite_local and files_summary.written > 0:
                     rewrite_local_website(
                         layout.website_root,
-                        routes=website_route_map(
-                            files_groups,
-                            website_plan,
-                        ),
                         include_timestamps=(
                             files_mode in {"unique", "all"}
                         ),
