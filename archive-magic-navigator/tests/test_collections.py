@@ -13,11 +13,34 @@ from archive_magic_navigator.errors import ValidationError
 
 @pytest.mark.parametrize(
     "value",
-    ("", ".", "..", "../escape", "nested/name", r"nested\name", "/absolute", "bad\x00id"),
+    (
+        "",
+        ".",
+        "..",
+        "../escape",
+        "nested/name",
+        r"nested\name",
+        "/absolute",
+        "bad\x00id",
+        "query?id",
+        "fragment#id",
+        "line\nbreak",
+        "café",
+        "$root",
+        "static",
+    ),
 )
 def test_invalid_collection_ids(value):
     with pytest.raises(ValidationError, match="invalid collection ID"):
         validate_collection_id(value)
+
+
+@pytest.mark.parametrize(
+    "value",
+    ("example.org", "collection-1", "collection_name", "A.B"),
+)
+def test_route_safe_collection_ids(value):
+    assert validate_collection_id(value) == value
 
 
 def test_select_collection_resolves_direct_child(collection_factory):

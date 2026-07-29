@@ -211,7 +211,7 @@ def test_each_distinct_warc_is_validated_once(
     calls = []
 
     def counted(*args, **kwargs):
-        calls.append(args[3])
+        calls.append(args[1])
         return original(*args, **kwargs)
 
     monkeypatch.setattr(validation, "_validate_warc_path", counted)

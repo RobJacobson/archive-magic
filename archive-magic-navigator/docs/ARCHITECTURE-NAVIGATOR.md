@@ -251,6 +251,12 @@ argument is an ID, not an arbitrary path. This keeps route names and filesystem
 resolution separate. Users with a nonstandard location pass its parent with
 `--archives`.
 
+Collection IDs use the deliberately narrow route-safe grammar
+`[A-Za-z0-9][A-Za-z0-9._-]*`. Navigator rejects pywb-reserved route names such
+as `static`. This prevents filesystem names containing URL delimiters or
+control characters from producing broken links and prevents collection routes
+from colliding with pywb's own endpoints.
+
 The command prints the landing-page URL after startup:
 
 ```text
@@ -276,8 +282,10 @@ parse and validate CLI arguments
     -> create an ephemeral runtime directory outside archives/
     -> render pywb config.yaml with absolute paths
     -> expose packaged branding templates/static assets
+    -> locate the pinned pywb executable beside Navigator's Python interpreter
+    -> create a random ephemeral readiness resource
     -> start the pinned pywb executable as a child process
-    -> poll the landing-page HTTP endpoint or detect an early child failure
+    -> poll that resource without HTTP proxies or detect an early child failure
     -> print the landing-page URL
     -> optionally open the browser
     -> forward interrupt/termination to pywb
@@ -289,10 +297,18 @@ Navigator owns the child process. It must preserve pywb's nonzero exit status,
 report a port conflict clearly, and avoid leaving an orphan server after
 Ctrl-C or ordinary termination.
 
+The readiness resource contains a per-run random token and lives beneath the
+ephemeral static directory. Navigator requires an exact response before
+declaring the child ready and rechecks that the child is still running after
+the response. An unrelated service already occupying the requested port
+therefore cannot satisfy readiness.
+
 The wrapper uses pywb's supported executable/configuration boundary instead
 of importing pywb implementation classes. This reduces coupling to internal
 Python APIs, isolates pywb's gevent monkey-patching, and provides the cleanest
-license and process boundary.
+license and process boundary. Executable discovery is scoped to the current
+Python environment rather than global `PATH`, and Navigator verifies the exact
+pinned pywb distribution version before launch.
 
 ## 7. Pywb configuration
 
@@ -769,8 +785,9 @@ After pywb starts:
 - temporary runtime files are cleaned on all handled exits.
 
 Debug mode sends pywb's stdout and stderr directly to the console. Without
-`--debug`, Navigator captures that output in the ephemeral runtime directory
-and includes its tail in relevant startup errors.
+`--debug`, Navigator continuously drains that output into a bounded in-memory
+tail, writes at most 256 KiB to the ephemeral runtime directory, and includes
+the final 20 lines in relevant startup errors.
 
 ## 17. Testing and acceptance
 
@@ -783,8 +800,12 @@ Unit tests cover:
 - CDXJ parsing, ordering, numeric ranges, and filename safety;
 - config generation for one and all collections;
 - no recording/live/autoindex settings;
-- child startup failure, port conflict, interrupt, and exit propagation; and
-- configuration and packaged assets staged outside the archives root.
+- child startup failure, port conflict, interrupt, and exit propagation;
+- child-specific, proxy-free readiness;
+- interpreter-local executable and pinned-version discovery;
+- bounded diagnostic output capture;
+- configuration and packaged assets staged outside the archives root; and
+- rejection of route-unsafe and reserved collection IDs.
 
 Integration tests use real pywb 2.9.1 and a small real WARC/CDXJ fixture to
 verify:

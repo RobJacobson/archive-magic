@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
-import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
 from .errors import ValidationError
+
+
+_COLLECTION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+_RESERVED_COLLECTION_IDS = frozenset({"static"})
 
 
 @dataclass(frozen=True)
@@ -33,8 +37,6 @@ def resolve_archives_root(value: Path | str) -> Path:
         ) from error
     if not resolved.is_dir():
         raise ValidationError(f"archives root is not a directory: {resolved}")
-    if not os.access(resolved, os.R_OK | os.X_OK):
-        raise ValidationError(f"archives root is not readable: {resolved}")
     return resolved
 
 
@@ -42,12 +44,9 @@ def validate_collection_id(collection_id: str) -> str:
     """Require one immediate directory name, never an arbitrary path."""
 
     if (
-        not collection_id
+        not _COLLECTION_ID.fullmatch(collection_id)
         or collection_id in {".", ".."}
-        or "\x00" in collection_id
-        or "/" in collection_id
-        or "\\" in collection_id
-        or Path(collection_id).is_absolute()
+        or collection_id in _RESERVED_COLLECTION_IDS
     ):
         raise ValidationError(f"invalid collection ID: {collection_id!r}")
     return collection_id
@@ -123,9 +122,5 @@ def _validate_candidate(
     if not resolved.is_dir():
         raise ValidationError(
             f"collection {collection_id!r} is not a directory: {resolved}"
-        )
-    if not os.access(resolved, os.R_OK | os.X_OK):
-        raise ValidationError(
-            f"collection {collection_id!r} is not readable: {resolved}"
         )
     return Collection(collection_id=collection_id, root=resolved)

@@ -3,28 +3,81 @@
 from __future__ import annotations
 
 import ipaddress
-import os
+import secrets
 import shutil
 import signal
 import subprocess
+import sysconfig
+import threading
 import time
 from collections.abc import Callable
+from importlib import metadata
 from pathlib import Path
-from typing import IO
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from typing import BinaryIO
+from urllib.request import ProxyHandler, Request, build_opener
 
 from .errors import StartupError
 
 
+PYWB_VERSION = "2.9.1"
 STARTUP_TIMEOUT_SECONDS = 15.0
 SHUTDOWN_TIMEOUT_SECONDS = 5.0
 POLL_INTERVAL_SECONDS = 0.1
 LOG_TAIL_LINES = 20
+MAX_CAPTURE_BYTES = 256 * 1024
+CAPTURE_CHUNK_BYTES = 8192
 
 
 class _TerminationRequested(Exception):
     pass
+
+
+class _OutputCapture:
+    """Drain child output without allowing diagnostics to grow unbounded."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._buffer = bytearray()
+        self._lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+        self.path.touch()
+
+    def start(self, stream: BinaryIO) -> None:
+        self._thread = threading.Thread(
+            target=self._drain,
+            args=(stream,),
+            daemon=True,
+            name="archive-magic-pywb-output",
+        )
+        self._thread.start()
+
+    def tail(self, *, wait: bool = False) -> str:
+        if wait and self._thread is not None:
+            self._thread.join(timeout=1.0)
+        with self._lock:
+            text = bytes(self._buffer).decode("utf-8", errors="replace")
+        return "\n".join(text.splitlines()[-LOG_TAIL_LINES:])
+
+    def close(self) -> None:
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+        with self._lock:
+            output = bytes(self._buffer)
+        try:
+            self.path.write_bytes(output)
+        except OSError:
+            pass
+
+    def _drain(self, stream: BinaryIO) -> None:
+        try:
+            while chunk := stream.read(CAPTURE_CHUNK_BYTES):
+                with self._lock:
+                    self._buffer.extend(chunk)
+                    overflow = len(self._buffer) - MAX_CAPTURE_BYTES
+                    if overflow > 0:
+                        del self._buffer[:overflow]
+        finally:
+            stream.close()
 
 
 def is_loopback_bind(address: str) -> bool:
@@ -61,13 +114,29 @@ def landing_url(address: str, port: int) -> str:
 
 
 def find_wayback() -> str:
-    """Locate the console executable installed with pywb."""
+    """Locate the pinned pywb console script beside the current interpreter."""
 
-    executable = shutil.which("wayback")
+    try:
+        installed_version = metadata.version("pywb")
+    except metadata.PackageNotFoundError as error:
+        raise StartupError(
+            "pywb is not installed in Navigator's Python environment"
+        ) from error
+    if installed_version != PYWB_VERSION:
+        raise StartupError(
+            f"pywb {PYWB_VERSION} is required, but {installed_version} is installed"
+        )
+
+    scripts_directory = sysconfig.get_path("scripts")
+    if not scripts_directory:
+        raise StartupError(
+            "cannot locate Navigator's Python scripts directory"
+        )
+    executable = shutil.which("wayback", path=scripts_directory)
     if executable is None:
         raise StartupError(
-            "wayback executable not found; install archive-magic-navigator "
-            "with its pywb dependency"
+            "wayback executable not found in Navigator's Python environment: "
+            f"{scripts_directory}"
         )
     return executable
 
@@ -115,36 +184,22 @@ def run_wayback(
         port,
         debug=debug,
     )
-    log_path = runtime_directory / "pywb.log"
-    log_stream: IO[bytes] | None = None
-    output: int | None
-    if debug:
-        output = None
-    else:
-        log_stream = log_path.open("wb")
-        output = log_stream.fileno()
-
-    try:
-        process = subprocess.Popen(
-            command,
-            stdin=subprocess.DEVNULL,
-            stdout=output,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
-    except OSError as error:
-        if log_stream is not None:
-            log_stream.close()
-        raise StartupError(f"cannot start wayback: {error}") from error
+    probe_path, probe_body = _create_readiness_marker(runtime_directory)
+    process, capture = _start_wayback(
+        command,
+        runtime_directory / "pywb.log",
+        debug=debug,
+    )
 
     previous_term = _install_termination_handler()
     try:
         url = landing_url(bind, port)
         _wait_until_ready(
             process,
-            url,
+            url + probe_path,
+            probe_body,
             startup_timeout,
-            log_path if not debug else None,
+            capture,
             bind,
             port,
         )
@@ -158,15 +213,47 @@ def run_wayback(
         _restore_termination_handler(previous_term)
         if process.poll() is None:
             _shutdown(process)
-        if log_stream is not None:
-            log_stream.close()
+        if capture is not None:
+            capture.close()
+
+
+def _start_wayback(
+    command: list[str],
+    log_path: Path,
+    *,
+    debug: bool,
+) -> tuple[subprocess.Popen[bytes], _OutputCapture | None]:
+    capture: _OutputCapture | None = None
+    try:
+        if not debug:
+            capture = _OutputCapture(log_path)
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=None if debug else subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    except OSError as error:
+        if capture is not None:
+            capture.close()
+        raise StartupError(f"cannot start wayback: {error}") from error
+
+    if capture is not None:
+        if process.stdout is None:
+            _shutdown(process)
+            capture.close()
+            raise StartupError("cannot capture wayback output")
+        capture.start(process.stdout)
+    return process, capture
 
 
 def _wait_until_ready(
     process: subprocess.Popen[bytes],
-    url: str,
+    probe_url: str,
+    expected_body: bytes,
     timeout: float,
-    log_path: Path | None,
+    capture: _OutputCapture | None,
     bind: str,
     port: int,
 ) -> None:
@@ -174,7 +261,7 @@ def _wait_until_ready(
     while time.monotonic() < deadline:
         return_code = process.poll()
         if return_code is not None:
-            detail = _log_tail(log_path)
+            detail = capture.tail(wait=True) if capture is not None else ""
             if _address_in_use(detail):
                 raise StartupError(
                     f"port {port} is already in use on {bind}"
@@ -184,26 +271,43 @@ def _wait_until_ready(
                 f"wayback exited before becoming ready with status "
                 f"{return_code}{suffix}"
             )
-        if _http_ready(url):
-            return
+        if _http_ready(probe_url, expected_body):
+            if process.poll() is None:
+                return
+            continue
         time.sleep(POLL_INTERVAL_SECONDS)
 
     _shutdown(process)
-    detail = _log_tail(log_path)
+    detail = capture.tail(wait=True) if capture is not None else ""
     suffix = f"\n{detail}" if detail else ""
     raise StartupError(
         f"wayback did not become ready within {timeout:g} seconds{suffix}"
     )
 
 
-def _http_ready(url: str) -> bool:
-    request = Request(url, headers={"User-Agent": "archive-magic-navigator/0.1"})
+def _create_readiness_marker(runtime_directory: Path) -> tuple[str, bytes]:
+    filename = f"archive-magic-ready-{secrets.token_urlsafe(18)}.txt"
+    body = secrets.token_urlsafe(24)
+    static_directory = runtime_directory / "static"
     try:
-        with urlopen(request, timeout=0.5) as response:
-            return 200 <= response.status < 400
-    except HTTPError:
-        return False
-    except (OSError, URLError):
+        static_directory.mkdir(exist_ok=True)
+        (static_directory / filename).write_text(body, encoding="ascii")
+    except OSError as error:
+        raise StartupError(f"cannot create readiness marker: {error}") from error
+    return f"static/{filename}", body.encode("ascii")
+
+
+def _http_ready(url: str, expected_body: bytes) -> bool:
+    try:
+        request = Request(
+            url,
+            headers={"User-Agent": "archive-magic-navigator/0.1"},
+        )
+        opener = build_opener(ProxyHandler({}))
+        with opener.open(request, timeout=0.5) as response:
+            body = response.read(len(expected_body) + 1)
+            return response.status == 200 and body == expected_body
+    except (OSError, ValueError):
         return False
 
 
@@ -224,16 +328,6 @@ def _map_exit_code(return_code: int) -> int:
     if return_code > 0:
         return return_code
     return 1
-
-
-def _log_tail(path: Path | None) -> str:
-    if path is None:
-        return ""
-    try:
-        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-    except OSError:
-        return ""
-    return "\n".join(lines[-LOG_TAIL_LINES:])
 
 
 def _address_in_use(detail: str) -> bool:

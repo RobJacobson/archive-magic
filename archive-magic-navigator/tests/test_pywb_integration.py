@@ -17,7 +17,8 @@ import pytest
 
 from archive_magic_navigator.collections import Collection
 from archive_magic_navigator.config import build_config, write_config
-from archive_magic_navigator.process import find_wayback
+from archive_magic_navigator.errors import StartupError
+from archive_magic_navigator.process import find_wayback, run_wayback
 from archive_magic_navigator.validation import validate_collection
 
 
@@ -240,3 +241,59 @@ def test_real_pywb_lists_multiple_explicit_collections(tmp_path):
         assert b"Archived version one" in body
 
     assert snapshot_tree(archives) == before
+
+
+@pytest.mark.integration
+def test_readiness_does_not_accept_an_unrelated_service(tmp_path):
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    fixture = FIXTURE.resolve()
+    write_config(runtime, build_config([Collection("fixture", fixture)]))
+    ready = []
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), SentinelHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with pytest.raises(StartupError, match="port .* is already in use"):
+            run_wayback(
+                runtime,
+                "127.0.0.1",
+                server.server_port,
+                debug=False,
+                on_ready=ready.append,
+                startup_timeout=5,
+            )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert ready == []
+
+
+@pytest.mark.integration
+def test_run_wayback_accepts_its_private_readiness_marker(tmp_path):
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    fixture = FIXTURE.resolve()
+    write_config(runtime, build_config([Collection("fixture", fixture)]))
+    ready = []
+
+    def stop_after_ready(url):
+        ready.append(url)
+        raise KeyboardInterrupt
+
+    port = free_port()
+    assert (
+        run_wayback(
+            runtime,
+            "127.0.0.1",
+            port,
+            debug=False,
+            on_ready=stop_after_ready,
+            startup_timeout=5,
+        )
+        == 0
+    )
+    assert ready == [f"http://127.0.0.1:{port}/"]
