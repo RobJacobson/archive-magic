@@ -404,8 +404,10 @@ Rewrite rules (minimum viable):
 - Root-relative `/path`, scheme-relative `//host/path`, and absolute
   `http(s)://host/path` references are rewritten to relative links when the
   host normalizes to a host segment present under `website/` and the local
-  target exists. Resolution uses the planned route map, so MIME-derived files
-  such as `/download/report/` → `report.pdf` are found correctly.
+  target exists. Resolution is deliberately filesystem-driven: it recognizes
+  conventional HTML directory indexes and explicit filenames, but does not
+  guess MIME-derived suffixes. For example, `/download/report/` remains
+  unchanged when the only local target is `download/report.pdf`.
 - `url(...)` is rewritten in `.css` and HTML inline styles only (not `.js`, so
   JS helpers named `url` are left alone). Straightforward `srcset` and
   `href`/`src`/`action` attributes are rewritten in HTML and JS.
