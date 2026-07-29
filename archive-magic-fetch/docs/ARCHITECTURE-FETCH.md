@@ -4,7 +4,7 @@
 
 **Scope:** `archive-magic-fetch` only
 
-**Updated:** July 27, 2026
+**Updated:** July 28, 2026
 
 ## 1. Decision
 
@@ -62,6 +62,7 @@ The implementation remains deliberately small:
 - public `wayback` APIs for discovery and playback;
 - `warcio` for WARC construction;
 - `cdxj-indexer` for final-byte replay indexing;
+- a thin CLI process boundary and one explicit fetch-job workflow;
 - a flat `src/archive_magic_fetch/` package; and
 - no source-adapter hierarchy, database, checkpoint store, output reuse, or
   publication service.
@@ -99,6 +100,10 @@ retries;
 values are otherwise uncapped. Exceptionally large waits are slept in bounded
 chunks to avoid platform timeout overflow.
 
+Argument parsing validates these numeric bounds and cross-option requirements
+before a job begins. Successful parsing produces one immutable `FetchRequest`;
+the fetch workflow does not receive or depend on an `argparse.Namespace`.
+
 The two axes are independent. Default behavior remains full WARC history plus
 replay CDXJ with no loose files. `--warc none --files none` exits successfully
 with `Nothing to do: both --warc and --files are none` and performs no
@@ -119,10 +124,12 @@ date_end = args.end or current_utc_cdx_timestamp()
 The output root is the repository sibling `../archives`; there is no output
 argument.
 
-The successful flow is:
+The successful process and job flow is:
 
 ```text
-parse arguments and apply date defaults
+parse and validate arguments, apply date defaults, and build FetchRequest
+    -> start the timed, console-mirrored process boundary
+    -> run the fetch-job workflow
     -> if warc=none and files=none: message + exit 0
     -> derive and validate the collection name
     -> create one application-owned WaybackSession and WaybackClient
@@ -137,6 +144,7 @@ parse arguments and apply date defaults
     -> if --rewrite-local and at least one file was written: rewrite under website/
     -> print aggregate summary
     -> close the client/session
+    -> map job success/failure to exit status and print end time/duration
 ```
 
 Selection is an export transform. Provenance always stores the full CDX result
@@ -685,12 +693,13 @@ place.
 `export_all()` returns:
 
 ```text
-ExportResult(summary, final_warcs, files_summary)
+ExportResult(summary, final_warcs, files_summary, failed_capture_urls)
 ```
 
 `final_warcs` contains every available WARC in deterministic export-plan order,
 including atomically replaced and preserved finals, and is the complete input
-to replay indexing.
+to replay indexing. `failed_capture_urls` contains each failed clickable
+Wayback URL once for final reporting and the partial-failure exit status.
 
 ## 10. Replay CDXJ
 
@@ -759,12 +768,14 @@ Blocks appear in completion order without line interleaving. Their headers use
 readable original URLs rather than CDX SURT keys, and capture lines begin with
 clickable Wayback view URLs.
 
-Every parsed CLI job prints UTC start and end times in second-precision
+Every successfully parsed CLI job prints UTC start and end times in
+second-precision
 ISO-8601 form. A monotonic clock supplies total elapsed time, reported in
 decimal minutes with one digit after the decimal point. The end and duration
 lines are emitted from the outer job boundary on success, no-op/empty results,
-usage validation failures, and caught runtime failures. Argument-parser exits
-such as `--help` occur before a job begins.
+partial failures, and caught runtime failures. Argument-parser exits, including
+`--help` and usage-validation failures, occur before a job begins and therefore
+do not print job timing.
 
 The WARC summary reports selected rows, written responses, revisits, and
 playback failures for the active `--warc` mode. The legacy redirect-omission
@@ -783,7 +794,8 @@ The flat package contains:
 
 | File | Responsibility |
 | --- | --- |
-| `cli.py` | Arguments, job timing, concurrency/retry defaults, stage gating, final status |
+| `cli.py` | Argument validation/defaults, job timing, console mirroring, exception and exit-status handling |
+| `job.py` | Immutable fetch request, discovery/export orchestration, output finalization and reporting |
 | `discovery.py` | Complete search, application retry, URL-key grouping, output selection |
 | `paths.py` | Collection normalization, safe readable WARC/website paths, collision buckets, preflight |
 | `publication.py` | Same-filesystem atomic no-replace file/directory publication |
@@ -812,9 +824,10 @@ stack to verify outgoing punycode behavior.
 
 ## 13. Testing and acceptance
 
-The deterministic suite uses real `CdxRecord` values, fake Wayback clients,
-temporary collections, actual `warcio` parsing, and the real pinned CDXJ
-indexer. It does not contact Internet Archive.
+The deterministic suite separates CLI-boundary, fetch-job, and discovery
+coverage. It uses real `CdxRecord` values, fake Wayback clients, temporary
+collections, actual `warcio` parsing, and the real pinned CDXJ indexer. It does
+not contact Internet Archive.
 
 Acceptance covers:
 
