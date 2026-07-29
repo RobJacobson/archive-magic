@@ -1,0 +1,4 @@
+test,example)/ 20200101000000 {"digest":"sha1:BVEBWQOHFMEK2IWJ7PM532L6AMTG2PTK","filename":"archive/fixture.warc.gz","length":"418","mime":"text/html","offset":"0","status":"200","url":"http://example.test/"}
+test,example)/ 20210101000000 {"digest":"sha1:OBBH7RGFXOVGGHKOLIWQ25ELWV4N4FQ4","filename":"archive/fixture.warc.gz","length":"382","mime":"text/html","offset":"747","status":"200","url":"http://example.test/"}
+test,example)/ 20220101000000 {"digest":"sha1:OBBH7RGFXOVGGHKOLIWQ25ELWV4N4FQ4","filename":"archive/fixture.warc.gz","length":"363","mime":"warc/revisit","offset":"1129","status":"200","url":"http://example.test/"}
+test,example)/assets/site.css 20200101000001 {"digest":"sha1:42EOHDO7TPYQMBU4G44S76CP72HOFHBW","filename":"archive/fixture.warc.gz","length":"329","mime":"text/css","offset":"418","status":"200","url":"http://example.test/assets/site.css"}

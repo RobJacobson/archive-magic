@@ -2,16 +2,21 @@
 name = "archive-magic"
 version = "0.0.0"
 description = "Archive Magic monorepo root"
-requires-python = ">=3.12"
+requires-python = ">=3.12,<3.13"
 dependencies = [
     "archive-magic-fetch",
+    "archive-magic-navigator",
 ]
 
 [tool.uv]
 package = false
 
 [tool.uv.workspace]
-members = ["archive-magic-fetch"]
+members = [
+    "archive-magic-fetch",
+    "archive-magic-navigator",
+]
 
 [tool.uv.sources]
 archive-magic-fetch = { workspace = true }
+archive-magic-navigator = { workspace = true }
