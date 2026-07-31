@@ -63,8 +63,8 @@ Collection directory names also become browser routes. They must start with an
 ASCII letter or digit, contain only ASCII letters, digits, `.`, `_`, or `-`,
 and must not use Navigator-reserved names such as `static`.
 
-Running Navigator while Fetch is publishing the same collection is unsupported
-in Phase 2. Stop Fetch or wait for it to finish before starting Navigator.
+Running Navigator while Fetch is publishing the same collection is unsupported.
+Stop Fetch or wait for it to finish before starting Navigator.
 
 ## Development
 

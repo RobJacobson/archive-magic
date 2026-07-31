@@ -1,13 +1,12 @@
 # Archive Magic Navigator Architecture
 
-**Status:** Implemented Phase 2 proof of concept
+**Status:** Implemented
 
 **Scope:** `archive-magic-navigator` only
 
-**Updated:** July 28, 2026
+**Updated:** July 29, 2026
 
-**Historical implementation handoff:**
-[IMPLEMENTATION-HANDOFF.md](IMPLEMENTATION-HANDOFF.md)
+**Compatibility spike:** [PYWB-SPIKE.md](PYWB-SPIKE.md)
 
 ## 1. Decision
 
@@ -22,7 +21,7 @@ an association with another archive product. "Replay" remains appropriate as
 an internal and ecosystem-facing technical term, but it is not the product
 name.
 
-Phase 2 is deliberately small:
+Navigator's current scope is deliberately small:
 
 - serve existing Archive Magic collections from the local filesystem;
 - support one selected collection or all immediate collections, failing startup
@@ -47,22 +46,50 @@ archive-magic-navigator --all
 They do not import each other's Python packages or invoke each other's CLIs.
 Their integration boundary is the documented collection layout.
 
+### 1.1 Current decisions
+
+| Area | Decision |
+| --- | --- |
+| Product name | Archive Magic Navigator |
+| Repository/distribution/CLI | `archive-magic-navigator` |
+| Import package | `archive_magic_navigator` |
+| Runtime language | Ordinary CPython 3.12 |
+| Python range | Navigator `>=3.12,<3.13` |
+| Replay engine | Stable `pywb==2.9.1` |
+| Pywb integration | Separate child process through supported CLI/config |
+| Preferred pywb executable | `wayback` from Navigator's Python environment |
+| Navigator license | MIT, subject to final packaging review |
+| Data source | Existing local WARC/CDXJ files |
+| Collection ownership | Fetch owns; Navigator reads |
+| Collection writes | Forbidden |
+| Live-web fallback | Forbidden |
+| Recording/crawling | Forbidden |
+| Auto-indexing | Forbidden |
+| Default bind | `127.0.0.1` |
+| Default port | `8080` |
+| Initial UI | Pywb built-in UI with light example branding |
+| Initial landing behavior | Root landing page, not a forced first URL |
+| Browser opening | `--open` is opt-in |
+| Concurrent Fetch writes | Unsupported |
+| S3/R2 | Future work only |
+| React frontend | Future work only |
+
 ## 2. Goals and principles
 
 ### 2.1 Goals
 
-Phase 2 must:
+Navigator:
 
-1. replay HTML and supporting archived resources from the WARC records;
-2. expose multiple captures of a URL through pywb's timeline/calendar UI;
-3. navigate between older and newer captures supported by the replay index;
-4. show a minimal landing page instead of immediately opening one archived
+1. replays HTML and supporting archived resources from the WARC records;
+2. exposes multiple captures of a URL through pywb's timeline/calendar UI;
+3. navigates between older and newer captures supported by the replay index;
+4. shows a minimal landing page instead of immediately opening one archived
    URL;
-5. expose a pywb-backed multi-collection picker when serving all collections;
-6. make safe, quiescent replacements at an existing WARC or CDXJ path visible
+5. exposes a pywb-backed multi-collection picker when serving all collections;
+6. makes safe, quiescent replacements at an existing WARC or CDXJ path visible
    without maintaining a private authoritative copy;
-7. leave every file under the selected `archives/` tree unchanged; and
-8. fail clearly when the input collection is missing, malformed, unsafe, or
+7. leaves every file under the selected `archives/` tree unchanged; and
+8. fails clearly when the input collection is missing, malformed, unsafe, or
    incompatible.
 
 ### 2.2 Principles
@@ -74,7 +101,7 @@ The implementation follows these principles:
   the interface between applications.
 - **Strict archive replay:** A missing archived resource remains missing.
   There is no live-web fallback.
-- **Pywb as a product dependency:** Phase 2 configures and launches pywb
+- **Pywb as a product dependency:** Navigator configures and launches pywb
   rather than reimplementing its replay engine.
 - **Public terminology may differ from implementation terminology:** The UI
   may say "snapshot", "version", "browse", and "history" while code and pywb
@@ -122,12 +149,25 @@ Navigator does not depend on `archive-magic-fetch`. A user may copy a valid
 Archive Magic collection to a machine that has only Navigator installed and serve
 it there.
 
+Navigator must not:
+
+- import `archive_magic_fetch` or invoke its CLI;
+- create, regenerate, sort, merge, convert, or repair WARC or CDXJ;
+- run `wb-manager`;
+- move or copy the collection into a pywb-managed layout;
+- write metadata, indexes, templates, static files, logs, or caches beneath
+  `archives/`;
+- enable pywb recording, live, proxy, auto-fetch, or auto-indexing modes;
+- treat `sources/` or `website/` as replay inputs;
+- infer capture timestamps or target URLs from WARC filenames; or
+- add a shared Fetch/Navigator Python library.
+
 The repository root remains a uv workspace and development convenience. It
 does not turn Fetch and Navigator into one application.
 
 ## 4. Collection data contract
 
-Phase 2 consumes the existing Phase 1 layout:
+Navigator consumes the Fetch collection layout:
 
 ```text
 archives/
@@ -149,6 +189,12 @@ A locally replayable collection has, at minimum:
 <collection-root>/<each CDXJ filename>
 ```
 
+Each non-empty CDXJ line has three whitespace-separated fields:
+
+```text
+<SURT-url-key> <14-digit-timestamp> <JSON-object>
+```
+
 Fetch's CDXJ entries use collection-relative filenames:
 
 ```json
@@ -158,6 +204,12 @@ Fetch's CDXJ entries use collection-relative filenames:
   "length": "9362"
 }
 ```
+
+| Field | Meaning | Validation |
+| --- | --- | --- |
+| `filename` | Collection-relative WARC path | Normalized relative POSIX path beginning `archive/` |
+| `offset` | Compressed-member byte offset | Integer string or integer, value `>= 0` |
+| `length` | Compressed-member byte length | Integer string or integer, value `> 0` |
 
 Consequently, pywb's resource prefix must be the collection root, not the
 `archive/` directory:
@@ -169,8 +221,17 @@ resource prefix + filename
 ```
 
 The CDXJ, not the readable WARC filename, defines capture identity and the
-compressed byte range to load. Navigator must not infer a target URL or timestamp
+compressed byte range to load. Navigator does not infer a target URL or timestamp
 from a WARC path.
+
+Fetch guarantees that:
+
+- the index is sorted by URL key and timestamp;
+- `filename` is relative to the collection root;
+- offsets and lengths address independently compressed WARC members;
+- response and revisit records are indexed; and
+- completed WARC files and the CDXJ file are each published with atomic
+  replacement.
 
 ### 4.1 Required preflight
 
@@ -179,16 +240,25 @@ Before starting pywb, Navigator validates the selected input without changing it
 1. The archives root and selected collection are directories.
 2. The collection resolves beneath the configured archives root.
 3. `replay/index.cdxj` resolves beneath the collection root and is a regular,
-   readable file.
-4. Each non-empty CDXJ line is syntactically valid.
+   readable UTF-8 file.
+4. Each non-empty CDXJ line splits into a URL key, 14-digit timestamp, and JSON
+   object.
 5. CDXJ keys and timestamps are nondecreasing.
 6. Each replay record has a relative `filename` and nonnegative integer
-   `offset` and positive integer `length`.
+   `offset` and positive integer `length` (numeric strings or JSON integers;
+   not booleans, floats, or signed forms).
 7. A filename is a normalized relative POSIX path, begins with `archive/`,
    contains no `.` or `..` traversal, and resolves beneath the collection
    root.
-8. Each distinct referenced WARC is a readable regular file.
+8. Each distinct referenced WARC is a readable regular file, and
+   `offset + length` does not exceed the current file size.
 9. Symlinks or resolved targets that escape the collection are rejected.
+10. An entirely empty index is rejected.
+
+Validation streams the index line by line. Diagnostics include the collection
+ID, index path, and one-based line number without dumping the full JSON
+record. Distinct WARC filenames are validated once and cached for the rest of
+the index.
 
 Navigator does not fully parse every WARC at startup. Fetch already performs WARC
 validation, and eagerly decompressing all records would make server startup
@@ -197,8 +267,8 @@ indexed byte ranges.
 
 ### 4.2 Future collection manifest
 
-Phase 2 does not require a new manifest. Folder names and the existing CDXJ
-are sufficient for the proof of concept.
+Navigator does not require a new manifest. Folder names and the existing CDXJ
+are sufficient for the local filesystem mode.
 
 A future storage/concurrency revision should add a small versioned manifest
 that identifies:
@@ -211,7 +281,8 @@ that identifies:
 - an optional preferred starting URL; and
 - integrity metadata such as sizes, ETags, or hashes.
 
-Navigator must retain a manifest-less local mode for Phase 1 collections.
+Navigator must retain a manifest-less local mode for existing Fetch
+collections.
 
 ## 5. CLI contract
 
@@ -266,9 +337,16 @@ Open http://127.0.0.1:8080/
 Press Ctrl-C to stop.
 ```
 
+| Condition | Exit |
+| --- | --- |
+| Success / clean Ctrl-C | `0` |
+| Argument parser error | `2` |
+| Validation or startup failure | `1` |
+| Pywb exits nonzero after launch | Preserve a positive pywb exit code where practical; otherwise `1` |
+
 `--bind 0.0.0.0` is permitted as an explicit development choice but prints a
 warning that authentication, TLS, hardened deployment, and hostile archive
-review are outside Phase 2.
+review are outside Navigator's current scope.
 
 ## 6. Startup and shutdown flow
 
@@ -281,10 +359,10 @@ parse and validate CLI arguments
     -> perform read-only collection/CDXJ preflight
     -> create an ephemeral runtime directory outside archives/
     -> render pywb config.yaml with absolute paths
-    -> expose packaged branding templates/static assets
-    -> locate the pinned pywb executable beside Navigator's Python interpreter
+    -> stage packaged branding templates/static assets into the runtime
+    -> locate the pinned wayback executable beside Navigator's Python interpreter
     -> create a random ephemeral readiness resource
-    -> start the pinned pywb executable as a child process
+    -> start the pinned wayback executable as a child process
     -> poll that resource without HTTP proxies or detect an early child failure
     -> print the landing-page URL
     -> optionally open the browser
@@ -293,8 +371,8 @@ parse and validate CLI arguments
     -> remove the ephemeral runtime directory
 ```
 
-Navigator owns the child process. It must preserve pywb's nonzero exit status,
-report a port conflict clearly, and avoid leaving an orphan server after
+Navigator owns the child process. It preserves pywb's nonzero exit status,
+reports a port conflict clearly, and avoids leaving an orphan server after
 Ctrl-C or ordinary termination.
 
 The readiness resource contains a per-run random token and lives beneath the
@@ -310,6 +388,10 @@ license and process boundary. Executable discovery is scoped to the current
 Python environment rather than global `PATH`, and Navigator verifies the exact
 pinned pywb distribution version before launch.
 
+Pywb 2.9.1 installs equivalent `wayback` and `pywb` console commands. Navigator
+prefers `wayback` because the pinned source and documentation call it the main
+application. The public command remains `archive-magic-navigator`.
+
 ## 7. Pywb configuration
 
 Navigator always enables:
@@ -319,8 +401,9 @@ Navigator always enables:
 - Memento/timeline behavior needed by the built-in viewer; and
 - packaged Archive Magic templates.
 
-Pywb 2.9's optional `client_side_replay` mode remains off unless the
-implementation spike demonstrates a concrete fidelity reason to enable it.
+`client_side_replay` remains off. There is no public "extra pywb YAML" escape
+hatch; that would undermine the safety guarantees by allowing recording or live
+fallback.
 
 Navigator never enables:
 
@@ -339,6 +422,7 @@ looks like:
 ```yaml
 enable_auto_colls: false
 framed_replay: true
+client_side_replay: false
 
 collections:
   example.com:
@@ -347,8 +431,9 @@ collections:
       - /absolute/path/archives/example.com/
 ```
 
-The exact keys are verified against the pinned pywb release in the
-implementation spike.
+The spike documented in [PYWB-SPIKE.md](PYWB-SPIKE.md) confirmed that pywb
+2.9.1 accepts this shape against Fetch's collection-root `archive/...`
+filenames.
 
 ### 7.2 All collections
 
@@ -358,6 +443,7 @@ collection:
 ```yaml
 enable_auto_colls: false
 framed_replay: true
+client_side_replay: false
 collections:
   example.com:
     index: /absolute/path/archives/example.com/replay/index.cdxj
@@ -375,10 +461,17 @@ validate. Replacements at configured CDXJ/WARC paths remain visible to later
 pywb reads. Adding or removing an entire collection requires restarting
 Navigator, which is acceptable while concurrent publication is unsupported.
 
+Every immediate child directory under the archives root is treated as an
+intended collection. If any such directory is invalid, startup fails with
+diagnostics instead of allowing pywb's homepage to list a broken collection.
+Non-directory entries are ignored. A later filtered dynamic-collection view
+would be a separate design if mixed collection and non-collection directories
+become common.
+
 ## 8. Browser UI and replay behavior
 
 Pywb's default root homepage lists available collection routes. Its home-page
-template receives the route list and collection metadata, so Phase 2 does not
+template receives the route list and collection metadata, so Navigator does not
 need a separate collection-picker application.
 
 The browser flow is:
@@ -392,7 +485,7 @@ Archive Magic landing page
     -> older/newer captures of the current URL
 ```
 
-The Phase 2 branding demonstrates supported customization without replacing
+Navigator branding demonstrates supported customization without replacing
 pywb:
 
 - an Archive Magic title and short explanation on the root home page;
@@ -401,8 +494,15 @@ pywb:
 - terminology such as "archived version" or "snapshot" where that is clearer
   to non-archivists.
 
-The replay banner, timeline, calendar, URL rewriting, Wombat behavior, and
-capture selection remain pywb-owned.
+Only `index.html` and `search.html` are overridden. The templates are original
+minimal Jinja using documented pywb variables; they are not wholesale copies of
+pywb's default GPLv3 templates. The replay banner, timeline, calendar, URL
+rewriting, Wombat behavior, and capture selection remain pywb-owned.
+
+Pywb 2.9.1's root-page Jinja loader searches `templates/` beneath the server
+working directory before its packaged defaults. Navigator therefore copies its
+packaged overrides and stylesheet into the ephemeral runtime directory before
+startup. No template or static file is written beneath a collection.
 
 The initial UI is functional rather than a final design. A polished homepage
 and a React client are future possibilities.
@@ -441,14 +541,14 @@ This observation is not a concurrency guarantee. See the next section.
 
 ## 10. Consistency and safe concurrency
 
-### 10.1 Phase 2 rule
+### 10.1 Current rule
 
 Early development assumes there is no writer modifying a served collection.
 Fetch and Navigator may be installed and run independently, but a Fetch
 publication must not overlap replay requests for that collection.
 
-Navigator does not enforce this assumption with a long-lived lock in Phase 2.
-The limitation is documented in the README; there is no runtime lock or
+Navigator does not enforce this assumption with a long-lived lock. The
+limitation is documented in the README; there is no runtime lock or
 concurrency warning.
 
 ### 10.2 Why current atomic files are insufficient
@@ -506,8 +606,8 @@ published WARC.
 
 ## 11. Future bucket and remote-resource support
 
-Remote storage is out of Phase 2, but the local architecture must not obstruct
-it.
+Remote storage is out of Navigator's current scope, but the local architecture
+must not obstruct it.
 
 Pywb loads a WARC record using the CDXJ `filename`, `offset`, and `length`:
 
@@ -528,7 +628,7 @@ local/cacheable CDXJ index
 ```
 
 Pywb 2.9.1's plain file index source expects a local CDX/CDXJ file. A raw CDXJ
-object URL is not a remote index API. Options for a later phase include:
+object URL is not a remote index API. Options for a later revision include:
 
 1. download and atomically cache the comparatively small CDXJ locally;
 2. serve the index through a pywb-compatible CDX API;
@@ -564,20 +664,26 @@ publish the generation manifest last.
 
 ## 12. Python and dependency policy
 
-The initial runtime pins:
+The runtime pins:
 
 ```text
 Python >=3.12,<3.13
 pywb ==2.9.1
+setuptools >=68,<81
 ```
 
 Pywb 2.9.1 is the current stable release and declares Python
 `>=3.7,<3.13`. Pywb 2.10.0b1 is a prerelease, and the development branch now
-declares `>=3.9,<3.15`, but Phase 2 does not depend on a prerelease or an
+declares `>=3.9,<3.15`, but Navigator does not depend on a prerelease or an
 unreleased commit.
 
-The delay was caused by ordinary compatibility work, not a stated architectural
-problem with newer Python:
+The published pywb 2.9.1 console entry point imports `pkg_resources`. A fresh
+uv environment does not install setuptools by default, so Navigator declares
+`setuptools>=68,<81` as a direct runtime dependency. PyYAML is also declared
+directly because Navigator serializes configuration with `yaml.safe_dump()`.
+
+The delay in newer-Python support was caused by ordinary compatibility work,
+not a stated architectural problem with newer Python:
 
 - Python 3.13 removed the deprecated standard-library `cgi` module, requiring
   pywb to adopt `legacy-cgi`;
@@ -592,18 +698,18 @@ not yet appeared in a stable release.
 
 Python 3.13 and 3.14 add useful incremental language/runtime work, including
 optional free-threaded builds and experimental/runtime performance features.
-None is important to this wrapper or to normal pywb replay. Phase 2 uses the
+None is important to this wrapper or to normal pywb replay. Navigator uses the
 ordinary GIL-enabled CPython build.
 
 Python 3.12 remains under upstream security support through October 2028. Its
-age is not a material reliability problem for a local proof of concept. The
+age is not a material reliability problem for a local development server. The
 more important reliability choice is using a released pywb/dependency set that
 supports the selected interpreter.
 
 The uv workspace uses one shared lock and the intersection of member Python
-ranges. Adding the Navigator member will therefore make Python 3.12 the
-workspace development runtime while pywb 2.9.1 is pinned. This does not require
-Fetch to reduce its standalone compatibility:
+ranges. Navigator therefore makes Python 3.12 the workspace development runtime
+while pywb 2.9.1 is pinned. This does not require Fetch to reduce its
+standalone compatibility:
 
 ```text
 workspace/root:       >=3.12,<3.13
@@ -612,7 +718,7 @@ archive-magic-fetch:  >=3.12
 ```
 
 Fetch already targets Python 3.12 or newer. Running its tests and CLI on 3.12
-should not change behavior. Fetch may retain separate CI coverage on a newer
+does not change behavior. Fetch may retain separate CI coverage on a newer
 Python outside the shared workspace environment if desired.
 
 When a stable pywb release supports Python 3.13/3.14, Navigator should test that
@@ -630,7 +736,7 @@ niche archival infrastructure. Evidence as of July 2026 includes:
   and
 - ongoing CI and dependency maintenance.
 
-This is enough activity for the Phase 2 proof of concept, but not enough to
+This is enough activity for Navigator's current wrapper, but not enough to
 treat pywb as a fast-moving or low-risk dependency. The stable release cadence
 lags the main branch, and the maintainer pool appears small. Navigator therefore
 pins a stable version, tests real replay behavior rather than only startup, and
@@ -696,7 +802,7 @@ Fetch remains MIT and independent regardless of the Navigator decision.
 
 ## 14. Security posture
 
-Archived pages can contain hostile or obsolete HTML and JavaScript. Phase 2:
+Archived pages can contain hostile or obsolete HTML and JavaScript. Navigator:
 
 - binds to `127.0.0.1` by default;
 - uses pywb's recommended framed replay;
@@ -724,7 +830,6 @@ archive-magic-navigator/
 ├── pyproject.toml
 ├── docs/
 │   ├── ARCHITECTURE-NAVIGATOR.md
-│   ├── IMPLEMENTATION-HANDOFF.md
 │   └── PYWB-SPIKE.md
 ├── src/
 │   └── archive_magic_navigator/
@@ -761,9 +866,9 @@ archive-magic-navigator/
 | `templates/` | Minimal supported pywb UI overrides |
 | `static/` | Minimal Archive Magic branding |
 
-There is no generic storage abstraction in Phase 2. The local path model is
-kept narrow, while configuration and validation avoid assumptions that would
-prevent a later remote source implementation.
+There is no generic storage abstraction. The local path model is kept narrow,
+while configuration and validation avoid assumptions that would prevent a later
+remote source implementation.
 
 ## 16. Failure policy
 
@@ -831,7 +936,7 @@ A future remote fixture uses an HTTP server that records requests and rejects
 full-object reads. It verifies the exact `Range` header before bucket support is
 accepted.
 
-Routine Phase 2 validation should become:
+Validation commands:
 
 ```bash
 uv --directory archive-magic-navigator run pytest
@@ -840,9 +945,9 @@ uv run --package archive-magic-navigator archive-magic-navigator --help
 git diff --check
 ```
 
-## 18. Implementation status and future work
+## 18. Current capabilities and future work
 
-### Phase 2 completed
+### Implemented
 
 - [x] Verify pywb 2.9.1 against Fetch's WARC/CDXJ layout.
 - [x] Add the Python 3.12 Navigator workspace package and CLI.
@@ -892,9 +997,24 @@ git diff --check
       backend.
 - [ ] Preserve a non-React built-in pywb mode for diagnostics and fallback.
 
+### Future invariants
+
+Although not implemented now, current design choices must not contradict these
+future requirements:
+
+- WARC objects must remain byte-range addressable by CDXJ offset and length.
+- Remote WARC objects should be immutable and generation-qualified.
+- A future manifest should atomically select a complete generation.
+- Navigator should pin one generation for the duration of a request/worker
+  view.
+- Remote credentials must remain outside collection metadata.
+- S3/R2 acceptance tests must prove `206 Partial Content` and transferred byte
+  counts.
+- Fetch and Navigator must continue to install and run independently.
+
 ## 19. Explicit non-goals
 
-Phase 2 does not include:
+Navigator does not include:
 
 - WARC or CDXJ creation;
 - automatic indexing, reindexing, conversion, or repair;
@@ -922,6 +1042,7 @@ Phase 2 does not include:
 ## References
 
 - [Archive Magic Fetch architecture](../../archive-magic-fetch/docs/ARCHITECTURE-FETCH.md)
+- [pywb compatibility spike](PYWB-SPIKE.md)
 - [pywb usage documentation](https://pywb.readthedocs.io/en/latest/manual/usage.html)
 - [pywb configuration documentation](https://pywb.readthedocs.io/en/latest/manual/configuring.html)
 - [pywb template guide](https://github.com/webrecorder/pywb/blob/main/docs/manual/template-guide.rst)
