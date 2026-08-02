@@ -140,7 +140,8 @@ def _format_job_time(value: datetime) -> str:
     """Format an aware time as a compact UTC ISO-8601 timestamp."""
 
     return (
-        value.astimezone(timezone.utc)
-        .isoformat(timespec="seconds")
-        .replace("+00:00", "Z")
+        value
+            .astimezone(timezone.utc)
+            .isoformat(timespec="seconds")
+            .replace("+00:00", "Z")
     )
