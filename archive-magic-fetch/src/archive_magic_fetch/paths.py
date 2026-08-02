@@ -26,6 +26,20 @@ _WINDOWS_RESERVED_NAMES = {
     *(f"LPT{number}" for number in range(1, 10)),
 }
 _PARTIAL_ESCAPE = re.compile(r"%(?:[0-9A-F])?$")
+_MIME_SUFFIXES = {
+    "text/html": ".html",
+    "application/xhtml+xml": ".html",
+    "application/pdf": ".pdf",
+    "text/css": ".css",
+    "application/javascript": ".js",
+    "text/javascript": ".js",
+    "application/json": ".json",
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/gif": ".gif",
+    "image/svg+xml": ".svg",
+    "image/webp": ".webp",
+}
 
 
 @dataclass(frozen=True)
@@ -54,22 +68,6 @@ class CollectionLayout:
     @property
     def replay_index(self) -> Path:
         return self.collection_root / "replay" / "index.cdxj"
-
-
-@dataclass(frozen=True)
-class WarcBucket:
-    """One WARC path and the URL-key groups assigned to it."""
-
-    path: Path
-    urlkeys: tuple[str, ...]
-
-
-@dataclass(frozen=True)
-class ExportPlan:
-    """Preflighted collection layout and ordered WARC buckets."""
-
-    layout: CollectionLayout
-    buckets: tuple[WarcBucket, ...]
 
 
 @dataclass(frozen=True)
@@ -142,6 +140,60 @@ def _truncate_escape_safe(encoded: str, byte_limit: int) -> str:
     return encoded
 
 
+def normalize_url_authority(
+    value: str,
+    *,
+    allow_bare: bool = False,
+) -> tuple[str, Optional[int]]:
+    """Return normalized host and significant port for one URL."""
+
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("URL must be a non-empty string")
+    text = value.strip()
+    has_scheme = "://" in text
+    parsed = urlsplit(text if has_scheme else f"//{text}")
+    if not allow_bare and (not parsed.scheme or not parsed.netloc):
+        raise ValueError(f"URL must be absolute: {value}")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("URL user information is not supported")
+
+    host = parsed.hostname
+    if not host:
+        raise ValueError(f"URL must include a host: {value}")
+    host = host.rstrip(".").lower()
+    if not host:
+        raise ValueError("URL host cannot be empty")
+    try:
+        host = host.encode("idna").decode("ascii").lower()
+    except UnicodeError as error:
+        raise ValueError(f"URL host is not valid IDNA: {host}") from error
+    if host.startswith("www."):
+        host = host[4:]
+    if not host:
+        raise ValueError("URL host cannot be only www")
+
+    try:
+        port = parsed.port
+    except ValueError as error:
+        raise ValueError(f"URL has an invalid port: {value}") from error
+    scheme = parsed.scheme.lower()
+    if (
+        (scheme == "http" and port == 80)
+        or (scheme == "https" and port == 443)
+    ):
+        port = None
+    return host, port
+
+
+def mime_suffix(value: object) -> Optional[str]:
+    """Return the supported conventional suffix for one MIME value."""
+
+    if not isinstance(value, str):
+        return None
+    normalized = value.split(";", 1)[0].strip().lower()
+    return _MIME_SUFFIXES.get(normalized)
+
+
 def normalize_collection_name(url_pattern: str) -> str:
     """Derive one safe collection directory from a supported URL pattern."""
 
@@ -152,41 +204,13 @@ def normalize_collection_name(url_pattern: str) -> str:
     if pattern.startswith("*."):
         pattern = pattern[2:]
 
-    has_scheme = "://" in pattern
-    parsed = urlsplit(pattern if has_scheme else f"//{pattern}")
-    if parsed.username is not None or parsed.password is not None:
-        raise ValueError("URL pattern user information is not supported")
-
-    host = parsed.hostname
-    if not host or "*" in host:
+    host, port = normalize_url_authority(pattern, allow_bare=True)
+    if "*" in host:
         raise ValueError(
             f"URL pattern must identify one unambiguous website host: "
             f"{url_pattern}"
         )
-
-    host = host.rstrip(".").lower()
-    if not host:
-        raise ValueError("URL pattern host cannot be empty")
-    try:
-        host = host.encode("idna").decode("ascii").lower()
-    except UnicodeError as error:
-        raise ValueError(f"URL pattern host is not valid IDNA: {host}") from error
-
-    if host.startswith("www."):
-        host = host[4:]
-    if not host:
-        raise ValueError("URL pattern host cannot be only www")
-
-    try:
-        port = parsed.port
-    except ValueError as error:
-        raise ValueError(f"URL pattern has an invalid port: {url_pattern}") from error
-
-    scheme = parsed.scheme.lower()
-    if port is not None and not (
-        (scheme == "http" and port == 80)
-        or (scheme == "https" and port == 443)
-    ):
+    if port is not None:
         host = f"{host}--port-{port}"
 
     name = _safe_segment(host)
@@ -257,63 +281,32 @@ def _cdx_timestamp_text(timestamp: datetime) -> str:
 def website_host_segment(original_url: str) -> str:
     """Return the filesystem host segment for one absolute capture URL."""
 
-    if not isinstance(original_url, str) or not original_url.strip():
-        raise ValueError("capture URL must be a non-empty string")
-
-    parsed = urlsplit(original_url.strip())
-    if not parsed.scheme or not parsed.netloc:
-        raise ValueError(f"capture URL must be absolute: {original_url}")
-
-    host = parsed.hostname
-    if not host:
-        raise ValueError(f"capture URL must include a host: {original_url}")
-
-    host = host.rstrip(".").lower()
-    try:
-        host = host.encode("idna").decode("ascii").lower()
-    except UnicodeError as error:
-        raise ValueError(f"capture URL host is not valid IDNA: {host}") from error
-
-    if host.startswith("www."):
-        host = host[4:]
-    if not host:
-        raise ValueError(f"capture URL host cannot be only www: {original_url}")
-
-    try:
-        port = parsed.port
-    except ValueError as error:
-        raise ValueError(f"capture URL has an invalid port: {original_url}") from error
-
-    scheme = parsed.scheme.lower()
-    if port is not None and not (
-        (scheme == "http" and port == 80)
-        or (scheme == "https" and port == 443)
-    ):
+    host, port = normalize_url_authority(original_url)
+    if port is not None:
         host = f"{host}--port-{port}"
 
     return host
 
 
 def _split_site_path(path: str) -> tuple[list[str], bool]:
-    """Return decoded path segments and whether the path is directory-like.
+    """Return decoded path segments and whether the URL has an explicit suffix.
 
     Query strings are intentionally ignored for loose-file path planning.
     """
 
     path = unquote(path or "")
-    trailing_slash = path.endswith("/")
     if path.startswith("/"):
         path = path[1:]
     if path.endswith("/"):
         path = path[:-1]
 
     segments = [segment for segment in path.split("/") if segment != ""]
-    directory_like = trailing_slash or not segments or "." not in segments[-1]
-    return segments, directory_like
+    explicit_suffix = bool(segments and "." in segments[-1])
+    return segments, explicit_suffix
 
 
 def _website_path_segments(original_url: str) -> tuple[list[str], bool]:
-    """Return decoded path segments and whether the URL is directory-like."""
+    """Return decoded path segments and explicit-suffix state."""
 
     if not isinstance(original_url, str) or not original_url.strip():
         raise ValueError("capture URL must be a non-empty string")
@@ -325,24 +318,34 @@ def _website_path_segments(original_url: str) -> tuple[list[str], bool]:
     return _split_site_path(parsed.path or "")
 
 
-def _website_relative_parts(
+def website_relative_parts(
     original_url: str,
     *,
+    mimetype: object,
     timestamp: Optional[datetime] = None,
 ) -> tuple[str, ...]:
     """Build safe relative parts under ``website/`` for one capture URL."""
 
     host = website_host_segment(original_url)
-    segments, directory_like = _website_path_segments(original_url)
+    segments, explicit_suffix = _website_path_segments(original_url)
     parts: list[str] = [host]
     if timestamp is not None:
         parts.append(_cdx_timestamp_text(timestamp))
 
-    if directory_like:
+    suffix = mime_suffix(mimetype)
+    if explicit_suffix:
+        parts.extend(segments)
+    elif suffix == ".html":
         parts.extend(segments)
         parts.append("index.html")
+    elif suffix is not None:
+        if segments:
+            parts.extend(segments[:-1])
+            parts.append(f"{segments[-1]}{suffix}")
+        else:
+            parts.append(f"index{suffix}")
     else:
-        parts.extend(segments)
+        parts.extend(segments or ["index"])
 
     return tuple(
         _bounded_segment(segment, byte_limit=MAX_COMPONENT_BYTES)
@@ -354,12 +357,17 @@ def preferred_website_path(
     original_url: str,
     layout: CollectionLayout,
     *,
+    mimetype: object,
     timestamp: Optional[datetime] = None,
 ) -> Path:
     """Map one original URL to its preferred loose-file path under website/."""
 
     return layout.website_root.joinpath(
-        *_website_relative_parts(original_url, timestamp=timestamp)
+        *website_relative_parts(
+            original_url,
+            mimetype=mimetype,
+            timestamp=timestamp,
+        )
     )
 
 
@@ -369,9 +377,9 @@ def preferred_site_file(site_root: Path, url_path: str) -> Path:
     Query strings are ignored (folded), matching loose-file path planning.
     """
 
-    segments, directory_like = _split_site_path(url_path)
+    segments, explicit_suffix = _split_site_path(url_path)
     parts = list(segments)
-    if directory_like:
+    if not explicit_suffix:
         parts.append("index.html")
     return site_root.joinpath(
         *(
@@ -480,8 +488,10 @@ def validate_path_limits(path: Path) -> None:
         )
 
 
-def _inspect_target(path: Path) -> None:
-    """Reject an existing final target or an unusable ancestor."""
+def _inspect_target(
+    path: Path,
+) -> None:
+    """Inspect one output target and its nearest existing ancestor."""
 
     inspect_error = None
     try:
@@ -508,72 +518,53 @@ def _inspect_target(path: Path) -> None:
     validate_path_limits(path)
 
 
-def preflight_layout(
+def allocate_warc_paths(
     capture_groups: Mapping[str, Sequence[object]],
     layout: CollectionLayout,
-) -> ExportPlan:
-    """Allocate collision buckets and inspect all final targets."""
+) -> dict[Path, tuple[str, ...]]:
+    """Map readable WARC paths to URL keys in linear path-depth work."""
 
-    candidates: dict[tuple[str, ...], list[tuple[Path, str]]] = {}
+    candidates: dict[
+        tuple[str, ...],
+        list[tuple[str, Path, str]],
+    ] = {}
     for urlkey, captures in capture_groups.items():
         if not captures:
             raise ValueError(f"capture group is empty: {urlkey}")
         path = preferred_warc_path(urlkey, layout)
         key = _equivalent_path(path, layout.collection_root)
-        candidates.setdefault(key, []).append((path, urlkey))
+        relative = path.relative_to(layout.collection_root).as_posix()
+        candidates.setdefault(key, []).append((relative, path, urlkey))
 
-    exact_buckets = []
-    for key, equivalent_candidates in candidates.items():
-        ordered = sorted(
-            equivalent_candidates,
-            key=lambda item: (
-                item[0].relative_to(layout.collection_root).as_posix(),
-                item[1],
-            ),
+    exact = {
+        key: (
+            min(entries, key=lambda entry: entry[0])[1],
+            [entry[2] for entry in entries],
         )
-        final_path = ordered[0][0]
-        urlkeys = sorted(urlkey for _, urlkey in ordered)
-        exact_buckets.append((key, final_path, urlkeys))
+        for key, entries in candidates.items()
+    }
 
-    # A planned WARC may otherwise become the directory ancestor of another
-    # planned WARC. Assign descendant groups to the shortest conflicting WARC
-    # so every conflict is resolved before playback begins.
-    exact_buckets.sort(
-        key=lambda item: (
-            len(item[0]),
-            item[0],
-            item[1].relative_to(layout.collection_root).as_posix(),
-        )
-    )
-    allocated: list[tuple[tuple[str, ...], Path, list[str]]] = []
-    for key, final_path, urlkeys in exact_buckets:
-        ancestor = next(
+    allocated: dict[tuple[str, ...], list[str]] = {}
+    for key, (_path, urlkeys) in exact.items():
+        owner = next(
             (
-                bucket
-                for bucket in allocated
-                if len(bucket[0]) < len(key)
-                and key[: len(bucket[0])] == bucket[0]
+                key[:length]
+                for length in range(1, len(key))
+                if key[:length] in exact
             ),
-            None,
+            key,
         )
-        if ancestor is not None:
-            ancestor[2].extend(urlkeys)
-        else:
-            allocated.append((key, final_path, urlkeys))
+        allocated.setdefault(owner, []).extend(urlkeys)
 
-    buckets = [
-        WarcBucket(path, tuple(sorted(urlkeys)))
-        for _, path, urlkeys in allocated
-    ]
-    buckets.sort(
-        key=lambda bucket: bucket.path.relative_to(
-            layout.collection_root
-        ).as_posix()
-    )
-    for bucket in buckets:
-        _inspect_target(bucket.path)
-    _inspect_target(layout.replay_index)
-    return ExportPlan(layout, tuple(buckets))
+    return {
+        exact[key][0]: tuple(sorted(urlkeys))
+        for key, urlkeys in sorted(
+            allocated.items(),
+            key=lambda item: exact[item[0]][0]
+            .relative_to(layout.collection_root)
+            .as_posix(),
+        )
+    }
 
 
 def _newest_wins_website_paths(
@@ -674,20 +665,16 @@ def _reshape_website_paths(
                 )
 
         keys = sorted(by_key, key=len)
+        strict_prefixes = {
+            key[:length]
+            for key in keys
+            for length in range(1, len(key))
+        }
         reshaped: list[tuple[Path, str, int, str]] = []
         changed = False
         for key, entries in ((key, by_key[key]) for key in keys):
             path, urlkey, capture_index, token = entries[0]
-            descendant = next(
-                (
-                    other_key
-                    for other_key in keys
-                    if len(other_key) > len(key)
-                    and other_key[: len(key)] == key
-                ),
-                None,
-            )
-            if descendant is None:
+            if key not in strict_prefixes:
                 reshaped.append((path, urlkey, capture_index, token))
                 continue
 
@@ -729,6 +716,7 @@ def preflight_website_layout(
             path = preferred_website_path(
                 original,
                 layout,
+                mimetype=getattr(capture, "mimetype", None),
                 timestamp=path_timestamp,
             )
             planned.append(

@@ -23,6 +23,7 @@ class FilesSummary:
     playback_failures: int = 0
     invalid_content_encoding_failures: int = 0
     truncated_response_failures: int = 0
+    content_type_mismatches: int = 0
 
     def add(self, other: FilesSummary) -> None:
         """Accumulate another URL group's outcomes."""
@@ -37,6 +38,7 @@ class FilesSummary:
         self.truncated_response_failures += (
             other.truncated_response_failures
         )
+        self.content_type_mismatches += other.content_type_mismatches
 
     def record_playback_failure(
         self,
@@ -120,5 +122,6 @@ def print_files_summary(summary: FilesSummary, *, files_mode: str) -> None:
     print(
         f"Files: {summary.written} written ({files_mode}); "
         f"{failures}; "
+        f"{summary.content_type_mismatches} content-type mismatches; "
         f"{summary.redirects_omitted} redirects omitted"
     )

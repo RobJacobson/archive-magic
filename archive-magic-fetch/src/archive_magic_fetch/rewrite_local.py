@@ -73,7 +73,10 @@ def _site_context(
     return host, website_root / host
 
 
-def _existing_local_target(site_root: Path, url_path: str) -> Optional[Path]:
+def _existing_local_target(
+    site_root: Path,
+    url_path: str,
+) -> Optional[Path]:
     candidate = preferred_site_file(site_root, url_path)
     if candidate.is_file():
         return candidate
@@ -150,7 +153,10 @@ def rewrite_reference(
                 current_file,
                 include_timestamps=include_timestamps,
             )
-            target = _existing_local_target(site_root, parsed.path or "/")
+            target = _existing_local_target(
+                site_root,
+                parsed.path or "/",
+            )
             if target is None:
                 return reference
             return _relative_link(
@@ -177,7 +183,10 @@ def rewrite_reference(
         # resolve under that host's non-timestamp root.
         site_root = website_root / host_segment
 
-    target = _existing_local_target(site_root, parsed.path or "/")
+    target = _existing_local_target(
+        site_root,
+        parsed.path or "/",
+    )
     if target is None:
         return reference
     return _relative_link(

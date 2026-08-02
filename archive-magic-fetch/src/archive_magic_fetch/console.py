@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import Iterator, Optional, TextIO
 from urllib.parse import urlsplit
 
+from .paths import normalize_url_authority
+
 
 _OUTPUT_LOCK = threading.Lock()
 
@@ -99,18 +101,8 @@ def readable_url(original_url: str) -> str:
     """Return a compact, non-SURT URL label for one capture group."""
 
     parsed = urlsplit(original_url)
-    host = parsed.hostname or parsed.netloc
-    if host.lower().startswith("www."):
-        host = host[4:]
-
-    try:
-        port = parsed.port
-    except ValueError:
-        port = None
-    if port is not None and not (
-        (parsed.scheme.lower() == "http" and port == 80)
-        or (parsed.scheme.lower() == "https" and port == 443)
-    ):
+    host, port = normalize_url_authority(original_url)
+    if port is not None:
         host = f"{host}:{port}"
 
     path = parsed.path or "/"
@@ -119,16 +111,16 @@ def readable_url(original_url: str) -> str:
 
 
 def capture_result_line(capture: object, result: str) -> str:
-    """Format a capture URL and its result with scheme-aware alignment."""
+    """Format a capture URL and its result with URL-aware alignment."""
 
     view_url = getattr(capture, "view_url", str(capture))
     original_url = getattr(capture, "original", "")
-    scheme = (
-        urlsplit(original_url).scheme.lower()
-        if isinstance(original_url, str)
-        else ""
-    )
-    separator = "  : " if scheme == "http" else " : "
+    parsed = urlsplit(original_url) if isinstance(original_url, str) else None
+    scheme = parsed.scheme.lower() if parsed is not None else ""
+    host = (parsed.hostname or parsed.netloc) if parsed is not None else ""
+    host_padding = "" if host.lower().startswith("www.") else " " * 4
+    scheme_padding = "  " if scheme == "http" else " "
+    separator = f"{host_padding}{scheme_padding}: "
     return f"{view_url}{separator}{result}"
 
 

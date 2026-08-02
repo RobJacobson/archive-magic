@@ -21,8 +21,7 @@ from .retry import (
 )
 
 
-# Matches WaybackClient.search()'s default per-request limit.
-_PROGRESS_INTERVAL = 1000
+_CDX_REQUEST_LIMIT = 10_000
 
 OutputMode = str
 WARC_MODES = ("none", "latest", "all")
@@ -44,7 +43,8 @@ def select_latest_capture(
     Preference order:
     1. newest capture with CDX status ``200``
     2. newest capture whose status is present and not ``3xx``
-    3. omit the group (redirect-only / statusless-only)
+    3. newest capture whose status is ``3xx``
+    4. omit the group (statusless-only)
 
     “Newest” is determined by ``capture.timestamp``, not input order.
     """
@@ -52,28 +52,42 @@ def select_latest_capture(
     if not captures:
         raise ValueError("capture group is empty")
 
-    with_200 = [
-        capture for capture in captures if capture.statuscode == 200
-    ]
-    if with_200:
-        return max(with_200, key=lambda capture: capture.timestamp)
+    newest_200 = max(
+        (capture for capture in captures if capture.statuscode == 200),
+        key=lambda capture: capture.timestamp,
+        default=None,
+    )
+    if newest_200 is not None:
+        return newest_200
 
-    non_redirect = [
-        capture
-        for capture in captures
-        if capture.statuscode is not None
-        and not _is_redirect_status(capture.statuscode)
-    ]
-    if non_redirect:
-        return max(non_redirect, key=lambda capture: capture.timestamp)
+    newest_non_redirect = max(
+        (
+            capture
+            for capture in captures
+            if capture.statuscode is not None
+            and not _is_redirect_status(capture.statuscode)
+        ),
+        key=lambda capture: capture.timestamp,
+        default=None,
+    )
+    if newest_non_redirect is not None:
+        return newest_non_redirect
 
-    return None
+    return max(
+        (
+            capture
+            for capture in captures
+            if _is_redirect_status(capture.statuscode)
+        ),
+        key=lambda capture: capture.timestamp,
+        default=None,
+    )
 
 
 def apply_output_mode(
     capture_groups: Mapping[str, Sequence[CdxRecord]],
     mode: OutputMode,
-) -> dict[str, list[CdxRecord]]:
+) -> Mapping[str, Sequence[CdxRecord]]:
     """Transform grouped captures into the selection for one output axis."""
 
     if mode not in FILES_MODES:
@@ -81,10 +95,7 @@ def apply_output_mode(
     if mode == "none":
         return {}
     if mode in {"all", "unique"}:
-        return {
-            urlkey: list(captures)
-            for urlkey, captures in capture_groups.items()
-        }
+        return capture_groups
 
     selected: dict[str, list[CdxRecord]] = {}
     for urlkey, captures in capture_groups.items():
@@ -121,16 +132,17 @@ def discover(
 ) -> list[CdxRecord]:
     """Materialize all Internet Archive captures for the supplied selection.
 
-    When ``progress`` is provided, it is called with the capture count after
-    every ``_PROGRESS_INTERVAL`` records during a successful attempt. A
-    rate-limited attempt discards partial rows before retrying, so progress
-    restarts from zero on the next attempt.
+    When ``progress`` is provided, it is called after each request limit's
+    worth of records during a successful attempt. A rate-limited attempt
+    discards partial rows before retrying, so progress restarts from zero on
+    the next attempt.
     """
 
     search_url, match_type = normalize_cdx_search(url_pattern)
     search_kwargs: dict[str, object] = {
         "from_date": date_start,
         "to_date": date_end,
+        "limit": _CDX_REQUEST_LIMIT,
         "resolve_revisits": False,
     }
     if match_type is not None:
@@ -141,7 +153,7 @@ def discover(
         for capture in client.search(search_url, **search_kwargs):
             captures.append(capture)
             count = len(captures)
-            if progress is not None and count % _PROGRESS_INTERVAL == 0:
+            if progress is not None and count % _CDX_REQUEST_LIMIT == 0:
                 progress(count)
         return captures
 
@@ -154,7 +166,7 @@ def discover(
         "https://web.archive.org/cdx/search/cdx?"
         + urlencode({"url": search_url, **search_kwargs})
     )
-    while attempt_number <= retries:
+    while True:
         attempt_number += 1
         try:
             return attempt()
@@ -181,8 +193,6 @@ def discover(
                 f"{format_seconds(delay)}s after {decision.cause}"
             )
             sleep_seconds(delay)
-
-    raise RuntimeError("unreachable discovery retry state")  # pragma: no cover
 
 
 def group_captures(

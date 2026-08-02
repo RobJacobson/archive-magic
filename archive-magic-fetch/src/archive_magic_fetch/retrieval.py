@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import re
 import time
 from dataclasses import dataclass
 from http import HTTPStatus
@@ -10,7 +13,10 @@ from io import BytesIO
 from typing import Callable, Mapping, Optional
 
 from requests.exceptions import ContentDecodingError, RequestException
-from urllib3.exceptions import IncompleteRead as Urllib3IncompleteRead
+from urllib3.exceptions import (
+    HTTPError as Urllib3HTTPError,
+    IncompleteRead as Urllib3IncompleteRead,
+)
 from warcio.recordbuilder import RecordBuilder
 from warcio.statusandheaders import StatusAndHeaders
 from wayback import Mode, WaybackClient
@@ -36,7 +42,9 @@ from .warc import timestamp_to_warc_date
 
 DEFAULT_CONCURRENCY = 8
 
-REPEATED_TRUNCATION_ATTEMPTS = 3
+REPEATED_TRUNCATION_ATTEMPTS = 2
+
+_VALID_CDX_SHA1 = re.compile(r"[A-Z2-7]{32}")
 
 _REPRESENTATION_HEADERS = {
     "content-digest",
@@ -70,7 +78,8 @@ class MalformedContentEncodingError(MementoPlaybackError):
         cause_detail = f": {cause_text}" if cause_text else ""
         super().__init__(
             "original Wayback replay could not be decoded by the HTTP client"
-            f"{encoding_detail}{cause_detail}; capture discarded without retry"
+            f"{encoding_detail}{cause_detail}; raw recovery was not verified "
+            "by the CDX digest, so the capture was discarded"
         )
 
 
@@ -152,7 +161,7 @@ def format_playback_failure_summary(
 def _content_encoding(memento) -> Optional[str]:
     """Return the replay response encoding involved in a decode failure."""
 
-    for attribute in ("raw_headers", "headers"):
+    for attribute in ("_raw_headers", "raw_headers", "headers"):
         headers = getattr(memento, attribute, None)
         if headers is None:
             continue
@@ -162,6 +171,69 @@ def _content_encoding(memento) -> Optional[str]:
             if encoding:
                 return encoding
     return None
+
+
+def normalize_cdx_digest(digest: object) -> Optional[str]:
+    """Return a canonical CDX SHA-1 payload digest when valid."""
+
+    if not isinstance(digest, str):
+        return None
+    value = digest.strip().upper()
+    if value.startswith("SHA1:"):
+        value = value[5:]
+    if not _VALID_CDX_SHA1.fullmatch(value):
+        return None
+    return f"sha1:{value}"
+
+
+def _payload_digest(payload: bytes) -> str:
+    """Return one CDX-compatible SHA-1 digest for semantic payload bytes."""
+
+    encoded = base64.b32encode(hashlib.sha1(payload).digest()).decode(
+        "ascii"
+    )
+    return f"sha1:{encoded}"
+
+
+def _recover_raw_payload(
+    client,
+    capture,
+    *,
+    source_uri: str,
+    status_code: int,
+) -> Optional[bytes]:
+    """Return one exact raw replay only when its CDX digest verifies it."""
+
+    expected_digest = normalize_cdx_digest(
+        getattr(capture, "digest", None)
+    )
+    if expected_digest is None:
+        return None
+
+    try:
+        with client.session.request(
+            "GET",
+            source_uri,
+            allow_redirects=False,
+        ) as response:
+            if (
+                response.status_code != status_code
+                or "Memento-Datetime" not in response.headers
+            ):
+                return None
+            payload = response.raw.read(decode_content=False)
+    except (
+        RateLimitError,
+        RetryableWaybackResponseError,
+        WaybackRetryError,
+        RequestException,
+        Urllib3HTTPError,
+    ):
+        return None
+
+    if _payload_digest(payload) != expected_digest:
+        return None
+    return payload
 
 
 def _incomplete_read_boundary(
@@ -219,6 +291,7 @@ class RetrievedMemento:
     source_uri: str
     status_code: int
     headers: tuple[tuple[str, str], ...]
+    recovered_content_encoding: bool = False
 
     def to_warc_record(self, *, target_url: Optional[str] = None):
         """Build a fresh WARC response record over the semantic body."""
@@ -297,10 +370,32 @@ def _retrieve_memento_with_retry(
                     headers=headers,
                 )
         except ContentDecodingError as error:
-            raise MalformedContentEncodingError(
-                _content_encoding(memento),
-                cause=error,
-            ) from error
+            payload = (
+                _recover_raw_payload(
+                    client,
+                    capture,
+                    source_uri=memento.memento_url,
+                    status_code=memento.status_code,
+                )
+                if memento is not None
+                else None
+            )
+            if payload is None:
+                raise MalformedContentEncodingError(
+                    _content_encoding(memento),
+                    cause=error,
+                ) from error
+            return RetrievedMemento(
+                body=payload,
+                url=memento.url,
+                capture_date=timestamp_to_warc_date(memento.timestamp),
+                source_uri=memento.memento_url,
+                status_code=memento.status_code,
+                headers=tuple(
+                    _semantic_headers(memento.headers, len(payload))
+                ),
+                recovered_content_encoding=True,
+            )
         except (
             RateLimitError,
             RetryableWaybackResponseError,
@@ -349,6 +444,15 @@ def _retrieve_memento_with_retry(
                     elapsed_seconds=time.monotonic() - started_at,
                     cause=decision.cause,
                 ) from error
+
+            if truncation is not None:
+                print_progress(
+                    capture_result_line(
+                        capture,
+                        "retrying after incomplete response",
+                    )
+                )
+                continue
 
             delay = retry_delay_seconds(
                 attempt_number,

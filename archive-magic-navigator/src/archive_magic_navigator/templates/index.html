@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block title %}Archive Magic Navigator{% endblock %}
+{% block head %}
+{{ super() }}
+<link rel="stylesheet" href="{{ static_prefix }}/archive-magic.css">
+{% endblock %}
+{% block body %}
+<main class="am-shell">
+  <p class="am-kicker">Archive Magic</p>
+  <h1>Browse archived websites</h1>
+  <p class="am-intro">Choose a collection to explore its snapshots and history.</p>
+  <ul class="am-collections">
+    {% for route in routes | sort %}
+    <li>
+      <a href="{{ env['pywb.app_prefix'] + ('/' + env.pywb_lang if env.pywb_lang else '') + '/' + route + '/' }}">
+        <strong>{{ all_metadata[route].title if all_metadata and all_metadata[route] and all_metadata[route].title else route }}</strong>
+        <span>Open collection</span>
+      </a>
+    </li>
+    {% endfor %}
+  </ul>
+</main>
+{% endblock %}

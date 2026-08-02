@@ -7,10 +7,11 @@ from archive_magic_fetch import retry
 
 
 def test_retry_delay_is_exponential_and_honors_retry_after():
-    assert retry.retry_delay_seconds(1) == 2
-    assert retry.retry_delay_seconds(12) == 4096
-    assert retry.retry_delay_seconds(3, retry_after=11) == 11
-    assert retry.retry_delay_seconds(100) == 2**100
+    assert retry.DEFAULT_RETRIES == 8
+    assert retry.retry_delay_seconds(1) == 10
+    assert retry.retry_delay_seconds(8) == 1280
+    assert retry.retry_delay_seconds(3, retry_after=41) == 41
+    assert retry.retry_delay_seconds(100) == 5 * (2**100)
 
 
 def test_sleep_seconds_chunks_platform_sized_waits(monkeypatch):

@@ -1,0 +1,124 @@
+:root {
+  --am-ink: #172126;
+  --am-muted: #5c696f;
+  --am-paper: #f5f0e7;
+  --am-card: #fffdf8;
+  --am-accent: #b7432f;
+  --am-line: #d8d0c2;
+}
+
+body {
+  background: var(--am-paper);
+  color: var(--am-ink);
+}
+
+.am-shell {
+  box-sizing: border-box;
+  margin: 0 auto;
+  max-width: 70rem;
+  padding: 7rem 2rem;
+}
+
+.am-kicker {
+  color: var(--am-accent);
+  font-size: 0.8rem;
+  font-weight: 700;
+  letter-spacing: 0.16em;
+  margin: 0 0 1rem;
+  text-transform: uppercase;
+}
+
+.am-shell h1 {
+  font-family: Georgia, serif;
+  font-size: clamp(2.5rem, 7vw, 5.5rem);
+  letter-spacing: -0.04em;
+  line-height: 0.95;
+  margin: 0;
+}
+
+.am-intro {
+  color: var(--am-muted);
+  font-size: 1.2rem;
+  margin: 1.5rem 0 3rem;
+  max-width: 42rem;
+}
+
+.am-collections {
+  display: grid;
+  gap: 1rem;
+  grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr));
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.am-collections a {
+  background: var(--am-card);
+  border: 1px solid var(--am-line);
+  color: var(--am-ink);
+  display: flex;
+  flex-direction: column;
+  min-height: 8rem;
+  padding: 1.5rem;
+  text-decoration: none;
+}
+
+.am-collections a:hover {
+  border-color: var(--am-accent);
+  color: var(--am-accent);
+}
+
+.am-collections span {
+  color: var(--am-muted);
+  margin-top: auto;
+}
+
+.am-back {
+  color: var(--am-muted);
+  display: inline-block;
+  margin-bottom: 4rem;
+}
+
+.am-search form {
+  max-width: 52rem;
+}
+
+.am-search label {
+  display: block;
+  font-weight: 700;
+  margin-bottom: 0.6rem;
+}
+
+.am-search-row {
+  display: flex;
+  gap: 0.75rem;
+}
+
+.am-search-row input {
+  background: var(--am-card);
+  border: 1px solid var(--am-line);
+  flex: 1;
+  font: inherit;
+  min-width: 0;
+  padding: 0.9rem 1rem;
+}
+
+.am-search-row button {
+  background: var(--am-accent);
+  border: 0;
+  color: white;
+  cursor: pointer;
+  font: inherit;
+  font-weight: 700;
+  padding: 0.9rem 1.4rem;
+}
+
+@media (max-width: 40rem) {
+  .am-shell {
+    padding: 4rem 1.25rem;
+  }
+
+  .am-search-row {
+    flex-direction: column;
+  }
+}

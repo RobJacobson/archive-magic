@@ -18,7 +18,7 @@ from wayback import WaybackSession
 from wayback.exceptions import RateLimitError, WaybackRetryError
 
 
-DEFAULT_RETRIES = 12
+DEFAULT_RETRIES = 8
 MAX_SLEEP_CHUNK_SECONDS = 3600
 RETRYABLE_HTTP_STATUSES = frozenset(
     {413, 421, 429, 500, 502, 503, 504, 599}
@@ -140,7 +140,7 @@ def retry_delay_seconds(
 
     if retry_number < 1:
         raise ValueError("retry number must be at least 1")
-    delay: int | float = 2**retry_number
+    delay: int | float = 5 * (2**retry_number)
     if retry_after is not None:
         delay = max(delay, retry_after)
     return delay

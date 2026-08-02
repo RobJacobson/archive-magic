@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+{% block title %}{{ coll }} — Archive Magic Navigator{% endblock %}
+{% block head %}
+{{ super() }}
+<link rel="stylesheet" href="{{ static_prefix }}/archive-magic.css">
+{% endblock %}
+{% block body %}
+<main class="am-shell am-search">
+  <a class="am-back" href="/">← All collections</a>
+  <p class="am-kicker">Archive Magic Navigator</p>
+  <h1>{{ metadata.title if metadata and metadata.title else coll }}</h1>
+  <p class="am-intro">Enter a URL to see its archived versions and history.</p>
+  <form id="archive-magic-search">
+    <label for="archive-url">Website URL</label>
+    <div class="am-search-row">
+      <input id="archive-url" type="url" required autofocus
+             placeholder="https://example.com/">
+      <button type="submit">Find snapshots</button>
+    </div>
+  </form>
+</main>
+<script>
+document.getElementById("archive-magic-search").addEventListener("submit", function (event) {
+  event.preventDefault();
+  var value = document.getElementById("archive-url").value.trim();
+  if (value) {
+    window.location.assign({{ (wb_prefix + '*/') | tojson | safe }} + value);
+  }
+});
+</script>
+{% endblock %}

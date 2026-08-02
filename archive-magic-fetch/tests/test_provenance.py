@@ -131,7 +131,7 @@ def test_source_snapshot_rejects_ambiguous_cdx_tokens(tmp_path):
     with pytest.raises(ValueError, match="whitespace"):
         save(tmp_path, [invalid])
 
-    assert not (tmp_path / "archives").exists()
+    assert list(collection(tmp_path).sources_root.iterdir()) == []
 
 
 def test_acquisition_identifier_collision_uses_numeric_suffix(tmp_path):
