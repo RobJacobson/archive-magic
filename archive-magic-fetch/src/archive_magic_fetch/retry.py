@@ -25,31 +25,6 @@ RETRYABLE_HTTP_STATUSES = frozenset(
 )
 
 
-def short_cause(cause: Optional[BaseException]) -> str:
-    """Return one short, single-line cause suitable for console output."""
-
-    if cause is None:
-        return ""
-    text = " ".join(str(cause).split())
-    if not text:
-        return type(cause).__name__
-    lower = text.lower()
-    for needle in (
-        "incorrect header check",
-        "incorrect gzip header",
-        "crc check failed",
-        "invalid stored block lengths",
-        "connection reset",
-        "read timed out",
-        "timed out",
-    ):
-        if needle in lower:
-            return needle
-    if len(text) > 72:
-        return text[:69] + "..."
-    return text
-
-
 @dataclass(frozen=True)
 class RetryDecision:
     """Why an Internet Archive operation should be retried."""

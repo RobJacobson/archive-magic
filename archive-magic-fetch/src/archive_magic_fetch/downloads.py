@@ -38,7 +38,6 @@ from .retry import (
     format_seconds,
     retry_decision,
     retry_delay_seconds,
-    short_cause,
     sleep_seconds,
 )
 from .warc_records import timestamp_to_warc_date
@@ -69,6 +68,12 @@ _REPRESENTATION_HEADERS = {
     "repr-digest",
     "transfer-encoding",
 }
+
+
+def _one_line(value: object) -> str:
+    """Collapse one value to a single console line."""
+
+    return " ".join(str(value).split())
 
 
 class ThreadClientPool:
@@ -121,9 +126,10 @@ class MalformedContentEncodingError(MementoPlaybackError):
         self.cause = cause
         label = encoding or "content"
         detail = f"{label} decode failed"
-        cause_text = short_cause(cause)
-        if cause_text:
-            detail = f"{detail} ({cause_text})"
+        if cause is not None:
+            cause_text = _one_line(cause)
+            if cause_text:
+                detail = f"{detail} ({cause_text})"
         super().__init__(f"{detail}; raw recovery digest mismatch")
 
 
@@ -163,7 +169,7 @@ def format_playback_failure(error: Exception) -> str:
         return str(error)
     if isinstance(error, RetryExhaustedError):
         noun = "attempt" if error.attempts == 1 else "attempts"
-        cause = short_cause(error.cause)
+        cause = _one_line(error.cause)
         detail = (
             f"failed after {error.attempts} {noun} over "
             f"{error.elapsed_seconds:.1f}s"
@@ -176,11 +182,11 @@ def format_playback_failure(error: Exception) -> str:
             else "?"
         )
         noun = "attempt" if error.retries == 1 else "attempts"
-        cause = short_cause(getattr(error, "cause", None))
+        nested = getattr(error, "cause", None)
+        cause = _one_line(nested) if nested is not None else ""
         detail = f"failed after {error.retries} {noun} over {elapsed}"
         return f"{detail}: {cause}" if cause else detail
-    return short_cause(error) or type(error).__name__
-
+    return _one_line(error) or type(error).__name__
 
 def _content_encoding(memento) -> Optional[str]:
     """Return the replay response encoding involved in a decode failure."""
@@ -478,7 +484,7 @@ def _download_capture_with_retry(
                 attempt_number,
                 retry_after=decision.retry_after,
             )
-            cause = short_cause(decision.cause)
+            cause = _one_line(decision.cause)
             after = f" after {cause}" if cause else ""
             print_progress(
                 f"{capture_label}\n  retry {attempt_number}/{retries} in "

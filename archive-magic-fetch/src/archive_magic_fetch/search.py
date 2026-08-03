@@ -18,7 +18,6 @@ from .retry import (
     format_seconds,
     retry_decision,
     retry_delay_seconds,
-    short_cause,
     sleep_seconds,
 )
 
@@ -192,7 +191,7 @@ def search_captures(
                 attempt_number,
                 retry_after=decision.retry_after,
             )
-            cause = short_cause(decision.cause)
+            cause = " ".join(str(decision.cause).split())
             after = f" after {cause}" if cause else ""
             print_progress(
                 f"{query_url}\n  retry {attempt_number}/{retries} in "
