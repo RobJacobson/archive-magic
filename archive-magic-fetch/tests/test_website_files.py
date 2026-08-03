@@ -144,8 +144,13 @@ def test_files_latest_writes_website_without_timestamps(tmp_path, capsys):
     assert not (layout.replay_index).exists()
     output = capsys.readouterr().out.splitlines()
     assert output[0] == "Website files: building 2 histories with 8 workers"
-    assert len([line for line in output if line.startswith("[")]) == 2
-    assert all("1 written, 0 failed" in line for line in output[1:])
+    headers = [line for line in output if line.startswith("[")]
+    assert len(headers) == 2
+    assert all(line.startswith("http://web.archive.org/web/*/") for line in (
+        headers[0].split("] ", 1)[1],
+        headers[1].split("] ", 1)[1],
+    ))
+    assert output.count("  1 written, 0 failed") == 2
 
 
 def test_files_all_writes_timestamp_directories(tmp_path):
@@ -292,7 +297,7 @@ def test_dual_mode_reuses_one_representative_download(tmp_path, capsys):
         layout.website_root / "example.com" / "index.html"
     ).read_bytes() == b"shared-body"
     output = capsys.readouterr().out
-    assert "archive/example.com/index.warc.gz" in output
+    assert "http://web.archive.org/web/*/https://example.com/" in output
     assert "files 1 written, 0 failed" in output
     assert "Website files:" not in output
 

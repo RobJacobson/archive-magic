@@ -1093,7 +1093,9 @@ def test_warc_all_runs_different_warc_batches_concurrently(
 
     def record_print(*args, **kwargs):
         real_print(*args, **kwargs)
-        if args and "archive/example.com/b.warc.gz" in str(args[0]):
+        if args and "http://web.archive.org/web/*/https://example.com/b" in str(
+            args[0]
+        ):
             second_reported.set()
 
     monkeypatch.setattr(warc_files, "print", record_print, raising=False)
@@ -1159,8 +1161,8 @@ def test_warc_all_runs_different_warc_batches_concurrently(
     completed = [
         line for line in output.splitlines() if line.startswith("[")
     ]
-    assert "archive/example.com/b.warc.gz" in completed[0]
-    assert "archive/example.com/a.warc.gz" in completed[1]
+    assert "http://web.archive.org/web/*/https://example.com/b" in completed[0]
+    assert "http://web.archive.org/web/*/https://example.com/a" in completed[1]
 
 
 def test_thread_client_pool_reuses_and_closes_client():

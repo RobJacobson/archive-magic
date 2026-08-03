@@ -846,6 +846,27 @@ def _build_warc(
     )
 
 
+def _wayback_calendar_url(original_url: str) -> str:
+    """Return a Wayback calendar URL for one original capture URL."""
+
+    return f"http://web.archive.org/web/*/{original_url}"
+
+
+def _batch_display_url(batch: WarcBatch) -> str:
+    """Return the console URL for one WARC batch."""
+
+    for history in batch.histories:
+        sample = next(iter(history.warc_captures), None)
+        if sample is not None and isinstance(sample.original, str):
+            return _wayback_calendar_url(sample.original)
+        if history.website_files:
+            capture = history.website_files[0].capture
+            if isinstance(capture.original, str):
+                return _wayback_calendar_url(capture.original)
+    relative = batch.path.name
+    return relative
+
+
 def build_warc_files(
     captures_by_url: Mapping[tuple[str, str], Sequence[CdxRecord]],
     client,
@@ -941,19 +962,20 @@ def build_warc_files(
         if not isinstance(batch, WarcBatch):
             return
         completed_warcs += 1
-        relative = batch.path.relative_to(layout.collection_root).as_posix()
-        line = (
-            f"[{completed_warcs}/{total_warcs}] {relative}: "
+        print(
+            f"[{completed_warcs}/{total_warcs}] {_batch_display_url(batch)}"
+        )
+        stats = (
             f"{result.warc.responses} responses, "
             f"{result.warc.revisits} revisits, "
             f"{result.warc.playback_failures} failed"
         )
         if result.files.selected:
-            line += (
+            stats += (
                 f", files {result.files.written} written, "
                 f"{result.files.playback_failures} failed"
             )
-        print(line)
+        print(f"  {stats}")
         for message in result.messages:
             print(f"  {message}")
 
@@ -969,8 +991,11 @@ def build_warc_files(
         completed_files += 1
         original = batch.history.website_files[0].capture.original
         print(
-            f"[{completed_files}/{len(website_batches)}] {original}: "
-            f"{result.files.written} written, "
+            f"[{completed_files}/{len(website_batches)}] "
+            f"{_wayback_calendar_url(original)}"
+        )
+        print(
+            f"  {result.files.written} written, "
             f"{result.files.playback_failures} failed"
         )
         for message in result.messages:

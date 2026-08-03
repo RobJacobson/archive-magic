@@ -219,10 +219,13 @@ The console reports phases and completed files, not successful captures:
 Fetch example.com/* (1995-20260803): WARC all, files none, redirects website, 8 workers
 Search: 120 captures in 18 URL histories
 WARC files: building 18 with 8 workers
-[1/18] archive/example.com/index.warc.gz: 4 responses, 3 revisits, 0 failed
+[1/18] http://web.archive.org/web/*/https://example.com/
+  4 responses, 3 revisits, 0 failed
 Redirect: +2 histories from https://target.org/
-[2/20] archive/example.com/about.warc.gz: 1 responses, 0 revisits, 0 failed
-[3/20] archive/target.org/index.warc.gz: 8 responses, 1 revisits, 1 failed
+[2/20] http://web.archive.org/web/*/https://example.com/about
+  1 responses, 0 revisits, 0 failed
+[3/20] http://web.archive.org/web/*/https://target.org/
+  8 responses, 1 revisits, 1 failed
   https://web.archive.org/...
     truncated after 9 attempts over 12.0s (1,000/2,000 bytes)
 Replay index: replay/index.cdxj from 20 WARC files
@@ -230,9 +233,10 @@ Done in 2.3 minutes: 155 selected, 120 responses, 34 revisits, 1 failed
 ```
 
 Retries print immediately because a worker may wait through a long backoff.
-Capture failures and warnings print the URL on one line and a single indented
-detail line beneath it. File counts are appended to their owning WARC
-line. Redirect expansion prints a short `Redirect: +N histories from <url>`
+WARC completions print a Wayback calendar URL, then an indented stats line.
+Capture failures and warnings print the capture URL on one line and a single
+indented detail line beneath it. File counts are appended to their owning WARC
+stats line. Redirect expansion prints a short `Redirect: +N histories from <url>`
 line when new WARC work is queued. File-only histories appear in a separate
 `Website files` phase.
 
