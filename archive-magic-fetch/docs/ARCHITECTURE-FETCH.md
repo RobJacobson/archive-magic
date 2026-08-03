@@ -165,7 +165,7 @@ up URL keys in collection-wide capture dictionaries.
 One worker owns one `WarcBatch` from start to finish:
 
 1. inventory an existing WARC when present;
-2. open one exclusive temporary WARC on demand;
+2. replace any leftover temporary WARC, then open one exclusive temporary on demand;
 3. process the batch's URL histories sequentially;
 4. preserve capture order and per-history digest/revisit state;
 5. validate the completed temporary WARC;

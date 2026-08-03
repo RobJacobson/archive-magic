@@ -65,6 +65,8 @@ class _WarcFileBuilder:
 
     def get_writer(self):
         if self.writer is None:
+            if self.temporary_path.exists():
+                self.temporary_path.unlink()
             self.stream, self.writer = open_new_warc(
                 self.temporary_path,
                 self.final_path.name,

@@ -770,22 +770,28 @@ def test_local_open_failure_is_fatal(tmp_path, monkeypatch, capsys):
     assert "WARNING" not in capsys.readouterr().err
 
 
-def test_existing_temporary_is_not_removed_by_losing_build(tmp_path):
+def test_existing_temporary_is_replaced_on_rebuild(tmp_path):
     selected = capture()
     target = output_path(tmp_path)
     temporary = target.with_name(target.name + ".tmp")
     temporary.parent.mkdir(parents=True)
-    temporary.write_bytes(b"active rebuild")
+    temporary.write_bytes(b"stale rebuild")
+    client = FakeClient({selected: memento_for(selected)})
 
-    with pytest.raises(FileExistsError):
-        warc_files.build_url_history(
-            URLKEY,
-            [selected],
-            target,
-            FakeClient({selected: memento_for(selected)}),
-        )
+    summary = warc_files.build_url_history(
+        URLKEY,
+        [selected],
+        target,
+        client,
+    )
 
-    assert temporary.read_bytes() == b"active rebuild"
+    assert summary.responses == 1
+    assert not temporary.exists()
+    assert target.is_file()
+    assert [record.rec_type for record in read_records(target)] == [
+        "warcinfo",
+        "response",
+    ]
 
 
 def test_warc_serialization_failure_is_fatal(tmp_path, monkeypatch):
