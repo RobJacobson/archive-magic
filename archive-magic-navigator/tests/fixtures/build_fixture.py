@@ -19,6 +19,8 @@ MAIN_URL = "http://example.test/"
 CSS_URL = "http://example.test/assets/site.css"
 REDIRECT_URL = "http://redirect.test/"
 FALLBACK_URL = "http://fallback.test/"
+LOCAL_REDIRECT_URL = "http://local-redirect.test/"
+LOCAL_TARGET_URL = "http://local-target.test/"
 
 
 def http_headers(
@@ -68,6 +70,60 @@ def main() -> None:
                 MAIN_URL,
                 "text/html",
                 first,
+                start,
+                stream.tell() - start,
+            )
+        )
+
+        local_redirect = writer.create_warc_record(
+            LOCAL_REDIRECT_URL,
+            "response",
+            payload=BytesIO(b""),
+            http_headers=http_headers(
+                "text/html; charset=utf-8",
+                status="301 Moved Permanently",
+                extra=(("Location", LOCAL_TARGET_URL),),
+            ),
+            warc_headers_dict={
+                "WARC-Date": "2020-01-01T00:00:03Z",
+                "WARC-Record-ID": "<urn:uuid:00000000-0000-0000-0000-000000000006>",
+            },
+        )
+        start = stream.tell()
+        writer.write_record(local_redirect)
+        entries.append(
+            entry(
+                "test,local-redirect)/",
+                "20200101000003",
+                LOCAL_REDIRECT_URL,
+                "text/html",
+                local_redirect,
+                start,
+                stream.tell() - start,
+                status="301",
+            )
+        )
+
+        local_target_body = b"<html>Redirect target captured locally</html>"
+        local_target = writer.create_warc_record(
+            LOCAL_TARGET_URL,
+            "response",
+            payload=BytesIO(local_target_body),
+            http_headers=http_headers("text/html; charset=utf-8"),
+            warc_headers_dict={
+                "WARC-Date": "2020-01-01T00:00:00Z",
+                "WARC-Record-ID": "<urn:uuid:00000000-0000-0000-0000-000000000007>",
+            },
+        )
+        start = stream.tell()
+        writer.write_record(local_target)
+        entries.append(
+            entry(
+                "test,local-target)/",
+                "20200101000000",
+                LOCAL_TARGET_URL,
+                "text/html",
+                local_target,
                 start,
                 stream.tell() - start,
             )

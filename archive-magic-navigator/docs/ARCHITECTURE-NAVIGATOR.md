@@ -134,6 +134,7 @@ The applications have separate ownership:
 Fetch is responsible for:
 
 - capture discovery and selection;
+- recursive capture-time expansion of permanent redirect targets when enabled;
 - network retrieval and retry;
 - WARC record construction and validation;
 - response/revisit identity;
@@ -151,6 +152,13 @@ Navigator is responsible for:
 - replay-oriented console errors;
 - minimal UI branding; and
 - browser-facing routes.
+
+Fetch's default redirect closure and Navigator's default Wayback fallback are
+complementary. A locally captured target is authoritative and prevents remote
+lookup. Fallback covers targets or assets that closure did not capture because
+they were outside the Fetch date range, unavailable, unsupported, or omitted
+with `--redirect-capture none`. Navigator neither knows nor needs to know which
+records entered the collection through closure.
 
 Navigator does not depend on `archive-magic-fetch`. A user may copy a valid
 Archive Magic collection to a machine that has only Navigator installed and serve

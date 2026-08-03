@@ -205,7 +205,7 @@ def test_real_pywb_replays_versions_revisit_and_subresources_read_only(
     collection_root = archives / "fixture"
     shutil.copytree(FIXTURE, collection_root)
     collection = Collection("fixture", collection_root.resolve())
-    assert validate_collection(collection).record_count == 5
+    assert validate_collection(collection).record_count == 7
     before = snapshot_tree(archives)
 
     SentinelHandler.requests = 0
@@ -275,6 +275,13 @@ def test_real_pywb_replays_versions_revisit_and_subresources_read_only(
             assert css == b"body { color: rgb(18, 52, 86); }\n"
             assert headers.get_content_type() == "text/css"
 
+            _, local_redirect_target, _ = get(
+                base
+                + "/fixture/20200101000003mp_/"
+                + "http://local-redirect.test/"
+            )
+            assert b"Redirect target captured locally" in local_redirect_target
+
             with pytest.raises(HTTPError) as raised:
                 get(
                     base
@@ -300,7 +307,7 @@ def test_real_pywb_uses_wayback_fallback_for_redirect_and_assets(
     collection_root = archives / "fixture"
     shutil.copytree(FIXTURE, collection_root)
     collection = Collection("fixture", collection_root.resolve())
-    assert validate_collection(collection).record_count == 5
+    assert validate_collection(collection).record_count == 7
     before = snapshot_tree(archives)
 
     with memento_server() as (source, handler):
