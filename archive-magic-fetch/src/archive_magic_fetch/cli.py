@@ -69,10 +69,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> FetchSettings:
     parser.add_argument(
         "--redirect-capture",
         choices=REDIRECT_CAPTURE_MODES,
-        default="website",
+        default="page",
         help=(
             "Capture permanent redirect targets into WARC as none, exact "
-            "page history, or full host history (default: website)"
+            "page history, or host history for site-root Locations "
+            "(default: page)"
         ),
     )
     parser.add_argument(

@@ -122,16 +122,26 @@ captured URL (fragment removed). Missing or invalid `Location` values are
 warnings. Statuses such as 302, 303, and 307 are still preserved in final
 WARCs when selected, but never introduce searches.
 
-The main thread translates each unseen target into either:
+The coordinator translates each unseen target into either:
 
 - an exact page search for `--redirect-capture page`; or
-- a normalized host search for `--redirect-capture website`.
+- for `--redirect-capture website`, a normalized host search when the
+  Location is a site root (`/` with no query), otherwise an exact page search.
 
-These CDX searches stay serial on the main Wayback client. Every nonempty
-result is saved as source files. Only URL histories that were not already
-selected from the primary search are allocated as new WARC batches and pushed
-onto the live work queue. Search scopes are deduplicated, so cycles terminate.
-Discovery stops when finished WARCs yield no unseen redirect searches.
+Deep Location paths never trigger host-wide CDX, so an asset CDN permanent
+redirect cannot pull an entire third-party host. Site-root Locations still
+expand to host history when website mode is selected. The CLI default is
+`--redirect-capture page`.
+
+These CDX searches run on a dedicated single-thread expand executor, not on
+the WARC coordinator. WARC workers keep filling from the pending queue while
+an expand is in flight. Expands stay serial on the shared main Wayback client.
+Every nonempty result is saved as source files. Only URL histories that were
+not already selected from the primary search are allocated as new WARC batches
+and pushed onto the live work queue. Search scopes are deduplicated, so cycles
+terminate. Discovery stops when finished WARCs yield no unseen redirect
+searches. Long redirect CDX pulls print a start line and periodic fetch
+progress so they are not mistaken for a stalled WARC build.
 
 Redirect responses are downloaded once for final WARC storage; there is no
 separate discarded probe pass. Existing valid WARC responses may still be
@@ -172,8 +182,9 @@ One worker owns one `WarcBatch` from start to finish:
 6. atomically replace the final path once.
 
 Different WARC batches run concurrently and may finish out of allocation
-order. Redirect expansion may append additional batches while workers are
-still running; the completion counter's denominator grows when that happens.
+order. Redirect expansion is scheduled off the coordinator when a finished
+WARC yields Location targets; additional batches are appended when that expand
+completes, and the completion counter's denominator grows when that happens.
 A URL history never has two WARC owners. Histories selected for both WARC and
 loose-file output stay attached to the WARC batch and use the same downloaded
 body. Histories selected only for files run as `WebsiteBatch` values in a
@@ -216,7 +227,7 @@ the domain-folder path in the CDXJ `filename` field.
 The console reports phases and completed files, not successful captures:
 
 ```text
-Fetch example.com/* (1995-20260803): WARC all, files none, redirects website, 8 workers
+Fetch example.com/* (1995-20260803): WARC all, files none, redirects page, 8 workers
 Search: 120 captures in 18 URL histories
 WARC files: building 18 with 8 workers
 [1/18] http://web.archive.org/web/*/https://example.com/

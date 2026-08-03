@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Sequence
+from typing import Callable, Optional, Sequence
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
 from wayback import CdxRecord
@@ -73,20 +73,36 @@ def resolve_redirect_target(
 
 
 def redirect_scope(url: str, mode: str) -> RedirectScope:
-    """Translate a target URL into an exact-page or exact-host CDX query."""
+    """Translate a target URL into an exact-page or host-root CDX query.
+
+    In ``website`` mode, only site-root Locations (``/`` with no query) expand
+    to a host-wide CDX search. Deeper paths stay exact so an asset CDN 301
+    cannot pull an entire third-party host.
+    """
 
     if mode not in {"page", "website"}:
         raise ValueError(f"unsupported redirect capture mode: {mode}")
     parsed = urlsplit(url)
     host, port = normalize_domain(url)
     authority = (host, port)
-    if mode == "website":
+    path = parsed.path or "/"
+    if mode == "website" and path == "/" and not parsed.query:
         return RedirectScope(authority, url, "host")
     return RedirectScope(
-        (*authority, parsed.path or "/", parsed.query),
+        (*authority, path, parsed.query),
         url,
         "exact",
     )
+
+
+def _redirect_search_label(scope: RedirectScope) -> str:
+    """Return a short console label for one redirect CDX search."""
+
+    if scope.match_type == "host":
+        host, port = scope.key[0], scope.key[1]
+        authority = host if port is None else f"{host}:{port}"
+        return f"host {authority}"
+    return f"page {scope.url}"
 
 
 def expand_redirect_target(
@@ -99,6 +115,7 @@ def expand_redirect_target(
     seen_searches: set[tuple[object, ...]],
     known_history_keys: set[tuple[str, str]],
     retries: int = DEFAULT_RETRIES,
+    progress: Optional[Callable[[int], None]] = None,
 ) -> Optional[RedirectExpansion]:
     """CDX-search one Location target and return only unseen URL histories.
 
@@ -110,12 +127,14 @@ def expand_redirect_target(
     if scope.key in seen_searches:
         return None
     seen_searches.add(scope.key)
+    print(f"Redirect search: {_redirect_search_label(scope)}")
     captures = search_captures(
         client,
         scope.url,
         date_start,
         date_end,
         match_type=scope.match_type,
+        progress=progress,
         retries=retries,
     )
     if not captures:

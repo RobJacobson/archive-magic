@@ -1171,6 +1171,98 @@ def test_warc_all_runs_different_warc_batches_concurrently(
     assert "http://web.archive.org/web/*/https://example.com/a" in completed[1]
 
 
+def test_redirect_expand_does_not_block_warc_workers(
+    tmp_path,
+    capsys,
+    monkeypatch,
+):
+    redirected = capture(
+        original="https://example.com/start",
+        captured="20170101000000",
+        payload=b"redirect",
+        statuscode=301,
+        urlkey="com,example)/start",
+    )
+    other = capture(
+        original="https://example.com/other",
+        captured="20180101000000",
+        payload=b"other",
+        urlkey="com,example)/other",
+    )
+    expand_started = threading.Event()
+    release_expand = threading.Event()
+    other_reported = threading.Event()
+    real_print = print
+
+    def record_print(*args, **kwargs):
+        real_print(*args, **kwargs)
+        if args and "http://web.archive.org/web/*/https://example.com/other" in str(
+            args[0]
+        ):
+            other_reported.set()
+
+    monkeypatch.setattr(warc_files, "print", record_print, raising=False)
+
+    class FactoryClient:
+        def __init__(self):
+            self.calls = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def get_memento(self, selected, **kwargs):
+            self.calls.append(selected)
+            if selected is redirected:
+                return memento_for(
+                    selected,
+                    payload=b"redirect",
+                    status_code=301,
+                    headers={"Location": "https://target.test/landing"},
+                )
+            return memento_for(selected, payload=b"other")
+
+    def factory():
+        return FactoryClient()
+
+    def expand(targets):
+        assert targets == ("https://target.test/landing",)
+        expand_started.set()
+        assert release_expand.wait(timeout=10)
+        return []
+
+    layout = collection_paths.collection_paths(
+        "https://example.com/*",
+        root=tmp_path / "archives",
+    )
+    groups = {
+        redirected.urlkey: [redirected],
+        other.urlkey: [other],
+    }
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(
+            warc_files.build_warc_files,
+            groups,
+            FactoryClient(),
+            layout=layout,
+            client_factory=factory,
+            worker_count=2,
+            collect_redirects=True,
+            expand_redirects=expand,
+        )
+        assert expand_started.wait(timeout=2)
+        assert other_reported.wait(timeout=2)
+        assert not future.done()
+        release_expand.set()
+        result = future.result(timeout=2)
+
+    assert result.warc_counts.responses == 2
+    assert len(result.built_warcs) == 2
+
+
 def test_thread_client_pool_reuses_and_closes_client():
     created = []
 

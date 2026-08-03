@@ -84,6 +84,7 @@ def _redirect_expand(
                 seen_searches=seen_searches,
                 known_history_keys=known_history_keys,
                 retries=retries,
+                progress=_report_discovery_progress,
             )
             if expansion is None:
                 continue

@@ -1019,13 +1019,8 @@ def build_warc_files(
         if not pending:
             return results
 
-        def finish(batch: WarcBatch | WebsiteBatch, result: _BuiltBatch) -> None:
+        def accept_expanded(added: Sequence[WarcBatch]) -> None:
             nonlocal total_warcs
-            results.append(result)
-            report_finished(batch, result)
-            if expand is None or not isinstance(batch, WarcBatch):
-                return
-            added = list(expand(result.redirect_targets))
             if not added:
                 return
             for warc_batch in added:
@@ -1033,10 +1028,20 @@ def build_warc_files(
             pending.extend(added)
             total_warcs += len(added)
 
+        def finish_sync(
+            batch: WarcBatch | WebsiteBatch,
+            result: _BuiltBatch,
+        ) -> None:
+            results.append(result)
+            report_finished(batch, result)
+            if expand is None or not isinstance(batch, WarcBatch):
+                return
+            accept_expanded(expand(result.redirect_targets))
+
         if client_factory is None:
             while pending:
                 batch = pending.pop(0)
-                finish(batch, run(batch, client))
+                finish_sync(batch, run(batch, client))
             return results
 
         clients = ThreadClientPool(client_factory)
@@ -1046,17 +1051,37 @@ def build_warc_files(
 
         try:
             with ThreadPoolExecutor(max_workers=worker_count) as pool:
-                in_flight: dict = {}
-                while pending or in_flight:
-                    while pending and len(in_flight) < worker_count:
-                        batch = pending.pop(0)
-                        in_flight[pool.submit(run_with_thread_client, batch)] = (
-                            batch
+                with ThreadPoolExecutor(max_workers=1) as expand_pool:
+                    warc_futures: dict = {}
+                    expand_futures: dict = {}
+                    while pending or warc_futures or expand_futures:
+                        while pending and len(warc_futures) < worker_count:
+                            batch = pending.pop(0)
+                            warc_futures[
+                                pool.submit(run_with_thread_client, batch)
+                            ] = batch
+                        done, _ = wait(
+                            set(warc_futures) | set(expand_futures),
+                            return_when=FIRST_COMPLETED,
                         )
-                    done, _ = wait(in_flight, return_when=FIRST_COMPLETED)
-                    for finished in done:
-                        batch = in_flight.pop(finished)
-                        finish(batch, finished.result())
+                        for finished in done:
+                            if finished in warc_futures:
+                                batch = warc_futures.pop(finished)
+                                result = finished.result()
+                                results.append(result)
+                                report_finished(batch, result)
+                                if (
+                                    expand is not None
+                                    and isinstance(batch, WarcBatch)
+                                    and result.redirect_targets
+                                ):
+                                    targets = tuple(result.redirect_targets)
+                                    expand_futures[
+                                        expand_pool.submit(expand, targets)
+                                    ] = targets
+                                continue
+                            expand_futures.pop(finished)
+                            accept_expanded(finished.result())
         finally:
             clients.close()
         return results

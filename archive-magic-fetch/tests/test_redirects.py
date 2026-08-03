@@ -86,15 +86,20 @@ def test_page_scope_keeps_paths_queries_and_significant_ports_distinct():
     assert len(scopes) == 4
 
 
-def test_website_scope_uses_a_host_query_and_canonicalizes_www():
-    first = redirect_scope("http://www.target.test/one", "website")
-    second = redirect_scope("https://target.test/two", "website")
-    numbered = redirect_scope("https://www1.target.test/three", "website")
+def test_website_scope_uses_host_query_only_for_site_root_locations():
+    root = redirect_scope("http://www.target.test/", "website")
+    also_root = redirect_scope("https://target.test", "website")
+    deep = redirect_scope("https://target.test/assets/file.jpg", "website")
+    queried = redirect_scope("https://target.test/?q=1", "website")
+    numbered = redirect_scope("https://www1.target.test/", "website")
 
-    assert first.url == "http://www.target.test/one"
-    assert first.match_type == "host"
-    assert first.key == second.key
-    assert numbered.key == second.key
+    assert root.match_type == "host"
+    assert root.key == also_root.key
+    assert numbered.key == root.key
+    assert deep.match_type == "exact"
+    assert deep.key != root.key
+    assert queried.match_type == "exact"
+    assert queried.key != root.key
 
 
 def test_redirect_scope_rejects_unknown_mode():
@@ -187,3 +192,74 @@ def test_expand_redirect_target_returns_none_for_empty_search(monkeypatch):
         )
         is None
     )
+
+
+def test_expand_redirect_target_prints_search_label_and_forwards_progress(
+    monkeypatch,
+    capsys,
+):
+    progress_counts = []
+
+    def fake_search(_client, url, *_args, progress=None, **_kwargs):
+        assert url == "https://target.test/page"
+        if progress is not None:
+            progress(10_000)
+        return []
+
+    monkeypatch.setattr(redirects, "search_captures", fake_search)
+
+    expand_redirect_target(
+        _Client(),
+        "https://target.test/page",
+        mode="page",
+        date_start="1995",
+        date_end="2001",
+        seen_searches=set(),
+        known_history_keys=set(),
+        retries=0,
+        progress=progress_counts.append,
+    )
+
+    assert progress_counts == [10_000]
+    assert "Redirect search: page https://target.test/page" in (
+        capsys.readouterr().out
+    )
+
+
+def test_expand_website_deep_path_stays_exact_and_labels_as_page(
+    monkeypatch,
+    capsys,
+):
+    monkeypatch.setattr(redirects, "search_captures", lambda *_a, **_k: [])
+
+    expand_redirect_target(
+        _Client(),
+        "https://www.target.test/assets/SHARE-5-web.jpg",
+        mode="website",
+        date_start="1995",
+        date_end="2001",
+        seen_searches=set(),
+        known_history_keys=set(),
+        retries=0,
+    )
+
+    assert "Redirect search: page https://www.target.test/assets/SHARE-5-web.jpg" in (
+        capsys.readouterr().out
+    )
+
+
+def test_expand_website_root_search_label_uses_host(monkeypatch, capsys):
+    monkeypatch.setattr(redirects, "search_captures", lambda *_a, **_k: [])
+
+    expand_redirect_target(
+        _Client(),
+        "https://www.target.test/",
+        mode="website",
+        date_start="1995",
+        date_end="2001",
+        seen_searches=set(),
+        known_history_keys=set(),
+        retries=0,
+    )
+
+    assert "Redirect search: host target.test" in capsys.readouterr().out

@@ -15,7 +15,7 @@ def test_parse_args_returns_plain_fetch_settings(monkeypatch):
         warc_mode="all",
         files_mode="none",
         rewrite_local=False,
-        redirect_capture="website",
+        redirect_capture="page",
         worker_count=DEFAULT_WORKER_COUNT,
         retries=8,
     )
