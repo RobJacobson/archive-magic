@@ -1,10 +1,8 @@
 from datetime import datetime, timezone
-from pathlib import Path
 
 from wayback import CdxRecord
 
 from archive_magic_fetch import fetch
-from archive_magic_fetch.redirects import RedirectDiscovery, RedirectSearch
 from archive_magic_fetch.warc_files import BuiltFiles, WarcCounts
 
 
@@ -71,71 +69,37 @@ def install_common(monkeypatch, tmp_path, captures):
     return client, paths
 
 
-def test_run_fetch_builds_final_warcs_once_after_redirect_discovery(
+def test_run_fetch_passes_primary_histories_and_inline_redirect_expand(
     monkeypatch,
     tmp_path,
 ):
     primary = capture(statuscode=301)
-    target = capture(
-        urlkey="org,target)/",
-        original="https://target.org/",
-    )
     client, paths = install_common(monkeypatch, tmp_path, [primary])
     calls = []
-    saved_searches = []
-    monkeypatch.setattr(
-        fetch,
-        "save_search_results",
-        lambda captures, **kwargs: (
-            saved_searches.append((tuple(captures), kwargs["url_pattern"]))
-            or type("SearchFiles", (), {"path": tmp_path})()
-        ),
-    )
-    redirects = RedirectDiscovery(
-        captures=(target,),
-        searches=(
-            RedirectSearch(
-                type(
-                    "Scope",
-                    (),
-                    {
-                        "url": "https://target.org/",
-                        "key": ("target.org",),
-                        "match_type": "host",
-                    },
-                )(),
-                (target,),
-            ),
-        ),
-        failed_capture_urls=(),
-        messages=(),
-        additional_domains=1,
-    )
-    monkeypatch.setattr(
-        fetch,
-        "discover_redirect_captures",
-        lambda *args, **kwargs: redirects,
-    )
 
     def build(groups, active_client, **kwargs):
         calls.append((groups, active_client, kwargs))
-        return BuiltFiles(WarcCounts(selected=2, responses=2), ())
+        return BuiltFiles(WarcCounts(selected=1, responses=1), ())
 
     monkeypatch.setattr(fetch, "build_warc_files", build)
+    monkeypatch.setattr(
+        fetch,
+        "allocate_warc_paths",
+        lambda captures_by_url, layout: {
+            layout.collection_root / "archive" / "example.com" / "index.warc.gz": (
+                ("example.com", primary.urlkey),
+            )
+        },
+    )
 
     assert fetch.run_fetch(settings(redirect_capture="website")) is True
     assert len(calls) == 1
     assert calls[0][1] is client
-    assert set(calls[0][0]) == {
-        ("example.com", primary.urlkey),
-        ("target.org", target.urlkey),
-    }
+    assert set(calls[0][0]) == {("example.com", primary.urlkey)}
     assert calls[0][2]["layout"] is paths
     assert calls[0][2]["worker_count"] == 8
-    assert saved_searches == [
-        ((primary,), "example.com/*"),
-        ((target,), "https://target.org/"),
-    ]
+    assert calls[0][2]["collect_redirects"] is True
+    assert callable(calls[0][2]["expand_redirects"])
 
 
 def test_run_fetch_prints_compact_phases_without_final_failed_url_list(
@@ -162,26 +126,37 @@ def test_run_fetch_prints_compact_phases_without_final_failed_url_list(
     assert "Done in " in output
     assert "1 selected, 0 responses, 0 revisits, 1 failed" in output
     assert "Failed captures:" not in output
+    assert "Redirects:" not in output
 
 
-def test_redirect_histories_ignore_primary_latest_and_stay_out_of_files(
+def test_redirect_capture_disabled_when_warc_none(monkeypatch, tmp_path):
+    selected = capture()
+    install_common(monkeypatch, tmp_path, [selected])
+    calls = []
+
+    def build(groups, active_client, **kwargs):
+        calls.append(kwargs)
+        return BuiltFiles(WarcCounts(), ())
+
+    monkeypatch.setattr(fetch, "build_warc_files", build)
+    monkeypatch.setattr(
+        fetch,
+        "prepare_website_files",
+        lambda *_args, **_kwargs: object(),
+    )
+
+    assert fetch.run_fetch(
+        settings(warc_mode="none", files_mode="latest", redirect_capture="page")
+    ) is True
+    assert calls[0]["collect_redirects"] is False
+    assert calls[0]["expand_redirects"] is None
+
+
+def test_files_mode_still_prepares_website_files_without_redirect_stage(
     monkeypatch,
     tmp_path,
 ):
     primary = capture(statuscode=301)
-    first_target = capture(
-        urlkey="org,target)/",
-        original="https://target.org/",
-    )
-    second_target = CdxRecord(
-        urlkey=first_target.urlkey,
-        timestamp=datetime(2001, 1, 1, tzinfo=timezone.utc),
-        original=first_target.original,
-        mimetype=first_target.mimetype,
-        statuscode=first_target.statuscode,
-        digest="B" * 32,
-        length=first_target.length,
-    )
     client, _paths = install_common(monkeypatch, tmp_path, [primary])
     website_files = object()
     monkeypatch.setattr(
@@ -191,21 +166,19 @@ def test_redirect_histories_ignore_primary_latest_and_stay_out_of_files(
     )
     monkeypatch.setattr(
         fetch,
-        "discover_redirect_captures",
-        lambda *_args, **_kwargs: RedirectDiscovery(
-            captures=(first_target, second_target),
-            searches=(),
-            failed_capture_urls=(),
-            messages=(),
-            additional_domains=1,
-        ),
+        "allocate_warc_paths",
+        lambda captures_by_url, layout: {
+            layout.collection_root / "archive" / "example.com" / "index.warc.gz": (
+                ("example.com", primary.urlkey),
+            )
+        },
     )
     builds = []
 
     def build(captures_by_url, active_client, **kwargs):
         assert active_client is client
         builds.append((captures_by_url, kwargs))
-        return BuiltFiles(WarcCounts(selected=3, responses=3), ())
+        return BuiltFiles(WarcCounts(selected=1, responses=1), ())
 
     monkeypatch.setattr(fetch, "build_warc_files", build)
 
@@ -218,14 +191,13 @@ def test_redirect_histories_ignore_primary_latest_and_stay_out_of_files(
     ) is True
 
     captures_by_url, kwargs = builds[0]
-    assert captures_by_url[("target.org", "org,target)/")] == [
-        first_target,
-        second_target,
-    ]
+    assert set(captures_by_url) == {("example.com", primary.urlkey)}
     assert set(kwargs["file_captures_by_url"]) == {
         ("example.com", primary.urlkey)
     }
     assert kwargs["website_files"] is website_files
+    assert kwargs["collect_redirects"] is True
+    assert callable(kwargs["expand_redirects"])
 
 
 def test_run_fetch_empty_search_is_compact_success(monkeypatch, tmp_path, capsys):

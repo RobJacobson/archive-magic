@@ -147,6 +147,5 @@ def test_redirect_page_history_is_written_with_primary_in_one_collection(
     assert len(tuple((collection / "sources").iterdir())) == 2
     assert [capture for capture, _kwargs in client.playback_calls] == [
         primary,
-        primary,
         target,
     ]

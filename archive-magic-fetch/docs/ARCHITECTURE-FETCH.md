@@ -5,9 +5,9 @@ Archive Magic Fetch performs two concrete operations:
 1. Search Internet Archive for each URL's captures across time.
 2. Build final WARC files from those URL histories.
 
-The implementation deliberately separates searching from writing. Redirect
-discovery reaches closure before WARC paths are allocated, so every final WARC
-has one owner and is built exactly once.
+The implementation deliberately separates searching from writing. WARC builds
+start from the primary search selection. Permanent redirects discovered while
+writing a response enqueue additional URL histories as new WARC work.
 
 ## Command line
 
@@ -23,13 +23,13 @@ archive-magic-fetch URL_PATTERN
   [--rewrite-local]
 ```
 
-`--workers` defaults to 8. It is the maximum number of simultaneous
-redirect probes or WARC builds. There is no `--concurrency` alias.
+`--workers` defaults to 8. It is the maximum number of simultaneous WARC
+builds. There is no `--concurrency` alias.
 
-CDX searches remain serial because they define the set of work. Network-bound
-redirect probes and independent WARC files use bounded thread pools. Each pool
-thread lazily creates and reuses one Wayback client; all clients retain the
-shared process-wide Internet Archive rate limit.
+CDX searches remain serial because they define the set of work. Independent
+WARC files use a bounded thread pool. Each pool thread lazily creates and
+reuses one Wayback client; all clients retain the shared process-wide
+Internet Archive rate limit.
 
 ## Collection paths
 
@@ -105,26 +105,22 @@ and loose-file modes independently:
 - `latest`: prefer the newest 200, then the newest known non-redirect,
   then the newest known redirect.
 
-Primary WARC and file selection happens before redirect expansion. Redirect
-captures are always added to WARC output in full, even when the primary WARC
-mode is `latest`. They are never added to loose website-file output.
+Primary WARC and file selection happens before WARC construction. Redirect
+expansion runs inline while those WARCs are written: only **new** URL
+histories introduced by Location targets are enqueued, with their full CDX
+histories, and they are never added to loose website-file output. Already
+selected primary histories keep their original selection mode.
 
 ## Redirect discovery
 
-Only selected captures whose known CDX status is 301 or 308 seed redirect
-discovery. A bounded worker pool downloads those captures concurrently.
+Redirect discovery is inline with WARC construction when
+`--redirect-capture` is `page` or `website`.
 
-Each probe:
-
-1. downloads exact original playback without following redirects;
-2. validates playback status against the CDX status when one is known;
-3. resolves an HTTP or HTTPS `Location` relative to the captured URL;
-4. removes the fragment;
-5. returns only the target URL and discards the response body.
-
-Missing or invalid `Location` values are warnings. Playback and status
-failures are recorded as failed probes. Statuses such as 302, 303, and 307 are
-still preserved in final WARCs when selected, but never introduce searches.
+When a WARC worker successfully stores a 301 or 308 response, it reuses that
+downloaded response to resolve an HTTP or HTTPS `Location` relative to the
+captured URL (fragment removed). Missing or invalid `Location` values are
+warnings. Statuses such as 302, 303, and 307 are still preserved in final
+WARCs when selected, but never introduce searches.
 
 The main thread translates each unseen target into either:
 
@@ -132,15 +128,14 @@ The main thread translates each unseen target into either:
 - a normalized host search for `--redirect-capture website`.
 
 These CDX searches stay serial on the main Wayback client. Every nonempty
-result is saved as source files and all newly found 301/308 captures enter the
-next probe wave. Search scopes and individual probes are deduplicated, so
-cycles terminate. Discovery stops when no unseen redirect search remains.
+result is saved as source files. Only URL histories that were not already
+selected from the primary search are allocated as new WARC batches and pushed
+onto the live work queue. Search scopes are deduplicated, so cycles terminate.
+Discovery stops when finished WARCs yield no unseen redirect searches.
 
-Redirect captures are intentionally downloaded once for probing and again
-during fresh final WARC construction. This duplicate request is the KISS
-tradeoff that permits complete discovery followed by exactly-once WARC
-publication. Existing valid WARC responses may still be reused during a
-rebuild.
+Redirect responses are downloaded once for final WARC storage; there is no
+separate discarded probe pass. Existing valid WARC responses may still be
+reused during a rebuild and still contribute Location targets.
 
 ## WARC ownership
 
@@ -177,10 +172,12 @@ One worker owns one `WarcBatch` from start to finish:
 6. atomically replace the final path once.
 
 Different WARC batches run concurrently and may finish out of allocation
-order. A URL history never has two WARC owners. Histories selected for both
-WARC and loose-file output stay attached to the WARC batch and use the same
-downloaded body. Histories selected only for files run as `WebsiteBatch`
-values in a separate phase.
+order. Redirect expansion may append additional batches while workers are
+still running; the completion counter's denominator grows when that happens.
+A URL history never has two WARC owners. Histories selected for both WARC and
+loose-file output stay attached to the WARC batch and use the same downloaded
+body. Histories selected only for files run as `WebsiteBatch` values in a
+separate phase.
 
 The existing behavior remains authoritative for:
 
@@ -221,19 +218,22 @@ The console reports phases and completed files, not successful captures:
 ```text
 Fetch example.com/* (1995-20260803): WARC all, files none, redirects website, 8 workers
 Search: 120 captures in 18 URL histories
-Redirects: 2 additional domains, 35 additional captures
-WARC files: building 24 with 8 workers
-[1/24] archive/example.com/index.warc.gz: 4 responses, 3 revisits, 0 failed
-[2/24] archive/target.org/index.warc.gz: 8 responses, 1 revisits, 1 failed
+WARC files: building 18 with 8 workers
+[1/18] archive/example.com/index.warc.gz: 4 responses, 3 revisits, 0 failed
+Redirect: +2 histories from https://target.org/
+[2/20] archive/example.com/about.warc.gz: 1 responses, 0 revisits, 0 failed
+[3/20] archive/target.org/index.warc.gz: 8 responses, 1 revisits, 1 failed
   https://web.archive.org/...: timeout after 9 attempts
-Replay index: replay/index.cdxj from 24 WARC files
+Replay index: replay/index.cdxj from 20 WARC files
 Done in 2.3 minutes: 155 selected, 120 responses, 34 revisits, 1 failed
 ```
 
 Retries print immediately because a worker may wait through a long backoff.
 Warning and failure details are returned by workers and printed once beneath
 the related WARC completion. File counts are appended to their owning WARC
-line. File-only histories appear in a separate `Website files` phase.
+line. Redirect expansion prints a short `Redirect: +N histories from <url>`
+line when new WARC work is queued. File-only histories appear in a separate
+`Website files` phase.
 
 There are no successful per-capture lines, URL alignment, per-history summary
 blocks, verbose mode, or second event log. The same compact output is mirrored
@@ -243,9 +243,9 @@ to the primary source log.
 
 | Module | Responsibility |
 | --- | --- |
-| `fetch.py` | Settings, phase orchestration, final reporting |
+| `fetch.py` | Settings, phase orchestration, redirect enqueue callback |
 | `search.py` | CDX search, grouping, primary selection |
-| `redirects.py` | Redirect probes, target resolution, recursive closure |
+| `redirects.py` | Location resolution and redirect CDX expansion helpers |
 | `collection_paths.py` | Collection/domain paths and collision handling |
 | `source_files.py` | Saved CDX search results and query metadata |
 | `downloads.py` | Exact playback, retries, thread-private clients |

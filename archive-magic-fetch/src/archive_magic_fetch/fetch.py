@@ -12,16 +12,17 @@ from wayback import CdxRecord
 
 from .console import ConsoleMirror
 from .search import group_by_url, search_captures, select_captures
-from .warc_files import BuiltFiles, build_warc_files
+from .warc_files import BuiltFiles, UrlHistory, WarcBatch, build_warc_files
 from .collection_paths import (
     DEFAULT_OUTPUT_ROOT,
     CollectionPaths,
+    allocate_warc_paths,
     collection_paths,
     prepare_website_files,
 )
 from .source_files import save_search_results
 from .replay_index import build_replay_index
-from .redirects import discover_redirect_captures
+from .redirects import expand_redirect_target
 from .downloads import make_client_factory
 from .local_links import rewrite_local_links
 
@@ -57,6 +58,78 @@ def _report_discovery_progress(count: int) -> None:
     print(f"  fetched {count}...")
 
 
+def _redirect_expand(
+    client,
+    *,
+    mode: str,
+    date_start: str,
+    date_end: str,
+    layout: CollectionPaths,
+    known_history_keys: set[tuple[str, str]],
+    reserved_paths: set[Path],
+    seen_searches: set[tuple[object, ...]],
+    retries: int,
+) -> Callable[[Sequence[str]], list[WarcBatch]]:
+    """Build a callback that turns Location targets into new WARC batches."""
+
+    def expand(targets: Sequence[str]) -> list[WarcBatch]:
+        added: list[WarcBatch] = []
+        for target in dict.fromkeys(targets):
+            expansion = expand_redirect_target(
+                client,
+                target,
+                mode=mode,
+                date_start=date_start,
+                date_end=date_end,
+                seen_searches=seen_searches,
+                known_history_keys=known_history_keys,
+                retries=retries,
+            )
+            if expansion is None:
+                continue
+            save_search_results(
+                expansion.search.captures,
+                layout=layout,
+                url_pattern=expansion.search.scope.url,
+                date_start=date_start,
+                date_end=date_end,
+                acquired_at=datetime.now(timezone.utc),
+            )
+            if not expansion.histories:
+                continue
+            new_paths = allocate_warc_paths(expansion.histories, layout)
+            queued_keys: list[tuple[str, str]] = []
+            for path, history_keys in new_paths.items():
+                if path in reserved_paths:
+                    relative = path.relative_to(layout.collection_root).as_posix()
+                    print(
+                        "  WARNING: skipping redirect histories at "
+                        f"{relative}: WARC path already reserved"
+                    )
+                    known_history_keys.update(history_keys)
+                    continue
+                histories = []
+                for history_key in history_keys:
+                    domain, urlkey = history_key
+                    known_history_keys.add(history_key)
+                    queued_keys.append(history_key)
+                    histories.append(
+                        UrlHistory(
+                            domain=domain,
+                            urlkey=urlkey,
+                            warc_captures=tuple(expansion.histories[history_key]),
+                            website_files=(),
+                        )
+                    )
+                reserved_paths.add(path)
+                added.append(WarcBatch(path, tuple(histories)))
+            if queued_keys:
+                print(f"Redirect: +{len(queued_keys)} histories from {target}")
+        return added
+
+    return expand
+
+
 def _build_files(
     settings: FetchSettings,
     captures: Sequence[CdxRecord],
@@ -64,7 +137,7 @@ def _build_files(
     client_factory: Callable,
     paths: CollectionPaths,
 ) -> BuiltFiles:
-    """Select captures, discover redirects, and build requested files."""
+    """Select captures and build requested files with inline redirect expansion."""
 
     captures_by_url = group_by_url(captures)
     warc_captures_by_url = select_captures(
@@ -74,13 +147,6 @@ def _build_files(
     file_captures_by_url = select_captures(
         captures_by_url,
         settings.files_mode,
-    )
-    warc_captures = list(
-        dict.fromkeys(
-            capture
-            for history in warc_captures_by_url.values()
-            for capture in history
-        )
     )
     include_timestamps = settings.files_mode in {"unique", "all"}
 
@@ -92,41 +158,27 @@ def _build_files(
             include_timestamps=include_timestamps,
         )
 
-    redirect_enabled = (
-        settings.warc_mode != "none" and settings.redirect_capture != "none"
-    )
-    failed_capture_urls: list[str] = []
-    if redirect_enabled:
-        redirects = discover_redirect_captures(
-            warc_captures,
+    expand_redirects = None
+    collect_redirects = False
+    if settings.warc_mode != "none" and settings.redirect_capture != "none":
+        collect_redirects = True
+        known_history_keys = set(warc_captures_by_url).union(file_captures_by_url)
+        reserved_paths = set(
+            allocate_warc_paths(warc_captures_by_url, paths)
+        )
+        expand_redirects = _redirect_expand(
             client,
-            client_factory,
             mode=settings.redirect_capture,
             date_start=settings.date_start,
             date_end=settings.date_end,
-            worker_count=settings.worker_count,
+            layout=paths,
+            known_history_keys=known_history_keys,
+            reserved_paths=reserved_paths,
+            seen_searches=set(),
             retries=settings.retries,
         )
-        print(
-            f"Redirects: {redirects.additional_domains} additional domains, "
-            f"{len(redirects.captures)} additional captures"
-        )
-        for message in redirects.messages:
-            print(f"  {message}")
-        failed_capture_urls.extend(redirects.failed_capture_urls)
-        warc_captures.extend(redirects.captures)
-        for search in redirects.searches:
-            save_search_results(
-                search.captures,
-                layout=paths,
-                url_pattern=search.scope.url,
-                date_start=settings.date_start,
-                date_end=settings.date_end,
-                acquired_at=datetime.now(timezone.utc),
-            )
 
-    warc_captures_by_url = group_by_url(warc_captures)
-    result = build_warc_files(
+    return build_warc_files(
         warc_captures_by_url,
         client,
         layout=paths,
@@ -137,14 +189,8 @@ def _build_files(
         client_factory=client_factory,
         worker_count=settings.worker_count,
         retries=settings.retries,
-    )
-    failed_capture_urls.extend(result.failed_capture_urls)
-
-    return BuiltFiles(
-        result.warc_counts,
-        result.built_warcs,
-        result.file_counts,
-        tuple(dict.fromkeys(failed_capture_urls)),
+        collect_redirects=collect_redirects,
+        expand_redirects=expand_redirects,
     )
 
 

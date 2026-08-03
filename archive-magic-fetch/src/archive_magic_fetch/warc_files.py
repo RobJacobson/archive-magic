@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from datetime import timezone
 from heapq import merge
@@ -31,6 +31,7 @@ from .downloads import (
     normalize_cdx_digest,
     download_capture,
 )
+from .redirects import PERMANENT_REDIRECT_STATUSES, permanent_redirect_target
 from .retry import DEFAULT_RETRIES
 from .warc_records import (
     ExistingWarcCache,
@@ -164,6 +165,7 @@ class _UrlHistoryResult:
     files: WebsiteFileCounts
     failed_capture_urls: list[str]
     messages: list[str]
+    redirect_targets: list[str]
 
 
 @dataclass
@@ -191,6 +193,7 @@ class _BuiltBatch:
     final_warc: Optional[Path]
     failed_capture_urls: list[str]
     messages: list[str]
+    redirect_targets: list[str] = field(default_factory=list)
 
 
 def _is_redirect(status: Optional[int]) -> bool:
@@ -616,6 +619,8 @@ def _commit_representative(
     *,
     wants_warc: bool,
     capture_paths: Sequence[Path],
+    collect_redirects: bool,
+    redirect_targets: list[str],
 ) -> None:
     """Commit one successful representative to every selected output."""
 
@@ -644,6 +649,20 @@ def _commit_representative(
         files_summary=state.files,
         messages=state.messages,
     )
+    if (
+        collect_redirects
+        and wants_warc
+        and downloaded.status_code in PERMANENT_REDIRECT_STATUSES
+    ):
+        target, warning = permanent_redirect_target(
+            capture.original,
+            downloaded.status_code,
+            downloaded.headers,
+        )
+        if warning is not None:
+            state.messages.append(f"{capture.view_url}: {warning}")
+        elif target is not None:
+            redirect_targets.append(target)
 
 
 def _write_url_history(
@@ -660,6 +679,7 @@ def _write_url_history(
     retries: int,
     warc_mode: str,
     files_mode: str,
+    collect_redirects: bool = False,
 ) -> _UrlHistoryResult:
     """Write one URL history with private response references."""
 
@@ -688,6 +708,7 @@ def _write_url_history(
         existing_warc,
         files_mode=files_mode,
     )
+    redirect_targets: list[str] = []
 
     for capture in processing:
         wants_warc = id(capture) in state.warc_ids
@@ -727,6 +748,8 @@ def _write_url_history(
                 digest,
                 wants_warc=wants_warc,
                 capture_paths=capture_paths,
+                collect_redirects=collect_redirects,
+                redirect_targets=redirect_targets,
             )
 
     return _UrlHistoryResult(
@@ -734,6 +757,7 @@ def _write_url_history(
         state.files,
         state.failed_capture_urls,
         state.messages,
+        redirect_targets,
     )
 
 
@@ -744,6 +768,7 @@ def _build_warc(
     retries: int,
     warc_mode: str,
     files_mode: str,
+    collect_redirects: bool = False,
 ) -> _BuiltBatch:
     histories = (
         batch.histories
@@ -768,6 +793,7 @@ def _build_warc(
     warc_summary = WarcCounts()
     files_summary = WebsiteFileCounts()
     failed_capture_urls = []
+    redirect_targets: list[str] = []
     try:
         for history in histories:
             result = _write_url_history(
@@ -780,11 +806,13 @@ def _build_warc(
                 retries=retries,
                 warc_mode=warc_mode,
                 files_mode=files_mode,
+                collect_redirects=collect_redirects,
             )
             warc_summary.add(result.warc)
             files_summary.add(result.files)
             failed_capture_urls.extend(result.failed_capture_urls)
             messages.extend(result.messages)
+            redirect_targets.extend(result.redirect_targets)
         final_warc = (
             owner.publish(
                 has_records=bool(
@@ -804,6 +832,7 @@ def _build_warc(
         final_warc,
         failed_capture_urls,
         messages,
+        redirect_targets,
     )
 
 
@@ -821,13 +850,24 @@ def build_warc_files(
     client_factory: Optional[Callable] = None,
     worker_count: int = DEFAULT_WORKER_COUNT,
     retries: int = DEFAULT_RETRIES,
+    collect_redirects: bool = False,
+    expand_redirects: Optional[
+        Callable[[Sequence[str]], Sequence[WarcBatch]]
+    ] = None,
 ) -> BuiltFiles:
-    """Build WARC and loose-file outputs through bounded worker pools."""
+    """Build WARC and loose-file outputs through bounded worker pools.
+
+    When ``expand_redirects`` is provided, Location targets collected from
+    finished WARC batches are passed to it and any returned batches are
+    appended to the live WARC work queue.
+    """
 
     if retries < 0:
         raise ValueError("retries cannot be negative")
     if worker_count < 1:
         raise ValueError("worker_count must be at least 1")
+    if expand_redirects is not None and not collect_redirects:
+        raise ValueError("expand_redirects requires collect_redirects=True")
     captures_by_url = _attach_domains(captures_by_url)
     file_captures_by_url = _attach_domains(file_captures_by_url or {})
     website_files_by_url: dict[tuple[str, str], list[WebsiteFile]] = {}
@@ -871,6 +911,7 @@ def build_warc_files(
             set(website_files_by_url) - assigned_histories
         )
     ]
+    built_warc_order = list(warc_paths)
 
     def run(batch: WarcBatch | WebsiteBatch, active_client):
         return _build_warc(
@@ -879,55 +920,20 @@ def build_warc_files(
             retries=retries,
             warc_mode=warc_mode,
             files_mode=files_mode,
+            collect_redirects=collect_redirects and isinstance(batch, WarcBatch),
         )
 
-    def run_batches(
-        selected_batches: Sequence[WarcBatch | WebsiteBatch],
-        report_finished: Callable[
-            [WarcBatch | WebsiteBatch, _BuiltBatch], None
-        ],
-    ) -> list[_BuiltBatch]:
-        results: list[_BuiltBatch] = []
-        if client_factory is None:
-            for batch in selected_batches:
-                result = run(batch, client)
-                results.append(result)
-                report_finished(batch, result)
-            return results
-
-        clients = ThreadClientPool(client_factory)
-
-        def run_with_thread_client(batch: WarcBatch | WebsiteBatch):
-            return run(batch, clients.get())
-
-        try:
-            with ThreadPoolExecutor(max_workers=worker_count) as pool:
-                pending_warcs = {
-                    pool.submit(run_with_thread_client, batch): batch
-                    for batch in selected_batches
-                }
-                for finished_warc in as_completed(pending_warcs):
-                    batch = pending_warcs[finished_warc]
-                    result = finished_warc.result()
-                    results.append(result)
-                    report_finished(batch, result)
-        finally:
-            clients.close()
-        return results
-
     completed_warcs = 0
+    total_warcs = len(warc_batches)
 
-    def report_warc(
-        batch: WarcBatch | WebsiteBatch,
-        result: _BuiltBatch,
-    ) -> None:
+    def report_warc(batch: WarcBatch | WebsiteBatch, result: _BuiltBatch) -> None:
         nonlocal completed_warcs
         if not isinstance(batch, WarcBatch):
             return
         completed_warcs += 1
         relative = batch.path.relative_to(layout.collection_root).as_posix()
         line = (
-            f"[{completed_warcs}/{len(warc_batches)}] {relative}: "
+            f"[{completed_warcs}/{total_warcs}] {relative}: "
             f"{result.warc.responses} responses, "
             f"{result.warc.revisits} revisits, "
             f"{result.warc.playback_failures} failed"
@@ -960,13 +966,73 @@ def build_warc_files(
         for message in result.messages:
             print(f"  {message}")
 
+    def run_batches(
+        selected_batches: Sequence[WarcBatch | WebsiteBatch],
+        report_finished: Callable[
+            [WarcBatch | WebsiteBatch, _BuiltBatch], None
+        ],
+        *,
+        expand: Optional[
+            Callable[[Sequence[str]], Sequence[WarcBatch]]
+        ] = None,
+    ) -> list[_BuiltBatch]:
+        nonlocal total_warcs
+        results: list[_BuiltBatch] = []
+        pending: list[WarcBatch | WebsiteBatch] = list(selected_batches)
+        if not pending:
+            return results
+
+        def finish(batch: WarcBatch | WebsiteBatch, result: _BuiltBatch) -> None:
+            nonlocal total_warcs
+            results.append(result)
+            report_finished(batch, result)
+            if expand is None or not isinstance(batch, WarcBatch):
+                return
+            added = list(expand(result.redirect_targets))
+            if not added:
+                return
+            for warc_batch in added:
+                built_warc_order.append(warc_batch.path)
+            pending.extend(added)
+            total_warcs += len(added)
+
+        if client_factory is None:
+            while pending:
+                batch = pending.pop(0)
+                finish(batch, run(batch, client))
+            return results
+
+        clients = ThreadClientPool(client_factory)
+
+        def run_with_thread_client(batch: WarcBatch | WebsiteBatch):
+            return run(batch, clients.get())
+
+        try:
+            with ThreadPoolExecutor(max_workers=worker_count) as pool:
+                in_flight: dict = {}
+                while pending or in_flight:
+                    while pending and len(in_flight) < worker_count:
+                        batch = pending.pop(0)
+                        in_flight[pool.submit(run_with_thread_client, batch)] = (
+                            batch
+                        )
+                    done, _ = wait(in_flight, return_when=FIRST_COMPLETED)
+                    for finished in done:
+                        batch = in_flight.pop(finished)
+                        finish(batch, finished.result())
+        finally:
+            clients.close()
+        return results
+
     results: list[_BuiltBatch] = []
     if warc_batches:
         print(
             f"WARC files: building {len(warc_batches)} with "
             f"{worker_count} workers"
         )
-        results.extend(run_batches(warc_batches, report_warc))
+        results.extend(
+            run_batches(warc_batches, report_warc, expand=expand_redirects)
+        )
     if website_batches:
         print(
             f"Website files: building {len(website_batches)} histories with "
@@ -992,12 +1058,13 @@ def build_warc_files(
         summary,
         tuple(
             path
-            for path in warc_paths
+            for path in built_warc_order
             if path in available_warcs
         ),
         files_summary,
         tuple(failed_capture_urls),
     )
+
 
 
 def _attach_domains(

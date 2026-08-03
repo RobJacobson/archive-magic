@@ -1,23 +1,16 @@
-"""Discover capture histories introduced by permanent redirects."""
+"""Resolve permanent-redirect targets and expand them via CDX search."""
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from typing import Callable, Sequence
+from typing import Optional, Sequence
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
 from wayback import CdxRecord
 
-from .search import search_captures
 from .collection_paths import normalize_domain
-from .downloads import (
-    PLAYBACK_ERRORS,
-    ThreadClientPool,
-    format_playback_failure,
-    download_capture,
-)
 from .retry import DEFAULT_RETRIES
+from .search import group_by_url, search_captures
 
 
 REDIRECT_CAPTURE_MODES = ("none", "page", "website")
@@ -42,22 +35,11 @@ class RedirectSearch:
 
 
 @dataclass(frozen=True)
-class RedirectDiscovery:
-    """All additional captures and diagnostics found before WARC building."""
+class RedirectExpansion:
+    """New URL histories discovered from one Location target."""
 
-    captures: tuple[CdxRecord, ...]
-    searches: tuple[RedirectSearch, ...]
-    failed_capture_urls: tuple[str, ...]
-    messages: tuple[str, ...]
-    additional_domains: int
-
-
-@dataclass(frozen=True)
-class _ProbeResult:
-    capture: CdxRecord
-    target: str | None = None
-    failed: bool = False
-    message: str | None = None
+    search: RedirectSearch
+    histories: dict[tuple[str, str], list[CdxRecord]]
 
 
 def resolve_redirect_target(
@@ -107,152 +89,58 @@ def redirect_scope(url: str, mode: str) -> RedirectScope:
     )
 
 
-def _probe_redirect(client, capture: CdxRecord, *, retries: int) -> _ProbeResult:
-    """Download one redirect capture and return only its resolved target."""
-
-    try:
-        downloaded = download_capture(client, capture, retries=retries)
-    except PLAYBACK_ERRORS as error:
-        return _ProbeResult(
-            capture,
-            failed=True,
-            message=(
-                f"{capture.view_url}: {format_playback_failure(error)}"
-            ),
-        )
-
-    if (
-        capture.statuscode is not None
-        and downloaded.status_code != capture.statuscode
-    ):
-        return _ProbeResult(
-            capture,
-            failed=True,
-            message=(
-                f"{capture.view_url}: CDX status {capture.statuscode} but "
-                f"playback returned {downloaded.status_code}"
-            ),
-        )
-
-    try:
-        target = resolve_redirect_target(
-            capture.original,
-            downloaded.status_code,
-            downloaded.headers,
-        )
-    except ValueError as error:
-        return _ProbeResult(
-            capture,
-            message=f"{capture.view_url}: {error}",
-        )
-    return _ProbeResult(capture, target=target)
-
-
-def discover_redirect_captures(
-    selected_captures: Sequence[CdxRecord],
+def expand_redirect_target(
     client,
-    client_factory: Callable,
+    target_url: str,
     *,
     mode: str,
     date_start: str,
     date_end: str,
-    worker_count: int,
+    seen_searches: set[tuple[object, ...]],
+    known_history_keys: set[tuple[str, str]],
     retries: int = DEFAULT_RETRIES,
-) -> RedirectDiscovery:
-    """Find the complete recursive 301/308 capture closure.
+) -> Optional[RedirectExpansion]:
+    """CDX-search one Location target and return only unseen URL histories.
 
-    Playback probes overlap through a bounded worker pool. CDX searches stay
-    serial on ``client`` and every returned body is deliberately discarded.
+    Already-known history keys keep their primary selection and are omitted.
+    Returns ``None`` when the search scope was already queried or empty.
     """
 
-    if mode not in {"page", "website"}:
-        raise ValueError(f"unsupported redirect capture mode: {mode}")
-    if worker_count < 1:
-        raise ValueError("worker_count must be at least 1")
+    scope = redirect_scope(target_url, mode)
+    if scope.key in seen_searches:
+        return None
+    seen_searches.add(scope.key)
+    captures = search_captures(
+        client,
+        scope.url,
+        date_start,
+        date_end,
+        match_type=scope.match_type,
+        retries=retries,
+    )
+    if not captures:
+        return None
 
-    primary_domains = {
-        normalize_domain(capture.original)
-        for capture in selected_captures
+    grouped = group_by_url(captures)
+    histories = {
+        key: history
+        for key, history in grouped.items()
+        if key not in known_history_keys
     }
-    probe_queue = [
-        capture
-        for capture in selected_captures
-        if capture.statuscode in PERMANENT_REDIRECT_STATUSES
-    ]
-    seen_probes = set(probe_queue)
-    seen_searches: set[tuple[object, ...]] = set()
-    known_captures = set(selected_captures)
-    redirect_captures: list[CdxRecord] = []
-    searches: list[RedirectSearch] = []
-    failed_capture_urls: list[str] = []
-    messages: list[str] = []
+    return RedirectExpansion(
+        RedirectSearch(scope, tuple(captures)),
+        histories,
+    )
 
-    clients = ThreadClientPool(client_factory)
+
+def permanent_redirect_target(
+    base_url: str,
+    status_code: int,
+    headers,
+) -> tuple[Optional[str], Optional[str]]:
+    """Return ``(target, warning)`` for one stored permanent-redirect response."""
+
     try:
-        with ThreadPoolExecutor(max_workers=worker_count) as pool:
-            while probe_queue:
-                def run_probe(capture: CdxRecord) -> _ProbeResult:
-                    return _probe_redirect(
-                        clients.get(),
-                        capture,
-                        retries=retries,
-                    )
-
-                pending_probes = {
-                    pool.submit(run_probe, capture): capture
-                    for capture in probe_queue
-                }
-                probe_queue = []
-                targets: list[str] = []
-                for finished_probe in as_completed(pending_probes):
-                    result = finished_probe.result()
-                    if result.message is not None:
-                        messages.append(result.message)
-                    if result.failed:
-                        failed_capture_urls.append(result.capture.view_url)
-                    if result.target is not None:
-                        targets.append(result.target)
-
-                for target in sorted(set(targets)):
-                    scope = redirect_scope(target, mode)
-                    if scope.key in seen_searches:
-                        continue
-                    seen_searches.add(scope.key)
-                    captures = search_captures(
-                        client,
-                        scope.url,
-                        date_start,
-                        date_end,
-                        match_type=scope.match_type,
-                        retries=retries,
-                    )
-                    if not captures:
-                        continue
-                    searches.append(RedirectSearch(scope, tuple(captures)))
-                    for capture in captures:
-                        if capture not in known_captures:
-                            known_captures.add(capture)
-                            redirect_captures.append(capture)
-                        if (
-                            capture.statuscode in PERMANENT_REDIRECT_STATUSES
-                            and capture not in seen_probes
-                        ):
-                            seen_probes.add(capture)
-                            probe_queue.append(capture)
-    finally:
-        clients.close()
-
-    additional_domains = len(
-        {
-            normalize_domain(capture.original)
-            for capture in redirect_captures
-        }
-        - primary_domains
-    )
-    return RedirectDiscovery(
-        tuple(redirect_captures),
-        tuple(searches),
-        tuple(dict.fromkeys(failed_capture_urls)),
-        tuple(messages),
-        additional_domains,
-    )
+        return resolve_redirect_target(base_url, status_code, headers), None
+    except ValueError as error:
+        return None, str(error)
