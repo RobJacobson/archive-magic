@@ -11,6 +11,7 @@ from typing import Optional, Sequence
 from .console import mirror_console_output
 from .discovery import FILES_MODES, WARC_MODES
 from .job import FetchRequest, run_fetch
+from .redirect_capture import REDIRECT_CAPTURE_MODES
 from .retrieval import DEFAULT_CONCURRENCY
 from .retry import DEFAULT_RETRIES
 
@@ -75,6 +76,15 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> FetchRequest:
         ),
     )
     parser.add_argument(
+        "--redirect-capture",
+        choices=REDIRECT_CAPTURE_MODES,
+        default="website",
+        help=(
+            "Capture permanent redirect targets into WARC as none, exact "
+            "page history, or full host history (default: website)"
+        ),
+    )
+    parser.add_argument(
         "--concurrency",
         type=_positive_int,
         default=DEFAULT_CONCURRENCY,
@@ -106,6 +116,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> FetchRequest:
         warc_mode=args.warc,
         files_mode=args.files,
         rewrite_local=args.rewrite_local,
+        redirect_capture=args.redirect_capture,
         concurrency=args.concurrency,
         retries=args.retries,
     )
@@ -119,6 +130,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     started_tick = _monotonic()
     with mirror_console_output() as console_log:
         print(f"Job started: {_format_job_time(started_at)}", flush=True)
+        print(
+            f"Redirect capture: {request.redirect_capture}",
+            flush=True,
+        )
         try:
             try:
                 succeeded = run_fetch(request, console_log=console_log)

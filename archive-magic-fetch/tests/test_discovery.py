@@ -181,6 +181,24 @@ def test_discover_passes_exact_patterns_without_match_type():
     ]
 
 
+def test_discover_accepts_explicit_host_match_type():
+    calls = []
+
+    class Client:
+        def search(self, url_pattern, **kwargs):
+            calls.append((url_pattern, kwargs))
+            return iter(())
+
+    assert discovery.discover(
+        Client(),
+        "https://example.com/path",
+        "2002",
+        "2003",
+        match_type="host",
+    ) == []
+    assert calls[0][1]["match_type"] == "host"
+
+
 def test_discover_reports_progress_after_each_request_limit(monkeypatch):
     monkeypatch.setattr(discovery, "_CDX_REQUEST_LIMIT", 2)
     expected = [record() for _ in range(5)]

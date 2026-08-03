@@ -454,6 +454,37 @@ def test_known_cdx_3xx_is_written_as_response(
     assert summary == export.ExportSummary(selected=1, responses=1)
 
 
+def test_export_result_surfaces_permanent_redirect_target(tmp_path):
+    selected = capture(
+        original="http://source.test/path/start",
+        statuscode=301,
+        payload=b"redirect",
+        urlkey="test,source)/path/start",
+    )
+    client = FakeClient(
+        {
+            selected: memento_for(
+                selected,
+                payload=b"redirect",
+                status_code=301,
+                headers={"Location": "../landing#section"},
+            )
+        }
+    )
+    layout = paths.collection_layout(
+        "source.test/*",
+        root=tmp_path / "archives",
+    )
+
+    result = export.export_all(
+        {selected.urlkey: [selected]},
+        client,
+        layout=layout,
+    )
+
+    assert result.redirect_targets == ("http://source.test/landing",)
+
+
 def test_retrieved_statusless_redirect_is_written_as_response(tmp_path):
     selected = capture(statuscode=None, payload=b"redirect")
     client = FakeClient(

@@ -127,6 +127,7 @@ def discover(
     date_start: str,
     date_end: str,
     *,
+    match_type: Optional[str] = None,
     progress: Optional[Callable[[int], None]] = None,
     retries: int = DEFAULT_RETRIES,
 ) -> list[CdxRecord]:
@@ -138,15 +139,16 @@ def discover(
     the next attempt.
     """
 
-    search_url, match_type = normalize_cdx_search(url_pattern)
+    search_url, inferred_match_type = normalize_cdx_search(url_pattern)
     search_kwargs: dict[str, object] = {
         "from_date": date_start,
         "to_date": date_end,
         "limit": _CDX_REQUEST_LIMIT,
         "resolve_revisits": False,
     }
-    if match_type is not None:
-        search_kwargs["match_type"] = match_type
+    selected_match_type = match_type or inferred_match_type
+    if selected_match_type is not None:
+        search_kwargs["match_type"] = selected_match_type
 
     def attempt() -> list[CdxRecord]:
         captures: list[CdxRecord] = []

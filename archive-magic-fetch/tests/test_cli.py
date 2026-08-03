@@ -35,6 +35,7 @@ def test_parse_args_returns_normalized_fetch_request(monkeypatch):
         warc_mode="all",
         files_mode="none",
         rewrite_local=False,
+        redirect_capture="website",
         concurrency=DEFAULT_CONCURRENCY,
         retries=retry.DEFAULT_RETRIES,
     )
@@ -69,6 +70,35 @@ def test_parse_args_accepts_supported_concurrency_and_retry_counts():
     assert cli.parse_args(
         ["example.com/*", "--retries", "100"]
     ).retries == 100
+
+
+def test_parse_args_accepts_redirect_capture_modes():
+    assert cli.parse_args(
+        ["example.com/*", "--redirect-capture", "none"]
+    ).redirect_capture == "none"
+    assert cli.parse_args(
+        ["example.com/*", "--redirect-capture", "page"]
+    ).redirect_capture == "page"
+    assert cli.parse_args(
+        ["example.com/*", "--redirect-capture", "website"]
+    ).redirect_capture == "website"
+
+    with pytest.raises(SystemExit) as raised:
+        cli.parse_args(
+            ["example.com/*", "--redirect-capture", "sometimes"]
+        )
+
+    assert raised.value.code == 2
+
+
+def test_help_describes_redirect_capture_default(capsys):
+    with pytest.raises(SystemExit) as raised:
+        cli.parse_args(["--help"])
+
+    assert raised.value.code == 0
+    output = capsys.readouterr().out
+    assert "--redirect-capture {none,page,website}" in output
+    assert "default: website" in " ".join(output.split())
 
 
 @pytest.mark.parametrize(
@@ -121,6 +151,7 @@ def test_main_times_successful_job_and_passes_request(monkeypatch, capsys):
     assert received["console_log"] is not None
     assert capsys.readouterr().out == (
         "Job started: 2026-07-24T12:00:00Z\n"
+        "Redirect capture: website\n"
         "Job ended: 2026-07-24T12:01:35Z\n"
         "Job duration: 1.6 minutes\n"
     )

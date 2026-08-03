@@ -42,6 +42,7 @@ def request(**overrides):
         "warc_mode": "all",
         "files_mode": "none",
         "rewrite_local": False,
+        "redirect_capture": "none",
         "concurrency": DEFAULT_CONCURRENCY,
         "retries": retry.DEFAULT_RETRIES,
     }
@@ -256,6 +257,132 @@ def test_run_fetch_plans_and_rewrites_website_files(monkeypatch):
         layout.website_root,
         {"include_timestamps": True},
     )
+
+
+def test_run_fetch_merges_redirect_capture_and_saves_query_provenance(
+    monkeypatch,
+):
+    install_fake_lifecycle(monkeypatch)
+    primary = record(statuscode=301, digest="A" * 32)
+    target_old = record(
+        urlkey="org,target)/",
+        original="https://target.org/",
+        captured="20010101000000",
+        digest="B" * 32,
+    )
+    target_new = record(
+        urlkey="org,target)/",
+        original="https://target.org/",
+        captured="20020101000000",
+        digest="C" * 32,
+    )
+    layout = object()
+    calls = {"acquisitions": [], "discoveries": [], "exports": []}
+
+    monkeypatch.setattr(job, "collection_layout", lambda *args, **kwargs: layout)
+
+    def fake_discover(client, pattern, start, end, **kwargs):
+        calls["discoveries"].append((pattern, start, end, kwargs))
+        if pattern == "example.com/*":
+            return [primary]
+        if pattern == "https://target.org/":
+            return [target_old, target_new]
+        raise AssertionError(pattern)
+
+    monkeypatch.setattr(job, "discover", fake_discover)
+    monkeypatch.setattr(
+        job,
+        "save_acquisition",
+        lambda captures, **kwargs: calls["acquisitions"].append(
+            (tuple(captures), kwargs)
+        )
+        or type("Acquisition", (), {"path": Path("source")})(),
+    )
+
+    def fake_export(groups, client, **kwargs):
+        calls["exports"].append((groups, kwargs))
+        if len(calls["exports"]) == 1:
+            return ExportResult(
+                ExportSummary(selected=1),
+                (),
+                FilesSummary(written=1),
+                (),
+                ("https://target.org/",),
+            )
+        return ExportResult(ExportSummary(selected=3), ())
+
+    monkeypatch.setattr(
+        job,
+        "preflight_website_layout",
+        lambda *args, **kwargs: object(),
+    )
+    monkeypatch.setattr(job, "export_all", fake_export)
+    monkeypatch.setattr(job, "generate_replay_index", lambda *args, **kwargs: None)
+    monkeypatch.setattr(job, "print_summary", lambda *args, **kwargs: None)
+    monkeypatch.setattr(job, "print_files_summary", lambda *args, **kwargs: None)
+
+    assert job.run_fetch(
+        request(
+            redirect_capture="website",
+            warc_mode="latest",
+            files_mode="latest",
+            date_start="2000",
+            date_end="2002",
+        )
+    ) is True
+
+    assert calls["discoveries"][1][0:3] == (
+        "https://target.org/",
+        "2000",
+        "2002",
+    )
+    assert calls["discoveries"][1][3]["match_type"] == "host"
+    assert calls["exports"][0][0] == {primary.urlkey: [primary]}
+    assert calls["exports"][0][1]["file_capture_groups"] == {
+        primary.urlkey: [primary]
+    }
+    assert calls["exports"][0][1]["files_mode"] == "latest"
+    assert calls["exports"][1][0] == {
+        primary.urlkey: [primary],
+        target_old.urlkey: [target_old, target_new],
+    }
+    assert calls["exports"][1][1]["file_capture_groups"] is None
+    assert calls["exports"][1][1]["files_mode"] == "none"
+    assert len(calls["acquisitions"]) == 2
+    assert calls["acquisitions"][1][0] == (target_old, target_new)
+    assert calls["acquisitions"][1][1]["url_pattern"] == "https://target.org/"
+
+
+def test_redirect_capture_is_inactive_for_files_only_jobs(
+    monkeypatch,
+    capsys,
+):
+    install_fake_lifecycle(monkeypatch)
+    primary = record()
+    layout = object()
+    monkeypatch.setattr(job, "collection_layout", lambda *args, **kwargs: layout)
+    monkeypatch.setattr(job, "discover", lambda *args, **kwargs: [primary])
+    monkeypatch.setattr(job, "save_acquisition", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        job,
+        "preflight_website_layout",
+        lambda *args, **kwargs: object(),
+    )
+    monkeypatch.setattr(
+        job,
+        "export_all",
+        lambda *args, **kwargs: successful_export(),
+    )
+    monkeypatch.setattr(job, "print_files_summary", lambda *args, **kwargs: None)
+
+    assert job.run_fetch(
+        request(
+            warc_mode="none",
+            files_mode="latest",
+            redirect_capture="website",
+        )
+    ) is True
+    assert "Redirect capture inactive: --warc none\n" in capsys.readouterr().out
 
 
 def test_run_fetch_lists_failures_after_finalizing_outputs(

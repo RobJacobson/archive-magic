@@ -4,7 +4,7 @@
 
 **Scope:** `archive-magic-fetch` only
 
-**Updated:** July 28, 2026
+**Updated:** August 3, 2026
 
 ## 1. Decision
 
@@ -77,6 +77,7 @@ archive-magic-fetch URL_PATTERN
   [--warc {none,latest,all}]
   [--files {none,latest,unique,all}]
   [--rewrite-local]
+  [--redirect-capture {none,page,website}]
   [--concurrency N]
   [--retries N]
 ```
@@ -86,6 +87,7 @@ archive-magic-fetch URL_PATTERN
 | `--warc` | `none`, `latest`, `all` | `all` |
 | `--files` | `none`, `latest`, `unique`, `all` | `none` |
 | `--rewrite-local` | flag | off |
+| `--redirect-capture` | `none`, `page`, `website` | `website` |
 | `--concurrency` | integer ≥ 1 | `8` |
 | `--retries` | integer ≥ 0 | `8` |
 
@@ -105,10 +107,15 @@ before a job begins. Successful parsing produces one immutable `FetchRequest`;
 the fetch workflow does not receive or depend on an `argparse.Namespace`.
 
 The two axes are independent. Default behavior remains full WARC history plus
-replay CDXJ with no loose files. `--warc none --files none` exits successfully
-with `Nothing to do: both --warc and --files are none` and performs no
-discovery. `--rewrite-local` requires `--files latest`, `unique`, or `all`
-(usage error otherwise) and does not enable files mode by itself.
+replay CDXJ with no loose files. Permanent redirect capture is also enabled by
+default. `page` adds the full exact-URL history of each target; `website` adds
+the full history of every URL on each target's exact host. Both use the
+primary `--start`/`--end` bounds and follow 301/308 targets recursively.
+`none` disables expansion. With `--warc none`, redirect capture is reported as
+inactive and loose-file behavior is unchanged. `--warc none --files none`
+exits successfully with `Nothing to do: both --warc and --files are none` and
+performs no discovery. `--rewrite-local` requires `--files latest`, `unique`,
+or `all` (usage error otherwise) and does not enable files mode by itself.
 
 Numeric partial dates are passed through unchanged to `WaybackClient.search()`,
 which forwards them to the Internet Archive CDX `from`/`to` parameters. Those
@@ -139,7 +146,11 @@ parse and validate arguments, apply date defaults, and build FetchRequest
     -> group records by urlkey
     -> build warc_selection and files_selection from output modes
     -> if files enabled: plan website/ paths (MIME + query folding + newest-wins)
-    -> export enabled outputs with one reusable Wayback client per worker thread
+    -> export selected groups and surface Location targets from written 301/308 responses
+    -> discover each new target with the ordinary exact-page or exact-host search
+    -> publish each non-empty target query as a separate source acquisition
+    -> add its captures to the same WARC groups and re-export
+    -> repeat until an export introduces no new redirect scope or capture
     -> if warc enabled: generate replay/index.cdxj
     -> if --rewrite-local and at least one file was written: rewrite under website/
     -> print aggregate summary
@@ -149,6 +160,11 @@ parse and validate arguments, apply date defaults, and build FetchRequest
 
 Selection is an export transform. Provenance always stores the full CDX result
 for the query window, not the post-`latest` subset.
+
+Redirect target selection is deliberately different: after a selected primary
+301/308 introduces a page or host, every target capture inside the primary date
+window is included in WARC output, even when the primary mode is `latest`.
+Redirect targets never extend loose `website/` output.
 
 `latest` keeps exactly one capture per urlkey group:
 
@@ -255,6 +271,43 @@ After source provenance is saved, Fetch:
 
 The original discovery order, duplicates, and redirects remain present in the
 source snapshot even though downstream export transforms that selection.
+
+### 3.1 Redirect capture closure
+
+When WARC output and redirect capture are enabled, the ordinary exporter writes
+the selected groups and returns the resolved `Location` targets it encountered
+in successfully retrieved 301 and 308 responses. It does not make a separate
+redirect probe. Location resolution removes fragments and accepts only absolute
+HTTP/HTTPS results. Missing, malformed, credential-bearing, and non-HTTP targets
+warn and do not expand. Other 3xx statuses are stored normally when selected but
+never introduce target captures.
+
+`page` queries the resolved URL with exact match. `website` queries its exact
+host with host match; normal Wayback HTTP/HTTPS and www/apex canonicalization
+still applies. Every returned target row inside the primary date bounds is
+added to the WARC plan. Its known 301/308 rows enter the same queue. Canonical
+page/host keys and value-equal CDX rows are tracked
+so duplicate targets and cycles terminate without limits or arbitrary partial
+selection.
+
+Each non-empty target search is saved through the existing provenance path and
+its records are added to the same capture list as the primary records. Fetch
+then calls the same grouping and exporter code again. The exporter rebuilds the
+combined WARC allocation, while its existing exact-response WARC cache supplies
+records written by an earlier pass instead of downloading them again. A later
+pass can surface another permanent redirect, so this small discover-and-export
+loop naturally handles recursion and cycles without a second retrieval system.
+Loose `website/` paths are supplied only on the first pass and remain limited to
+the primary selection.
+
+Playback failure handling and retries remain entirely in the exporter. A failed
+selected response is listed as a failed capture and cannot introduce a target.
+A failed CDX query remains fatal; an empty query is reported and is not an
+error.
+
+Fetch does not estimate closure size, prompt for approval, impose thresholds,
+or partially select a target. The operator chooses the capture strategy through
+`--redirect-capture` and may interrupt or delete output when necessary.
 
 ## 4. Collection naming
 
@@ -544,6 +597,11 @@ After publication, `log.txt` receives the complete job console transcript.
 Output produced before the acquisition directory exists is buffered, then
 flushed into the log; later stdout and stderr writes are mirrored immediately.
 
+The primary query and each non-empty redirect page/host query are published as
+separate acquisitions using the same schema. This preserves each complete CDX
+result without introducing a multi-query manifest or changing existing source
+readers. The console log remains attached to the primary acquisition.
+
 ## 8. Retrieval and WARC construction
 
 Retrieval and writing happen inside exclusive WARC-bucket tasks:
@@ -626,8 +684,9 @@ never writes a partial response as a successful capture.
 Selected 3xx rows are played back exactly without following their redirects
 and are stored as full WARC responses. Redirect bodies remain omitted from
 loose-file output. A known CDX/Memento status mismatch warns and skips the
-capture. Fetch does not synthesize redirects, unavailable-resource metadata,
-or broken-resource responses.
+capture. Redirect capture discovers eligible historical targets but never
+synthesizes redirects, unavailable-resource metadata, or broken-resource
+responses.
 
 Approved Wayback playback/availability failures—including a content-encoding
 mismatch—warn, count as playback failures, and allow later captures to
@@ -748,6 +807,7 @@ Ordinary output remains compact:
 
 ```text
 Job started: 2026-07-24T19:04:12Z
+Redirect capture: website
 https://web.archive.org/web/20190812143015/https://example.com/images/logo.png : retry 1/8 in 10s after Internet Archive returned retryable HTTP 503
 [completed 1/235] example.com/images/logo.png
 https://web.archive.org/web/20170604120533/https://example.com/images/logo.png : wrote response
@@ -783,6 +843,8 @@ The WARC summary reports selected rows, written responses, revisits, and
 playback failures for the active `--warc` mode. The legacy redirect-omission
 count remains zero for WARC output. When `--files` is enabled, a second line
 reports written bodies, omitted redirects, and failures for that mode.
+Failures from every export pass are included in the final failed-URL list even
+if a later combined pass can still write other records.
 
 The CLI catches fatal errors, prints `ERROR: ...` to stderr, and returns 1.
 It also returns 1 after finalizing otherwise usable outputs when selected
@@ -799,6 +861,7 @@ The flat package contains:
 | `cli.py` | Argument validation/defaults, job timing, console mirroring, exception and exit-status handling |
 | `job.py` | Immutable fetch request, discovery/export orchestration, output finalization and reporting |
 | `discovery.py` | Complete search, application retry, URL-key grouping, output selection |
+| `redirect_capture.py` | Permanent-Location resolution and page/host scope normalization |
 | `paths.py` | Collection normalization, safe readable WARC/website paths, collision buckets, preflight |
 | `publication.py` | Same-filesystem atomic no-replace file/directory publication |
 | `provenance.py` | Source CDX and query-manifest serialization/publication |
@@ -847,6 +910,9 @@ Acceptance covers:
 - retrieval fields, redirect/status policy, per-operation exponential retry,
   independent worker backoff, thread-client reuse, CDX-digest-gated raw
   content-encoding recovery, and final failed-URL behavior;
+- default website closure, page/website/none modes, 301/308 recursion, target
+  normalization, cycle/overlap deduplication, full target history, and
+  files-only inactivity;
 - complete-plan sorted response CDXJ semantics and nested filenames;
 - exact offset/length selection of independently compressed WARC members;
 - replay-index replacement and indexer failures;
@@ -880,7 +946,8 @@ This implementation does not include:
 - output-root configuration;
 - a generic archive-source interface or Common Crawl;
 - source-WARC representation-byte preservation;
-- redirect preservation or unavailable-capture metadata;
+- persistent redirect-response caching or automatic capture sizing;
+- unavailable-capture metadata;
 - a replay server or pywb configuration;
 - sharded or ZipNum replay indexes;
 - a database or persistent naming registry;

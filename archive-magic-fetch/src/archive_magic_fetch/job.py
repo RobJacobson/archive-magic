@@ -21,6 +21,7 @@ from .paths import (
 )
 from .provenance import save_acquisition
 from .replay import generate_replay_index
+from .redirect_capture import redirect_scope
 from .retrieval import make_client_factory
 from .rewrite_local import rewrite_local_website
 
@@ -45,6 +46,7 @@ class FetchRequest:
     warc_mode: str
     files_mode: str
     rewrite_local: bool
+    redirect_capture: str
     concurrency: int
     retries: int
 
@@ -66,8 +68,19 @@ def _export_captures(
 
     print(f"Grouping {len(captures)} captures...")
     capture_groups = group_captures(captures)
-    warc_groups = apply_output_mode(capture_groups, request.warc_mode)
+    primary_warc_groups = apply_output_mode(
+        capture_groups,
+        request.warc_mode,
+    )
     files_groups = apply_output_mode(capture_groups, request.files_mode)
+    warc_captures = list(
+        dict.fromkeys(
+            capture
+            for group in primary_warc_groups.values()
+            for capture in group
+        )
+    )
+    warc_groups = group_captures(warc_captures)
     include_timestamps = request.files_mode in {"unique", "all"}
 
     website_plan = None
@@ -79,22 +92,104 @@ def _export_captures(
             include_timestamps=include_timestamps,
         )
 
-    print(
-        "Exporting "
-        f"{len(set(warc_groups).union(files_groups))} URL groups "
-        f"(concurrency={request.concurrency})..."
+    redirect_enabled = (
+        request.warc_mode != "none" and request.redirect_capture != "none"
     )
-    return export_all(
-        warc_groups,
-        client,
-        layout=layout,
-        file_capture_groups=files_groups,
-        website_plan=website_plan,
-        warc_mode=request.warc_mode,
-        files_mode=request.files_mode,
-        client_factory=client_factory,
-        concurrency=request.concurrency,
-        retries=request.retries,
+    if not redirect_enabled:
+        print(
+            "Exporting "
+            f"{len(set(warc_groups).union(files_groups))} URL groups "
+            f"(concurrency={request.concurrency})..."
+        )
+        return export_all(
+            warc_groups,
+            client,
+            layout=layout,
+            file_capture_groups=files_groups,
+            website_plan=website_plan,
+            warc_mode=request.warc_mode,
+            files_mode=request.files_mode,
+            client_factory=client_factory,
+            concurrency=request.concurrency,
+            retries=request.retries,
+        )
+
+    seen_scopes = set()
+    known_captures = set(warc_captures)
+    failed_capture_urls = []
+    first_pass = True
+    while True:
+        print(
+            "Exporting "
+            f"{len(warc_groups)} WARC URL groups for redirect discovery "
+            f"(concurrency={request.concurrency})..."
+        )
+        result = export_all(
+            warc_groups,
+            client,
+            layout=layout,
+            file_capture_groups=files_groups if first_pass else None,
+            website_plan=website_plan if first_pass else None,
+            warc_mode=request.warc_mode,
+            files_mode=request.files_mode if first_pass else "none",
+            client_factory=client_factory,
+            concurrency=request.concurrency,
+            retries=request.retries,
+        )
+        if first_pass:
+            files_summary = result.files_summary
+            first_pass = False
+        failed_capture_urls.extend(result.failed_capture_urls)
+        added = False
+        for target in result.redirect_targets:
+            scope = redirect_scope(target, request.redirect_capture)
+            if scope.key in seen_scopes:
+                continue
+            seen_scopes.add(scope.key)
+            print(
+                f"Discovering redirect {request.redirect_capture} captures "
+                f"for {scope.url} ({request.date_start}-{request.date_end})"
+            )
+            target_captures = discover(
+                client,
+                scope.url,
+                request.date_start,
+                request.date_end,
+                match_type=scope.match_type,
+                progress=_report_discovery_progress,
+                retries=request.retries,
+            )
+            if not target_captures:
+                print(f"No redirect captures found for {scope.url}")
+                continue
+            print(
+                f"Discovered {len(target_captures)} redirect captures "
+                f"for {scope.url}"
+            )
+            print(f"Saving redirect source acquisition for {scope.url}...")
+            save_acquisition(
+                target_captures,
+                layout=layout,
+                url_pattern=scope.url,
+                date_start=request.date_start,
+                date_end=request.date_end,
+                acquired_at=datetime.now(timezone.utc),
+            )
+            for capture in target_captures:
+                if capture not in known_captures:
+                    known_captures.add(capture)
+                    warc_captures.append(capture)
+                    added = True
+        if not added:
+            break
+        warc_groups = group_captures(warc_captures)
+
+    return ExportResult(
+        result.summary,
+        result.final_warcs,
+        files_summary,
+        tuple(dict.fromkeys(failed_capture_urls)),
+        result.redirect_targets,
     )
 
 
@@ -135,6 +230,9 @@ def run_fetch(
     console_log: Optional[ConsoleMirror] = None,
 ) -> bool:
     """Discover captures, export enabled outputs, and report job success."""
+
+    if request.warc_mode == "none" and request.redirect_capture != "none":
+        print("Redirect capture inactive: --warc none")
 
     if request.warc_mode == "none" and request.files_mode == "none":
         print("Nothing to do: both --warc and --files are none")

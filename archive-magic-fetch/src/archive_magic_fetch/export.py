@@ -18,7 +18,6 @@ from wayback.exceptions import (
     MementoPlaybackError,
     WaybackRetryError,
 )
-
 from .console import GroupReporter, capture_result_line, print_progress
 from .files import FilesSummary, write_body
 from .paths import (
@@ -37,6 +36,7 @@ from .retrieval import (
     normalize_cdx_digest,
     retrieve_memento,
 )
+from .redirect_capture import resolve_redirect_target
 from .retry import DEFAULT_RETRIES, RetryExhaustedError
 from .warc import (
     ExistingWarcCache,
@@ -146,6 +146,7 @@ class ExportResult:
     final_warcs: tuple[Path, ...]
     files_summary: FilesSummary = field(default_factory=FilesSummary)
     failed_capture_urls: tuple[str, ...] = ()
+    redirect_targets: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -161,6 +162,7 @@ class _GroupResult:
     warc: ExportSummary
     files: FilesSummary
     failed_capture_urls: list[str]
+    redirect_targets: list[str]
 
 
 @dataclass
@@ -180,6 +182,7 @@ class _GroupState:
     failed_files: set[Path]
     events: dict[int, list[str]]
     failed_capture_urls: list[str]
+    redirect_targets: list[str]
 
 
 @dataclass
@@ -188,6 +191,7 @@ class _JobResult:
     files: FilesSummary
     final_warc: Optional[Path]
     failed_capture_urls: list[str]
+    redirect_targets: list[str]
 
 
 class _ThreadClientPool:
@@ -541,6 +545,7 @@ def _new_group_state(
         failed_files=set(),
         events={id(capture): [] for capture in union},
         failed_capture_urls=[],
+        redirect_targets=[],
     )
 
 
@@ -718,6 +723,18 @@ def _commit_representative(
                 "recovered invalid content encoding via CDX digest",
             )
         )
+    if wants_warc:
+        try:
+            redirect_target = resolve_redirect_target(
+                capture.original,
+                retrieved.status_code,
+                retrieved.headers,
+            )
+        except ValueError as error:
+            state.events[id(capture)].append(f"  WARNING: {error}")
+        else:
+            if redirect_target is not None:
+                state.redirect_targets.append(redirect_target)
     reference = None
     if wants_warc:
         reference = _write_response_record(
@@ -862,6 +879,7 @@ def _export_group(
         state.warc,
         state.files,
         state.failed_capture_urls,
+        state.redirect_targets,
     )
 
 
@@ -897,6 +915,7 @@ def _export_job(
     warc_summary = ExportSummary()
     files_summary = FilesSummary()
     failed_capture_urls = []
+    redirect_targets = []
     try:
         for urlkey in job.urlkeys:
             result = _export_group(
@@ -915,6 +934,7 @@ def _export_job(
             warc_summary.add(result.warc)
             files_summary.add(result.files)
             failed_capture_urls.extend(result.failed_capture_urls)
+            redirect_targets.extend(result.redirect_targets)
         final_warc = (
             owner.publish(
                 has_records=bool(
@@ -933,6 +953,7 @@ def _export_job(
         files_summary,
         final_warc,
         failed_capture_urls,
+        redirect_targets,
     )
 
 
@@ -1016,6 +1037,7 @@ def export_all(
     available_warcs = set()
     failed_capture_urls = []
     seen_failed_urls = set()
+    redirect_targets = set()
     for result in results:
         summary.add(result.warc)
         files_summary.add(result.files)
@@ -1025,6 +1047,7 @@ def export_all(
             if url not in seen_failed_urls:
                 seen_failed_urls.add(url)
                 failed_capture_urls.append(url)
+        redirect_targets.update(result.redirect_targets)
     return ExportResult(
         summary,
         tuple(
@@ -1034,6 +1057,7 @@ def export_all(
         ),
         files_summary,
         tuple(failed_capture_urls),
+        tuple(sorted(redirect_targets)),
     )
 
 
