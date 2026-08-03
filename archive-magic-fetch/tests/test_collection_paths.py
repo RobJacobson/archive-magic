@@ -48,6 +48,8 @@ def groups(*urlkeys):
     [
         ("https://Kevin.Burke.Dev/", "kevin.burke.dev"),
         ("http://www.example.com/*", "example.com"),
+        ("http://www1.example.com/*", "example.com"),
+        ("http://www12.example.com/*", "example.com"),
         ("*.example.com", "example.com"),
         ("https://example.com:443/*", "example.com"),
         ("http://example.com:80/*", "example.com"),
@@ -135,6 +137,7 @@ def test_readable_urlkey_paths(tmp_path, urlkey, relative):
     [
         ("https://example.com/", "example.com"),
         ("https://www.Example.com.:443/", "example.com"),
+        ("https://www1.Example.com.:443/", "example.com"),
         ("http://example.com:80/", "example.com"),
         ("https://example.com:8443/", "example.com%3A8443"),
         ("http://example.com:8080/", "example.com%3A8080"),

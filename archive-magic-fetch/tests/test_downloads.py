@@ -504,10 +504,10 @@ def test_repeated_identical_incomplete_read_stops_early(
     assert error.expected_bytes == 275029
     assert error.attempts == downloads.REPEATED_TRUNCATION_ATTEMPTS
     assert (
-        "truncated Wayback response after 2 attempts over "
+        "truncated after 2 attempts over "
         in str(error)
     )
-    assert "received 130,810 of 275,029 bytes" in str(error)
+    assert "130,810/275,029 bytes" in str(error)
     output = capsys.readouterr().out
     assert "retrying after incomplete response" in output
     assert "retry 1/8" not in output
@@ -571,7 +571,7 @@ def test_content_decoding_error_discards_raw_digest_mismatch():
 
     with pytest.raises(
         downloads.MalformedContentEncodingError,
-        match="raw recovery was not verified by the CDX digest",
+        match="raw recovery digest mismatch",
     ):
         downloads.download_response(client, capture)
 
@@ -588,21 +588,15 @@ def test_content_decoding_error_discards_without_valid_cdx_digest():
 
     with pytest.raises(
         downloads.MalformedContentEncodingError,
-        match=(
-            "original Wayback replay could not be decoded "
-            "by the HTTP client"
-        ),
+        match="gzip decode failed",
     ) as raised:
         downloads.download_response(client, object())
 
     assert len(client.calls) == 1
     assert broken.closed is True
-    assert (
-        "raw recovery was not verified by the CDX digest"
-        in str(raised.value)
-    )
-    assert "(Content-Encoding: gzip)" in str(raised.value)
+    assert "raw recovery digest mismatch" in str(raised.value)
     assert "incorrect gzip header" in str(raised.value)
+    assert "Content-Encoding:" not in str(raised.value)
 
 
 def test_content_decoding_raw_recovery_does_not_retry_transport_failure(

@@ -223,14 +223,15 @@ WARC files: building 18 with 8 workers
 Redirect: +2 histories from https://target.org/
 [2/20] archive/example.com/about.warc.gz: 1 responses, 0 revisits, 0 failed
 [3/20] archive/target.org/index.warc.gz: 8 responses, 1 revisits, 1 failed
-  https://web.archive.org/...: timeout after 9 attempts
+  https://web.archive.org/...
+    truncated after 9 attempts over 12.0s (1,000/2,000 bytes)
 Replay index: replay/index.cdxj from 20 WARC files
 Done in 2.3 minutes: 155 selected, 120 responses, 34 revisits, 1 failed
 ```
 
 Retries print immediately because a worker may wait through a long backoff.
-Warning and failure details are returned by workers and printed once beneath
-the related WARC completion. File counts are appended to their owning WARC
+Capture failures and warnings print the URL on one line and a single indented
+detail line beneath it. File counts are appended to their owning WARC
 line. Redirect expansion prints a short `Redirect: +N histories from <url>`
 line when new WARC work is queued. File-only histories appear in a separate
 `Website files` phase.

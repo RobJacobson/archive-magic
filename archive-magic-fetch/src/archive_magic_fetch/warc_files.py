@@ -236,26 +236,28 @@ def _failure_code(error: BaseException) -> Optional[int]:
     return None
 
 
+def _url_messages(url: str, detail: str) -> list[str]:
+    """Return a URL line plus one more-indented detail line."""
+
+    return [url, f"  {detail}"]
+
+
 def _failure_lines(capture: CdxRecord, error: Exception) -> list[str]:
     code = _failure_code(error)
-    outcome = (
-        f"failed with code {code}"
-        if code is not None
-        else "failed during playback"
-    )
-    return [
-        f"{capture.view_url}: {outcome}; {format_playback_failure(error)}",
-    ]
+    detail = format_playback_failure(error)
+    if code is not None:
+        detail = f"HTTP {code}; {detail}"
+    return _url_messages(capture.view_url, detail)
 
 
 def _status_failure_lines(
     capture: CdxRecord,
     actual_status: int,
 ) -> list[str]:
-    return [
-        f"{capture.view_url}: CDX status {capture.statuscode} but playback "
-        f"returned {actual_status}",
-    ]
+    return _url_messages(
+        capture.view_url,
+        f"CDX status {capture.statuscode} but playback returned {actual_status}",
+    )
 
 
 def _file_targets(
@@ -401,9 +403,11 @@ def _write_history_files(
         if planned_parts != actual_parts:
             failed_files.add(path)
             files_summary.content_type_mismatches += 1
-            messages.append(
-                f"{target_capture.view_url}: skipped file because response "
-                "Content-Type changes its path"
+            messages.extend(
+                _url_messages(
+                    target_capture.view_url,
+                    "skipped file: response Content-Type changes path",
+                )
             )
             continue
         write_body(path, body)
@@ -515,9 +519,12 @@ def _download_validated(
         try:
             cached = state.existing_warc.get(capture)
         except ValueError as error:
-            state.messages.append(
-                "WARNING: existing WARC cache entry could not be reused; "
-                f"fetching from Wayback: {error}"
+            state.messages.extend(
+                _url_messages(
+                    capture.view_url,
+                    f"WARNING: existing WARC cache unusable; "
+                    f"fetching from Wayback ({error})",
+                )
             )
         else:
             if cached is not None:
@@ -526,9 +533,12 @@ def _download_validated(
                     and normalize_cdx_digest(capture.digest)
                     != _EMPTY_PAYLOAD_DIGEST
                 ):
-                    state.messages.append(
-                        "WARNING: existing WARC cache entry has an "
-                        "unexpected empty payload; fetching from Wayback"
+                    state.messages.extend(
+                        _url_messages(
+                            capture.view_url,
+                            "WARNING: existing WARC cache empty; "
+                            "fetching from Wayback",
+                        )
                     )
                 else:
                     downloaded = DownloadedCapture(
@@ -660,7 +670,7 @@ def _commit_representative(
             downloaded.headers,
         )
         if warning is not None:
-            state.messages.append(f"{capture.view_url}: {warning}")
+            state.messages.extend(_url_messages(capture.view_url, warning))
         elif target is not None:
             redirect_targets.append(target)
 
@@ -788,7 +798,7 @@ def _build_warc(
         except Exception as error:
             messages.append(
                 "WARNING: existing WARC cache could not be inventoried; "
-                f"fetching from Wayback: {error}"
+                f"fetching from Wayback ({error})"
             )
     warc_summary = WarcCounts()
     files_summary = WebsiteFileCounts()
@@ -1112,5 +1122,5 @@ def build_url_history(
         retries=retries,
     )
     for message in result.messages:
-        print(message)
+        print(f"  {message}")
     return result.warc

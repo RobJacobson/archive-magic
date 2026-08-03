@@ -38,6 +38,7 @@ from .retry import (
     format_seconds,
     retry_decision,
     retry_delay_seconds,
+    short_cause,
     sleep_seconds,
 )
 from .warc_records import timestamp_to_warc_date
@@ -118,17 +119,12 @@ class MalformedContentEncodingError(MementoPlaybackError):
     ) -> None:
         self.encoding = encoding
         self.cause = cause
-        if encoding:
-            encoding_detail = f" (Content-Encoding: {encoding})"
-        else:
-            encoding_detail = ""
-        cause_text = str(cause).strip() if cause is not None else ""
-        cause_detail = f": {cause_text}" if cause_text else ""
-        super().__init__(
-            "original Wayback replay could not be decoded by the HTTP client"
-            f"{encoding_detail}{cause_detail}; raw recovery was not verified "
-            "by the CDX digest, so the capture was discarded"
-        )
+        label = encoding or "content"
+        detail = f"{label} decode failed"
+        cause_text = short_cause(cause)
+        if cause_text:
+            detail = f"{detail} ({cause_text})"
+        super().__init__(f"{detail}; raw recovery digest mismatch")
 
 
 class TruncatedWaybackResponseError(MementoPlaybackError):
@@ -146,10 +142,11 @@ class TruncatedWaybackResponseError(MementoPlaybackError):
         self.expected_bytes = expected_bytes
         self.attempts = attempts
         self.elapsed_seconds = elapsed_seconds
+        noun = "attempt" if attempts == 1 else "attempts"
         super().__init__(
-            "truncated Wayback response after "
-            f"{attempts} attempts over {elapsed_seconds:.1f}s "
-            f"(received {received_bytes:,} of {expected_bytes:,} bytes)"
+            f"truncated after {attempts} {noun} over "
+            f"{elapsed_seconds:.1f}s "
+            f"({received_bytes:,}/{expected_bytes:,} bytes)"
         )
 
 
@@ -160,23 +157,29 @@ def format_playback_failure(error: Exception) -> str:
         error,
         (
             MalformedContentEncodingError,
-            RetryExhaustedError,
             TruncatedWaybackResponseError,
         ),
     ):
         return str(error)
+    if isinstance(error, RetryExhaustedError):
+        noun = "attempt" if error.attempts == 1 else "attempts"
+        cause = short_cause(error.cause)
+        detail = (
+            f"failed after {error.attempts} {noun} over "
+            f"{error.elapsed_seconds:.1f}s"
+        )
+        return f"{detail}: {cause}" if cause else detail
     if isinstance(error, WaybackRetryError):
         elapsed = (
             f"{float(error.time):.1f}s"
             if isinstance(error.time, (int, float))
-            else "an unknown duration"
+            else "?"
         )
-        attempts = "attempt" if error.retries == 1 else "attempts"
-        return (
-            f"Wayback request failed after {error.retries} {attempts} over "
-            f"{elapsed}: {error.cause}"
-        )
-    return str(error) or type(error).__name__
+        noun = "attempt" if error.retries == 1 else "attempts"
+        cause = short_cause(getattr(error, "cause", None))
+        detail = f"failed after {error.retries} {noun} over {elapsed}"
+        return f"{detail}: {cause}" if cause else detail
+    return short_cause(error) or type(error).__name__
 
 
 def _content_encoding(memento) -> Optional[str]:
@@ -467,7 +470,7 @@ def _download_capture_with_retry(
 
             if truncation is not None:
                 print_progress(
-                    f"{capture_label}: retrying after incomplete response"
+                    f"{capture_label}\n  retrying after incomplete response"
                 )
                 continue
 
@@ -475,9 +478,11 @@ def _download_capture_with_retry(
                 attempt_number,
                 retry_after=decision.retry_after,
             )
+            cause = short_cause(decision.cause)
+            after = f" after {cause}" if cause else ""
             print_progress(
-                f"{capture_label}: retry {attempt_number}/{retries} in "
-                f"{format_seconds(delay)}s after {decision.cause}"
+                f"{capture_label}\n  retry {attempt_number}/{retries} in "
+                f"{format_seconds(delay)}s{after}"
             )
             sleep_seconds(delay)
         else:

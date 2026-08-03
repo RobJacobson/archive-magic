@@ -89,10 +89,12 @@ def test_page_scope_keeps_paths_queries_and_significant_ports_distinct():
 def test_website_scope_uses_a_host_query_and_canonicalizes_www():
     first = redirect_scope("http://www.target.test/one", "website")
     second = redirect_scope("https://target.test/two", "website")
+    numbered = redirect_scope("https://www1.target.test/three", "website")
 
     assert first.url == "http://www.target.test/one"
     assert first.match_type == "host"
     assert first.key == second.key
+    assert numbered.key == second.key
 
 
 def test_redirect_scope_rejects_unknown_mode():

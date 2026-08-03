@@ -306,7 +306,7 @@ def test_search_captures_retries_repeated_rate_limits(monkeypatch, capsys):
     assert search.search_captures(Client(), "example.com", "1995", "2020") == []
     assert attempts == 4
     assert sleeps == [10, 20, 40]
-    assert capsys.readouterr().out.count(" : retry ") == 3
+    assert capsys.readouterr().out.count("\n  retry ") == 3
 
 
 def test_search_captures_unexpected_response_format_is_fatal():

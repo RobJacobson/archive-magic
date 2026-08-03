@@ -637,15 +637,15 @@ def test_content_decoding_error_warns_once_when_raw_recovery_is_unavailable(
     assert summary.playback_failures == 1
     assert summary.invalid_content_encoding_failures == 1
     warning = capsys.readouterr().out
-    assert (
-        "original Wayback replay could not be decoded by the HTTP client"
-        in warning
-    )
-    assert (
-        "raw recovery was not verified by the CDX digest"
-        in warning
-    )
+    assert selected.view_url in warning
+    assert "decode failed" in warning
     assert "incorrect gzip header" in warning
+    assert "raw recovery digest mismatch" in warning
+    assert "original Wayback replay could not be decoded" not in warning
+    assert "failed during playback" not in warning
+    # URL on its own line, detail indented beneath it.
+    assert f"  {selected.view_url}\n    " in warning
+    assert "\n    " in warning and "decode failed" in warning.split("\n    ", 1)[1]
 
 
 def test_repeated_truncated_response_warns_early_and_is_categorized(
@@ -682,9 +682,10 @@ def test_repeated_truncated_response_warns_early_and_is_categorized(
     assert summary.truncated_response_failures == 1
     warning = capsys.readouterr().out
     assert "retrying after incomplete response" in warning
-    assert "truncated Wayback response after 2 attempts over" in warning
-    assert "received 130,810 of 275,029 bytes" in warning
+    assert "truncated after 2 attempts over" in warning
+    assert "130,810/275,029 bytes" in warning
     assert "IncompleteRead" not in warning
+    assert "truncated Wayback response after" not in warning
 
 
 def test_unexpected_response_format_is_fatal(tmp_path):
@@ -733,7 +734,7 @@ def test_repeated_rate_limit_is_bounded_and_skips_capture(
     assert summary.playback_failures == 1
     assert not target.exists()
     output = capsys.readouterr()
-    assert output.out.count(": retry ") == rate_limits - 1
+    assert output.out.count("\n  retry ") == rate_limits - 1
     assert "after 3 attempts" in output.out
 
 
@@ -1533,9 +1534,10 @@ def test_invalid_cached_payload_digest_warns_and_fetches_wayback(
     warc_files.build_url_history(URLKEY, [selected], target, client)
 
     assert client.calls == [selected]
-    assert "cache entry could not be reused; fetching from Wayback" in (
-        capsys.readouterr().out
-    )
+    output = capsys.readouterr().out
+    assert selected.view_url in output
+    assert "WARNING: existing WARC cache unusable" in output
+    assert "fetching from Wayback" in output
 
 
 def test_temporary_validation_failure_preserves_existing_warc(

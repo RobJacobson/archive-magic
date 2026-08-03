@@ -26,6 +26,7 @@ _WINDOWS_RESERVED_NAMES = {
     *(f"LPT{number}" for number in range(1, 10)),
 }
 _PARTIAL_ESCAPE = re.compile(r"%(?:[0-9A-F])?$")
+_WWW_ALIAS_PREFIX = re.compile(r"^www\d*\.")
 _MIME_SUFFIXES = {
     "text/html": ".html",
     "application/xhtml+xml": ".html",
@@ -167,8 +168,7 @@ def normalize_domain(
         host = host.encode("idna").decode("ascii").lower()
     except UnicodeError as error:
         raise ValueError(f"URL host is not valid IDNA: {host}") from error
-    if host.startswith("www."):
-        host = host[4:]
+    host = _WWW_ALIAS_PREFIX.sub("", host, count=1)
     if not host:
         raise ValueError("URL host cannot be only www")
 
