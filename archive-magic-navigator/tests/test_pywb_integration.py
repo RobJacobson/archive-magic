@@ -206,6 +206,15 @@ def test_real_pywb_replays_versions_revisit_and_subresources_read_only(
     shutil.copytree(FIXTURE, collection_root)
     collection = Collection("fixture", collection_root.resolve())
     assert validate_collection(collection).record_count == 7
+    replay_filenames = {
+        json.loads(line.split(" ", 2)[2])["filename"]
+        for line in collection.replay_index.read_text().splitlines()
+    }
+    assert replay_filenames == {
+        "archive/example.test/index.warc.gz",
+        "archive/local-redirect.test/index.warc.gz",
+        "archive/local-target.test/index.warc.gz",
+    }
     before = snapshot_tree(archives)
 
     SentinelHandler.requests = 0
@@ -263,7 +272,10 @@ def test_real_pywb_replays_versions_revisit_and_subresources_read_only(
                 + "http://example.test/"
             )
             assert b"Archived version one" in first
-            assert b"/fixture/20200101000000cs_/http://example.test/assets/site.css" in first
+            assert (
+                b"/fixture/20200101000000cs_/"
+                b"http://example.test/assets/site.css"
+            ) in first
             assert b"Archived version two" in second
             assert revisit == second
 

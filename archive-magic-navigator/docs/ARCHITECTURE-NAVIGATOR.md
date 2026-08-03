@@ -214,7 +214,7 @@ Fetch's CDXJ entries use collection-relative filenames:
 
 ```json
 {
-  "filename": "archive/posts/index.warc.gz",
+  "filename": "archive/example.com/posts/index.warc.gz",
   "offset": "9673",
   "length": "9362"
 }
@@ -222,7 +222,7 @@ Fetch's CDXJ entries use collection-relative filenames:
 
 | Field | Meaning | Validation |
 | --- | --- | --- |
-| `filename` | Collection-relative WARC path | Normalized relative POSIX path beginning `archive/` |
+| `filename` | Collection-relative WARC path | Normalized relative POSIX path beginning `archive/<domain-folder>/` |
 | `offset` | Compressed-member byte offset | Integer string or integer, value `>= 0` |
 | `length` | Compressed-member byte length | Integer string or integer, value `> 0` |
 
@@ -232,7 +232,7 @@ Consequently, pywb's resource prefix must be the collection root, not the
 ```text
 resource prefix + filename
 = /absolute/path/archives/example.com/
-  + archive/posts/index.warc.gz
+  + archive/example.com/posts/index.warc.gz
 ```
 
 The CDXJ, not the readable WARC filename, defines capture identity and the
@@ -262,9 +262,9 @@ Before starting pywb, Navigator validates the selected input without changing it
 6. Each replay record has a relative `filename` and nonnegative integer
    `offset` and positive integer `length` (numeric strings or JSON integers;
    not booleans, floats, or signed forms).
-7. A filename is a normalized relative POSIX path, begins with `archive/`,
-   contains no `.` or `..` traversal, and resolves beneath the collection
-   root.
+7. A filename is a normalized relative POSIX path, begins with
+   `archive/<domain-folder>/`, contains no `.` or `..` traversal, and resolves
+   beneath the collection root.
 8. Each distinct referenced WARC is a readable regular file, and
    `offset + length` does not exceed the current file size.
 9. Symlinks or resolved targets that escape the collection are rejected.
@@ -709,9 +709,8 @@ Pywb's HTTP loader sends a `Range` request but does not by itself prove that an
 origin honored it efficiently. Provider-level tests and metrics are therefore
 required before claiming bandwidth-safe bucket support.
 
-Fetch's future bucket writer should preserve the same relative filename
-semantics where practical, upload immutable WARC objects before the index, and
-publish the generation manifest last.
+Fetch's domain-folder WARC writer preserves these relative filename semantics.
+Navigator never derives a WARC location from the captured URL.
 
 ## 12. Python and dependency policy
 

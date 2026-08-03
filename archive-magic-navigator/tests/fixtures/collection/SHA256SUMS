@@ -1,2 +1,4 @@
-acb852353522972960126f3eaa270742abd79e38980b8a8d59b370a5e4070424  archive/fixture.warc.gz
-5fdb74b64b2bcb1d9208d0b0f2ec6ecf186851a69fc884e17a7e51547e2dc22a  replay/index.cdxj
+050e01084dd88c4588c82a8990929240e941615359acd5a0ce3c2c757a9d3fd7  archive/example.test/index.warc.gz
+e98abdd4a6d87e4a229dcec75a928fb6b18651c053f56fb306d35171ec04da0b  archive/local-redirect.test/index.warc.gz
+749e2cee8c3834dea432f9889323b35840b0d4581e14960502673227ce0f39ff  archive/local-target.test/index.warc.gz
+2e2cc96668985463e970deb41dd574cda94176534723770b6044b37d79c91060  replay/index.cdxj

@@ -12,7 +12,13 @@ from warcio.warcwriter import WARCWriter
 
 
 ROOT = Path(__file__).parent / "collection"
-WARC = ROOT / "archive" / "fixture.warc.gz"
+WARC = ROOT / "archive" / "example.test" / "index.warc.gz"
+LOCAL_REDIRECT_WARC = (
+    ROOT / "archive" / "local-redirect.test" / "index.warc.gz"
+)
+LOCAL_TARGET_WARC = (
+    ROOT / "archive" / "local-target.test" / "index.warc.gz"
+)
 INDEX = ROOT / "replay" / "index.cdxj"
 HASHES = ROOT / "SHA256SUMS"
 MAIN_URL = "http://example.test/"
@@ -37,7 +43,8 @@ def http_headers(
 
 
 def main() -> None:
-    WARC.parent.mkdir(parents=True, exist_ok=True)
+    for warc in (WARC, LOCAL_REDIRECT_WARC, LOCAL_TARGET_WARC):
+        warc.parent.mkdir(parents=True, exist_ok=True)
     INDEX.parent.mkdir(parents=True, exist_ok=True)
 
     entries = []
@@ -70,60 +77,6 @@ def main() -> None:
                 MAIN_URL,
                 "text/html",
                 first,
-                start,
-                stream.tell() - start,
-            )
-        )
-
-        local_redirect = writer.create_warc_record(
-            LOCAL_REDIRECT_URL,
-            "response",
-            payload=BytesIO(b""),
-            http_headers=http_headers(
-                "text/html; charset=utf-8",
-                status="301 Moved Permanently",
-                extra=(("Location", LOCAL_TARGET_URL),),
-            ),
-            warc_headers_dict={
-                "WARC-Date": "2020-01-01T00:00:03Z",
-                "WARC-Record-ID": "<urn:uuid:00000000-0000-0000-0000-000000000006>",
-            },
-        )
-        start = stream.tell()
-        writer.write_record(local_redirect)
-        entries.append(
-            entry(
-                "test,local-redirect)/",
-                "20200101000003",
-                LOCAL_REDIRECT_URL,
-                "text/html",
-                local_redirect,
-                start,
-                stream.tell() - start,
-                status="301",
-            )
-        )
-
-        local_target_body = b"<html>Redirect target captured locally</html>"
-        local_target = writer.create_warc_record(
-            LOCAL_TARGET_URL,
-            "response",
-            payload=BytesIO(local_target_body),
-            http_headers=http_headers("text/html; charset=utf-8"),
-            warc_headers_dict={
-                "WARC-Date": "2020-01-01T00:00:00Z",
-                "WARC-Record-ID": "<urn:uuid:00000000-0000-0000-0000-000000000007>",
-            },
-        )
-        start = stream.tell()
-        writer.write_record(local_target)
-        entries.append(
-            entry(
-                "test,local-target)/",
-                "20200101000000",
-                LOCAL_TARGET_URL,
-                "text/html",
-                local_target,
                 start,
                 stream.tell() - start,
             )
@@ -236,6 +189,65 @@ def main() -> None:
             )
         )
 
+    with LOCAL_REDIRECT_WARC.open("wb") as stream:
+        writer = WARCWriter(stream, gzip=True, warc_version="1.0")
+        local_redirect = writer.create_warc_record(
+            LOCAL_REDIRECT_URL,
+            "response",
+            payload=BytesIO(b""),
+            http_headers=http_headers(
+                "text/html; charset=utf-8",
+                status="301 Moved Permanently",
+                extra=(("Location", LOCAL_TARGET_URL),),
+            ),
+            warc_headers_dict={
+                "WARC-Date": "2020-01-01T00:00:03Z",
+                "WARC-Record-ID": "<urn:uuid:00000000-0000-0000-0000-000000000006>",
+            },
+        )
+        start = stream.tell()
+        writer.write_record(local_redirect)
+        entries.append(
+            entry(
+                "test,local-redirect)/",
+                "20200101000003",
+                LOCAL_REDIRECT_URL,
+                "text/html",
+                local_redirect,
+                start,
+                stream.tell() - start,
+                status="301",
+                filename="archive/local-redirect.test/index.warc.gz",
+            )
+        )
+
+    with LOCAL_TARGET_WARC.open("wb") as stream:
+        writer = WARCWriter(stream, gzip=True, warc_version="1.0")
+        local_target = writer.create_warc_record(
+            LOCAL_TARGET_URL,
+            "response",
+            payload=BytesIO(b"<html>Redirect target captured locally</html>"),
+            http_headers=http_headers("text/html; charset=utf-8"),
+            warc_headers_dict={
+                "WARC-Date": "2020-01-01T00:00:00Z",
+                "WARC-Record-ID": "<urn:uuid:00000000-0000-0000-0000-000000000007>",
+            },
+        )
+        start = stream.tell()
+        writer.write_record(local_target)
+        entries.append(
+            entry(
+                "test,local-target)/",
+                "20200101000000",
+                LOCAL_TARGET_URL,
+                "text/html",
+                local_target,
+                start,
+                stream.tell() - start,
+                filename="archive/local-target.test/index.warc.gz",
+            )
+        )
+
     entries.sort(key=lambda item: (item[0], item[1]))
     INDEX.write_text(
         "".join(
@@ -246,7 +258,7 @@ def main() -> None:
         encoding="utf-8",
     )
     hashes = []
-    for path in (WARC, INDEX):
+    for path in (WARC, LOCAL_REDIRECT_WARC, LOCAL_TARGET_WARC, INDEX):
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
         hashes.append(f"{digest}  {path.relative_to(ROOT).as_posix()}\n")
     HASHES.write_text("".join(hashes), encoding="ascii")
@@ -262,13 +274,14 @@ def entry(
     length: int,
     *,
     status: str = "200",
+    filename: str = "archive/example.test/index.warc.gz",
 ):
     return (
         url_key,
         timestamp,
         {
             "digest": record.rec_headers.get_header("WARC-Payload-Digest"),
-            "filename": "archive/fixture.warc.gz",
+            "filename": filename,
             "length": str(length),
             "mime": mime,
             "offset": str(offset),

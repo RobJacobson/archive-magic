@@ -16,7 +16,7 @@ def collection_factory(tmp_path):
     ):
         root = tmp_path / "archives"
         collection = root / collection_id
-        warc = collection / "archive" / "fixture.warc.gz"
+        warc = collection / "archive" / "example.org" / "index.warc.gz"
         warc.parent.mkdir(parents=True, exist_ok=True)
         warc.write_bytes(b"x" * warc_size)
         if entries is None:
@@ -25,7 +25,7 @@ def collection_factory(tmp_path):
                     "org,example)/",
                     "20200101000000",
                     {
-                        "filename": "archive/fixture.warc.gz",
+                        "filename": "archive/example.org/index.warc.gz",
                         "offset": "0",
                         "length": "16",
                     },
