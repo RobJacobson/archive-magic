@@ -11,10 +11,12 @@ from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.error import HTTPError
+from urllib.parse import unquote
 from urllib.request import urlopen
 
 import pytest
 
+from archive_magic_navigator import config as navigator_config
 from archive_magic_navigator.collections import Collection
 from archive_magic_navigator.config import build_config, write_config
 from archive_magic_navigator.errors import StartupError
@@ -51,12 +53,15 @@ def free_port():
 
 
 @contextmanager
-def pywb_server(tmp_path, collections):
+def pywb_server(tmp_path, collections, *, wayback_fallback=False):
     runtime = tmp_path / f"runtime-{free_port()}"
     runtime.mkdir()
     write_config(
         runtime,
-        build_config(collections),
+        build_config(
+            collections,
+            wayback_fallback=wayback_fallback,
+        ),
     )
     port = free_port()
     log = (runtime / "pywb.log").open("wb")
@@ -120,6 +125,78 @@ class SentinelHandler(BaseHTTPRequestHandler):
         pass
 
 
+class MementoHandler(BaseHTTPRequestHandler):
+    capture_timestamp = "20200101000000"
+    capture_datetime = "Wed, 01 Jan 2020 00:00:00 GMT"
+    timegate_requests = []
+    resource_requests = []
+
+    def do_HEAD(self):
+        original = unquote(self.path.removeprefix("/web/"))
+        type(self).timegate_requests.append(
+            (original, self.headers.get("Accept-Datetime"))
+        )
+        memento = (
+            f"http://127.0.0.1:{self.server.server_port}/web/"
+            f"{self.capture_timestamp}id_/{original}"
+        )
+        links = (
+            f'<{original}>; rel="original", '
+            f'<{memento}>; rel="memento"; '
+            f'datetime="{self.capture_datetime}"'
+        )
+        self.send_response(200)
+        self.send_header("Link", links)
+        self.end_headers()
+
+    def do_GET(self):
+        type(self).resource_requests.append(self.path)
+        if self.path.endswith("/http://fallback.test/"):
+            body = (
+                b"<!doctype html><html><head>"
+                b'<link rel="stylesheet" '
+                b'href="http://fallback.test/asset.css">'
+                b"</head><body>Wayback fallback page</body></html>"
+            )
+            content_type = "text/html; charset=utf-8"
+        elif self.path.endswith("/http://fallback.test/asset.css"):
+            body = b"body { background: rgb(1, 2, 3); }\n"
+            content_type = "text/css"
+        else:
+            self.send_error(404)
+            return
+
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Memento-Datetime", self.capture_datetime)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format, *args):
+        pass
+
+
+@contextmanager
+def memento_server():
+    class IsolatedMementoHandler(MementoHandler):
+        timegate_requests = []
+        resource_requests = []
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), IsolatedMementoHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        source = (
+            f"memento+http://127.0.0.1:{server.server_port}/web/"
+        )
+        yield source, IsolatedMementoHandler
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
 @pytest.mark.integration
 def test_real_pywb_replays_versions_revisit_and_subresources_read_only(
     tmp_path,
@@ -128,7 +205,7 @@ def test_real_pywb_replays_versions_revisit_and_subresources_read_only(
     collection_root = archives / "fixture"
     shutil.copytree(FIXTURE, collection_root)
     collection = Collection("fixture", collection_root.resolve())
-    assert validate_collection(collection).record_count == 4
+    assert validate_collection(collection).record_count == 5
     before = snapshot_tree(archives)
 
     SentinelHandler.requests = 0
@@ -210,6 +287,72 @@ def test_real_pywb_replays_versions_revisit_and_subresources_read_only(
         sentinel.shutdown()
         sentinel.server_close()
         thread.join(timeout=2)
+
+    assert snapshot_tree(archives) == before
+
+
+@pytest.mark.integration
+def test_real_pywb_uses_wayback_fallback_for_redirect_and_assets(
+    tmp_path,
+    monkeypatch,
+):
+    archives = tmp_path / "archives"
+    collection_root = archives / "fixture"
+    shutil.copytree(FIXTURE, collection_root)
+    collection = Collection("fixture", collection_root.resolve())
+    assert validate_collection(collection).record_count == 5
+    before = snapshot_tree(archives)
+
+    with memento_server() as (source, handler):
+        monkeypatch.setattr(
+            navigator_config,
+            "WAYBACK_MEMENTO_SOURCE",
+            source,
+        )
+        with pywb_server(
+            tmp_path,
+            [collection],
+            wayback_fallback=True,
+        ) as base:
+            _, local, _ = get(
+                base
+                + "/fixture/20200101000000id_/"
+                + "http://example.test/"
+            )
+            assert b"Archived version one" in local
+            assert handler.timegate_requests == []
+            assert handler.resource_requests == []
+
+            _, fallback, _ = get(
+                base
+                + "/fixture/20200101000002mp_/"
+                + "http://redirect.test/"
+            )
+            assert b"Wayback fallback page" in fallback
+            assert (
+                b"/fixture/20200101000002cs_/"
+                b"http://fallback.test/asset.css"
+            ) in fallback
+            assert handler.timegate_requests == [
+                (
+                    "http://fallback.test/",
+                    "Wed, 01 Jan 2020 00:00:02 GMT",
+                )
+            ]
+            assert len(handler.resource_requests) == 1
+
+            _, css, headers = get(
+                base
+                + "/fixture/20200101000002cs_/"
+                + "http://fallback.test/asset.css"
+            )
+            assert css == b"body { background: rgb(1, 2, 3); }\n"
+            assert headers.get_content_type() == "text/css"
+            assert handler.timegate_requests[-1] == (
+                "http://fallback.test/asset.css",
+                "Wed, 01 Jan 2020 00:00:02 GMT",
+            )
+            assert len(handler.resource_requests) == 2
 
     assert snapshot_tree(archives) == before
 

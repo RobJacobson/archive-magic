@@ -30,6 +30,7 @@ class NavigatorRequest:
     archives: Path
     bind: str
     port: int
+    wayback_fallback: bool
     open_browser: bool
     debug: bool
 
@@ -89,6 +90,15 @@ def parse_args(
         help="listen port (default: 8080)",
     )
     parser.add_argument(
+        "--wayback-fallback",
+        choices=("on", "off"),
+        default="on",
+        help=(
+            "load missing resources from the Internet Archive "
+            "(default: on)"
+        ),
+    )
+    parser.add_argument(
         "--open",
         action="store_true",
         dest="open_browser",
@@ -107,6 +117,7 @@ def parse_args(
         archives=args.archives,
         bind=args.bind,
         port=args.port,
+        wayback_fallback=args.wayback_fallback == "on",
         open_browser=args.open_browser,
         debug=args.debug,
     )
@@ -146,6 +157,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
             config = build_config(
                 collections,
+                wayback_fallback=request.wayback_fallback,
             )
             write_config(runtime_directory, config)
 
@@ -155,6 +167,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                     f"Serving {len(collections)} "
                     f"{'collection' if len(collections) == 1 else 'collections'} "
                     f"from {archives_root}",
+                    flush=True,
+                )
+                print(
+                    "Wayback fallback: "
+                    f"{'on' if request.wayback_fallback else 'off'}",
                     flush=True,
                 )
                 print(f"Open {url}", flush=True)

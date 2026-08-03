@@ -17,12 +17,19 @@ INDEX = ROOT / "replay" / "index.cdxj"
 HASHES = ROOT / "SHA256SUMS"
 MAIN_URL = "http://example.test/"
 CSS_URL = "http://example.test/assets/site.css"
+REDIRECT_URL = "http://redirect.test/"
+FALLBACK_URL = "http://fallback.test/"
 
 
-def http_headers(content_type: str) -> StatusAndHeaders:
+def http_headers(
+    content_type: str,
+    *,
+    status: str = "200 OK",
+    extra: tuple[tuple[str, str], ...] = (),
+) -> StatusAndHeaders:
     return StatusAndHeaders(
-        "200 OK",
-        [("Content-Type", content_type)],
+        status,
+        [("Content-Type", content_type), *extra],
         protocol="HTTP/1.1",
     )
 
@@ -63,6 +70,35 @@ def main() -> None:
                 first,
                 start,
                 stream.tell() - start,
+            )
+        )
+
+        redirect = writer.create_warc_record(
+            REDIRECT_URL,
+            "response",
+            payload=BytesIO(b""),
+            http_headers=http_headers(
+                "text/html; charset=utf-8",
+                status="301 Moved Permanently",
+                extra=(("Location", FALLBACK_URL),),
+            ),
+            warc_headers_dict={
+                "WARC-Date": "2020-01-01T00:00:02Z",
+                "WARC-Record-ID": "<urn:uuid:00000000-0000-0000-0000-000000000005>",
+            },
+        )
+        start = stream.tell()
+        writer.write_record(redirect)
+        entries.append(
+            entry(
+                "test,redirect)/",
+                "20200101000002",
+                REDIRECT_URL,
+                "text/html",
+                redirect,
+                start,
+                stream.tell() - start,
+                status="301",
             )
         )
 
@@ -168,6 +204,8 @@ def entry(
     record,
     offset: int,
     length: int,
+    *,
+    status: str = "200",
 ):
     return (
         url_key,
@@ -178,7 +216,7 @@ def entry(
             "length": str(length),
             "mime": mime,
             "offset": str(offset),
-            "status": "200",
+            "status": status,
             "url": url,
         },
     )

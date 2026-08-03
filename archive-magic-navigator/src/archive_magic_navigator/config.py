@@ -14,6 +14,34 @@ import yaml
 from .collections import Collection
 
 
+WAYBACK_MEMENTO_SOURCE = "memento+https://web.archive.org/web/"
+WAYBACK_TIMEOUT_SECONDS = 10
+
+
+def _collection_config(
+    collection: Collection,
+    *,
+    wayback_fallback: bool,
+) -> dict[str, Any]:
+    local = {
+        "index": str(collection.replay_index),
+        "archive_paths": [str(collection.root) + os.sep],
+    }
+    if not wayback_fallback:
+        return local
+
+    return {
+        "sequence": [
+            {"name": "local", **local},
+            {
+                "name": "wayback",
+                "index_group": {"ia": WAYBACK_MEMENTO_SOURCE},
+                "timeout": WAYBACK_TIMEOUT_SECONDS,
+            },
+        ]
+    }
+
+
 def package_asset_paths() -> tuple[Path, Path]:
     """Return absolute installed template and static directories."""
 
@@ -25,16 +53,18 @@ def package_asset_paths() -> tuple[Path, Path]:
 
 def build_config(
     collections: Sequence[Collection],
+    *,
+    wayback_fallback: bool = True,
 ) -> dict[str, Any]:
     """Build one safe pywb configuration from validated inputs."""
 
     return {
         "enable_auto_colls": False,
         "collections": {
-            collection.collection_id: {
-                "index": str(collection.replay_index),
-                "archive_paths": [str(collection.root) + os.sep],
-            }
+            collection.collection_id: _collection_config(
+                collection,
+                wayback_fallback=wayback_fallback,
+            )
             for collection in collections
         },
         "framed_replay": True,
