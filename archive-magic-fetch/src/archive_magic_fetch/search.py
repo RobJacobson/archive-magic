@@ -1,4 +1,4 @@
-"""Internet Archive CDX discovery."""
+"""Search Internet Archive CDX capture indexes."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ from urllib.parse import urlencode
 from wayback import CdxRecord
 from wayback.exceptions import RateLimitError, WaybackRetryError
 
+from .collection_paths import domain_folder
 from .console import print_progress
 from .retry import (
     DEFAULT_RETRIES,
@@ -38,19 +39,19 @@ def _is_redirect_status(status: Optional[int]) -> bool:
 def select_latest_capture(
     captures: Sequence[CdxRecord],
 ) -> Optional[CdxRecord]:
-    """Choose one capture for ``latest`` mode from a urlkey group.
+    """Choose one capture for ``latest`` mode from a URL history.
 
     Preference order:
     1. newest capture with CDX status ``200``
     2. newest capture whose status is present and not ``3xx``
     3. newest capture whose status is ``3xx``
-    4. omit the group (statusless-only)
+    4. omit the history (statusless-only)
 
     “Newest” is determined by ``capture.timestamp``, not input order.
     """
 
     if not captures:
-        raise ValueError("capture group is empty")
+        raise ValueError("URL history is empty")
 
     newest_200 = max(
         (capture for capture in captures if capture.statuscode == 200),
@@ -84,24 +85,24 @@ def select_latest_capture(
     )
 
 
-def apply_output_mode(
-    capture_groups: Mapping[str, Sequence[CdxRecord]],
+def select_captures(
+    captures_by_url: Mapping[tuple[str, str], Sequence[CdxRecord]],
     mode: OutputMode,
-) -> Mapping[str, Sequence[CdxRecord]]:
-    """Transform grouped captures into the selection for one output axis."""
+) -> Mapping[tuple[str, str], Sequence[CdxRecord]]:
+    """Select captures from each URL history for one output axis."""
 
     if mode not in FILES_MODES:
         raise ValueError(f"unsupported output mode: {mode}")
     if mode == "none":
         return {}
     if mode in {"all", "unique"}:
-        return capture_groups
+        return captures_by_url
 
-    selected: dict[str, list[CdxRecord]] = {}
-    for urlkey, captures in capture_groups.items():
+    selected: dict[tuple[str, str], list[CdxRecord]] = {}
+    for history_key, captures in captures_by_url.items():
         capture = select_latest_capture(captures)
         if capture is not None:
-            selected[urlkey] = [capture]
+            selected[history_key] = [capture]
     return selected
 
 
@@ -121,7 +122,7 @@ def normalize_cdx_search(url_pattern: str) -> tuple[str, Optional[str]]:
     return url_pattern, None
 
 
-def discover(
+def search_captures(
     client,
     url_pattern: str,
     date_start: str,
@@ -197,12 +198,12 @@ def discover(
             sleep_seconds(delay)
 
 
-def group_captures(
+def group_by_url(
     captures: Iterable[CdxRecord],
-) -> dict[str, list[CdxRecord]]:
+) -> dict[tuple[str, str], list[CdxRecord]]:
     """Group captures by Wayback URL key and sort them by timestamp."""
 
-    grouped: dict[str, list[CdxRecord]] = {}
+    captures_by_url: dict[tuple[str, str], list[CdxRecord]] = {}
     for capture in captures:
         if not isinstance(capture.original, str):
             raise ValueError("capture URL must be a string")
@@ -211,9 +212,12 @@ def group_captures(
         if not isinstance(urlkey, str) or not urlkey:
             raise ValueError("capture must include a non-empty CDX urlkey")
 
-        grouped.setdefault(urlkey, []).append(capture)
+        captures_by_url.setdefault(
+            (domain_folder(capture.original), urlkey),
+            [],
+        ).append(capture)
 
-    for group_list in grouped.values():
-        group_list.sort(key=lambda capture: capture.timestamp)
+    for history in captures_by_url.values():
+        history.sort(key=lambda capture: capture.timestamp)
 
-    return grouped
+    return captures_by_url

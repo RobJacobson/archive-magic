@@ -1,10 +1,11 @@
-"""Wayback Memento retrieval and semantic WARC response construction."""
+"""Download and validate Wayback captures."""
 
 from __future__ import annotations
 
 import base64
 import hashlib
 import re
+import threading
 import time
 from dataclasses import dataclass
 from http import HTTPStatus
@@ -21,12 +22,14 @@ from warcio.recordbuilder import RecordBuilder
 from warcio.statusandheaders import StatusAndHeaders
 from wayback import Mode, WaybackClient
 from wayback.exceptions import (
+    BlockedByRobotsError,
+    BlockedSiteError,
     MementoPlaybackError,
     RateLimitError,
     WaybackRetryError,
 )
 
-from .console import capture_result_line, print_progress
+from .console import print_progress
 from .retry import (
     DEFAULT_RETRIES,
     ArchiveMagicWaybackSession,
@@ -37,10 +40,18 @@ from .retry import (
     retry_delay_seconds,
     sleep_seconds,
 )
-from .warc import timestamp_to_warc_date
+from .warc_records import timestamp_to_warc_date
 
 
-DEFAULT_CONCURRENCY = 8
+DEFAULT_WORKER_COUNT = 8
+
+PLAYBACK_ERRORS = (
+    MementoPlaybackError,
+    RetryExhaustedError,
+    BlockedByRobotsError,
+    BlockedSiteError,
+    WaybackRetryError,
+)
 
 REPEATED_TRUNCATION_ATTEMPTS = 2
 
@@ -57,6 +68,43 @@ _REPRESENTATION_HEADERS = {
     "repr-digest",
     "transfer-encoding",
 }
+
+
+class ThreadClientPool:
+    """Lazily own and reuse one Wayback client per worker thread."""
+
+    def __init__(self, factory: Callable) -> None:
+        self._factory = factory
+        self._local = threading.local()
+        self._lock = threading.Lock()
+        self._clients: list[object] = []
+
+    def get(self):
+        active = getattr(self._local, "active", None)
+        if active is not None:
+            return active
+
+        client = self._factory()
+        enter = getattr(client, "__enter__", None)
+        active = enter() if callable(enter) else client
+        if active is None:
+            active = client
+        self._local.active = active
+        with self._lock:
+            self._clients.append(client)
+        return active
+
+    def close(self) -> None:
+        """Close every client after all worker threads have stopped."""
+
+        for client in self._clients:
+            exit_fn = getattr(client, "__exit__", None)
+            if callable(exit_fn):
+                exit_fn(None, None, None)
+            else:
+                close = getattr(client, "close", None)
+                if callable(close):
+                    close()
 
 
 class MalformedContentEncodingError(MementoPlaybackError):
@@ -129,33 +177,6 @@ def format_playback_failure(error: Exception) -> str:
             f"{elapsed}: {error.cause}"
         )
     return str(error) or type(error).__name__
-
-
-def format_playback_failure_summary(
-    total: int,
-    *,
-    invalid_content_encoding: int,
-    truncated_response: int,
-) -> str:
-    """Format a total with complete category detail when useful."""
-
-    noun = "failure" if total == 1 else "failures"
-    base = f"{total} playback {noun}"
-    categorized = invalid_content_encoding + truncated_response
-    if total == 0 or categorized == 0:
-        return base
-
-    categories = []
-    if invalid_content_encoding:
-        categories.append(
-            f"{invalid_content_encoding} invalid content encoding"
-        )
-    if truncated_response:
-        categories.append(f"{truncated_response} truncated response")
-    other = total - categorized
-    if other > 0:
-        categories.append(f"{other} other")
-    return f"{base} ({', '.join(categories)})"
 
 
 def _content_encoding(memento) -> Optional[str]:
@@ -282,7 +303,7 @@ def _incomplete_read_boundary(
 
 
 @dataclass(frozen=True)
-class RetrievedMemento:
+class DownloadedCapture:
     """Semantic playback result reusable by WARC and loose-file writers."""
 
     body: bytes
@@ -291,7 +312,6 @@ class RetrievedMemento:
     source_uri: str
     status_code: int
     headers: tuple[tuple[str, str], ...]
-    recovered_content_encoding: bool = False
 
     def to_warc_record(self, *, target_url: Optional[str] = None):
         """Build a fresh WARC response record over the semantic body."""
@@ -332,18 +352,19 @@ def make_client_factory(user_agent: str) -> Callable[[], WaybackClient]:
     return factory
 
 
-def _retrieve_memento_with_retry(
+def _download_capture_with_retry(
     client,
     capture,
     *,
     retries: int,
-) -> RetrievedMemento:
+) -> DownloadedCapture:
     """Retrieve and consume one Memento with application-owned retries."""
 
     started_at = time.monotonic()
     attempt_number = 0
     previous_truncation = None
     repeated_truncations = 0
+    capture_label = getattr(capture, "view_url", str(capture))
     while attempt_number <= retries:
         attempt_number += 1
         memento = None
@@ -359,7 +380,7 @@ def _retrieve_memento_with_retry(
                 headers = tuple(
                     _semantic_headers(memento.headers, len(payload))
                 )
-                result = RetrievedMemento(
+                result = DownloadedCapture(
                     body=payload,
                     url=memento.url,
                     capture_date=timestamp_to_warc_date(
@@ -385,7 +406,7 @@ def _retrieve_memento_with_retry(
                     _content_encoding(memento),
                     cause=error,
                 ) from error
-            return RetrievedMemento(
+            return DownloadedCapture(
                 body=payload,
                 url=memento.url,
                 capture_date=timestamp_to_warc_date(memento.timestamp),
@@ -394,7 +415,6 @@ def _retrieve_memento_with_retry(
                 headers=tuple(
                     _semantic_headers(memento.headers, len(payload))
                 ),
-                recovered_content_encoding=True,
             )
         except (
             RateLimitError,
@@ -447,10 +467,7 @@ def _retrieve_memento_with_retry(
 
             if truncation is not None:
                 print_progress(
-                    capture_result_line(
-                        capture,
-                        "retrying after incomplete response",
-                    )
+                    f"{capture_label}: retrying after incomplete response"
                 )
                 continue
 
@@ -459,11 +476,8 @@ def _retrieve_memento_with_retry(
                 retry_after=decision.retry_after,
             )
             print_progress(
-                capture_result_line(
-                    capture,
-                    f"retry {attempt_number}/{retries} in "
-                    f"{format_seconds(delay)}s after {decision.cause}",
-                )
+                f"{capture_label}: retry {attempt_number}/{retries} in "
+                f"{format_seconds(delay)}s after {decision.cause}"
             )
             sleep_seconds(delay)
         else:
@@ -497,24 +511,24 @@ def _status_line(status_code: int) -> str:
     return f"{status_code} {reason}".rstrip()
 
 
-def retrieve_memento(
+def download_capture(
     client,
     capture,
     *,
     retries: int = DEFAULT_RETRIES,
-) -> RetrievedMemento:
+) -> DownloadedCapture:
     """Retrieve one Memento as reusable semantic body and metadata."""
 
     if retries < 0:
         raise ValueError("retries cannot be negative")
-    return _retrieve_memento_with_retry(
+    return _download_capture_with_retry(
         client,
         capture,
         retries=retries,
     )
 
 
-def retrieve_response(
+def download_response(
     client,
     capture,
     *,
@@ -522,7 +536,7 @@ def retrieve_response(
 ):
     """Retrieve one Memento and construct the semantic WARC response."""
 
-    return retrieve_memento(
+    return download_capture(
         client,
         capture,
         retries=retries,

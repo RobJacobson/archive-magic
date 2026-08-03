@@ -3,8 +3,8 @@ from datetime import datetime, timezone
 from warcio.archiveiterator import ArchiveIterator
 from wayback import CdxRecord
 
-from archive_magic_fetch import job
-from archive_magic_fetch.job import FetchRequest
+from archive_magic_fetch import fetch
+from archive_magic_fetch.fetch import FetchSettings
 
 
 def _timestamp(value):
@@ -106,10 +106,10 @@ def test_redirect_page_history_is_written_with_primary_in_one_collection(
         200,
     )
     client = FakeWaybackClient(primary, target)
-    monkeypatch.setattr(job, "_DEFAULT_OUTPUT_ROOT", tmp_path / "archives")
-    monkeypatch.setattr(job, "make_client_factory", lambda _agent: lambda: client)
+    monkeypatch.setattr(fetch, "_DEFAULT_OUTPUT_ROOT", tmp_path / "archives")
+    monkeypatch.setattr(fetch, "make_client_factory", lambda _agent: lambda: client)
 
-    request = FetchRequest(
+    request = FetchSettings(
         url_pattern="source.test/*",
         date_start="2019",
         date_end="2020",
@@ -117,28 +117,36 @@ def test_redirect_page_history_is_written_with_primary_in_one_collection(
         files_mode="none",
         rewrite_local=False,
         redirect_capture="page",
-        concurrency=1,
+        worker_count=1,
         retries=0,
     )
 
-    assert job.run_fetch(request) is True
+    assert fetch.run_fetch(request) is True
 
     collection = tmp_path / "archives" / "source.test"
     warcs = tuple((collection / "archive").glob("**/*.warc.gz"))
-    assert len(warcs) == 1
-    targets = []
-    with warcs[0].open("rb") as stream:
+    assert {path.relative_to(collection).as_posix() for path in warcs} == {
+        "archive/source.test/index.warc.gz",
+        "archive/target.test/index.warc.gz",
+    }
+    targets = set()
+    for warc in warcs:
+        stream = warc.open("rb")
         for record in ArchiveIterator(stream):
             if record.rec_type == "response":
-                targets.append(record.rec_headers.get_header("WARC-Target-URI"))
-    assert targets == ["http://source.test/", "https://target.test/"]
+                targets.add(record.rec_headers.get_header("WARC-Target-URI"))
+        stream.close()
+    assert targets == {"http://source.test/", "https://target.test/"}
 
     replay = (collection / "replay" / "index.cdxj").read_text()
     assert "http://source.test/" in replay
     assert "https://target.test/" in replay
+    assert '"filename": "archive/source.test/index.warc.gz"' in replay
+    assert '"filename": "archive/target.test/index.warc.gz"' in replay
     assert not (collection / "website").exists()
     assert len(tuple((collection / "sources").iterdir())) == 2
     assert [capture for capture, _kwargs in client.playback_calls] == [
+        primary,
         primary,
         target,
     ]

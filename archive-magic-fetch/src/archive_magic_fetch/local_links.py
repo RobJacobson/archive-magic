@@ -1,4 +1,4 @@
-"""Optional post-write rewrite of website/ links for local browsing."""
+"""Optional post-write rewrite of website links for local browsing."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from pathlib import Path, PurePosixPath
 from typing import Optional
 from urllib.parse import urlsplit
 
-from .paths import preferred_site_file, website_host_segment
+from .collection_paths import domain_folder, preferred_site_file
 
 
 _REWRITE_EXTENSIONS = {".html", ".htm", ".css", ".js"}
@@ -112,7 +112,7 @@ def _relative_link(
 
 def _host_segment_for_url(url: str, known_hosts: set[str]) -> Optional[str]:
     try:
-        host = website_host_segment(url)
+        host = domain_folder(url)
     except ValueError:
         return None
     if host in known_hosts:
@@ -298,7 +298,7 @@ def _write_replaced(path: Path, text: str) -> None:
         raise
 
 
-def rewrite_local_website(
+def rewrite_local_links(
     website_root: Path,
     *,
     include_timestamps: bool = False,
@@ -313,7 +313,6 @@ def rewrite_local_website(
     if not known_hosts:
         return summary
 
-    print(f"Rewriting local links under {website_root.as_posix()}...")
     for path in sorted(website_root.rglob("*")):
         if not path.is_file():
             continue
@@ -344,7 +343,7 @@ def rewrite_local_website(
         summary.rewritten += 1
 
     print(
-        f"Rewrote {summary.rewritten} files; "
-        f"{summary.skipped_decode} skipped (decode errors)"
+        f"Local links: {summary.rewritten} rewritten, "
+        f"{summary.skipped_decode} skipped"
     )
     return summary

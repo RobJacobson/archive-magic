@@ -1,4 +1,4 @@
-"""Generate the site replay index from final WARC bytes."""
+"""Build the collection-wide replay index from final WARC files."""
 
 from __future__ import annotations
 
@@ -9,17 +9,17 @@ from typing import Sequence
 
 from cdxj_indexer.main import CDXJIndexer
 
-from .paths import CollectionLayout, validate_path_limits
+from .collection_paths import CollectionPaths, validate_path_limits
 
 
-def generate_replay_index(
-    final_warcs: Sequence[Path],
+def build_replay_index(
+    built_warcs: Sequence[Path],
     *,
-    layout: CollectionLayout,
+    layout: CollectionPaths,
 ) -> Path | None:
     """Build and atomically publish one sorted site-level CDXJ."""
 
-    if not final_warcs:
+    if not built_warcs:
         return None
 
     replay_dir = layout.replay_index.parent
@@ -37,7 +37,7 @@ def generate_replay_index(
         os.close(descriptor)
         CDXJIndexer(
             output=str(temporary),
-            inputs=[str(path) for path in final_warcs],
+            inputs=[str(path) for path in built_warcs],
             sort=True,
             records="response,revisit",
             dir_root=str(layout.collection_root),

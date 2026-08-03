@@ -4,15 +4,14 @@ from __future__ import annotations
 
 import argparse
 import sys
-import time
 from datetime import datetime, timezone
 from typing import Optional, Sequence
 
 from .console import mirror_console_output
-from .discovery import FILES_MODES, WARC_MODES
-from .job import FetchRequest, run_fetch
-from .redirect_capture import REDIRECT_CAPTURE_MODES
-from .retrieval import DEFAULT_CONCURRENCY
+from .search import FILES_MODES, WARC_MODES
+from .fetch import FetchSettings, run_fetch
+from .redirects import REDIRECT_CAPTURE_MODES
+from .downloads import DEFAULT_WORKER_COUNT
 from .retry import DEFAULT_RETRIES
 
 
@@ -20,14 +19,6 @@ def current_utc_cdx_timestamp() -> str:
     """Return the current UTC time as a full CDX timestamp."""
 
     return datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
-
-
-def _utc_now() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def _monotonic() -> float:
-    return time.monotonic()
 
 
 def _positive_int(value: str) -> int:
@@ -48,7 +39,7 @@ def _nonnegative_int(value: str) -> int:
     return parsed
 
 
-def parse_args(argv: Optional[Sequence[str]] = None) -> FetchRequest:
+def parse_args(argv: Optional[Sequence[str]] = None) -> FetchSettings:
     """Parse the deliberately small MVP command-line interface."""
 
     parser = argparse.ArgumentParser(prog="archive-magic-fetch")
@@ -85,13 +76,13 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> FetchRequest:
         ),
     )
     parser.add_argument(
-        "--concurrency",
+        "--workers",
         type=_positive_int,
-        default=DEFAULT_CONCURRENCY,
+        default=DEFAULT_WORKER_COUNT,
         metavar="N",
         help=(
-            "Max concurrent WARC/group workers (default: "
-            f"{DEFAULT_CONCURRENCY}; use 1 for serial diagnostics)"
+            "Maximum simultaneous redirect probes or WARC builds "
+            f"(default: {DEFAULT_WORKER_COUNT})"
         ),
     )
     parser.add_argument(
@@ -109,7 +100,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> FetchRequest:
         parser.error(
             "--rewrite-local requires --files latest, unique, or all"
         )
-    return FetchRequest(
+    return FetchSettings(
         url_pattern=args.url_pattern,
         date_start=args.start or "1995",
         date_end=args.end or current_utc_cdx_timestamp(),
@@ -117,46 +108,19 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> FetchRequest:
         files_mode=args.files,
         rewrite_local=args.rewrite_local,
         redirect_capture=args.redirect_capture,
-        concurrency=args.concurrency,
+        worker_count=args.workers,
         retries=args.retries,
     )
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    """Run one timed fetch job and return its process exit status."""
+    """Run one timed fetch request and return its process exit status."""
 
-    request = parse_args(argv)
-    started_at = _utc_now()
-    started_tick = _monotonic()
+    settings = parse_args(argv)
     with mirror_console_output() as console_log:
-        print(f"Job started: {_format_job_time(started_at)}", flush=True)
-        print(
-            f"Redirect capture: {request.redirect_capture}",
-            flush=True,
-        )
         try:
-            try:
-                succeeded = run_fetch(request, console_log=console_log)
-            except Exception as error:
-                print(f"ERROR: {error}", file=sys.stderr)
-                return 1
-            return 0 if succeeded else 1
-        finally:
-            ended_at = _utc_now()
-            duration_minutes = (_monotonic() - started_tick) / 60
-            print(f"Job ended: {_format_job_time(ended_at)}", flush=True)
-            print(
-                f"Job duration: {duration_minutes:.1f} minutes",
-                flush=True,
-            )
-
-
-def _format_job_time(value: datetime) -> str:
-    """Format an aware time as a compact UTC ISO-8601 timestamp."""
-
-    return (
-        value
-            .astimezone(timezone.utc)
-            .isoformat(timespec="seconds")
-            .replace("+00:00", "Z")
-    )
+            succeeded = run_fetch(settings, console_log=console_log)
+        except Exception as error:
+            print(f"ERROR: {error}", file=sys.stderr)
+            return 1
+        return 0 if succeeded else 1

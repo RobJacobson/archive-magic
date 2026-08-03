@@ -7,8 +7,9 @@ from datetime import datetime, timezone
 import pytest
 from wayback import CdxRecord
 
-from archive_magic_fetch import paths, provenance
-from archive_magic_fetch.publication import publish_directory_noreplace
+from archive_magic_fetch import collection_paths
+from archive_magic_fetch import source_files
+from archive_magic_fetch.atomic_files import publish_directory_noreplace
 
 
 ACQUIRED_AT = datetime(
@@ -47,7 +48,7 @@ def record(
 
 
 def collection(tmp_path):
-    return paths.collection_layout(
+    return collection_paths.collection_paths(
         "https://example.com/*",
         root=tmp_path / "archives",
     )
@@ -62,7 +63,7 @@ def save(tmp_path, captures, **overrides):
         "acquired_at": ACQUIRED_AT,
     }
     arguments.update(overrides)
-    return provenance.save_acquisition(captures, **arguments)
+    return source_files.save_search_results(captures, **arguments)
 
 
 def test_source_snapshot_preserves_order_duplicates_redirects_and_absent_values(
@@ -90,7 +91,7 @@ def test_source_snapshot_preserves_order_duplicates_redirects_and_absent_values(
     with gzip.open(result.captures_path, "rt", encoding="utf-8") as stream:
         lines = stream.read().splitlines()
     assert lines == [
-        provenance.CDX_HEADER,
+        source_files.CDX_HEADER,
         (
             "com,example)/ 20200102030405 https://example.com/café "
             f"text/html 200 {'A' * 32} 100"
@@ -118,7 +119,7 @@ def test_source_snapshot_preserves_order_duplicates_redirects_and_absent_values(
     assert manifest["acquired_at"] == "2026-07-23T18:45:01.123456Z"
     assert manifest["archive_magic_fetch_version"] == "0.1.0"
     assert manifest["wayback_version"] == "0.5.1"
-    assert manifest["cdx"]["fields"] == list(provenance.CDX_FIELDS)
+    assert manifest["cdx"]["fields"] == list(source_files.CDX_FIELDS)
     assert manifest["cdx"]["record_count"] == 4
     assert manifest["cdx"]["sha256"] == hashlib.sha256(
         result.captures_path.read_bytes()
@@ -134,7 +135,7 @@ def test_source_snapshot_rejects_ambiguous_cdx_tokens(tmp_path):
     assert list(collection(tmp_path).sources_root.iterdir()) == []
 
 
-def test_acquisition_identifier_collision_uses_numeric_suffix(tmp_path):
+def test_search_files_identifier_collision_uses_numeric_suffix(tmp_path):
     first = save(tmp_path, [record()])
     second = save(tmp_path, [record()])
 
@@ -144,12 +145,12 @@ def test_acquisition_identifier_collision_uses_numeric_suffix(tmp_path):
     assert first.captures_path.read_bytes() == second.captures_path.read_bytes()
 
 
-def test_concurrent_acquisitions_publish_without_replacement(tmp_path):
+def test_concurrent_search_files_publish_without_replacement(tmp_path):
     captures = [record()]
     selected_layout = collection(tmp_path)
 
     def publish():
-        return provenance.save_acquisition(
+        return source_files.save_search_results(
             captures,
             layout=selected_layout,
             url_pattern="https://example.com/*",
@@ -168,7 +169,7 @@ def test_concurrent_acquisitions_publish_without_replacement(tmp_path):
     assert all(result.query_path.exists() for result in results)
 
 
-def test_acquisition_created_during_publication_is_not_replaced(
+def test_search_files_created_during_publication_is_not_replaced(
     tmp_path,
     monkeypatch,
 ):
@@ -182,7 +183,7 @@ def test_acquisition_created_during_publication_is_not_replaced(
         publish_directory_noreplace(source, destination)
 
     monkeypatch.setattr(
-        provenance,
+        source_files,
         "publish_directory_noreplace",
         publish_with_race,
     )
@@ -202,7 +203,7 @@ def test_failed_publication_cleans_temporary_directory(
     def fail(*args):
         raise OSError("publication failed")
 
-    monkeypatch.setattr(provenance, "publish_directory_noreplace", fail)
+    monkeypatch.setattr(source_files, "publish_directory_noreplace", fail)
 
     with pytest.raises(OSError, match="publication failed"):
         save(tmp_path, [record()])

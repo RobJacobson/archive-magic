@@ -1,4 +1,4 @@
-"""Safe collection layout and deterministic WARC bucket allocation."""
+"""Safe collection paths and deterministic WARC file allocation."""
 
 from __future__ import annotations
 
@@ -40,10 +40,11 @@ _MIME_SUFFIXES = {
     "image/svg+xml": ".svg",
     "image/webp": ".webp",
 }
+UrlHistoryKey = tuple[str, str]
 
 
 @dataclass(frozen=True)
-class CollectionLayout:
+class CollectionPaths:
     """The filesystem boundaries for one requested website collection."""
 
     root: Path
@@ -71,20 +72,19 @@ class CollectionLayout:
 
 
 @dataclass(frozen=True)
-class WebsiteFileTarget:
-    """One planned loose-file destination for a selected capture."""
+class WebsiteFile:
+    """One loose-file destination attached directly to its capture."""
 
     path: Path
-    urlkey: str
-    capture_index: int
+    capture: object
 
 
 @dataclass(frozen=True)
-class WebsitePlan:
+class WebsiteFiles:
     """Preflighted loose-file destinations under ``website/``."""
 
-    layout: CollectionLayout
-    targets: tuple[WebsiteFileTarget, ...]
+    paths: CollectionPaths
+    targets: tuple[WebsiteFile, ...]
 
 
 def _safe_segment(component: str) -> str:
@@ -140,7 +140,7 @@ def _truncate_escape_safe(encoded: str, byte_limit: int) -> str:
     return encoded
 
 
-def normalize_url_authority(
+def normalize_domain(
     value: str,
     *,
     allow_bare: bool = False,
@@ -204,16 +204,13 @@ def normalize_collection_name(url_pattern: str) -> str:
     if pattern.startswith("*."):
         pattern = pattern[2:]
 
-    host, port = normalize_url_authority(pattern, allow_bare=True)
+    host, port = normalize_domain(pattern, allow_bare=True)
     if "*" in host:
         raise ValueError(
             f"URL pattern must identify one unambiguous website host: "
             f"{url_pattern}"
         )
-    if port is not None:
-        host = f"{host}--port-{port}"
-
-    name = _safe_segment(host)
+    name = _authority_segment(host, port)
     if not name or name in {".", ".."} or "/" in name or "\\" in name:
         raise ValueError(f"URL pattern produced an unsafe collection name: {name}")
     if len(name.encode("ascii")) > MAX_COMPONENT_BYTES:
@@ -223,19 +220,27 @@ def normalize_collection_name(url_pattern: str) -> str:
     return name
 
 
-def collection_layout(
+def collection_paths(
     url_pattern: str,
     root: Union[str, os.PathLike] = DEFAULT_OUTPUT_ROOT,
-) -> CollectionLayout:
+) -> CollectionPaths:
     """Build and validate the collection boundary for a command."""
 
-    layout = CollectionLayout(Path(root), normalize_collection_name(url_pattern))
+    layout = CollectionPaths(Path(root), normalize_collection_name(url_pattern))
     validate_path_limits(layout.collection_root)
     return layout
 
 
-def preferred_warc_path(urlkey: str, layout: CollectionLayout) -> Path:
-    """Map a CDX resource family to its preferred readable WARC bucket."""
+def preferred_warc_path(
+    urlkey: str,
+    original_url: str,
+    layout: CollectionPaths,
+) -> Path:
+    """Map one URL history to its preferred readable WARC path."""
+
+    if not isinstance(original_url, str):
+        raise TypeError("original_url must be a string")
+    domain = domain_folder(original_url)
 
     if not isinstance(urlkey, str) or not urlkey:
         raise ValueError("CDX urlkey must be a non-empty string")
@@ -262,6 +267,7 @@ def preferred_warc_path(urlkey: str, layout: CollectionLayout) -> Path:
     stem_limit = MAX_COMPONENT_BYTES - len(suffix)
     filename = f"{_bounded_segment(stem, byte_limit=stem_limit)}{suffix}"
     return layout.archive_root.joinpath(
+        domain,
         *(
             _bounded_segment(segment, byte_limit=MAX_COMPONENT_BYTES)
             for segment in directory_segments
@@ -278,14 +284,20 @@ def _cdx_timestamp_text(timestamp: datetime) -> str:
     return timestamp.astimezone(timezone.utc).strftime("%Y%m%d%H%M%S")
 
 
-def website_host_segment(original_url: str) -> str:
+def domain_folder(original_url: str) -> str:
     """Return the filesystem host segment for one absolute capture URL."""
 
-    host, port = normalize_url_authority(original_url)
-    if port is not None:
-        host = f"{host}--port-{port}"
+    host, port = normalize_domain(original_url)
+    return _authority_segment(host, port)
 
-    return host
+
+def _authority_segment(host: str, port: Optional[int]) -> str:
+    """Encode one normalized URL authority as a filesystem component."""
+
+    authority = f"[{host}]" if ":" in host else host
+    if port is not None:
+        authority = f"{authority}:{port}"
+    return _safe_segment(authority)
 
 
 def _split_site_path(path: str) -> tuple[list[str], bool]:
@@ -326,7 +338,7 @@ def website_relative_parts(
 ) -> tuple[str, ...]:
     """Build safe relative parts under ``website/`` for one capture URL."""
 
-    host = website_host_segment(original_url)
+    host = domain_folder(original_url)
     segments, explicit_suffix = _website_path_segments(original_url)
     parts: list[str] = [host]
     if timestamp is not None:
@@ -355,7 +367,7 @@ def website_relative_parts(
 
 def preferred_website_path(
     original_url: str,
-    layout: CollectionLayout,
+    layout: CollectionPaths,
     *,
     mimetype: object,
     timestamp: Optional[datetime] = None,
@@ -519,22 +531,46 @@ def _inspect_target(
 
 
 def allocate_warc_paths(
-    capture_groups: Mapping[str, Sequence[object]],
-    layout: CollectionLayout,
-) -> dict[Path, tuple[str, ...]]:
-    """Map readable WARC paths to URL keys in linear path-depth work."""
+    captures_by_url: Mapping[tuple[str, str], Sequence[object]],
+    layout: CollectionPaths,
+) -> dict[Path, tuple[tuple[str, str], ...]]:
+    """Map readable WARC paths to URL-history keys in linear path-depth work."""
 
     candidates: dict[
         tuple[str, ...],
-        list[tuple[str, Path, str]],
+        list[tuple[str, Path, object]],
     ] = {}
-    for urlkey, captures in capture_groups.items():
+    for history_key, captures in captures_by_url.items():
+        if (
+            not isinstance(history_key, tuple)
+            or len(history_key) != 2
+            or not all(isinstance(part, str) for part in history_key)
+        ):
+            raise ValueError(f"invalid URL-history key: {history_key}")
+        domain, urlkey = history_key
         if not captures:
-            raise ValueError(f"capture group is empty: {urlkey}")
-        path = preferred_warc_path(urlkey, layout)
+            raise ValueError(f"URL history is empty: {history_key}")
+        domains = {
+            domain_folder(capture.original)
+            for capture in captures
+        }
+        if len(domains) != 1:
+            raise ValueError(
+                f"URL history spans multiple domains: {history_key}"
+            )
+        if domain not in domains:
+            raise ValueError(
+                f"URL-history domain differs from URLs: {history_key}"
+            )
+        original_url = getattr(captures[0], "original", None)
+        if not isinstance(original_url, str):
+            raise ValueError("capture URL must be a string")
+        path = preferred_warc_path(urlkey, original_url, layout)
         key = _equivalent_path(path, layout.collection_root)
         relative = path.relative_to(layout.collection_root).as_posix()
-        candidates.setdefault(key, []).append((relative, path, urlkey))
+        candidates.setdefault(key, []).append(
+            (relative, path, history_key)
+        )
 
     exact = {
         key: (
@@ -544,8 +580,8 @@ def allocate_warc_paths(
         for key, entries in candidates.items()
     }
 
-    allocated: dict[tuple[str, ...], list[str]] = {}
-    for key, (_path, urlkeys) in exact.items():
+    allocated: dict[tuple[str, ...], list[object]] = {}
+    for key, (_path, group_keys) in exact.items():
         owner = next(
             (
                 key[:length]
@@ -554,11 +590,11 @@ def allocate_warc_paths(
             ),
             key,
         )
-        allocated.setdefault(owner, []).extend(urlkeys)
+        allocated.setdefault(owner, []).extend(group_keys)
 
     return {
-        exact[key][0]: tuple(sorted(urlkeys))
-        for key, urlkeys in sorted(
+        exact[key][0]: tuple(sorted(group_keys))
+        for key, group_keys in sorted(
             allocated.items(),
             key=lambda item: exact[item[0]][0]
             .relative_to(layout.collection_root)
@@ -568,9 +604,9 @@ def allocate_warc_paths(
 
 
 def _newest_wins_website_paths(
-    planned: list[tuple[Path, str, int, str, datetime]],
-    layout: CollectionLayout,
-) -> list[tuple[Path, str, int, str]]:
+    planned: list[tuple[Path, UrlHistoryKey, int, str, datetime]],
+    layout: CollectionPaths,
+) -> list[tuple[Path, UrlHistoryKey, int, str]]:
     """Keep the newest capture per filesystem-equivalent website path.
 
     Older timestamps at the same path are dropped. Captures that share both
@@ -579,13 +615,13 @@ def _newest_wins_website_paths(
 
     by_key: dict[
         tuple[str, ...],
-        list[tuple[Path, str, int, str, datetime]],
+        list[tuple[Path, UrlHistoryKey, int, str, datetime]],
     ] = {}
     for entry in planned:
         key = _equivalent_path(entry[0], layout.website_root)
         by_key.setdefault(key, []).append(entry)
 
-    survivors: list[tuple[Path, str, int, str]] = []
+    survivors: list[tuple[Path, UrlHistoryKey, int, str]] = []
     for entries in by_key.values():
         newest_timestamp = max(entry[4] for entry in entries)
         survivors.extend(
@@ -597,17 +633,20 @@ def _newest_wins_website_paths(
 
 
 def _disambiguate_website_paths(
-    planned: list[tuple[Path, str, int, str]],
-    layout: CollectionLayout,
-) -> list[tuple[Path, str, int, str]]:
+    planned: list[tuple[Path, UrlHistoryKey, int, str]],
+    layout: CollectionPaths,
+) -> list[tuple[Path, UrlHistoryKey, int, str]]:
     """Give colliding website paths distinct digest-suffixed filenames."""
 
-    by_key: dict[tuple[str, ...], list[tuple[Path, str, int, str]]] = {}
+    by_key: dict[
+        tuple[str, ...],
+        list[tuple[Path, UrlHistoryKey, int, str]],
+    ] = {}
     for entry in planned:
         key = _equivalent_path(entry[0], layout.website_root)
         by_key.setdefault(key, []).append(entry)
 
-    disambiguated: list[tuple[Path, str, int, str]] = []
+    disambiguated: list[tuple[Path, UrlHistoryKey, int, str]] = []
     for entries in by_key.values():
         if len(entries) == 1:
             disambiguated.append(entries[0])
@@ -639,14 +678,17 @@ def _disambiguate_website_paths(
 
 
 def _reshape_website_paths(
-    planned: list[tuple[Path, str, int, str]],
-    layout: CollectionLayout,
-) -> list[tuple[Path, str, int, str]]:
+    planned: list[tuple[Path, UrlHistoryKey, int, str]],
+    layout: CollectionPaths,
+) -> list[tuple[Path, UrlHistoryKey, int, str]]:
     """Resolve file-vs-directory conflicts by reshaping files to index.html."""
 
     # Repeat until stable: reshaping one file can expose another conflict.
     while True:
-        by_key: dict[tuple[str, ...], list[tuple[Path, str, int, str]]] = {}
+        by_key: dict[
+            tuple[str, ...],
+            list[tuple[Path, UrlHistoryKey, int, str]],
+        ] = {}
         for entry in planned:
             key = _equivalent_path(entry[0], layout.website_root)
             by_key.setdefault(key, []).append(entry)
@@ -670,7 +712,7 @@ def _reshape_website_paths(
             for key in keys
             for length in range(1, len(key))
         }
-        reshaped: list[tuple[Path, str, int, str]] = []
+        reshaped: list[tuple[Path, UrlHistoryKey, int, str]] = []
         changed = False
         for key, entries in ((key, by_key[key]) for key in keys):
             path, urlkey, capture_index, token = entries[0]
@@ -693,18 +735,18 @@ def _reshape_website_paths(
             return planned
 
 
-def preflight_website_layout(
-    capture_groups: Mapping[str, Sequence[object]],
-    layout: CollectionLayout,
+def prepare_website_files(
+    captures_by_url: Mapping[UrlHistoryKey, Sequence[object]],
+    layout: CollectionPaths,
     *,
     include_timestamps: bool,
-) -> WebsitePlan:
+) -> WebsiteFiles:
     """Plan and inspect all final loose-file targets under ``website/``."""
 
-    planned: list[tuple[Path, str, int, str, datetime]] = []
-    for urlkey, captures in capture_groups.items():
+    planned: list[tuple[Path, UrlHistoryKey, int, str, datetime]] = []
+    for history_key, captures in captures_by_url.items():
         if not captures:
-            raise ValueError(f"capture group is empty: {urlkey}")
+            raise ValueError(f"URL history is empty: {history_key}")
         for capture_index, capture in enumerate(captures):
             original = getattr(capture, "original", None)
             if not isinstance(original, str) or not original:
@@ -722,7 +764,7 @@ def preflight_website_layout(
             planned.append(
                 (
                     path,
-                    urlkey,
+                    history_key,
                     capture_index,
                     _digest_path_token(
                         getattr(capture, "digest", None),
@@ -744,13 +786,12 @@ def preflight_website_layout(
     )
 
     targets = []
-    for path, urlkey, capture_index, _token in planned:
+    for path, history_key, capture_index, _token in planned:
         _inspect_target(path)
         targets.append(
-            WebsiteFileTarget(
+            WebsiteFile(
                 path=path,
-                urlkey=urlkey,
-                capture_index=capture_index,
+                capture=captures_by_url[history_key][capture_index],
             )
         )
-    return WebsitePlan(layout, tuple(targets))
+    return WebsiteFiles(layout, tuple(targets))
