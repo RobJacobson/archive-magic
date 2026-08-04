@@ -218,3 +218,88 @@ def test_both_outputs_disabled_avoids_client_creation(monkeypatch, capsys):
 
     assert fetch.run_fetch(settings(warc_mode="none", files_mode="none")) is True
     assert "Nothing to do" in capsys.readouterr().out
+
+
+def test_redirect_expand_marks_same_site_and_foreign_batches(monkeypatch, tmp_path):
+    from archive_magic_fetch.redirects import RedirectExpansion, RedirectSearch, RedirectScope
+
+    subdomain = capture(
+        urlkey="org,seed)/news",
+        original="https://news.seed.org/",
+        statuscode=200,
+    )
+    foreign = capture(
+        urlkey="com,other)/",
+        original="https://other.com/",
+        statuscode=200,
+    )
+
+    layout = type(
+        "Paths",
+        (),
+        {
+            "collection_root": tmp_path,
+            "archive_root": tmp_path / "archive",
+        },
+    )()
+    known: set = set()
+    reserved: set = set()
+    seen: set = set()
+
+    def fake_expand_target(client, target, **kwargs):
+        if target == "https://news.seed.org/":
+            histories = {("news.seed.org", subdomain.urlkey): [subdomain]}
+            return RedirectExpansion(
+                RedirectSearch(
+                    RedirectScope(
+                        ("news.seed.org", None, "/", ""),
+                        target,
+                        "exact",
+                    ),
+                    (subdomain,),
+                ),
+                histories,
+            )
+        if target == "https://other.com/":
+            histories = {("other.com", foreign.urlkey): [foreign]}
+            return RedirectExpansion(
+                RedirectSearch(
+                    RedirectScope(("other.com", None, "/", ""), target, "exact"),
+                    (foreign,),
+                ),
+                histories,
+            )
+        return None
+
+    monkeypatch.setattr(fetch, "expand_redirect_target", fake_expand_target)
+    monkeypatch.setattr(
+        fetch,
+        "save_search_results",
+        lambda *_a, **_k: None,
+    )
+    monkeypatch.setattr(
+        fetch,
+        "allocate_warc_paths",
+        lambda histories, layout: {
+            layout.archive_root / key[0] / "index.warc.gz": (key,)
+            for key in histories
+        },
+    )
+
+    expand = fetch._redirect_expand(
+        client=object(),
+        seed_pattern="seed.org/*",
+        mode="page",
+        date_start="1995",
+        date_end="2020",
+        layout=layout,
+        known_history_keys=known,
+        reserved_paths=reserved,
+        seen_searches=seen,
+        retries=0,
+    )
+    batches = expand(
+        ["https://news.seed.org/", "https://other.com/"]
+    )
+    by_domain = {batch.histories[0].domain: batch.expand for batch in batches}
+    assert by_domain == {"news.seed.org": True, "other.com": False}

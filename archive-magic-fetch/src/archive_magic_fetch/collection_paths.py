@@ -185,6 +185,34 @@ def normalize_domain(
     return host, port
 
 
+def same_site(left: str, right: str) -> bool:
+    """Return True when two URL/host values share the same website root.
+
+    Hosts match when equal (after ``normalize_domain``), when one is a
+    subdomain of the other, or when they share the same two-label apex
+    (``example.com`` for ``news.example.com`` and ``blog.example.com``).
+    Ports are ignored so ``example.com:8443`` still matches ``example.com``.
+    """
+
+    left_host, _ = normalize_domain(left, allow_bare=True)
+    right_host, _ = normalize_domain(right, allow_bare=True)
+    if left_host == right_host:
+        return True
+    if left_host.endswith("." + right_host) or right_host.endswith(
+        "." + left_host
+    ):
+        return True
+    return _apex_domain(left_host) == _apex_domain(right_host)
+
+
+def _apex_domain(host: str) -> str:
+    """Return a coarse apex key (last two labels) for same-site checks."""
+
+    if ":" in host or host.count(".") < 1:
+        return host
+    return ".".join(host.rsplit(".", 2)[-2:])
+
+
 def mime_suffix(value: object) -> Optional[str]:
     """Return the supported conventional suffix for one MIME value."""
 

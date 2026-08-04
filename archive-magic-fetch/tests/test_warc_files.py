@@ -573,6 +573,104 @@ def test_redirect_expansion_stops_after_one_hop(tmp_path):
     )
 
 
+def test_same_site_redirect_batch_keeps_expanding(tmp_path):
+    seed = capture(
+        original="https://seed.test/",
+        captured="20170101000000",
+        payload=b"seed-redirect",
+        statuscode=301,
+        urlkey="test,seed)/",
+    )
+    news = capture(
+        original="https://news.seed.test/",
+        captured="20180101000000",
+        payload=b"news-redirect",
+        statuscode=301,
+        urlkey="test,seed)/news",
+    )
+    expand_calls: list[tuple[str, ...]] = []
+
+    client = FakeClient(
+        {
+            seed: memento_for(
+                seed,
+                payload=b"seed-redirect",
+                status_code=301,
+                headers={"Location": "https://news.seed.test/"},
+            ),
+            news: memento_for(
+                news,
+                payload=b"news-redirect",
+                status_code=301,
+                headers={"Location": "https://foreign.test/"},
+            ),
+        }
+    )
+    layout = collection_paths.collection_paths(
+        "seed.test/*",
+        root=tmp_path / "archives",
+    )
+    news_warc = layout.archive_root / "news.seed.test" / "index.warc.gz"
+    foreign = capture(
+        original="https://foreign.test/",
+        captured="20190101000000",
+        payload=b"foreign",
+        statuscode=200,
+        urlkey="test,foreign)/",
+    )
+    foreign_warc = layout.archive_root / "foreign.test" / "index.warc.gz"
+
+    def expand(targets):
+        expand_calls.append(tuple(targets))
+        if list(targets) == ["https://news.seed.test/"]:
+            return [
+                warc_files.WarcBatch(
+                    news_warc,
+                    (
+                        warc_files.UrlHistory(
+                            "news.seed.test",
+                            news.urlkey,
+                            (news,),
+                            (),
+                        ),
+                    ),
+                    expand=True,
+                )
+            ]
+        if list(targets) == ["https://foreign.test/"]:
+            return [
+                warc_files.WarcBatch(
+                    foreign_warc,
+                    (
+                        warc_files.UrlHistory(
+                            "foreign.test",
+                            foreign.urlkey,
+                            (foreign,),
+                            (),
+                        ),
+                    ),
+                    expand=False,
+                )
+            ]
+        raise AssertionError(f"unexpected expand targets: {targets}")
+
+    client.outcomes[foreign] = memento_for(foreign, payload=b"foreign")
+
+    result = warc_files.build_warc_files(
+        {seed.urlkey: [seed]},
+        client,
+        layout=layout,
+        collect_redirects=True,
+        expand_redirects=expand,
+    )
+
+    assert expand_calls == [
+        ("https://news.seed.test/",),
+        ("https://foreign.test/",),
+    ]
+    assert result.warc_counts.responses == 3
+
+
 def test_retrieved_statusless_redirect_is_written_as_response(tmp_path):
     selected = capture(statuscode=None, payload=b"redirect")
     client = FakeClient(

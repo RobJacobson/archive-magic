@@ -19,6 +19,7 @@ from .collection_paths import (
     allocate_warc_paths,
     collection_paths,
     prepare_website_files,
+    same_site,
 )
 from .source_files import save_search_results
 from .replay_index import build_replay_index
@@ -61,6 +62,7 @@ def _report_discovery_progress(count: int) -> None:
 def _redirect_expand(
     client,
     *,
+    seed_pattern: str,
     mode: str,
     date_start: str,
     date_end: str,
@@ -70,7 +72,12 @@ def _redirect_expand(
     seen_searches: set[tuple[object, ...]],
     retries: int,
 ) -> Callable[[Sequence[str]], list[WarcBatch]]:
-    """Build a callback that turns Location targets into new WARC batches."""
+    """Build a callback that turns Location targets into new WARC batches.
+
+    Same-site targets (subdomain/apex siblings of the seed pattern) keep
+    ``expand=True`` so intra-site permanent redirects can still expand.
+    Off-site targets use ``expand=False`` (one hop from the seed site).
+    """
 
     def expand(targets: Sequence[str]) -> list[WarcBatch]:
         added: list[WarcBatch] = []
@@ -100,6 +107,7 @@ def _redirect_expand(
                 continue
             new_paths = allocate_warc_paths(expansion.histories, layout)
             queued_keys: list[tuple[str, str]] = []
+            keep_expanding = same_site(seed_pattern, target)
             for path, history_keys in new_paths.items():
                 if path in reserved_paths:
                     relative = path.relative_to(layout.collection_root).as_posix()
@@ -123,7 +131,9 @@ def _redirect_expand(
                         )
                     )
                 reserved_paths.add(path)
-                added.append(WarcBatch(path, tuple(histories), expand=False))
+                added.append(
+                    WarcBatch(path, tuple(histories), expand=keep_expanding)
+                )
             if queued_keys:
                 print(f"Redirect: +{len(queued_keys)} histories from {target}")
         return added
@@ -169,6 +179,7 @@ def _build_files(
         )
         expand_redirects = _redirect_expand(
             client,
+            seed_pattern=settings.url_pattern,
             mode=settings.redirect_capture,
             date_start=settings.date_start,
             date_end=settings.date_end,

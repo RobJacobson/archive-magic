@@ -183,11 +183,12 @@ One worker owns one `WarcBatch` from start to finish:
 
 Different WARC batches run concurrently and may finish out of allocation
 order. Redirect expansion is scheduled off the coordinator when a finished
-seed WARC (`WarcBatch.expand=True`) yields Location targets; additional
+expandable WARC (`WarcBatch.expand=True`) yields Location targets; additional
 batches are appended when that expand completes, and the completion counter's
-denominator grows when that happens. Redirect-discovered batches use
-`expand=False`: their 301/308 responses are still stored in WARC, but are not
-expanded further (depth 1 from the seed pattern).
+denominator grows when that happens. Same-site targets (apex and subdomains of
+the seed pattern) keep ``expand=True``. Off-site targets use ``expand=False``:
+their 301/308 responses are still stored in WARC, but are not expanded further
+(one hop beyond the seed site).
 A URL history never has two WARC owners. Histories selected for both WARC and
 loose-file output stay attached to the WARC batch and use the same downloaded
 body. Histories selected only for files run as `WebsiteBatch` values in a

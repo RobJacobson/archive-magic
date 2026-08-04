@@ -892,10 +892,11 @@ def build_warc_files(
     """Build WARC and loose-file outputs through bounded worker pools.
 
     When ``expand_redirects`` is provided, Location targets collected from
-    finished seed WARC batches (``WarcBatch.expand=True``) are passed to it
-    and any returned batches are appended to the live WARC work queue.
-    Redirect-discovered batches should set ``expand=False`` so their
-    permanent redirects are stored without further expansion.
+    finished expandable WARC batches (``WarcBatch.expand=True``) are passed
+    to it and any returned batches are appended to the live WARC work queue.
+    Same-site redirect batches should keep ``expand=True``; off-site batches
+    should set ``expand=False`` so further permanent redirects are stored
+    without expansion.
     """
 
     if retries < 0:

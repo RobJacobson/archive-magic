@@ -63,6 +63,33 @@ def test_collection_name_normalization(pattern, expected):
     assert collection_paths.normalize_collection_name(pattern) == expected
 
 
+@pytest.mark.parametrize(
+    ("left", "right", "expected"),
+    [
+        ("https://example.com/", "http://example.com/page", True),
+        ("example.com/*", "https://news.example.com/", True),
+        ("https://news.example.com/", "example.com", True),
+        ("https://news.example.com/", "https://blog.example.com/", True),
+        ("http://www.example.com/", "https://example.com/", True),
+        ("example.com:8443", "example.com", True),
+        ("https://example.com/", "https://example.org/", False),
+        ("https://seed.test/", "https://hop1.test/", False),
+        (
+            "wecanstopthehate.org/*",
+            "https://news.wecanstopthehate.org/",
+            True,
+        ),
+        (
+            "wecanstopthehate.org/*",
+            "https://www.centerforimmigrationtruth.org/",
+            False,
+        ),
+    ],
+)
+def test_same_site_hosts(left, right, expected):
+    assert collection_paths.same_site(left, right) is expected
+
+
 def test_collection_idna_uses_the_python_codec(monkeypatch):
     monkeypatch.setitem(
         __import__("sys").modules,
