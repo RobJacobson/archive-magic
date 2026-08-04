@@ -23,6 +23,18 @@ archive-magic-fetch URL_PATTERN
   [--rewrite-local]
 ```
 
+`URL_PATTERN` seed scope:
+
+| Pattern | CDX meaning |
+|---|---|
+| `*.example.com` | Domain match: apex host plus all subdomains (preferred form) |
+| `*.example.com/*` | Same as `*.example.com` |
+| `example.com/*` | Path prefix on that single host |
+| `example.com` | Exact URL match for that page |
+
+Domain wildcard is orthogonal to `--redirect-capture`, which only controls
+expansion of permanent redirect Locations after the seed search.
+
 `--workers` defaults to 8. It is the maximum number of simultaneous WARC
 builds. There is no `--concurrency` alias.
 

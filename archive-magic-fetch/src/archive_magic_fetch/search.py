@@ -9,7 +9,7 @@ from urllib.parse import urlencode
 from wayback import CdxRecord
 from wayback.exceptions import RateLimitError, WaybackRetryError
 
-from .collection_paths import domain_folder
+from .collection_paths import domain_folder, normalize_domain
 from .console import print_progress
 from .retry import (
     DEFAULT_RETRIES,
@@ -109,17 +109,48 @@ def select_captures(
 def normalize_cdx_search(url_pattern: str) -> tuple[str, Optional[str]]:
     """Rewrite CDX URL sugar into an explicit match type when needed.
 
-    A trailing ``/*`` means prefix match on the text before ``*``. Internet
-    Archive's CDX server accepts that sugar, but the literal ``url=.../*`` form
-    can hang under date filters. Prefer ``url=.../`` with ``matchType=prefix``.
+    A leading ``*.`` on the host (e.g. ``*.example.com`` or
+    ``*.example.com/*``) means CDX domain match: the apex host plus all
+    subdomains. That form is checked before path-prefix sugar.
+
+    A trailing ``/*`` means path-prefix match on the text before ``*``.
+    Internet Archive's CDX server accepts that sugar, but the literal
+    ``url=.../*`` form can hang under date filters. Prefer ``url=.../``
+    with ``matchType=prefix``.
     """
 
     if not isinstance(url_pattern, str) or not url_pattern:
         raise ValueError("URL pattern must be a non-empty string")
 
-    if url_pattern.endswith("/*"):
-        return url_pattern.removesuffix("*"), "prefix"
+    text = url_pattern.strip()
+    domain_target = _domain_wildcard_target(text)
+    if domain_target is not None:
+        return domain_target, "domain"
+    if text.endswith("/*"):
+        return text.removesuffix("*"), "prefix"
     return url_pattern, None
+
+
+def _domain_wildcard_target(url_pattern: str) -> Optional[str]:
+    """Return the apex CDX URL for a ``*.host`` pattern, else ``None``."""
+
+    remainder = url_pattern
+    if "://" in remainder:
+        remainder = remainder.split("://", 1)[1]
+    if remainder.startswith("//"):
+        remainder = remainder[2:]
+    if not remainder.startswith("*."):
+        return None
+    host_part = remainder[2:].split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
+    if not host_part or "*" in host_part or host_part.startswith("."):
+        raise ValueError(
+            f"URL pattern must use a single leading *. on the host: "
+            f"{url_pattern}"
+        )
+    host, port = normalize_domain(host_part, allow_bare=True)
+    if port is None:
+        return host
+    return f"{host}:{port}"
 
 
 def search_captures(

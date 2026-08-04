@@ -119,15 +119,67 @@ def test_normalize_cdx_search_rewrites_trailing_star_to_explicit_prefix():
     )
 
 
+def test_normalize_cdx_search_domain_wildcard():
+    assert search.normalize_cdx_search("*.example.com") == (
+        "example.com",
+        "domain",
+    )
+    assert search.normalize_cdx_search("*.example.com/*") == (
+        "example.com",
+        "domain",
+    )
+    assert search.normalize_cdx_search("*.example.com/") == (
+        "example.com",
+        "domain",
+    )
+    assert search.normalize_cdx_search("*.WWW.Example.COM") == (
+        "example.com",
+        "domain",
+    )
+
+
+def test_normalize_cdx_search_rejects_broken_domain_wildcards():
+    with pytest.raises(ValueError, match="leading"):
+        search.normalize_cdx_search("*.")
+    with pytest.raises(ValueError, match="leading"):
+        search.normalize_cdx_search("*..example.com")
+
+
 def test_normalize_cdx_search_leaves_non_prefix_patterns_unchanged():
     assert search.normalize_cdx_search("example.com/") == (
         "example.com/",
         None,
     )
-    assert search.normalize_cdx_search("*.example.com") == (
-        "*.example.com",
+    assert search.normalize_cdx_search("example.com") == (
+        "example.com",
         None,
     )
+
+
+def test_search_captures_uses_domain_match_for_star_host():
+    expected = [record()]
+    calls = []
+
+    class Client:
+        def search(self, url_pattern, **kwargs):
+            calls.append((url_pattern, kwargs))
+            return iter(expected)
+
+    assert search.search_captures(
+        Client(), "*.example.com", "1995", "2020"
+    ) == expected
+    assert calls == [
+        (
+            "example.com",
+            {
+                "from_date": "1995",
+                "to_date": "2020",
+                "limit": 10_000,
+                "resolve_revisits": False,
+                "match_type": "domain",
+            },
+        )
+    ]
 
 
 def test_search_captures_materializes_search_with_explicit_bounds():
