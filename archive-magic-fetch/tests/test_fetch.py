@@ -1,8 +1,13 @@
 from datetime import datetime, timezone
 
+import pytest
 from wayback import CdxRecord
 
 from archive_magic_fetch import fetch
+from archive_magic_fetch.collection_coverage import (
+    CollectionCoverage,
+    CoverageModeError,
+)
 from archive_magic_fetch.warc_files import BuiltFiles, WarcCounts
 
 
@@ -11,14 +16,18 @@ def capture(
     urlkey="com,example)/",
     original="https://example.com/",
     statuscode=200,
+    captured="20000101000000",
+    digest="A" * 32,
 ):
     return CdxRecord(
         urlkey=urlkey,
-        timestamp=datetime(2000, 1, 1, tzinfo=timezone.utc),
+        timestamp=datetime.strptime(captured, "%Y%m%d%H%M%S").replace(
+            tzinfo=timezone.utc
+        ),
         original=original,
         mimetype="text/html",
         statuscode=statuscode,
-        digest="A" * 32,
+        digest=digest,
         length=100,
     )
 
@@ -34,6 +43,7 @@ def settings(**overrides):
         "redirect_capture": "none",
         "worker_count": 8,
         "retries": 0,
+        "fresh": False,
     }
     values.update(overrides)
     return fetch.FetchSettings(**values)
@@ -55,6 +65,10 @@ def install_common(monkeypatch, tmp_path, captures):
         {
             "collection_root": tmp_path,
             "website_root": tmp_path / "website",
+            "archive_root": tmp_path / "archive",
+            "sources_root": tmp_path / "sources",
+            "coverage_path": tmp_path / "collection.json",
+            "replay_index": tmp_path / "replay" / "index.cdxj",
         },
     )()
     monkeypatch.setattr(fetch, "make_client_factory", lambda _agent: lambda: client)
@@ -66,6 +80,13 @@ def install_common(monkeypatch, tmp_path, captures):
         lambda *_args, **_kwargs: type("SearchFiles", (), {"path": tmp_path})(),
     )
     monkeypatch.setattr(fetch, "build_replay_index", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(fetch, "list_collection_warcs", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(fetch, "save_coverage", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        fetch,
+        "resolve_prior_coverage",
+        lambda *_args, **_kwargs: None,
+    )
     return client, paths
 
 
@@ -221,7 +242,11 @@ def test_both_outputs_disabled_avoids_client_creation(monkeypatch, capsys):
 
 
 def test_redirect_expand_marks_same_site_and_foreign_batches(monkeypatch, tmp_path):
-    from archive_magic_fetch.redirects import RedirectExpansion, RedirectSearch, RedirectScope
+    from archive_magic_fetch.redirects import (
+        RedirectExpansion,
+        RedirectSearch,
+        RedirectScope,
+    )
 
     subdomain = capture(
         urlkey="org,seed)/news",
@@ -303,3 +328,151 @@ def test_redirect_expand_marks_same_site_and_foreign_batches(monkeypatch, tmp_pa
     )
     by_domain = {batch.histories[0].domain: batch.expand for batch in batches}
     assert by_domain == {"news.seed.org": True, "other.com": False}
+
+
+def test_run_fetch_merges_prior_coverage_into_search_window(
+    monkeypatch,
+    tmp_path,
+    capsys,
+):
+    early = capture(captured="19990101000000")
+    late = capture(captured="20080101000000", digest="B" * 32)
+    searches = []
+    _client, paths = install_common(monkeypatch, tmp_path, [early, late])
+    prior = CollectionCoverage(
+        url_pattern="example.com/*",
+        date_start="1995",
+        date_end="2005",
+        warc_mode="all",
+        files_mode="none",
+        redirect_capture="none",
+    )
+    monkeypatch.setattr(
+        fetch,
+        "resolve_prior_coverage",
+        lambda *_args, **_kwargs: prior,
+    )
+
+    def search(_client, pattern, start, end, **kwargs):
+        searches.append((pattern, start, end))
+        return [early, late]
+
+    monkeypatch.setattr(fetch, "search_captures", search)
+    monkeypatch.setattr(
+        fetch,
+        "build_warc_files",
+        lambda *_args, **_kwargs: BuiltFiles(
+            WarcCounts(selected=2, responses=2),
+            (),
+        ),
+    )
+    saved = []
+
+    def save(layout, coverage_value):
+        saved.append((layout, coverage_value))
+        return layout.coverage_path
+
+    monkeypatch.setattr(fetch, "save_coverage", save)
+
+    assert fetch.run_fetch(
+        settings(date_start="2005", date_end="2010")
+    ) is True
+    assert searches == [("example.com/*", "1995", "2010")]
+    assert saved[0][0] is paths
+    assert saved[0][1].date_start == "1995"
+    assert saved[0][1].date_end == "2010"
+    assert "Merge: expanding search 2005-2010" in capsys.readouterr().out
+
+
+def test_run_fetch_fresh_skips_prior_coverage(monkeypatch, tmp_path, capsys):
+    late = capture(captured="20080101000000")
+    searches = []
+    install_common(monkeypatch, tmp_path, [late])
+    prior = CollectionCoverage(
+        url_pattern="example.com/*",
+        date_start="1995",
+        date_end="2005",
+        warc_mode="all",
+        files_mode="none",
+        redirect_capture="none",
+    )
+    monkeypatch.setattr(
+        fetch,
+        "resolve_prior_coverage",
+        lambda *_args, **_kwargs: prior,
+    )
+
+    def search(_client, pattern, start, end, **kwargs):
+        searches.append((start, end))
+        return [late]
+
+    monkeypatch.setattr(fetch, "search_captures", search)
+    monkeypatch.setattr(
+        fetch,
+        "build_warc_files",
+        lambda *_args, **_kwargs: BuiltFiles(
+            WarcCounts(selected=1, responses=1),
+            (),
+        ),
+    )
+
+    assert fetch.run_fetch(
+        settings(date_start="2005", date_end="2010", fresh=True)
+    ) is True
+    assert searches == [("2005", "2010")]
+    assert "Merge:" not in capsys.readouterr().out
+
+
+def test_run_fetch_mode_mismatch_raises(monkeypatch, tmp_path):
+    install_common(monkeypatch, tmp_path, [])
+    prior = CollectionCoverage(
+        url_pattern="example.com/*",
+        date_start="1995",
+        date_end="2005",
+        warc_mode="all",
+        files_mode="none",
+        redirect_capture="none",
+    )
+    monkeypatch.setattr(
+        fetch,
+        "resolve_prior_coverage",
+        lambda *_args, **_kwargs: prior,
+    )
+    with pytest.raises(CoverageModeError, match="warc_mode"):
+        fetch.run_fetch(settings(warc_mode="latest"))
+
+
+def test_finalize_indexes_all_collection_warcs(monkeypatch, tmp_path):
+    paths = type(
+        "Paths",
+        (),
+        {
+            "collection_root": tmp_path,
+            "website_root": tmp_path / "website",
+            "archive_root": tmp_path / "archive",
+            "replay_index": tmp_path / "replay" / "index.cdxj",
+        },
+    )()
+    left = tmp_path / "archive" / "example.com" / "old.warc.gz"
+    right = tmp_path / "archive" / "example.com" / "new.warc.gz"
+    left.parent.mkdir(parents=True)
+    left.write_bytes(b"old")
+    right.write_bytes(b"new")
+    indexed = []
+
+    def build_index(warcs, *, layout):
+        indexed.append(list(warcs))
+        return layout.replay_index
+
+    monkeypatch.setattr(fetch, "build_replay_index", build_index)
+    monkeypatch.setattr(
+        fetch,
+        "list_collection_warcs",
+        lambda layout: [left, right],
+    )
+    result = BuiltFiles(
+        WarcCounts(selected=1, responses=1),
+        (right,),
+    )
+    assert fetch._finalize_outputs(settings(), result, paths) is True
+    assert indexed == [[left, right]]

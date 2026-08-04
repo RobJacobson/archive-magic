@@ -96,6 +96,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> FetchSettings:
             f"{DEFAULT_RETRIES}; use 0 to disable retries)"
         ),
     )
+    parser.add_argument(
+        "--fresh",
+        action="store_true",
+        help=(
+            "Ignore prior collection coverage and build only this run's "
+            "date window (default merges with existing coverage)"
+        ),
+    )
     args = parser.parse_args(argv)
     if args.rewrite_local and args.files == "none":
         parser.error(
@@ -111,6 +119,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> FetchSettings:
         redirect_capture=args.redirect_capture,
         worker_count=args.workers,
         retries=args.retries,
+        fresh=args.fresh,
     )
 
 

@@ -18,7 +18,14 @@ def test_parse_args_returns_plain_fetch_settings(monkeypatch):
         redirect_capture="page",
         worker_count=DEFAULT_WORKER_COUNT,
         retries=8,
+        fresh=False,
     )
+
+
+def test_parse_args_accepts_fresh_flag(monkeypatch):
+    monkeypatch.setattr(cli, "current_utc_cdx_timestamp", lambda: "20260803010203")
+    settings = cli.parse_args(["example.com/*", "--fresh"])
+    assert settings.fresh is True
 
 
 def test_parse_args_accepts_workers_and_output_modes():

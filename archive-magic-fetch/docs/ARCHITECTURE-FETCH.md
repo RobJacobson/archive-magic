@@ -21,6 +21,7 @@ archive-magic-fetch URL_PATTERN
   [--workers N]
   [--retries N]
   [--rewrite-local]
+  [--fresh]
 ```
 
 `URL_PATTERN` seed scope:
@@ -50,6 +51,7 @@ Each captured domain then receives one direct folder under `archive/`:
 
 ```text
 <collection>/
+├── collection.json          # merge/resume coverage envelope
 ├── archive/
 │   ├── example.com/
 │   │   ├── index.warc.gz
@@ -95,11 +97,49 @@ one domain folder. Within that folder, multiple URL histories may share a WARC
 when readable paths collide. Encoded query strings and the existing
 file/directory collision rules remain unchanged.
 
+## Merge and resume
+
+Repeated fetches against the same collection **merge by default**.
+
+Before CDX search, Fetch loads prior coverage from `collection.json` when
+present. If that file is missing, it bootstraps a date envelope from matching
+`sources/*/query.json` snapshots (modes are not confirmed until a full
+manifest is written). The effective search window is the union of prior
+coverage and the current `--start`/`--end`:
+
+```text
+min(prior.date_start, --start) … max(prior.date_end, --end)
+```
+
+That expanded window is used for the primary CDX search and for redirect
+expansion. The operator still sees the request dates on the `Fetch` line;
+expansion is reported as:
+
+```text
+Merge: expanding search 2005-2010 using prior coverage 1995-2005 -> 1995-2010
+```
+
+After WARC construction completes, coverage is rewritten to the effective
+window plus `url_pattern`, `warc_mode`, `files_mode`, and
+`redirect_capture`. Mode mismatches against a confirmed prior manifest raise
+an error; use `--fresh` to ignore prior coverage and build only the current
+window (today's non-merge semantics).
+
+Staging `1995–2000` then `2000–2005` is therefore equivalent to one `1995–2005`
+search for stable IA CDX data. Extending `--end` a month later re-searches the
+union window; existing exact responses are reused from on-disk WARCs and only
+missing captures are fetched. WARCs are still rewritten (temp + atomic
+replace), not binary-appended: reuse is per-response identity, not gzip
+append.
+
+Use `--fresh` when the operator intentionally wants a replace of an earlier
+date slice without retaining prior ranges.
+
 ## Search and selection
 
-`search_captures()` materializes a complete CDX result within the requested
-date bounds. Every nonempty search is saved under `sources/` before it is
-used downstream.
+`search_captures()` materializes a complete CDX result within the effective
+(merged) date bounds. Every nonempty search is saved under `sources/` before
+it is used downstream.
 
 `group_by_url()` groups records by:
 
@@ -220,8 +260,9 @@ The existing behavior remains authoritative for:
 ## Replay index
 
 After every WARC is validated and published, `build_replay_index()` runs once
-as a serial final stage. It indexes response and revisit records from every
-available WARC and atomically replaces:
+as a serial final stage. It indexes response and revisit records from **every**
+final `*.warc.gz` under `archive/` (not only WARCs rewritten in this run) and
+atomically replaces:
 
 ```text
 replay/index.cdxj
@@ -236,7 +277,8 @@ for example:
 ```
 
 There are no per-WARC CDX shards. Navigator resolves WARC files solely through
-the domain-folder path in the CDXJ `filename` field.
+the domain-folder path in the CDXJ `filename` field. Indexing the full tree
+keeps URLs that were only built in earlier stages in the replay index.
 
 ## Console output
 
@@ -279,6 +321,7 @@ to the primary source log.
 | `search.py` | CDX search, grouping, primary selection |
 | `redirects.py` | Location resolution and redirect CDX expansion helpers |
 | `collection_paths.py` | Collection/domain paths and collision handling |
+| `collection_coverage.py` | Merge/resume coverage envelope and date window union |
 | `source_files.py` | Saved CDX search results and query metadata |
 | `downloads.py` | Exact playback, retries, thread-private clients |
 | `warc_files.py` | URL histories, WARC batches, WARC/file construction |

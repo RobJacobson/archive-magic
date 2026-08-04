@@ -69,6 +69,31 @@ def read_index(path):
     return entries
 
 
+def test_list_collection_warcs_is_sorted_and_recursive(tmp_path):
+    selected_layout = collection(tmp_path)
+    later = (
+        selected_layout.archive_root
+        / "played.example"
+        / "z.warc.gz"
+    )
+    earlier = (
+        selected_layout.archive_root
+        / "played.example"
+        / "posts"
+        / "index.warc.gz"
+    )
+    later.parent.mkdir(parents=True)
+    earlier.parent.mkdir(parents=True)
+    later.write_bytes(b"later")
+    earlier.write_bytes(b"earlier")
+    (selected_layout.archive_root / "ignore.txt").write_text("nope")
+
+    assert replay_index.list_collection_warcs(selected_layout) == [
+        earlier,
+        later,
+    ]
+
+
 def test_replay_index_uses_warc_identity_and_real_record_ranges(tmp_path):
     selected_layout = collection(tmp_path)
     warc = (

@@ -21,8 +21,14 @@ from .collection_paths import (
     prepare_website_files,
     same_site,
 )
+from .collection_coverage import (
+    coverage_after_run,
+    merge_search_window,
+    resolve_prior_coverage,
+    save_coverage,
+)
 from .source_files import save_search_results
-from .replay_index import build_replay_index
+from .replay_index import build_replay_index, list_collection_warcs
 from .redirects import expand_redirect_target
 from .downloads import make_client_factory
 from .local_links import rewrite_local_links
@@ -51,6 +57,7 @@ class FetchSettings:
     redirect_capture: str
     worker_count: int
     retries: int
+    fresh: bool = False
 
 
 def _report_discovery_progress(count: int) -> None:
@@ -147,6 +154,9 @@ def _build_files(
     client,
     client_factory: Callable,
     paths: CollectionPaths,
+    *,
+    date_start: str,
+    date_end: str,
 ) -> BuiltFiles:
     """Select captures and build requested files with inline redirect expansion."""
 
@@ -181,8 +191,8 @@ def _build_files(
             client,
             seed_pattern=settings.url_pattern,
             mode=settings.redirect_capture,
-            date_start=settings.date_start,
-            date_end=settings.date_end,
+            date_start=date_start,
+            date_end=date_end,
             layout=paths,
             known_history_keys=known_history_keys,
             reserved_paths=reserved_paths,
@@ -214,12 +224,15 @@ def _finalize_outputs(
     """Finalize derived outputs, report results, and return request success."""
 
     if settings.warc_mode != "none":
-        replay_index = build_replay_index(result.built_warcs, layout=paths)
+        warcs = list_collection_warcs(paths)
+        if not warcs and result.built_warcs:
+            warcs = list(result.built_warcs)
+        replay_index = build_replay_index(warcs, layout=paths)
         if replay_index is not None:
             relative = replay_index.relative_to(paths.collection_root)
             print(
                 f"Replay index: {relative.as_posix()} from "
-                f"{len(result.built_warcs)} WARC files"
+                f"{len(warcs)} WARC files"
             )
 
     if settings.rewrite_local and result.file_counts.written > 0:
@@ -245,6 +258,7 @@ def run_fetch(
         f"WARC {settings.warc_mode}, files {settings.files_mode}, "
         f"redirects {settings.redirect_capture}, "
         f"{settings.worker_count} workers"
+        + (", fresh" if settings.fresh else "")
     )
 
     if settings.warc_mode == "none" and settings.redirect_capture != "none":
@@ -258,13 +272,37 @@ def run_fetch(
         settings.url_pattern,
         root=_DEFAULT_OUTPUT_ROOT,
     )
+    prior = None
+    if not settings.fresh:
+        prior = resolve_prior_coverage(
+            paths,
+            url_pattern=settings.url_pattern,
+        )
+    window = merge_search_window(
+        url_pattern=settings.url_pattern,
+        date_start=settings.date_start,
+        date_end=settings.date_end,
+        warc_mode=settings.warc_mode,
+        files_mode=settings.files_mode,
+        redirect_capture=settings.redirect_capture,
+        prior=prior,
+        fresh=settings.fresh,
+    )
+    if window.expanded and window.prior is not None:
+        print(
+            f"Merge: expanding search {settings.date_start}-{settings.date_end} "
+            f"using prior coverage {window.prior.date_start}-"
+            f"{window.prior.date_end} -> "
+            f"{window.date_start}-{window.date_end}"
+        )
+
     client_factory = make_client_factory(USER_AGENT)
     with client_factory() as client:
         captures = search_captures(
             client,
             settings.url_pattern,
-            settings.date_start,
-            settings.date_end,
+            window.date_start,
+            window.date_end,
             progress=_report_discovery_progress,
             retries=settings.retries,
         )
@@ -282,8 +320,8 @@ def run_fetch(
             captures,
             layout=paths,
             url_pattern=settings.url_pattern,
-            date_start=settings.date_start,
-            date_end=settings.date_end,
+            date_start=window.date_start,
+            date_end=window.date_end,
             acquired_at=datetime.now(timezone.utc),
         )
         if console_log is not None:
@@ -295,8 +333,21 @@ def run_fetch(
             client,
             client_factory,
             paths,
+            date_start=window.date_start,
+            date_end=window.date_end,
         )
         succeeded = _finalize_outputs(settings, result, paths)
+        save_coverage(
+            paths,
+            coverage_after_run(
+                url_pattern=settings.url_pattern,
+                date_start=window.date_start,
+                date_end=window.date_end,
+                warc_mode=settings.warc_mode,
+                files_mode=settings.files_mode,
+                redirect_capture=settings.redirect_capture,
+            ),
+        )
         failed = len(result.failed_capture_urls)
         print(
             f"Done in {(time.monotonic() - started_at) / 60:.1f} minutes: "

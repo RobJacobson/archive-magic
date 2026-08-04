@@ -71,6 +71,10 @@ class CollectionPaths:
     def replay_index(self) -> Path:
         return self.collection_root / "replay" / "index.cdxj"
 
+    @property
+    def coverage_path(self) -> Path:
+        return self.collection_root / "collection.json"
+
 
 @dataclass(frozen=True)
 class WebsiteFile:
