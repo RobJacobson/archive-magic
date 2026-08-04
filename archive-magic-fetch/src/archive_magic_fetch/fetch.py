@@ -123,7 +123,7 @@ def _redirect_expand(
                         )
                     )
                 reserved_paths.add(path)
-                added.append(WarcBatch(path, tuple(histories)))
+                added.append(WarcBatch(path, tuple(histories), expand=False))
             if queued_keys:
                 print(f"Redirect: +{len(queued_keys)} histories from {target}")
         return added

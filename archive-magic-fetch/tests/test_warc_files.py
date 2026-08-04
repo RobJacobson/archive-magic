@@ -495,6 +495,84 @@ def test_warc_build_does_not_return_redirect_targets(tmp_path):
     assert result.warc_counts.responses == 1
 
 
+def test_redirect_expansion_stops_after_one_hop(tmp_path):
+    seed = capture(
+        original="https://seed.test/",
+        captured="20170101000000",
+        payload=b"seed-redirect",
+        statuscode=301,
+        urlkey="test,seed)/",
+    )
+    hop1 = capture(
+        original="https://hop1.test/",
+        captured="20200101000000",
+        payload=b"hop1-redirect",
+        statuscode=301,
+        urlkey="test,hop1)/",
+    )
+    expand_calls: list[tuple[str, ...]] = []
+
+    client = FakeClient(
+        {
+            seed: memento_for(
+                seed,
+                payload=b"seed-redirect",
+                status_code=301,
+                headers={"Location": "https://hop1.test/"},
+            ),
+            hop1: memento_for(
+                hop1,
+                payload=b"hop1-redirect",
+                status_code=301,
+                headers={"Location": "https://hop2.test/"},
+            ),
+        }
+    )
+    layout = collection_paths.collection_paths(
+        "seed.test/*",
+        root=tmp_path / "archives",
+    )
+    hop1_warc = layout.archive_root / "hop1.test" / "index.warc.gz"
+
+    def expand(targets):
+        expand_calls.append(tuple(targets))
+        assert list(targets) == ["https://hop1.test/"]
+        return [
+            warc_files.WarcBatch(
+                hop1_warc,
+                (
+                    warc_files.UrlHistory(
+                        "hop1.test",
+                        hop1.urlkey,
+                        (hop1,),
+                        (),
+                    ),
+                ),
+                expand=False,
+            )
+        ]
+
+    result = warc_files.build_warc_files(
+        {seed.urlkey: [seed]},
+        client,
+        layout=layout,
+        collect_redirects=True,
+        expand_redirects=expand,
+    )
+
+    assert expand_calls == [("https://hop1.test/",)]
+    assert hop1 in client.calls
+    assert result.warc_counts.responses == 2
+    hop1_records = read_records(hop1_warc)
+    response = next(
+        record for record in hop1_records if record.rec_type == "response"
+    )
+    assert response.http_headers.get_statuscode() == "301"
+    assert (
+        response.http_headers.get_header("Location") == "https://hop2.test/"
+    )
+
+
 def test_retrieved_statusless_redirect_is_written_as_response(tmp_path):
     selected = capture(statuscode=None, payload=b"redirect")
     client = FakeClient(

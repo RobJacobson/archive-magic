@@ -152,6 +152,7 @@ class WarcBatch:
 
     path: Path
     histories: tuple[UrlHistory, ...]
+    expand: bool = True
 
 
 @dataclass(frozen=True)
@@ -891,8 +892,10 @@ def build_warc_files(
     """Build WARC and loose-file outputs through bounded worker pools.
 
     When ``expand_redirects`` is provided, Location targets collected from
-    finished WARC batches are passed to it and any returned batches are
-    appended to the live WARC work queue.
+    finished seed WARC batches (``WarcBatch.expand=True``) are passed to it
+    and any returned batches are appended to the live WARC work queue.
+    Redirect-discovered batches should set ``expand=False`` so their
+    permanent redirects are stored without further expansion.
     """
 
     if retries < 0:
@@ -953,7 +956,11 @@ def build_warc_files(
             retries=retries,
             warc_mode=warc_mode,
             files_mode=files_mode,
-            collect_redirects=collect_redirects and isinstance(batch, WarcBatch),
+            collect_redirects=(
+                collect_redirects
+                and isinstance(batch, WarcBatch)
+                and batch.expand
+            ),
         )
 
     completed_warcs = 0
@@ -1034,7 +1041,11 @@ def build_warc_files(
         ) -> None:
             results.append(result)
             report_finished(batch, result)
-            if expand is None or not isinstance(batch, WarcBatch):
+            if (
+                expand is None
+                or not isinstance(batch, WarcBatch)
+                or not batch.expand
+            ):
                 return
             accept_expanded(expand(result.redirect_targets))
 
@@ -1073,6 +1084,7 @@ def build_warc_files(
                                 if (
                                     expand is not None
                                     and isinstance(batch, WarcBatch)
+                                    and batch.expand
                                     and result.redirect_targets
                                 ):
                                     targets = tuple(result.redirect_targets)
