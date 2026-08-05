@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import re
 import threading
 import time
 from dataclasses import dataclass
@@ -40,6 +39,7 @@ from .retry import (
     retry_delay_seconds,
     sleep_seconds,
 )
+from .capture_identity import normalize_payload_digest
 from .warc_records import timestamp_to_warc_date
 
 
@@ -54,8 +54,6 @@ PLAYBACK_ERRORS = (
 )
 
 REPEATED_TRUNCATION_ATTEMPTS = 2
-
-_VALID_CDX_SHA1 = re.compile(r"[A-Z2-7]{32}")
 
 _REPRESENTATION_HEADERS = {
     "content-digest",
@@ -206,14 +204,7 @@ def _content_encoding(memento) -> Optional[str]:
 def normalize_cdx_digest(digest: object) -> Optional[str]:
     """Return a canonical CDX SHA-1 payload digest when valid."""
 
-    if not isinstance(digest, str):
-        return None
-    value = digest.strip().upper()
-    if value.startswith("SHA1:"):
-        value = value[5:]
-    if not _VALID_CDX_SHA1.fullmatch(value):
-        return None
-    return f"sha1:{value}"
+    return normalize_payload_digest(digest)
 
 
 def _payload_digest(payload: bytes) -> str:

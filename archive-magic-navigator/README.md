@@ -51,12 +51,12 @@ locally, pywb asks the Wayback Machine for the capture nearest the replay
 timestamp. Remote lookup and loading use a ten-second timeout. Navigator does
 not cache or persist fallback responses.
 
-Archive Magic Fetch captures permanent redirect targets locally by default via
-`--redirect-capture website`; use `page` for exact landing-page histories or
-`none` to disable capture-time expansion. Locally captured redirect pages and
-assets take precedence here exactly like primary records. Runtime Wayback
-fallback remains useful for targets outside the Fetch date range, unavailable
-captures, and any resources not included in the local closure.
+Archive Magic Fetch preserves selected historical redirect responses but does
+not automatically capture their targets. Its per-run `redirects.json` report
+lists covered, skipped, and unresolved targets so the operator can choose
+subsequent Fetch queries. Locally captured targets and assets take precedence
+here exactly like primary records; runtime Wayback fallback can supply missing
+resources without changing the local collection.
 
 ## Collection contract
 

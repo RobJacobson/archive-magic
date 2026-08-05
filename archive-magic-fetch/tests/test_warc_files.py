@@ -207,7 +207,7 @@ def test_matching_cdx_digests_write_one_response_and_one_revisit(tmp_path):
     ) == records[1].rec_headers.get_header("WARC-Record-ID")
 
 
-def test_value_equal_source_rows_remain_distinct_warc_records(tmp_path):
+def test_value_equal_source_rows_collapse_to_one_logical_capture(tmp_path):
     first = capture()
     second = capture()
     target = output_path(tmp_path)
@@ -221,12 +221,53 @@ def test_value_equal_source_rows_remain_distinct_warc_records(tmp_path):
 
     assert first == second
     assert first is not second
-    assert summary.selected == 2
+    assert summary.selected == 1
     assert [record.rec_type for record in read_records(target)] == [
         "warcinfo",
         "response",
-        "revisit",
     ]
+
+
+def test_value_equal_failed_rows_are_attempted_and_counted_once(tmp_path):
+    first = capture()
+    second = capture()
+    target = output_path(tmp_path)
+    client = FakeClient({first: MementoPlaybackError("unavailable")})
+
+    summary = warc_files.build_url_history(
+        URLKEY,
+        [first, second],
+        target,
+        client,
+    )
+
+    assert client.calls == [first]
+    assert summary == warc_files.WarcCounts(
+        selected=1,
+        playback_failures=1,
+    )
+
+
+def test_same_url_and_timestamp_with_different_digests_remain_distinct(tmp_path):
+    first = capture(payload=b"first")
+    second = capture(payload=b"second")
+    target = output_path(tmp_path)
+    client = FakeClient(
+        {
+            first: memento_for(first, payload=b"first"),
+            second: memento_for(second, payload=b"second"),
+        }
+    )
+
+    summary = warc_files.build_url_history(
+        URLKEY,
+        [first, second],
+        target,
+        client,
+    )
+
+    assert client.calls == [first, second]
+    assert summary == warc_files.WarcCounts(selected=2, responses=2)
 
 
 def test_empty_playback_body_writes_zero_length_response(tmp_path, capsys):
@@ -493,182 +534,6 @@ def test_warc_build_does_not_return_redirect_targets(tmp_path):
 
     assert not hasattr(result, "redirect_targets")
     assert result.warc_counts.responses == 1
-
-
-def test_redirect_expansion_stops_after_one_hop(tmp_path):
-    seed = capture(
-        original="https://seed.test/",
-        captured="20170101000000",
-        payload=b"seed-redirect",
-        statuscode=301,
-        urlkey="test,seed)/",
-    )
-    hop1 = capture(
-        original="https://hop1.test/",
-        captured="20200101000000",
-        payload=b"hop1-redirect",
-        statuscode=301,
-        urlkey="test,hop1)/",
-    )
-    expand_calls: list[tuple[str, ...]] = []
-
-    client = FakeClient(
-        {
-            seed: memento_for(
-                seed,
-                payload=b"seed-redirect",
-                status_code=301,
-                headers={"Location": "https://hop1.test/"},
-            ),
-            hop1: memento_for(
-                hop1,
-                payload=b"hop1-redirect",
-                status_code=301,
-                headers={"Location": "https://hop2.test/"},
-            ),
-        }
-    )
-    layout = collection_paths.collection_paths(
-        "seed.test/*",
-        root=tmp_path / "archives",
-    )
-    hop1_warc = layout.archive_root / "hop1.test" / "index.warc.gz"
-
-    def expand(targets):
-        expand_calls.append(tuple(targets))
-        assert list(targets) == ["https://hop1.test/"]
-        return [
-            warc_files.WarcBatch(
-                hop1_warc,
-                (
-                    warc_files.UrlHistory(
-                        "hop1.test",
-                        hop1.urlkey,
-                        (hop1,),
-                        (),
-                    ),
-                ),
-                expand=False,
-            )
-        ]
-
-    result = warc_files.build_warc_files(
-        {seed.urlkey: [seed]},
-        client,
-        layout=layout,
-        collect_redirects=True,
-        expand_redirects=expand,
-    )
-
-    assert expand_calls == [("https://hop1.test/",)]
-    assert hop1 in client.calls
-    assert result.warc_counts.responses == 2
-    hop1_records = read_records(hop1_warc)
-    response = next(
-        record for record in hop1_records if record.rec_type == "response"
-    )
-    assert response.http_headers.get_statuscode() == "301"
-    assert (
-        response.http_headers.get_header("Location") == "https://hop2.test/"
-    )
-
-
-def test_same_site_redirect_batch_keeps_expanding(tmp_path):
-    seed = capture(
-        original="https://seed.test/",
-        captured="20170101000000",
-        payload=b"seed-redirect",
-        statuscode=301,
-        urlkey="test,seed)/",
-    )
-    news = capture(
-        original="https://news.seed.test/",
-        captured="20180101000000",
-        payload=b"news-redirect",
-        statuscode=301,
-        urlkey="test,seed)/news",
-    )
-    expand_calls: list[tuple[str, ...]] = []
-
-    client = FakeClient(
-        {
-            seed: memento_for(
-                seed,
-                payload=b"seed-redirect",
-                status_code=301,
-                headers={"Location": "https://news.seed.test/"},
-            ),
-            news: memento_for(
-                news,
-                payload=b"news-redirect",
-                status_code=301,
-                headers={"Location": "https://foreign.test/"},
-            ),
-        }
-    )
-    layout = collection_paths.collection_paths(
-        "seed.test/*",
-        root=tmp_path / "archives",
-    )
-    news_warc = layout.archive_root / "news.seed.test" / "index.warc.gz"
-    foreign = capture(
-        original="https://foreign.test/",
-        captured="20190101000000",
-        payload=b"foreign",
-        statuscode=200,
-        urlkey="test,foreign)/",
-    )
-    foreign_warc = layout.archive_root / "foreign.test" / "index.warc.gz"
-
-    def expand(targets):
-        expand_calls.append(tuple(targets))
-        if list(targets) == ["https://news.seed.test/"]:
-            return [
-                warc_files.WarcBatch(
-                    news_warc,
-                    (
-                        warc_files.UrlHistory(
-                            "news.seed.test",
-                            news.urlkey,
-                            (news,),
-                            (),
-                        ),
-                    ),
-                    expand=True,
-                )
-            ]
-        if list(targets) == ["https://foreign.test/"]:
-            return [
-                warc_files.WarcBatch(
-                    foreign_warc,
-                    (
-                        warc_files.UrlHistory(
-                            "foreign.test",
-                            foreign.urlkey,
-                            (foreign,),
-                            (),
-                        ),
-                    ),
-                    expand=False,
-                )
-            ]
-        raise AssertionError(f"unexpected expand targets: {targets}")
-
-    client.outcomes[foreign] = memento_for(foreign, payload=b"foreign")
-
-    result = warc_files.build_warc_files(
-        {seed.urlkey: [seed]},
-        client,
-        layout=layout,
-        collect_redirects=True,
-        expand_redirects=expand,
-    )
-
-    assert expand_calls == [
-        ("https://news.seed.test/",),
-        ("https://foreign.test/",),
-    ]
-    assert result.warc_counts.responses == 3
 
 
 def test_retrieved_statusless_redirect_is_written_as_response(tmp_path):
@@ -1347,98 +1212,6 @@ def test_warc_all_runs_different_warc_batches_concurrently(
     assert "http://web.archive.org/web/*/https://example.com/a" in completed[1]
 
 
-def test_redirect_expand_does_not_block_warc_workers(
-    tmp_path,
-    capsys,
-    monkeypatch,
-):
-    redirected = capture(
-        original="https://example.com/start",
-        captured="20170101000000",
-        payload=b"redirect",
-        statuscode=301,
-        urlkey="com,example)/start",
-    )
-    other = capture(
-        original="https://example.com/other",
-        captured="20180101000000",
-        payload=b"other",
-        urlkey="com,example)/other",
-    )
-    expand_started = threading.Event()
-    release_expand = threading.Event()
-    other_reported = threading.Event()
-    real_print = print
-
-    def record_print(*args, **kwargs):
-        real_print(*args, **kwargs)
-        if args and "http://web.archive.org/web/*/https://example.com/other" in str(
-            args[0]
-        ):
-            other_reported.set()
-
-    monkeypatch.setattr(warc_files, "print", record_print, raising=False)
-
-    class FactoryClient:
-        def __init__(self):
-            self.calls = []
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args):
-            return False
-
-        def get_memento(self, selected, **kwargs):
-            self.calls.append(selected)
-            if selected is redirected:
-                return memento_for(
-                    selected,
-                    payload=b"redirect",
-                    status_code=301,
-                    headers={"Location": "https://target.test/landing"},
-                )
-            return memento_for(selected, payload=b"other")
-
-    def factory():
-        return FactoryClient()
-
-    def expand(targets):
-        assert targets == ("https://target.test/landing",)
-        expand_started.set()
-        assert release_expand.wait(timeout=10)
-        return []
-
-    layout = collection_paths.collection_paths(
-        "https://example.com/*",
-        root=tmp_path / "archives",
-    )
-    groups = {
-        redirected.urlkey: [redirected],
-        other.urlkey: [other],
-    }
-
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        future = executor.submit(
-            warc_files.build_warc_files,
-            groups,
-            FactoryClient(),
-            layout=layout,
-            client_factory=factory,
-            worker_count=2,
-            collect_redirects=True,
-            expand_redirects=expand,
-        )
-        assert expand_started.wait(timeout=2)
-        assert other_reported.wait(timeout=2)
-        assert not future.done()
-        release_expand.set()
-        result = future.result(timeout=2)
-
-    assert result.warc_counts.responses == 2
-    assert len(result.built_warcs) == 2
-
-
 def test_thread_client_pool_reuses_and_closes_client():
     created = []
 
@@ -1573,32 +1346,18 @@ def test_open_new_warc_exclusively_rejects_existing_target(tmp_path):
         warc_records.open_new_warc(target)
 
 
-def test_warc_rebuilds_unreadable_existing_target_from_wayback(
-    tmp_path,
-    capsys,
-):
+def test_unreadable_existing_target_is_fatal_and_untouched(tmp_path):
     selected = capture()
     target = output_path(tmp_path)
     target.parent.mkdir(parents=True)
     target.write_bytes(b"existing")
     client = FakeClient({selected: memento_for(selected)})
 
-    summary = warc_files.build_url_history(
-        URLKEY,
-        [selected],
-        target,
-        client,
-    )
+    with pytest.raises(ValueError, match="cannot inventory existing WARC"):
+        warc_files.build_url_history(URLKEY, [selected], target, client)
 
-    assert summary.responses == 1
-    assert client.calls == [selected]
-    assert [record.rec_type for record in read_records(target)] == [
-        "warcinfo",
-        "response",
-    ]
-    assert "could not be inventoried; fetching from Wayback" in (
-        capsys.readouterr().out
-    )
+    assert client.calls == []
+    assert target.read_bytes() == b"existing"
 
 
 def test_unchanged_rebuild_reuses_full_responses_without_wayback(
@@ -1609,6 +1368,7 @@ def test_unchanged_rebuild_reuses_full_responses_without_wayback(
     target = output_path(tmp_path)
     first_client = FakeClient({selected: memento_for(selected)})
     warc_files.build_url_history(URLKEY, [selected], target, first_client)
+    original = target.read_bytes()
     capsys.readouterr()
 
     second_client = FakeClient({})
@@ -1627,6 +1387,7 @@ def test_unchanged_rebuild_reuses_full_responses_without_wayback(
         "response",
     ]
     assert records[0].rec_headers.get_header("WARC-Filename") == target.name
+    assert target.read_bytes() == original
     assert not target.with_name(target.name + ".tmp").exists()
     assert capsys.readouterr().out == ""
 
@@ -1669,6 +1430,50 @@ def test_rebuild_reuses_old_response_and_fetches_only_missing_capture(
         "2017-01-01T00:00:00Z",
         "2018-01-01T00:00:00Z",
     ]
+
+
+def test_rebuild_preserves_old_capture_absent_from_current_cdx(tmp_path):
+    old = capture(captured="20170101000000", payload=b"old")
+    new = capture(captured="20190101000000", payload=b"new")
+    target = output_path(tmp_path)
+    warc_files.build_url_history(
+        URLKEY,
+        [old],
+        target,
+        FakeClient({old: memento_for(old, payload=b"old")}),
+    )
+
+    client = FakeClient({new: memento_for(new, payload=b"new")})
+    summary = warc_files.build_url_history(URLKEY, [new], target, client)
+
+    assert client.calls == [new]
+    assert summary == warc_files.WarcCounts(selected=1, responses=2)
+    records = read_records(target)
+    assert [
+        record.rec_headers.get_header("WARC-Date")
+        for record in records
+        if record.rec_type in {"response", "revisit"}
+    ] == ["2017-01-01T00:00:00Z", "2019-01-01T00:00:00Z"]
+
+
+def test_normalized_url_spelling_reuses_existing_capture(tmp_path):
+    first = capture(original="http://EXAMPLE.com:80/resource")
+    equivalent = capture(original="http://example.com/resource")
+    target = output_path(tmp_path)
+    warc_files.build_url_history(
+        URLKEY,
+        [first],
+        target,
+        FakeClient({first: memento_for(first)}),
+    )
+
+    client = FakeClient({})
+    warc_files.build_url_history(URLKEY, [equivalent], target, client)
+
+    assert client.calls == []
+    assert len(
+        [record for record in read_records(target) if record.rec_type == "response"]
+    ) == 1
 
 
 def test_partial_warc_is_published_and_backfilled_on_next_run(tmp_path):
@@ -1734,7 +1539,6 @@ def test_all_failed_rebuild_preserves_and_reports_existing_final(
             {previous: memento_for(previous, payload=b"previous")}
         ),
     )
-    original = target.read_bytes()
     layout = collection_paths.collection_paths(
         "https://example.com/*",
         root=tmp_path / "archives",
@@ -1750,10 +1554,14 @@ def test_all_failed_rebuild_preserves_and_reports_existing_final(
 
     assert result.built_warcs == (target,)
     assert result.warc_counts.playback_failures == 1
-    assert target.read_bytes() == original
+    records = read_records(target)
+    assert [record.rec_type for record in records] == ["warcinfo", "response"]
+    assert records[1].rec_headers.get_header("WARC-Date") == (
+        "2017-01-01T00:00:00Z"
+    )
 
 
-def test_old_exact_revisit_without_new_representative_fetches_wayback(
+def test_old_exact_revisit_is_preserved_without_wayback(
     tmp_path,
 ):
     first = capture(captured="20170101000000", payload=b"same")
@@ -1776,17 +1584,15 @@ def test_old_exact_revisit_without_new_representative_fetches_wayback(
     )
     warc_files.build_url_history(URLKEY, [second], target, client)
 
-    assert client.calls == [second]
+    assert client.calls == []
     assert [record.rec_type for record in read_records(target)] == [
         "warcinfo",
         "response",
+        "revisit",
     ]
 
 
-def test_invalid_cached_payload_digest_warns_and_fetches_wayback(
-    tmp_path,
-    capsys,
-):
+def test_invalid_cached_payload_digest_is_fatal_and_untouched(tmp_path):
     selected = capture()
     target = output_path(tmp_path)
     retrieved = downloads.DownloadedCapture(
@@ -1806,14 +1612,13 @@ def test_invalid_cached_payload_digest_warns_and_fetches_wayback(
     writer.write_record(response)
     stream.close()
 
+    original = target.read_bytes()
     client = FakeClient({selected: memento_for(selected)})
-    warc_files.build_url_history(URLKEY, [selected], target, client)
+    with pytest.raises(ValueError, match="cannot inventory existing WARC"):
+        warc_files.build_url_history(URLKEY, [selected], target, client)
 
-    assert client.calls == [selected]
-    output = capsys.readouterr().out
-    assert selected.view_url in output
-    assert "WARNING: existing WARC cache unusable" in output
-    assert "fetching from Wayback" in output
+    assert client.calls == []
+    assert target.read_bytes() == original
 
 
 def test_temporary_validation_failure_preserves_existing_warc(
@@ -1829,6 +1634,7 @@ def test_temporary_validation_failure_preserves_existing_warc(
         FakeClient({selected: memento_for(selected)}),
     )
     original = target.read_bytes()
+    added = capture(captured="20180101000000", payload=b"added")
 
     def fail_validation(path):
         raise ValueError("temporary is invalid")
@@ -1838,9 +1644,48 @@ def test_temporary_validation_failure_preserves_existing_warc(
     with pytest.raises(ValueError, match="temporary is invalid"):
         warc_files.build_url_history(
             URLKEY,
-            [selected],
+            [selected, added],
             target,
-            FakeClient({}),
+            FakeClient({added: memento_for(added, payload=b"added")}),
+        )
+
+    assert target.read_bytes() == original
+    assert not target.with_name(target.name + ".tmp").exists()
+
+
+def test_superset_check_failure_preserves_existing_warc(tmp_path, monkeypatch):
+    selected = capture()
+    target = output_path(tmp_path)
+    warc_files.build_url_history(
+        URLKEY,
+        [selected],
+        target,
+        FakeClient({selected: memento_for(selected)}),
+    )
+    original = target.read_bytes()
+    added = capture(captured="20180101000000", payload=b"added")
+    real_inventory = warc_records.ExistingWarcCache.inventory
+
+    class MissingInventory:
+        identities = frozenset()
+
+    def inventory(path):
+        if path.name.endswith(".tmp"):
+            return MissingInventory()
+        return real_inventory(path)
+
+    monkeypatch.setattr(
+        warc_files.ExistingWarcCache,
+        "inventory",
+        staticmethod(inventory),
+    )
+
+    with pytest.raises(ValueError, match="would lose 1 prior logical capture"):
+        warc_files.build_url_history(
+            URLKEY,
+            [selected, added],
+            target,
+            FakeClient({added: memento_for(added, payload=b"added")}),
         )
 
     assert target.read_bytes() == original

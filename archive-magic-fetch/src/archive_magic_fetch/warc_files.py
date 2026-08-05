@@ -31,10 +31,12 @@ from .downloads import (
     normalize_cdx_digest,
     download_capture,
 )
-from .redirects import PERMANENT_REDIRECT_STATUSES, permanent_redirect_target
+from .capture_identity import identity_for_capture, normalized_urlkey
 from .retry import DEFAULT_RETRIES
+from .replay_index import list_collection_warcs
 from .warc_records import (
     ExistingWarcCache,
+    ExistingWarcCollection,
     RevisitReference,
     open_new_warc,
     response_reference,
@@ -74,7 +76,12 @@ class _WarcFileBuilder:
             self.owns_temporary = True
         return self.writer
 
-    def publish(self, *, has_records: bool) -> Optional[Path]:
+    def publish(
+        self,
+        *,
+        has_records: bool,
+        prior_identities=frozenset(),
+    ) -> Optional[Path]:
         if self.stream is not None:
             self.stream.close()
         if not has_records:
@@ -82,6 +89,13 @@ class _WarcFileBuilder:
                 self.temporary_path.unlink()
             return self.final_path if self.final_path.is_file() else None
         validate_warc(self.temporary_path)
+        rebuilt = ExistingWarcCache.inventory(self.temporary_path)
+        missing = prior_identities - rebuilt.identities
+        if missing:
+            raise ValueError(
+                f"rebuilt WARC would lose {len(missing)} prior "
+                "logical capture(s)"
+            )
         os.replace(self.temporary_path, self.final_path)
         return self.final_path
 
@@ -152,7 +166,6 @@ class WarcBatch:
 
     path: Path
     histories: tuple[UrlHistory, ...]
-    expand: bool = True
 
 
 @dataclass(frozen=True)
@@ -168,7 +181,6 @@ class _UrlHistoryResult:
     files: WebsiteFileCounts
     failed_capture_urls: list[str]
     messages: list[str]
-    redirect_targets: list[str]
 
 
 @dataclass
@@ -177,7 +189,7 @@ class _UrlHistoryState:
 
     warc_ids: set[int]
     writer_factory: Optional[Callable[[], object]]
-    existing_warc: Optional[ExistingWarcCache]
+    existing_warcs: Optional[ExistingWarcCollection]
     files_mode: str
     warc: WarcCounts
     files: WebsiteFileCounts
@@ -196,7 +208,6 @@ class _BuiltBatch:
     final_warc: Optional[Path]
     failed_capture_urls: list[str]
     messages: list[str]
-    redirect_targets: list[str] = field(default_factory=list)
 
 
 def _is_redirect(status: Optional[int]) -> bool:
@@ -448,7 +459,7 @@ def _new_history_state(
     warc_captures: Sequence[CdxRecord],
     file_paths: Mapping[int, tuple[CdxRecord, Sequence[Path]]],
     writer_factory: Optional[Callable[[], object]],
-    existing_warc: Optional[ExistingWarcCache],
+    existing_warcs: Optional[ExistingWarcCollection],
     *,
     files_mode: str,
 ) -> _UrlHistoryState:
@@ -457,13 +468,19 @@ def _new_history_state(
     return _UrlHistoryState(
         warc_ids={id(capture) for capture in warc_captures},
         writer_factory=writer_factory,
-        existing_warc=existing_warc,
+        existing_warcs=existing_warcs,
         files_mode=files_mode,
         warc=WarcCounts(selected=len(warc_captures)),
         files=WebsiteFileCounts(
             selected=sum(len(paths) for _capture, paths in file_paths.values())
         ),
-        response_refs_by_digest={},
+        response_refs_by_digest=(
+            existing_warcs.references_for_urlkey(
+                normalized_urlkey(warc_captures[0].original)
+            )
+            if existing_warcs is not None and warc_captures
+            else {}
+        ),
         file_paths_by_digest=_file_paths_by_digest(file_paths),
         written_files=set(),
         failed_files=set(),
@@ -488,6 +505,7 @@ def _use_known_representative(
     digest: Optional[str],
     *,
     wants_warc: bool,
+    capture_paths: Sequence[Path],
 ) -> bool:
     """Write a revisit when possible and report whether playback is skipped."""
 
@@ -495,6 +513,11 @@ def _use_known_representative(
         return False
     reference = state.response_refs_by_digest[digest]
     if wants_warc and reference is None:
+        return False
+    if state.files_mode != "unique" and capture_paths and not all(
+        path in state.written_files or path in state.failed_files
+        for path in capture_paths
+    ):
         return False
     if wants_warc:
         _write_revisit_record(
@@ -518,42 +541,26 @@ def _download_validated(
     """Load one capture locally or record an expected playback failure."""
 
     downloaded = None
-    if wants_warc and state.existing_warc is not None:
-        try:
-            cached = state.existing_warc.get(capture)
-        except ValueError as error:
-            state.messages.extend(
-                _url_messages(
-                    capture.view_url,
-                    f"WARNING: existing WARC cache unusable; "
-                    f"fetching from Wayback ({error})",
+    if (wants_warc or capture_paths) and state.existing_warcs is not None:
+        cached = state.existing_warcs.get(capture)
+        if cached is not None:
+            if (
+                not cached.body
+                and normalize_cdx_digest(capture.digest)
+                != _EMPTY_PAYLOAD_DIGEST
+            ):
+                raise ValueError(
+                    f"existing WARC cache is unexpectedly empty for "
+                    f"{capture.view_url}"
                 )
+            downloaded = DownloadedCapture(
+                body=cached.body,
+                url=capture.original,
+                capture_date=timestamp_to_warc_date(capture.timestamp),
+                source_uri=capture.raw_url,
+                status_code=cached.status_code,
+                headers=cached.headers,
             )
-        else:
-            if cached is not None:
-                if (
-                    not cached.body
-                    and normalize_cdx_digest(capture.digest)
-                    != _EMPTY_PAYLOAD_DIGEST
-                ):
-                    state.messages.extend(
-                        _url_messages(
-                            capture.view_url,
-                            "WARNING: existing WARC cache empty; "
-                            "fetching from Wayback",
-                        )
-                    )
-                else:
-                    downloaded = DownloadedCapture(
-                        body=cached.body,
-                        url=capture.original,
-                        capture_date=timestamp_to_warc_date(
-                            capture.timestamp
-                        ),
-                        source_uri=capture.raw_url,
-                        status_code=cached.status_code,
-                        headers=cached.headers,
-                    )
 
     if downloaded is None:
         try:
@@ -632,21 +639,38 @@ def _commit_representative(
     *,
     wants_warc: bool,
     capture_paths: Sequence[Path],
-    collect_redirects: bool,
-    redirect_targets: list[str],
 ) -> None:
     """Commit one successful representative to every selected output."""
 
     reference = None
     if wants_warc:
-        reference = _write_response_record(
-            capture,
-            downloaded,
-            state.writer_factory,
+        known_reference = (
+            state.response_refs_by_digest.get(digest)
+            if digest is not None
+            else None
         )
-        state.warc.responses += 1
+        if known_reference is not None and not _is_redirect(
+            downloaded.status_code
+        ):
+            _write_revisit_record(
+                capture,
+                known_reference,
+                state.writer_factory,
+            )
+            state.warc.revisits += 1
+            reference = known_reference
+        else:
+            reference = _write_response_record(
+                capture,
+                downloaded,
+                state.writer_factory,
+            )
+            state.warc.responses += 1
     if digest is not None and not _is_redirect(downloaded.status_code):
-        state.response_refs_by_digest[digest] = reference
+        if reference is not None:
+            state.response_refs_by_digest.setdefault(digest, reference)
+        else:
+            state.response_refs_by_digest.setdefault(digest, None)
     if _is_redirect(downloaded.status_code):
         capture_paths = ()
     _write_history_files(
@@ -662,22 +686,6 @@ def _commit_representative(
         files_summary=state.files,
         messages=state.messages,
     )
-    if (
-        collect_redirects
-        and wants_warc
-        and downloaded.status_code in PERMANENT_REDIRECT_STATUSES
-    ):
-        target, warning = permanent_redirect_target(
-            capture.original,
-            downloaded.status_code,
-            downloaded.headers,
-        )
-        if warning is not None:
-            state.messages.extend(_url_messages(capture.view_url, warning))
-        elif target is not None:
-            redirect_targets.append(target)
-
-
 def _write_url_history(
     urlkey: str,
     warc_captures: Sequence[CdxRecord],
@@ -687,12 +695,10 @@ def _write_url_history(
     ],
     client,
     writer_factory: Optional[Callable[[], object]],
-    existing_warc: Optional[ExistingWarcCache],
+    existing_warcs: Optional[ExistingWarcCollection],
     *,
     retries: int,
-    warc_mode: str,
     files_mode: str,
-    collect_redirects: bool = False,
 ) -> _UrlHistoryResult:
     """Write one URL history with private response references."""
 
@@ -703,31 +709,41 @@ def _write_url_history(
     if not chronological:
         raise ValueError(f"URL history is empty: {urlkey}")
     processing = chronological
-    if warc_mode == "latest" and warc_captures:
-        selected = warc_captures[0]
-        processing = [
-            selected,
-            *(
-                capture
-                for capture in chronological
-                if capture is not selected
-            ),
-        ]
+
+    unique_warc_ids: set[int] = set()
+    seen_warc_identities = set()
+    for capture in warc_captures:
+        identity = identity_for_capture(capture)
+        if identity not in seen_warc_identities:
+            seen_warc_identities.add(identity)
+            unique_warc_ids.add(id(capture))
 
     state = _new_history_state(
         warc_captures,
         file_capture_paths,
         writer_factory,
-        existing_warc,
+        existing_warcs,
         files_mode=files_mode,
     )
-    redirect_targets: list[str] = []
+    state.warc_ids = unique_warc_ids
+    state.warc.selected = len(unique_warc_ids)
+    processed_identities = set()
 
     for capture in processing:
+        logical_identity = identity_for_capture(capture)
         wants_warc = id(capture) in state.warc_ids
         target = file_capture_paths.get(id(capture))
         capture_paths = list(target[1] if target is not None else ())
         known_redirect = _is_redirect(capture.statuscode)
+        if logical_identity in processed_identities and (
+            not capture_paths
+            or all(
+                path in state.written_files or path in state.failed_files
+                for path in capture_paths
+            )
+        ):
+            continue
+        processed_identities.add(logical_identity)
         if known_redirect and not wants_warc:
             _omit_redirect(
                 state,
@@ -735,12 +751,22 @@ def _write_url_history(
             )
             continue
 
+        already_stored = (
+            wants_warc
+            and existing_warcs is not None
+            and existing_warcs.contains(capture)
+        )
+        needs_warc = wants_warc and not already_stored
+        if already_stored and not capture_paths:
+            continue
+
         digest = normalize_cdx_digest(capture.digest)
         if not known_redirect and _use_known_representative(
             state,
             capture,
             digest,
-            wants_warc=wants_warc,
+            wants_warc=needs_warc,
+            capture_paths=capture_paths,
         ):
             continue
 
@@ -749,7 +775,7 @@ def _write_url_history(
             capture,
             client,
             retries=retries,
-            wants_warc=wants_warc,
+            wants_warc=needs_warc,
             capture_paths=capture_paths,
         )
         if downloaded_result is not None:
@@ -759,10 +785,8 @@ def _write_url_history(
                 capture,
                 downloaded,
                 digest,
-                wants_warc=wants_warc,
+                wants_warc=needs_warc,
                 capture_paths=capture_paths,
-                collect_redirects=collect_redirects,
-                redirect_targets=redirect_targets,
             )
 
     return _UrlHistoryResult(
@@ -770,7 +794,6 @@ def _write_url_history(
         state.files,
         state.failed_capture_urls,
         state.messages,
-        redirect_targets,
     )
 
 
@@ -779,9 +802,8 @@ def _build_warc(
     client,
     *,
     retries: int,
-    warc_mode: str,
     files_mode: str,
-    collect_redirects: bool = False,
+    existing_warcs: Optional[ExistingWarcCollection] = None,
 ) -> _BuiltBatch:
     histories = (
         batch.histories
@@ -793,21 +815,54 @@ def _build_warc(
         if isinstance(batch, WarcBatch)
         else None
     )
-    existing_warc = None
     messages = []
-    if owner is not None and owner.final_path.is_file():
-        try:
-            existing_warc = ExistingWarcCache.inventory(owner.final_path)
-        except Exception as error:
-            messages.append(
-                "WARNING: existing WARC cache could not be inventoried; "
-                f"fetching from Wayback ({error})"
-            )
+    local_existing = (
+        existing_warcs.cache_for(owner.final_path)
+        if owner is not None and existing_warcs is not None
+        else None
+    )
     warc_summary = WarcCounts()
     files_summary = WebsiteFileCounts()
     failed_capture_urls = []
-    redirect_targets: list[str] = []
+    selected_identities = {
+        identity_for_capture(capture)
+        for history in histories
+        for capture in history.warc_captures
+    }
+    if (
+        owner is not None
+        and existing_warcs is not None
+        and not any(history.website_files for history in histories)
+        and all(
+            existing_warcs.contains(capture)
+            for history in histories
+            for capture in history.warc_captures
+        )
+    ):
+        return _BuiltBatch(
+            WarcCounts(
+                selected=len(selected_identities),
+                responses=(
+                    local_existing.response_count
+                    if local_existing is not None
+                    else 0
+                ),
+                revisits=(
+                    local_existing.revisit_count
+                    if local_existing is not None
+                    else 0
+                ),
+            ),
+            files_summary,
+            owner.final_path if local_existing is not None else None,
+            failed_capture_urls,
+            messages,
+        )
     try:
+        if owner is not None and local_existing is not None:
+            local_existing.copy_records(owner.get_writer())
+            warc_summary.responses += local_existing.response_count
+            warc_summary.revisits += local_existing.revisit_count
         for history in histories:
             result = _write_url_history(
                 history.urlkey,
@@ -815,22 +870,24 @@ def _build_warc(
                 _file_targets(history.website_files),
                 client,
                 owner.get_writer if owner is not None else None,
-                existing_warc,
+                existing_warcs,
                 retries=retries,
-                warc_mode=warc_mode,
                 files_mode=files_mode,
-                collect_redirects=collect_redirects,
             )
             warc_summary.add(result.warc)
             files_summary.add(result.files)
             failed_capture_urls.extend(result.failed_capture_urls)
             messages.extend(result.messages)
-            redirect_targets.extend(result.redirect_targets)
         final_warc = (
             owner.publish(
                 has_records=bool(
                     warc_summary.responses + warc_summary.revisits
-                )
+                ),
+                prior_identities=(
+                    local_existing.identities
+                    if local_existing is not None
+                    else frozenset()
+                ),
             )
             if owner is not None
             else None
@@ -845,7 +902,6 @@ def _build_warc(
         final_warc,
         failed_capture_urls,
         messages,
-        redirect_targets,
     )
 
 
@@ -879,32 +935,17 @@ def build_warc_files(
         Mapping[tuple[str, str], Sequence[CdxRecord]]
     ] = None,
     website_files: Optional[WebsiteFiles] = None,
-    warc_mode: str = "all",
     files_mode: str = "none",
     client_factory: Optional[Callable] = None,
     worker_count: int = DEFAULT_WORKER_COUNT,
     retries: int = DEFAULT_RETRIES,
-    collect_redirects: bool = False,
-    expand_redirects: Optional[
-        Callable[[Sequence[str]], Sequence[WarcBatch]]
-    ] = None,
 ) -> BuiltFiles:
-    """Build WARC and loose-file outputs through bounded worker pools.
-
-    When ``expand_redirects`` is provided, Location targets collected from
-    finished expandable WARC batches (``WarcBatch.expand=True``) are passed
-    to it and any returned batches are appended to the live WARC work queue.
-    Same-site redirect batches should keep ``expand=True``; off-site batches
-    should set ``expand=False`` so further permanent redirects are stored
-    without expansion.
-    """
+    """Build WARC and loose-file outputs through a bounded worker pool."""
 
     if retries < 0:
         raise ValueError("retries cannot be negative")
     if worker_count < 1:
         raise ValueError("worker_count must be at least 1")
-    if expand_redirects is not None and not collect_redirects:
-        raise ValueError("expand_redirects requires collect_redirects=True")
     captures_by_url = _attach_domains(captures_by_url)
     file_captures_by_url = _attach_domains(file_captures_by_url or {})
     website_files_by_url: dict[tuple[str, str], list[WebsiteFile]] = {}
@@ -949,19 +990,19 @@ def build_warc_files(
         )
     ]
     built_warc_order = list(warc_paths)
+    existing_warcs = (
+        ExistingWarcCollection.inventory(list_collection_warcs(layout))
+        if warc_batches
+        else None
+    )
 
     def run(batch: WarcBatch | WebsiteBatch, active_client):
         return _build_warc(
             batch,
             active_client,
             retries=retries,
-            warc_mode=warc_mode,
             files_mode=files_mode,
-            collect_redirects=(
-                collect_redirects
-                and isinstance(batch, WarcBatch)
-                and batch.expand
-            ),
+            existing_warcs=existing_warcs,
         )
 
     completed_warcs = 0
@@ -1016,25 +1057,11 @@ def build_warc_files(
         report_finished: Callable[
             [WarcBatch | WebsiteBatch, _BuiltBatch], None
         ],
-        *,
-        expand: Optional[
-            Callable[[Sequence[str]], Sequence[WarcBatch]]
-        ] = None,
     ) -> list[_BuiltBatch]:
-        nonlocal total_warcs
         results: list[_BuiltBatch] = []
         pending: list[WarcBatch | WebsiteBatch] = list(selected_batches)
         if not pending:
             return results
-
-        def accept_expanded(added: Sequence[WarcBatch]) -> None:
-            nonlocal total_warcs
-            if not added:
-                return
-            for warc_batch in added:
-                built_warc_order.append(warc_batch.path)
-            pending.extend(added)
-            total_warcs += len(added)
 
         def finish_sync(
             batch: WarcBatch | WebsiteBatch,
@@ -1042,13 +1069,6 @@ def build_warc_files(
         ) -> None:
             results.append(result)
             report_finished(batch, result)
-            if (
-                expand is None
-                or not isinstance(batch, WarcBatch)
-                or not batch.expand
-            ):
-                return
-            accept_expanded(expand(result.redirect_targets))
 
         if client_factory is None:
             while pending:
@@ -1063,38 +1083,22 @@ def build_warc_files(
 
         try:
             with ThreadPoolExecutor(max_workers=worker_count) as pool:
-                with ThreadPoolExecutor(max_workers=1) as expand_pool:
-                    warc_futures: dict = {}
-                    expand_futures: dict = {}
-                    while pending or warc_futures or expand_futures:
-                        while pending and len(warc_futures) < worker_count:
-                            batch = pending.pop(0)
-                            warc_futures[
-                                pool.submit(run_with_thread_client, batch)
-                            ] = batch
-                        done, _ = wait(
-                            set(warc_futures) | set(expand_futures),
-                            return_when=FIRST_COMPLETED,
-                        )
-                        for finished in done:
-                            if finished in warc_futures:
-                                batch = warc_futures.pop(finished)
-                                result = finished.result()
-                                results.append(result)
-                                report_finished(batch, result)
-                                if (
-                                    expand is not None
-                                    and isinstance(batch, WarcBatch)
-                                    and batch.expand
-                                    and result.redirect_targets
-                                ):
-                                    targets = tuple(result.redirect_targets)
-                                    expand_futures[
-                                        expand_pool.submit(expand, targets)
-                                    ] = targets
-                                continue
-                            expand_futures.pop(finished)
-                            accept_expanded(finished.result())
+                warc_futures: dict = {}
+                while pending or warc_futures:
+                    while pending and len(warc_futures) < worker_count:
+                        batch = pending.pop(0)
+                        warc_futures[
+                            pool.submit(run_with_thread_client, batch)
+                        ] = batch
+                    done, _ = wait(
+                        set(warc_futures),
+                        return_when=FIRST_COMPLETED,
+                    )
+                    for finished in done:
+                        batch = warc_futures.pop(finished)
+                        result = finished.result()
+                        results.append(result)
+                        report_finished(batch, result)
         finally:
             clients.close()
         return results
@@ -1105,9 +1109,7 @@ def build_warc_files(
             f"WARC files: building {len(warc_batches)} with "
             f"{worker_count} workers"
         )
-        results.extend(
-            run_batches(warc_batches, report_warc, expand=expand_redirects)
-        )
+        results.extend(run_batches(warc_batches, report_warc))
     if website_batches:
         print(
             f"Website files: building {len(website_batches)} histories with "
@@ -1119,16 +1121,12 @@ def build_warc_files(
     files_summary = WebsiteFileCounts()
     available_warcs = set()
     failed_capture_urls = []
-    seen_failed_urls = set()
     for result in results:
         summary.add(result.warc)
         files_summary.add(result.files)
         if result.final_warc is not None:
             available_warcs.add(result.final_warc)
-        for url in result.failed_capture_urls:
-            if url not in seen_failed_urls:
-                seen_failed_urls.add(url)
-                failed_capture_urls.append(url)
+        failed_capture_urls.extend(result.failed_capture_urls)
     return BuiltFiles(
         summary,
         tuple(
@@ -1169,6 +1167,9 @@ def build_url_history(
 ) -> WarcCounts:
     """Build one URL history into one atomically replaced WARC."""
 
+    existing_warcs = (
+        ExistingWarcCollection.inventory((path,)) if path.is_file() else None
+    )
     result = _build_warc(
         WarcBatch(
             path,
@@ -1182,9 +1183,9 @@ def build_url_history(
             ),
         ),
         client,
-        warc_mode="all",
         files_mode="none",
         retries=retries,
+        existing_warcs=existing_warcs,
     )
     for message in result.messages:
         print(f"  {message}")

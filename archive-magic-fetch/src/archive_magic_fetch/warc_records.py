@@ -13,6 +13,12 @@ from warcio.archiveiterator import ArchiveIterator
 from warcio.statusandheaders import StatusAndHeaders
 from warcio.warcwriter import WARCWriter
 
+from .capture_identity import (
+    CaptureIdentity,
+    identity_for_capture,
+    identity_for_warc_record,
+)
+
 
 @dataclass(frozen=True)
 class CachedWarcResponse:
@@ -24,142 +30,187 @@ class CachedWarcResponse:
 
 
 @dataclass(frozen=True)
-class _CachedResponseLocation:
+class _StoredRecordLocation:
+    identity: CaptureIdentity
     offset: int
     length: int
-    status_code: int
+    record_type: str
 
 
 class ExistingWarcCache:
-    """Lazy exact-response cache backed by one existing WARC."""
+    """Validated semantic inventory backed by one existing WARC."""
 
     def __init__(
         self,
         path: Path,
-        entries: dict[
-            tuple[str, str, str],
-            Optional[_CachedResponseLocation],
-        ],
+        entries: dict[CaptureIdentity, _StoredRecordLocation],
+        records: tuple[_StoredRecordLocation, ...],
+        responses_by_digest: dict[str, _StoredRecordLocation],
+        references_by_urlkey: dict[str, dict[str, RevisitReference]],
     ) -> None:
         self.path = path
         self._entries = entries
+        self._records = records
+        self._responses_by_digest = responses_by_digest
+        self._references_by_urlkey = references_by_urlkey
 
     @classmethod
     def inventory(cls, path: Path) -> ExistingWarcCache:
-        """Scan a WARC once and index unambiguous full responses."""
+        """Validate a WARC and inventory every logical response/revisit."""
 
-        entries: dict[
-            tuple[str, str, str],
-            Optional[_CachedResponseLocation],
-        ] = {}
-        with path.open("rb") as stream:
-            iterator = ArchiveIterator(stream)
+        entries: dict[CaptureIdentity, _StoredRecordLocation] = {}
+        records: list[_StoredRecordLocation] = []
+        responses_by_digest: dict[str, _StoredRecordLocation] = {}
+        references_by_urlkey: dict[str, dict[str, RevisitReference]] = {}
+        record_types: list[str] = []
+        stream = path.open("rb")
+        try:
+            iterator = ArchiveIterator(stream, check_digests="raise")
             for record in iterator:
-                if record.rec_type != "response":
+                record_types.append(record.rec_type)
+                if record.rec_type not in {"response", "revisit"}:
+                    record.raw_stream.read()
                     continue
-                target_uri = record.rec_headers.get_header(
-                    "WARC-Target-URI"
-                )
-                warc_date = record.rec_headers.get_header("WARC-Date")
-                source_uri = record.rec_headers.get_header(
-                    "WARC-Source-URI"
-                )
-                status_text = (
-                    record.http_headers.get_statuscode()
-                    if record.http_headers is not None
-                    else None
-                )
+                identity = identity_for_warc_record(record)
                 offset = iterator.get_record_offset()
                 length = iterator.get_record_length()
-                if (
-                    not all((target_uri, warc_date, source_uri))
-                    or status_text is None
-                    or not status_text.isdigit()
-                ):
-                    continue
-                key = (target_uri, warc_date, source_uri)
-                location = _CachedResponseLocation(
+                location = _StoredRecordLocation(
+                    identity=identity,
                     offset=offset,
                     length=length,
-                    status_code=int(status_text),
+                    record_type=record.rec_type,
                 )
-                if key in entries:
-                    entries[key] = None
-                else:
-                    entries[key] = location
+                if identity not in entries:
+                    entries[identity] = location
+                    records.append(location)
+                if record.rec_type == "response":
+                    reference = response_reference(record)
+                    responses_by_digest.setdefault(
+                        identity.payload_digest,
+                        location,
+                    )
+                    references_by_urlkey.setdefault(
+                        identity.urlkey,
+                        {},
+                    ).setdefault(identity.payload_digest, reference)
+                record.raw_stream.read()
             if iterator.err_count:
                 raise ValueError(
                     f"existing WARC contains {iterator.err_count} "
                     "malformed record boundary warning(s)"
                 )
-        return cls(path, entries)
+            if not record_types or record_types[0] != "warcinfo":
+                raise ValueError("existing WARC is missing its initial warcinfo")
+            if not records:
+                raise ValueError("existing WARC contains no response or revisit")
+            return cls(
+                path,
+                entries,
+                tuple(records),
+                responses_by_digest,
+                references_by_urlkey,
+            )
+        except Exception:
+            stream.close()
+            raise
+        finally:
+            if not stream.closed:
+                stream.close()
+
+    @property
+    def identities(self) -> frozenset[CaptureIdentity]:
+        """Return every logical capture in this WARC."""
+
+        return frozenset(self._entries)
+
+    @property
+    def response_count(self) -> int:
+        return sum(record.record_type == "response" for record in self._records)
+
+    @property
+    def revisit_count(self) -> int:
+        return sum(record.record_type == "revisit" for record in self._records)
+
+    def reference_groups(self):
+        """Iterate normalized URL keys and their response representatives."""
+
+        return self._references_by_urlkey.items()
+
+    def contains(self, capture) -> bool:
+        """Return whether this WARC already contains a logical capture."""
+
+        return identity_for_capture(capture) in self._entries
+
+    def _member(self, location: _StoredRecordLocation) -> bytes:
+        with self.path.open("rb") as stream:
+            stream.seek(location.offset)
+            member = stream.read(location.length)
+        if len(member) != location.length:
+            raise ValueError("compressed WARC member is truncated")
+        return member
+
+    def _record(self, location: _StoredRecordLocation):
+        iterator = ArchiveIterator(
+            BytesIO(self._member(location)),
+            check_digests="raise",
+        )
+        record = next(iterator)
+        if identity_for_warc_record(record) != location.identity:
+            raise ValueError("cached record identity changed")
+        return iterator, record
+
+    def copy_records(self, writer: WARCWriter) -> None:
+        """Copy the validated semantic baseline into a replacement WARC."""
+
+        with self.path.open("rb") as stream:
+            for location in self._records:
+                stream.seek(location.offset)
+                member = stream.read(location.length)
+                if len(member) != location.length:
+                    raise ValueError("compressed WARC member is truncated")
+                iterator = ArchiveIterator(
+                    BytesIO(member),
+                    check_digests="raise",
+                )
+                record = next(iterator)
+                if identity_for_warc_record(record) != location.identity:
+                    raise ValueError("cached record identity changed")
+                writer.write_record(record)
+                try:
+                    next(iterator)
+                except StopIteration:
+                    pass
+                else:
+                    raise ValueError("cached member contains multiple records")
+                if iterator.err_count:
+                    raise ValueError("cached member has a malformed boundary")
 
     def get(self, capture) -> Optional[CachedWarcResponse]:
-        """Load and validate an exact full response for one CDX capture."""
+        """Load the payload represented by an exact logical capture."""
 
-        key = (
-            capture.original,
-            timestamp_to_warc_date(capture.timestamp),
-            capture.raw_url,
-        )
-        location = self._entries.get(key)
+        identity = identity_for_capture(capture)
+        location = self._entries.get(identity)
         if location is None:
-            return None
-        if (
-            capture.statuscode is not None
-            and location.status_code != capture.statuscode
-        ):
             return None
 
         try:
-            with self.path.open("rb") as stream:
-                stream.seek(location.offset)
-                member = stream.read(location.length)
-            if len(member) != location.length:
-                raise ValueError("compressed WARC member is truncated")
-
-            iterator = ArchiveIterator(
-                BytesIO(member),
-                check_digests="raise",
-            )
-            record = next(iterator)
-            if record.rec_type != "response":
-                raise ValueError("cached member is not a response")
-            target_uri = record.rec_headers.get_header("WARC-Target-URI")
-            warc_date = record.rec_headers.get_header("WARC-Date")
-            source_uri = record.rec_headers.get_header("WARC-Source-URI")
-            payload_digest = record.rec_headers.get_header(
-                "WARC-Payload-Digest"
-            )
-            status_text = (
-                record.http_headers.get_statuscode()
-                if record.http_headers is not None
-                else None
-            )
-            if (target_uri, warc_date, source_uri) != key:
-                raise ValueError("cached response identity changed")
-            if not payload_digest:
-                raise ValueError("cached response has no payload digest")
-            if status_text is None or not status_text.isdigit():
-                raise ValueError("cached response has no numeric status")
-            status_code = int(status_text)
-            if status_code != location.status_code:
-                raise ValueError("cached response status changed")
-            if (
-                capture.statuscode is not None
-                and status_code != capture.statuscode
-            ):
-                return None
-            headers = tuple(record.http_headers.headers)
-            body = record.content_stream().read()
-            try:
-                next(iterator)
-            except StopIteration:
-                pass
+            exact_iterator, exact_record = self._record(location)
+            status_code = int(exact_record.http_headers.get_statuscode())
+            headers = tuple(exact_record.http_headers.headers)
+            if location.record_type == "response":
+                body = exact_record.content_stream().read()
             else:
-                raise ValueError("cached member contains multiple records")
-            if iterator.err_count:
-                raise ValueError("cached member has a malformed boundary")
+                body_location = self._responses_by_digest.get(
+                    identity.payload_digest
+                )
+                if body_location is None:
+                    raise ValueError(
+                        "revisit has no local full-response representative"
+                    )
+                _body_iterator, body_record = self._record(body_location)
+                body = body_record.content_stream().read()
+                if not headers:
+                    headers = tuple(body_record.http_headers.headers)
             return CachedWarcResponse(
                 body=body,
                 status_code=status_code,
@@ -170,6 +221,50 @@ class ExistingWarcCache:
                 f"cannot reuse response from {self.path}: {error}"
             ) from error
 
+class ExistingWarcCollection:
+    """One validated, normalized cache spanning every collection WARC."""
+
+    def __init__(self, caches: dict[Path, ExistingWarcCache]) -> None:
+        self._caches = caches
+        self._identity_caches: dict[CaptureIdentity, ExistingWarcCache] = {}
+        self._references_by_urlkey: dict[str, dict[str, RevisitReference]] = {}
+        for cache in caches.values():
+            for identity in cache.identities:
+                self._identity_caches.setdefault(identity, cache)
+            for urlkey, references in cache.reference_groups():
+                target = self._references_by_urlkey.setdefault(urlkey, {})
+                for digest, reference in references.items():
+                    target.setdefault(digest, reference)
+
+    @classmethod
+    def inventory(cls, paths) -> ExistingWarcCollection:
+        """Inventory and validate all existing collection WARC files."""
+
+        caches: dict[Path, ExistingWarcCache] = {}
+        for path in paths:
+            try:
+                caches[path] = ExistingWarcCache.inventory(path)
+            except Exception as error:
+                raise ValueError(
+                    f"cannot inventory existing WARC {path}: {error}"
+                ) from error
+        return cls(caches)
+
+    def cache_for(self, path: Path) -> Optional[ExistingWarcCache]:
+        return self._caches.get(path)
+
+    def contains(self, capture) -> bool:
+        return identity_for_capture(capture) in self._identity_caches
+
+    def get(self, capture) -> Optional[CachedWarcResponse]:
+        cache = self._identity_caches.get(identity_for_capture(capture))
+        return cache.get(capture) if cache is not None else None
+
+    def references_for_urlkey(
+        self,
+        urlkey: str,
+    ) -> dict[str, RevisitReference]:
+        return dict(self._references_by_urlkey.get(urlkey, {}))
 
 def timestamp_to_warc_date(timestamp: datetime) -> str:
     """Normalize an aware timestamp to second-precision WARC UTC form."""

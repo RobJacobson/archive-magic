@@ -12,20 +12,12 @@ def test_parse_args_returns_plain_fetch_settings(monkeypatch):
         url_pattern="example.com/*",
         date_start="1995",
         date_end="20260803010203",
-        warc_mode="all",
+        build_warc=True,
         files_mode="none",
         rewrite_local=False,
-        redirect_capture="page",
         worker_count=DEFAULT_WORKER_COUNT,
         retries=8,
-        fresh=False,
     )
-
-
-def test_parse_args_accepts_fresh_flag(monkeypatch):
-    monkeypatch.setattr(cli, "current_utc_cdx_timestamp", lambda: "20260803010203")
-    settings = cli.parse_args(["example.com/*", "--fresh"])
-    assert settings.fresh is True
 
 
 def test_parse_args_accepts_workers_and_output_modes():
@@ -36,14 +28,12 @@ def test_parse_args_accepts_workers_and_output_modes():
             "2000",
             "--end",
             "2001",
-            "--warc",
-            "latest",
+            "--build-warc",
+            "false",
             "--files",
             "unique",
             "--workers",
             "3",
-            "--redirect-capture",
-            "page",
             "--retries",
             "0",
         ]
@@ -51,10 +41,9 @@ def test_parse_args_accepts_workers_and_output_modes():
 
     assert settings.date_start == "2000"
     assert settings.date_end == "2001"
-    assert settings.warc_mode == "latest"
+    assert settings.build_warc is False
     assert settings.files_mode == "unique"
     assert settings.worker_count == 3
-    assert settings.redirect_capture == "page"
     assert settings.retries == 0
 
 
@@ -62,6 +51,21 @@ def test_concurrency_option_is_rejected(capsys):
     with pytest.raises(SystemExit):
         cli.parse_args(["example.com/*", "--concurrency", "2"])
     assert "unrecognized arguments: --concurrency 2" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ("--warc", "all"),
+        ("--fresh",),
+        ("--redirect-capture", "none"),
+        ("--build-warc", "latest"),
+        ("--build-warc", "True"),
+    ],
+)
+def test_removed_and_invalid_options_are_rejected(arguments):
+    with pytest.raises(SystemExit):
+        cli.parse_args(["example.com/*", *arguments])
 
 
 @pytest.mark.parametrize(
@@ -87,7 +91,7 @@ def test_help_describes_worker_responsibility(capsys):
     assert result.value.code == 0
     output = capsys.readouterr().out
     assert "--workers N" in output
-    assert "redirect probes or WARC builds" in output
+    assert "Maximum simultaneous WARC builds" in output
 
 
 def test_main_maps_fetch_result_to_exit_status(monkeypatch):

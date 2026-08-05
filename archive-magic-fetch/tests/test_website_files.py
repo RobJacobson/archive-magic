@@ -129,7 +129,6 @@ def test_files_latest_writes_website_without_timestamps(tmp_path, capsys):
         layout=layout,
         file_captures_by_url=groups,
         website_files=website_files,
-        warc_mode="none",
         files_mode="latest",
     ).file_counts
 
@@ -188,7 +187,6 @@ def test_files_all_writes_timestamp_directories(tmp_path):
         layout=layout,
         file_captures_by_url=groups,
         website_files=website_files,
-        warc_mode="none",
         files_mode="all",
     ).file_counts
 
@@ -227,7 +225,6 @@ def test_files_only_omits_known_redirect_without_playback(tmp_path):
         layout=layout,
         file_captures_by_url=groups,
         website_files=website_files,
-        warc_mode="none",
         files_mode="latest",
     ).file_counts
 
@@ -365,7 +362,6 @@ def test_files_unique_without_warc_uses_same_digest_policy(tmp_path):
         layout=layout,
         file_captures_by_url=groups,
         website_files=website_plan,
-        warc_mode="none",
         files_mode="unique",
     )
 
@@ -430,7 +426,6 @@ def test_empty_playback_body_writes_zero_byte_file(tmp_path, capsys):
         layout=layout,
         file_captures_by_url=groups,
         website_files=website_files,
-        warc_mode="none",
         files_mode="latest",
     ).file_counts
 
@@ -462,7 +457,6 @@ def test_playback_failure_does_not_create_file(tmp_path):
         layout=layout,
         file_captures_by_url=groups,
         website_files=website_files,
-        warc_mode="none",
         files_mode="latest",
     ).file_counts
 
@@ -542,7 +536,6 @@ def test_explicit_extension_is_mime_independent(tmp_path):
         layout=layout,
         file_captures_by_url=groups,
         website_files=website_files,
-        warc_mode="none",
         files_mode="latest",
     )
 

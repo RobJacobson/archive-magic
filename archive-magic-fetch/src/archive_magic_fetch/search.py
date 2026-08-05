@@ -25,9 +25,7 @@ from .retry import (
 _CDX_REQUEST_LIMIT = 10_000
 
 OutputMode = str
-WARC_MODES = ("none", "latest", "all")
 FILES_MODES = ("none", "latest", "unique", "all")
-OUTPUT_MODES = WARC_MODES
 
 
 def _is_redirect_status(status: Optional[int]) -> bool:

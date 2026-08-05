@@ -30,6 +30,7 @@ version = "0.1.0"
 source = { editable = "archive-magic-fetch" }
 dependencies = [
     { name = "cdxj-indexer" },
+    { name = "surt" },
     { name = "warcio" },
     { name = "wayback" },
 ]
@@ -42,6 +43,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "cdxj-indexer", specifier = "==1.4.6" },
+    { name = "surt", specifier = "==0.3.1" },
     { name = "warcio", specifier = "==1.8.1" },
     { name = "wayback", specifier = "==0.5.1" },
 ]

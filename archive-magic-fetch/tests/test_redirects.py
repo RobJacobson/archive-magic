@@ -1,265 +1,142 @@
-from datetime import datetime, timezone
+import json
+from pathlib import Path
 
-import pytest
-from wayback import CdxRecord
-
-from archive_magic_fetch import redirects
+from archive_magic_fetch.downloads import DownloadedCapture
 from archive_magic_fetch.redirects import (
-    expand_redirect_target,
-    permanent_redirect_target,
-    redirect_scope,
-    resolve_redirect_target,
+    REDIRECT_REPORT_SCHEMA_VERSION,
+    build_redirect_report,
+    write_redirect_report,
 )
+from archive_magic_fetch.warc_records import open_new_warc
 
 
-@pytest.mark.parametrize("status_code", (200, 300, 302, 303, 307, 404))
-def test_non_permanent_responses_do_not_introduce_targets(status_code):
-    assert resolve_redirect_target(
-        "https://source.test/start",
-        status_code,
-        (("Location", "https://target.test/"),),
-    ) is None
+def write_warc(path: Path, records) -> None:
+    stream, writer = open_new_warc(path)
+    try:
+        for record in records:
+            writer.write_record(record)
+    finally:
+        stream.close()
 
 
-@pytest.mark.parametrize("status_code", (301, 308))
-def test_permanent_redirects_resolve_relative_locations(status_code):
-    assert resolve_redirect_target(
-        "https://source.test/path/start",
-        status_code,
-        (("location", "../landing?view=all#section"),),
-    ) == "https://source.test/landing?view=all"
+def response(
+    url,
+    captured,
+    status,
+    *,
+    location=None,
+    body=b"body",
+):
+    headers = [("Content-Type", "text/plain")]
+    if location is not None:
+        headers.append(("Location", location))
+    return DownloadedCapture(
+        body=body,
+        url=url,
+        capture_date=captured,
+        source_uri=f"https://web.archive.org/web/{captured}/{url}",
+        status_code=status,
+        headers=tuple(headers),
+    ).to_warc_record(target_url=url)
 
 
-def test_protocol_relative_location_is_supported():
-    assert resolve_redirect_target(
-        "http://source.test/",
-        301,
-        (("Location", "//target.test/page#fragment"),),
-    ) == "http://target.test/page"
-
-
-@pytest.mark.parametrize(
-    ("headers", "message"),
-    (
-        ((), "no Location"),
-        ((("Location", "mailto:person@example.com"),), "unsupported"),
-        ((("Location", "http://"),), "absolute"),
-        (
-            (("Location", "https://user:pass@target.test/"),),
-            "user information",
-        ),
-    ),
-)
-def test_invalid_locations_are_rejected(headers, message):
-    with pytest.raises(ValueError, match=message):
-        resolve_redirect_target("https://source.test/", 301, headers)
-
-
-def test_permanent_redirect_target_returns_warning_for_invalid_location():
-    target, warning = permanent_redirect_target(
-        "https://source.test/",
-        301,
-        (),
+def test_report_aggregates_and_classifies_full_collection_redirects(tmp_path):
+    source = tmp_path / "source.warc.gz"
+    covered = tmp_path / "covered.warc.gz"
+    write_warc(
+        source,
+        [
+            response(
+                "https://source.test/a/start",
+                "2020-01-01T00:00:00Z",
+                301,
+                location="../landing#fragment",
+            ),
+            response(
+                "https://source.test/a/start",
+                "2021-01-01T00:00:00Z",
+                302,
+                location="https://source.test/landing",
+            ),
+            response(
+                "https://source.test/other",
+                "2022-01-01T00:00:00Z",
+                307,
+                location="https://skipped.test/path#part",
+            ),
+        ],
     )
-    assert target is None
-    assert warning is not None
-    assert "no Location" in warning
+    write_warc(
+        covered,
+        [
+            response(
+                "https://source.test/landing",
+                "2020-01-01T00:00:01Z",
+                200,
+            )
+        ],
+    )
+
+    payload = build_redirect_report([source, covered])
+
+    assert payload["schema_version"] == REDIRECT_REPORT_SCHEMA_VERSION
+    assert payload["summary"] == {
+        "covered_targets": 1,
+        "redirect_occurrences": 3,
+        "skipped_targets": 1,
+        "unresolved_occurrences": 0,
+    }
+    targets = {entry["target_url"]: entry for entry in payload["targets"]}
+    assert targets["https://source.test/landing"]["classification"] == "covered"
+    assert targets["https://source.test/landing"]["occurrence_count"] == 2
+    assert targets["https://skipped.test/path"]["classification"] == "skipped"
 
 
-def test_page_scope_uses_an_exact_query_and_deduplicates_authority():
-    first = redirect_scope("http://www.target.test/page?q=1", "page")
-    second = redirect_scope("https://target.test/page?q=1", "page")
+def test_report_excludes_304_and_records_unresolved_redirects(tmp_path):
+    warc = tmp_path / "redirects.warc.gz"
+    write_warc(
+        warc,
+        [
+            response("https://source.test/not-modified", "2020-01-01T00:00:00Z", 304),
+            response("https://source.test/missing", "2020-01-02T00:00:00Z", 308),
+            response(
+                "https://source.test/invalid",
+                "2020-01-03T00:00:00Z",
+                305,
+                location="mailto:person@example.com",
+            ),
+        ],
+    )
 
-    assert first.url == "http://www.target.test/page?q=1"
-    assert first.match_type == "exact"
-    assert first.key == second.key
+    payload = build_redirect_report([warc])
 
-
-def test_page_scope_keeps_paths_queries_and_significant_ports_distinct():
-    scopes = {
-        redirect_scope("https://target.test/one", "page").key,
-        redirect_scope("https://target.test/two", "page").key,
-        redirect_scope("https://target.test/one?q=1", "page").key,
-        redirect_scope("https://target.test:8443/one", "page").key,
+    assert payload["summary"]["redirect_occurrences"] == 0
+    assert payload["summary"]["unresolved_occurrences"] == 2
+    assert {item["source_url"] for item in payload["unresolved"]} == {
+        "https://source.test/missing",
+        "https://source.test/invalid",
     }
 
-    assert len(scopes) == 4
 
-
-def test_website_scope_uses_host_query_only_for_site_root_locations():
-    root = redirect_scope("http://www.target.test/", "website")
-    also_root = redirect_scope("https://target.test", "website")
-    deep = redirect_scope("https://target.test/assets/file.jpg", "website")
-    queried = redirect_scope("https://target.test/?q=1", "website")
-    numbered = redirect_scope("https://www1.target.test/", "website")
-
-    assert root.match_type == "host"
-    assert root.key == also_root.key
-    assert numbered.key == root.key
-    assert deep.match_type == "exact"
-    assert deep.key != root.key
-    assert queried.match_type == "exact"
-    assert queried.key != root.key
-
-
-def test_redirect_scope_rejects_unknown_mode():
-    with pytest.raises(ValueError, match="unsupported redirect capture mode"):
-        redirect_scope("https://target.test/", "all")
-
-
-def _capture(original, status, *, timestamp="20000101000000", digest="A" * 32):
-    domain = original.split("//", 1)[1].split("/", 1)[0]
-    return CdxRecord(
-        urlkey=f"{domain})/",
-        timestamp=datetime.strptime(timestamp, "%Y%m%d%H%M%S").replace(
-            tzinfo=timezone.utc
-        ),
-        original=original,
-        mimetype="text/html",
-        statuscode=status,
-        digest=digest,
-        length=10,
+def test_write_redirect_report_is_durable_json(tmp_path):
+    warc = tmp_path / "redirects.warc.gz"
+    write_warc(
+        warc,
+        [
+            response(
+                "https://source.test/",
+                "2020-01-01T00:00:00Z",
+                303,
+                location="https://target.test/",
+            )
+        ],
     )
+    destination = tmp_path / "sources" / "run" / "redirects.json"
 
+    report = write_redirect_report([warc], destination)
 
-class _Client:
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *_args):
-        return False
-
-
-def test_expand_redirect_target_skips_known_histories_and_dedupes_scopes(monkeypatch):
-    known = _capture("https://source.test/", 301)
-    first = _capture("https://target.test/", 200)
-    second = first._replace(statuscode=404, digest="B" * 32, length=20)
-    searches = []
-
-    monkeypatch.setattr(
-        redirects,
-        "search_captures",
-        lambda _client, url, *_args, **_kwargs: searches.append(url)
-        or [known, first, second],
-    )
-
-    seen = set()
-    known_keys = {("source.test", known.urlkey)}
-    expansion = expand_redirect_target(
-        _Client(),
-        "https://target.test/",
-        mode="page",
-        date_start="1995",
-        date_end="2001",
-        seen_searches=seen,
-        known_history_keys=known_keys,
-        retries=0,
-    )
-
-    assert searches == ["https://target.test/"]
-    assert expansion is not None
-    assert expansion.search.captures == (known, first, second)
-    assert set(expansion.histories) == {("target.test", first.urlkey)}
-    assert expansion.histories[("target.test", first.urlkey)] == [first, second]
-
-    again = expand_redirect_target(
-        _Client(),
-        "https://target.test/",
-        mode="page",
-        date_start="1995",
-        date_end="2001",
-        seen_searches=seen,
-        known_history_keys=known_keys,
-        retries=0,
-    )
-    assert again is None
-    assert searches == ["https://target.test/"]
-
-
-def test_expand_redirect_target_returns_none_for_empty_search(monkeypatch):
-    monkeypatch.setattr(redirects, "search_captures", lambda *_a, **_k: [])
-
-    assert (
-        expand_redirect_target(
-            _Client(),
-            "https://missing.test/",
-            mode="website",
-            date_start="1995",
-            date_end="2001",
-            seen_searches=set(),
-            known_history_keys=set(),
-            retries=0,
-        )
-        is None
-    )
-
-
-def test_expand_redirect_target_prints_search_label_and_forwards_progress(
-    monkeypatch,
-    capsys,
-):
-    progress_counts = []
-
-    def fake_search(_client, url, *_args, progress=None, **_kwargs):
-        assert url == "https://target.test/page"
-        if progress is not None:
-            progress(10_000)
-        return []
-
-    monkeypatch.setattr(redirects, "search_captures", fake_search)
-
-    expand_redirect_target(
-        _Client(),
-        "https://target.test/page",
-        mode="page",
-        date_start="1995",
-        date_end="2001",
-        seen_searches=set(),
-        known_history_keys=set(),
-        retries=0,
-        progress=progress_counts.append,
-    )
-
-    assert progress_counts == [10_000]
-    assert "Redirect search: page https://target.test/page" in (
-        capsys.readouterr().out
-    )
-
-
-def test_expand_website_deep_path_stays_exact_and_labels_as_page(
-    monkeypatch,
-    capsys,
-):
-    monkeypatch.setattr(redirects, "search_captures", lambda *_a, **_k: [])
-
-    expand_redirect_target(
-        _Client(),
-        "https://www.target.test/assets/SHARE-5-web.jpg",
-        mode="website",
-        date_start="1995",
-        date_end="2001",
-        seen_searches=set(),
-        known_history_keys=set(),
-        retries=0,
-    )
-
-    assert "Redirect search: page https://www.target.test/assets/SHARE-5-web.jpg" in (
-        capsys.readouterr().out
-    )
-
-
-def test_expand_website_root_search_label_uses_host(monkeypatch, capsys):
-    monkeypatch.setattr(redirects, "search_captures", lambda *_a, **_k: [])
-
-    expand_redirect_target(
-        _Client(),
-        "https://www.target.test/",
-        mode="website",
-        date_start="1995",
-        date_end="2001",
-        seen_searches=set(),
-        known_history_keys=set(),
-        retries=0,
-    )
-
-    assert "Redirect search: host target.test" in capsys.readouterr().out
+    assert report.path == destination
+    assert (report.skipped, report.covered, report.unresolved) == (1, 0, 0)
+    assert json.loads(destination.read_text(encoding="utf-8"))["targets"][0][
+        "target_site"
+    ] == "target.test"

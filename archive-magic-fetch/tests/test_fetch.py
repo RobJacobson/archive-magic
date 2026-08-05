@@ -1,13 +1,9 @@
 from datetime import datetime, timezone
-
-import pytest
 from wayback import CdxRecord
 
 from archive_magic_fetch import fetch
-from archive_magic_fetch.collection_coverage import (
-    CollectionCoverage,
-    CoverageModeError,
-)
+from archive_magic_fetch.collection_coverage import CollectionCoverage
+from archive_magic_fetch.redirects import RedirectReport
 from archive_magic_fetch.warc_files import BuiltFiles, WarcCounts
 
 
@@ -37,13 +33,11 @@ def settings(**overrides):
         "url_pattern": "example.com/*",
         "date_start": "1995",
         "date_end": "20260803000000",
-        "warc_mode": "all",
+        "build_warc": True,
         "files_mode": "none",
         "rewrite_local": False,
-        "redirect_capture": "none",
         "worker_count": 8,
         "retries": 0,
-        "fresh": False,
     }
     values.update(overrides)
     return fetch.FetchSettings(**values)
@@ -82,15 +76,16 @@ def install_common(monkeypatch, tmp_path, captures):
     monkeypatch.setattr(fetch, "build_replay_index", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(fetch, "list_collection_warcs", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(fetch, "save_coverage", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(fetch, "resolve_prior_coverage", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
         fetch,
-        "resolve_prior_coverage",
-        lambda *_args, **_kwargs: None,
+        "write_redirect_report",
+        lambda _warcs, path: RedirectReport(path, 0, 0, 0),
     )
     return client, paths
 
 
-def test_run_fetch_passes_primary_histories_and_inline_redirect_expand(
+def test_run_fetch_passes_all_primary_histories_without_redirect_expansion(
     monkeypatch,
     tmp_path,
 ):
@@ -103,127 +98,62 @@ def test_run_fetch_passes_primary_histories_and_inline_redirect_expand(
         return BuiltFiles(WarcCounts(selected=1, responses=1), ())
 
     monkeypatch.setattr(fetch, "build_warc_files", build)
-    monkeypatch.setattr(
-        fetch,
-        "allocate_warc_paths",
-        lambda captures_by_url, layout: {
-            layout.collection_root / "archive" / "example.com" / "index.warc.gz": (
-                ("example.com", primary.urlkey),
-            )
-        },
-    )
 
-    assert fetch.run_fetch(settings(redirect_capture="website")) is True
-    assert len(calls) == 1
-    assert calls[0][1] is client
-    assert set(calls[0][0]) == {("example.com", primary.urlkey)}
-    assert calls[0][2]["layout"] is paths
-    assert calls[0][2]["worker_count"] == 8
-    assert calls[0][2]["collect_redirects"] is True
-    assert callable(calls[0][2]["expand_redirects"])
+    assert fetch.run_fetch(settings()) is True
+    groups, active_client, kwargs = calls[0]
+    assert active_client is client
+    assert set(groups) == {("example.com", primary.urlkey)}
+    assert kwargs["layout"] is paths
+    assert kwargs["worker_count"] == 8
+    assert "collect_redirects" not in kwargs
+    assert "expand_redirects" not in kwargs
 
 
-def test_run_fetch_prints_compact_phases_without_final_failed_url_list(
-    monkeypatch,
-    tmp_path,
-    capsys,
-):
+def test_run_fetch_counts_failed_capture_identities(monkeypatch, tmp_path, capsys):
     selected = capture()
     install_common(monkeypatch, tmp_path, [selected])
     monkeypatch.setattr(
         fetch,
         "build_warc_files",
         lambda *_args, **_kwargs: BuiltFiles(
-            WarcCounts(selected=1, playback_failures=1),
+            WarcCounts(selected=2, playback_failures=2),
             (),
-            failed_capture_urls=(selected.view_url,),
+            failed_capture_urls=(selected.view_url, selected.view_url),
         ),
     )
 
     assert fetch.run_fetch(settings()) is False
     output = capsys.readouterr().out
-    assert "Fetch example.com/* (1995-20260803000000)" in output
-    assert "Search: 1 captures in 1 URL histories" in output
-    assert "Done in " in output
-    assert "1 selected, 0 responses, 0 revisits, 1 failed" in output
-    assert "Failed captures:" not in output
-    assert "Redirects:" not in output
+    assert "2 selected, 0 responses, 0 revisits, 2 failed" in output
 
 
-def test_redirect_capture_disabled_when_warc_none(monkeypatch, tmp_path):
+def test_build_warc_false_keeps_loose_file_pipeline(monkeypatch, tmp_path):
     selected = capture()
     install_common(monkeypatch, tmp_path, [selected])
-    calls = []
-
-    def build(groups, active_client, **kwargs):
-        calls.append(kwargs)
-        return BuiltFiles(WarcCounts(), ())
-
-    monkeypatch.setattr(fetch, "build_warc_files", build)
-    monkeypatch.setattr(
-        fetch,
-        "prepare_website_files",
-        lambda *_args, **_kwargs: object(),
-    )
-
-    assert fetch.run_fetch(
-        settings(warc_mode="none", files_mode="latest", redirect_capture="page")
-    ) is True
-    assert calls[0]["collect_redirects"] is False
-    assert calls[0]["expand_redirects"] is None
-
-
-def test_files_mode_still_prepares_website_files_without_redirect_stage(
-    monkeypatch,
-    tmp_path,
-):
-    primary = capture(statuscode=301)
-    client, _paths = install_common(monkeypatch, tmp_path, [primary])
     website_files = object()
     monkeypatch.setattr(
         fetch,
         "prepare_website_files",
         lambda *_args, **_kwargs: website_files,
     )
-    monkeypatch.setattr(
-        fetch,
-        "allocate_warc_paths",
-        lambda captures_by_url, layout: {
-            layout.collection_root / "archive" / "example.com" / "index.warc.gz": (
-                ("example.com", primary.urlkey),
-            )
-        },
-    )
-    builds = []
+    calls = []
 
-    def build(captures_by_url, active_client, **kwargs):
-        assert active_client is client
-        builds.append((captures_by_url, kwargs))
-        return BuiltFiles(WarcCounts(selected=1, responses=1), ())
+    def build(groups, _client, **kwargs):
+        calls.append((groups, kwargs))
+        return BuiltFiles(WarcCounts(), ())
 
     monkeypatch.setattr(fetch, "build_warc_files", build)
-
     assert fetch.run_fetch(
-        settings(
-            warc_mode="latest",
-            files_mode="latest",
-            redirect_capture="page",
-        )
+        settings(build_warc=False, files_mode="latest")
     ) is True
-
-    captures_by_url, kwargs = builds[0]
-    assert set(captures_by_url) == {("example.com", primary.urlkey)}
-    assert set(kwargs["file_captures_by_url"]) == {
-        ("example.com", primary.urlkey)
-    }
+    groups, kwargs = calls[0]
+    assert groups == {}
     assert kwargs["website_files"] is website_files
-    assert kwargs["collect_redirects"] is True
-    assert callable(kwargs["expand_redirects"])
+    assert kwargs["file_captures_by_url"]
 
 
-def test_run_fetch_empty_search_is_compact_success(monkeypatch, tmp_path, capsys):
+def test_empty_search_is_compact_success(monkeypatch, tmp_path, capsys):
     install_common(monkeypatch, tmp_path, [])
-
     assert fetch.run_fetch(settings()) is True
     output = capsys.readouterr().out
     assert "Search: 0 captures in 0 URL histories" in output
@@ -236,98 +166,10 @@ def test_both_outputs_disabled_avoids_client_creation(monkeypatch, capsys):
         "make_client_factory",
         lambda *_args: (_ for _ in ()).throw(AssertionError("network")),
     )
-
-    assert fetch.run_fetch(settings(warc_mode="none", files_mode="none")) is True
+    assert fetch.run_fetch(
+        settings(build_warc=False, files_mode="none")
+    ) is True
     assert "Nothing to do" in capsys.readouterr().out
-
-
-def test_redirect_expand_marks_same_site_and_foreign_batches(monkeypatch, tmp_path):
-    from archive_magic_fetch.redirects import (
-        RedirectExpansion,
-        RedirectSearch,
-        RedirectScope,
-    )
-
-    subdomain = capture(
-        urlkey="org,seed)/news",
-        original="https://news.seed.org/",
-        statuscode=200,
-    )
-    foreign = capture(
-        urlkey="com,other)/",
-        original="https://other.com/",
-        statuscode=200,
-    )
-
-    layout = type(
-        "Paths",
-        (),
-        {
-            "collection_root": tmp_path,
-            "archive_root": tmp_path / "archive",
-        },
-    )()
-    known: set = set()
-    reserved: set = set()
-    seen: set = set()
-
-    def fake_expand_target(client, target, **kwargs):
-        if target == "https://news.seed.org/":
-            histories = {("news.seed.org", subdomain.urlkey): [subdomain]}
-            return RedirectExpansion(
-                RedirectSearch(
-                    RedirectScope(
-                        ("news.seed.org", None, "/", ""),
-                        target,
-                        "exact",
-                    ),
-                    (subdomain,),
-                ),
-                histories,
-            )
-        if target == "https://other.com/":
-            histories = {("other.com", foreign.urlkey): [foreign]}
-            return RedirectExpansion(
-                RedirectSearch(
-                    RedirectScope(("other.com", None, "/", ""), target, "exact"),
-                    (foreign,),
-                ),
-                histories,
-            )
-        return None
-
-    monkeypatch.setattr(fetch, "expand_redirect_target", fake_expand_target)
-    monkeypatch.setattr(
-        fetch,
-        "save_search_results",
-        lambda *_a, **_k: None,
-    )
-    monkeypatch.setattr(
-        fetch,
-        "allocate_warc_paths",
-        lambda histories, layout: {
-            layout.archive_root / key[0] / "index.warc.gz": (key,)
-            for key in histories
-        },
-    )
-
-    expand = fetch._redirect_expand(
-        client=object(),
-        seed_pattern="seed.org/*",
-        mode="page",
-        date_start="1995",
-        date_end="2020",
-        layout=layout,
-        known_history_keys=known,
-        reserved_paths=reserved,
-        seen_searches=seen,
-        retries=0,
-    )
-    batches = expand(
-        ["https://news.seed.org/", "https://other.com/"]
-    )
-    by_domain = {batch.histories[0].domain: batch.expand for batch in batches}
-    assert by_domain == {"news.seed.org": True, "other.com": False}
 
 
 def test_run_fetch_merges_prior_coverage_into_search_window(
@@ -343,17 +185,11 @@ def test_run_fetch_merges_prior_coverage_into_search_window(
         url_pattern="example.com/*",
         date_start="1995",
         date_end="2005",
-        warc_mode="all",
         files_mode="none",
-        redirect_capture="none",
     )
-    monkeypatch.setattr(
-        fetch,
-        "resolve_prior_coverage",
-        lambda *_args, **_kwargs: prior,
-    )
+    monkeypatch.setattr(fetch, "resolve_prior_coverage", lambda *_a, **_k: prior)
 
-    def search(_client, pattern, start, end, **kwargs):
+    def search(_client, pattern, start, end, **_kwargs):
         searches.append((pattern, start, end))
         return [early, late]
 
@@ -367,16 +203,13 @@ def test_run_fetch_merges_prior_coverage_into_search_window(
         ),
     )
     saved = []
+    monkeypatch.setattr(
+        fetch,
+        "save_coverage",
+        lambda layout, value: saved.append((layout, value)),
+    )
 
-    def save(layout, coverage_value):
-        saved.append((layout, coverage_value))
-        return layout.coverage_path
-
-    monkeypatch.setattr(fetch, "save_coverage", save)
-
-    assert fetch.run_fetch(
-        settings(date_start="2005", date_end="2010")
-    ) is True
+    assert fetch.run_fetch(settings(date_start="2005", date_end="2010")) is True
     assert searches == [("example.com/*", "1995", "2010")]
     assert saved[0][0] is paths
     assert saved[0][1].date_start == "1995"
@@ -384,65 +217,7 @@ def test_run_fetch_merges_prior_coverage_into_search_window(
     assert "Merge: expanding search 2005-2010" in capsys.readouterr().out
 
 
-def test_run_fetch_fresh_skips_prior_coverage(monkeypatch, tmp_path, capsys):
-    late = capture(captured="20080101000000")
-    searches = []
-    install_common(monkeypatch, tmp_path, [late])
-    prior = CollectionCoverage(
-        url_pattern="example.com/*",
-        date_start="1995",
-        date_end="2005",
-        warc_mode="all",
-        files_mode="none",
-        redirect_capture="none",
-    )
-    monkeypatch.setattr(
-        fetch,
-        "resolve_prior_coverage",
-        lambda *_args, **_kwargs: prior,
-    )
-
-    def search(_client, pattern, start, end, **kwargs):
-        searches.append((start, end))
-        return [late]
-
-    monkeypatch.setattr(fetch, "search_captures", search)
-    monkeypatch.setattr(
-        fetch,
-        "build_warc_files",
-        lambda *_args, **_kwargs: BuiltFiles(
-            WarcCounts(selected=1, responses=1),
-            (),
-        ),
-    )
-
-    assert fetch.run_fetch(
-        settings(date_start="2005", date_end="2010", fresh=True)
-    ) is True
-    assert searches == [("2005", "2010")]
-    assert "Merge:" not in capsys.readouterr().out
-
-
-def test_run_fetch_mode_mismatch_raises(monkeypatch, tmp_path):
-    install_common(monkeypatch, tmp_path, [])
-    prior = CollectionCoverage(
-        url_pattern="example.com/*",
-        date_start="1995",
-        date_end="2005",
-        warc_mode="all",
-        files_mode="none",
-        redirect_capture="none",
-    )
-    monkeypatch.setattr(
-        fetch,
-        "resolve_prior_coverage",
-        lambda *_args, **_kwargs: prior,
-    )
-    with pytest.raises(CoverageModeError, match="warc_mode"):
-        fetch.run_fetch(settings(warc_mode="latest"))
-
-
-def test_finalize_indexes_all_collection_warcs(monkeypatch, tmp_path):
+def test_finalize_indexes_and_reports_all_collection_warcs(monkeypatch, tmp_path):
     paths = type(
         "Paths",
         (),
@@ -455,24 +230,23 @@ def test_finalize_indexes_all_collection_warcs(monkeypatch, tmp_path):
     )()
     left = tmp_path / "archive" / "example.com" / "old.warc.gz"
     right = tmp_path / "archive" / "example.com" / "new.warc.gz"
-    left.parent.mkdir(parents=True)
-    left.write_bytes(b"old")
-    right.write_bytes(b"new")
     indexed = []
-
-    def build_index(warcs, *, layout):
-        indexed.append(list(warcs))
-        return layout.replay_index
-
-    monkeypatch.setattr(fetch, "build_replay_index", build_index)
+    reported = []
+    monkeypatch.setattr(fetch, "list_collection_warcs", lambda _layout: [left, right])
     monkeypatch.setattr(
         fetch,
-        "list_collection_warcs",
-        lambda layout: [left, right],
+        "build_replay_index",
+        lambda warcs, *, layout: indexed.append(list(warcs)) or layout.replay_index,
     )
-    result = BuiltFiles(
-        WarcCounts(selected=1, responses=1),
-        (right,),
+    monkeypatch.setattr(
+        fetch,
+        "write_redirect_report",
+        lambda warcs, path: reported.append((list(warcs), path))
+        or RedirectReport(path, 1, 2, 3),
     )
-    assert fetch._finalize_outputs(settings(), result, paths) is True
+    result = BuiltFiles(WarcCounts(selected=1, responses=1), (right,))
+    source = tmp_path / "sources" / "run"
+
+    assert fetch._finalize_outputs(settings(), result, paths, source) is True
     assert indexed == [[left, right]]
+    assert reported == [([left, right], source / "redirects.json")]

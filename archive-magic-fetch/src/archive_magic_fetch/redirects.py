@@ -1,165 +1,241 @@
-"""Resolve permanent-redirect targets and expand them via CDX search."""
+"""Build a durable operator report from stored historical redirects."""
 
 from __future__ import annotations
 
+import json
+import os
+import tempfile
+from collections import Counter, defaultdict
 from dataclasses import dataclass
-from typing import Callable, Optional, Sequence
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional, Sequence
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
-from wayback import CdxRecord
+from warcio.archiveiterator import ArchiveIterator
 
+from .capture_identity import normalized_urlkey
 from .collection_paths import normalize_domain
-from .retry import DEFAULT_RETRIES
-from .search import group_by_url, search_captures
 
 
-REDIRECT_CAPTURE_MODES = ("none", "page", "website")
-PERMANENT_REDIRECT_STATUSES = frozenset((301, 308))
+REDIRECT_REPORT_SCHEMA_VERSION = 1
 
 
 @dataclass(frozen=True)
-class RedirectScope:
-    """One deduplicated CDX query introduced by a redirect target."""
+class RedirectReport:
+    """Published redirect report and its operator-facing counts."""
 
-    key: tuple[object, ...]
-    url: str
-    match_type: str
-
-
-@dataclass(frozen=True)
-class RedirectSearch:
-    """One nonempty CDX result introduced by a redirect target."""
-
-    scope: RedirectScope
-    captures: tuple[CdxRecord, ...]
+    path: Path
+    skipped: int
+    covered: int
+    unresolved: int
 
 
-@dataclass(frozen=True)
-class RedirectExpansion:
-    """New URL histories discovered from one Location target."""
-
-    search: RedirectSearch
-    histories: dict[tuple[str, str], list[CdxRecord]]
-
-
-def resolve_redirect_target(
-    base_url: str,
-    status_code: int,
-    headers,
-) -> str | None:
-    """Resolve an HTTP(S) Location for a permanent redirect response."""
-
-    if status_code not in PERMANENT_REDIRECT_STATUSES:
+def _header(headers, name: str) -> Optional[str]:
+    if headers is None:
         return None
-    location = next(
-        (
-            str(value).strip()
-            for name, value in headers
-            if name.lower() == "location" and str(value).strip()
-        ),
-        None,
-    )
-    if location is None:
-        raise ValueError("permanent redirect has no Location header")
+    expected = name.lower()
+    for header_name, value in headers.headers:
+        if header_name.lower() == expected and str(value).strip():
+            return str(value).strip()
+    return None
 
+
+def _normalized_target(base_url: str, location: str) -> tuple[str, str]:
     resolved = urljoin(base_url, location)
     parsed = urlsplit(resolved)
-    if parsed.scheme.lower() not in {"http", "https"}:
-        raise ValueError(f"unsupported redirect scheme: {parsed.scheme}")
-    normalize_domain(resolved)
-    return urlunsplit(
-        (parsed.scheme, parsed.netloc, parsed.path, parsed.query, "")
+    scheme = parsed.scheme.lower()
+    if scheme not in {"http", "https"}:
+        raise ValueError(f"unsupported redirect scheme: {parsed.scheme or '-'}")
+    host, port = normalize_domain(resolved)
+    authority_host = f"[{host}]" if ":" in host else host
+    authority = authority_host if port is None else f"{authority_host}:{port}"
+    target = urlunsplit(
+        (scheme, authority, parsed.path or "/", parsed.query, "")
     )
+    return target, authority
 
 
-def redirect_scope(url: str, mode: str) -> RedirectScope:
-    """Translate a target URL into an exact-page or host-root CDX query.
+def _timestamp(record) -> str:
+    value = record.rec_headers.get_header("WARC-Date")
+    if not value:
+        raise ValueError("redirect record has no WARC-Date")
+    return value
 
-    In ``website`` mode, only site-root Locations (``/`` with no query) expand
-    to a host-wide CDX search. Deeper paths stay exact so an asset CDN 301
-    cannot pull an entire third-party host.
-    """
 
-    if mode not in {"page", "website"}:
-        raise ValueError(f"unsupported redirect capture mode: {mode}")
-    parsed = urlsplit(url)
-    host, port = normalize_domain(url)
-    authority = (host, port)
-    path = parsed.path or "/"
-    if mode == "website" and path == "/" and not parsed.query:
-        return RedirectScope(authority, url, "host")
-    return RedirectScope(
-        (*authority, path, parsed.query),
-        url,
-        "exact",
+def _atomic_json(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=".redirects-",
+        suffix=".json.tmp",
+        dir=path.parent,
     )
-
-
-def _redirect_search_label(scope: RedirectScope) -> str:
-    """Return a short console label for one redirect CDX search."""
-
-    if scope.match_type == "host":
-        host, port = scope.key[0], scope.key[1]
-        authority = host if port is None else f"{host}:{port}"
-        return f"host {authority}"
-    return f"page {scope.url}"
-
-
-def expand_redirect_target(
-    client,
-    target_url: str,
-    *,
-    mode: str,
-    date_start: str,
-    date_end: str,
-    seen_searches: set[tuple[object, ...]],
-    known_history_keys: set[tuple[str, str]],
-    retries: int = DEFAULT_RETRIES,
-    progress: Optional[Callable[[int], None]] = None,
-) -> Optional[RedirectExpansion]:
-    """CDX-search one Location target and return only unseen URL histories.
-
-    Already-known history keys keep their primary selection and are omitted.
-    Returns ``None`` when the search scope was already queried or empty.
-    """
-
-    scope = redirect_scope(target_url, mode)
-    if scope.key in seen_searches:
-        return None
-    seen_searches.add(scope.key)
-    print(f"Redirect search: {_redirect_search_label(scope)}")
-    captures = search_captures(
-        client,
-        scope.url,
-        date_start,
-        date_end,
-        match_type=scope.match_type,
-        progress=progress,
-        retries=retries,
-    )
-    if not captures:
-        return None
-
-    grouped = group_by_url(captures)
-    histories = {
-        key: history
-        for key, history in grouped.items()
-        if key not in known_history_keys
-    }
-    return RedirectExpansion(
-        RedirectSearch(scope, tuple(captures)),
-        histories,
-    )
-
-
-def permanent_redirect_target(
-    base_url: str,
-    status_code: int,
-    headers,
-) -> tuple[Optional[str], Optional[str]]:
-    """Return ``(target, warning)`` for one stored permanent-redirect response."""
-
+    temporary = Path(temporary_name)
     try:
-        return resolve_redirect_target(base_url, status_code, headers), None
-    except ValueError as error:
-        return None, str(error)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True, ensure_ascii=False)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def build_redirect_report(warcs: Sequence[Path]) -> dict[str, object]:
+    """Return a full-collection redirect report payload."""
+
+    covered_urlkeys: set[str] = set()
+    occurrences: list[dict[str, object]] = []
+    unresolved: list[dict[str, object]] = []
+
+    for path in warcs:
+        with path.open("rb") as stream:
+            iterator = ArchiveIterator(stream, check_digests="raise")
+            for record in iterator:
+                if record.rec_type not in {"response", "revisit"}:
+                    record.raw_stream.read()
+                    continue
+                source_url = record.rec_headers.get_header("WARC-Target-URI")
+                if not source_url:
+                    raise ValueError(f"{path} contains a record without a target URI")
+                covered_urlkeys.add(normalized_urlkey(source_url))
+                status_text = (
+                    record.http_headers.get_statuscode()
+                    if record.http_headers is not None
+                    else None
+                )
+                if status_text is None or not status_text.isdigit():
+                    raise ValueError(f"{path} contains a record without a numeric status")
+                status = int(status_text)
+                if not (300 <= status < 400) or status == 304:
+                    record.raw_stream.read()
+                    continue
+                timestamp = _timestamp(record)
+                location = _header(record.http_headers, "Location")
+                if location is None:
+                    unresolved.append(
+                        {
+                            "capture_timestamp": timestamp,
+                            "reason": "missing Location header",
+                            "source_url": source_url,
+                            "status": status,
+                        }
+                    )
+                    record.raw_stream.read()
+                    continue
+                try:
+                    target_url, target_site = _normalized_target(
+                        source_url,
+                        location,
+                    )
+                except ValueError as error:
+                    unresolved.append(
+                        {
+                            "capture_timestamp": timestamp,
+                            "location": location,
+                            "reason": str(error),
+                            "source_url": source_url,
+                            "status": status,
+                        }
+                    )
+                else:
+                    occurrences.append(
+                        {
+                            "capture_timestamp": timestamp,
+                            "source_url": source_url,
+                            "status": status,
+                            "target_site": target_site,
+                            "target_url": target_url,
+                        }
+                    )
+                record.raw_stream.read()
+            if iterator.err_count:
+                raise ValueError(
+                    f"{path} contains {iterator.err_count} malformed record "
+                    "boundary warning(s)"
+                )
+
+    grouped: dict[str, list[dict[str, object]]] = defaultdict(list)
+    for occurrence in occurrences:
+        grouped[str(occurrence["target_url"])].append(occurrence)
+
+    targets = []
+    summary = Counter()
+    for target_url in sorted(grouped):
+        items = grouped[target_url]
+        classification = (
+            "covered"
+            if normalized_urlkey(target_url) in covered_urlkeys
+            else "skipped"
+        )
+        summary[classification] += 1
+        source_counts = Counter(
+            (
+                str(item["source_url"]),
+                int(item["status"]),
+                str(item["capture_timestamp"]),
+            )
+            for item in items
+        )
+        sources = [
+            {
+                "capture_timestamp": timestamp,
+                "occurrence_count": count,
+                "source_url": source_url,
+                "status": status,
+            }
+            for (source_url, status, timestamp), count in sorted(
+                source_counts.items()
+            )
+        ]
+        targets.append(
+            {
+                "classification": classification,
+                "occurrence_count": len(items),
+                "sources": sources,
+                "target_site": items[0]["target_site"],
+                "target_url": target_url,
+            }
+        )
+
+    unresolved.sort(
+        key=lambda item: (
+            str(item["source_url"]),
+            str(item["capture_timestamp"]),
+            int(item["status"]),
+        )
+    )
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat().replace(
+            "+00:00",
+            "Z",
+        ),
+        "schema_version": REDIRECT_REPORT_SCHEMA_VERSION,
+        "summary": {
+            "covered_targets": summary["covered"],
+            "redirect_occurrences": len(occurrences),
+            "skipped_targets": summary["skipped"],
+            "unresolved_occurrences": len(unresolved),
+        },
+        "targets": targets,
+        "unresolved": unresolved,
+    }
+
+
+def write_redirect_report(
+    warcs: Sequence[Path],
+    path: Path,
+) -> RedirectReport:
+    """Build and atomically publish one full-collection redirect report."""
+
+    payload = build_redirect_report(warcs)
+    _atomic_json(path, payload)
+    summary = payload["summary"]
+    return RedirectReport(
+        path=path,
+        skipped=int(summary["skipped_targets"]),
+        covered=int(summary["covered_targets"]),
+        unresolved=int(summary["unresolved_occurrences"]),
+    )

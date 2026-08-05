@@ -6,8 +6,8 @@ Archive Magic Fetch performs two concrete operations:
 2. Build final WARC files from those URL histories.
 
 The implementation deliberately separates searching from writing. WARC builds
-start from the primary search selection. Permanent redirects discovered while
-writing a response enqueue additional URL histories as new WARC work.
+start from the primary search selection and preserve the complete validated
+local baseline before adding captures currently returned by IA.
 
 ## Command line
 
@@ -15,13 +15,11 @@ writing a response enqueue additional URL histories as new WARC work.
 archive-magic-fetch URL_PATTERN
   [--start DATE]
   [--end DATE]
-  [--warc none|latest|all]
+  [--build-warc true|false]
   [--files none|latest|unique|all]
-  [--redirect-capture none|page|website]
   [--workers N]
   [--retries N]
   [--rewrite-local]
-  [--fresh]
 ```
 
 `URL_PATTERN` seed scope:
@@ -33,8 +31,8 @@ archive-magic-fetch URL_PATTERN
 | `example.com/*` | Path prefix on that single host |
 | `example.com` | Exact URL match for that page |
 
-Domain wildcard is orthogonal to `--redirect-capture`, which only controls
-expansion of permanent redirect Locations after the seed search.
+`--build-warc` defaults to `true` and always selects the complete CDX history.
+Use `false` for a loose-files-only run. There is no latest-only WARC mode.
 
 `--workers` defaults to 8. It is the maximum number of simultaneous WARC
 builds. There is no `--concurrency` alias.
@@ -66,6 +64,7 @@ Each captured domain then receives one direct folder under `archive/`:
 │   └── <search timestamp>/
 │       ├── captures.cdx.gz
 │       ├── query.json
+│       ├── redirects.json
 │       └── log.txt
 └── website/                 # only when --files is enabled
 ```
@@ -102,38 +101,30 @@ file/directory collision rules remain unchanged.
 Repeated fetches against the same collection **merge by default**.
 
 Before CDX search, Fetch loads prior coverage from `collection.json` when
-present. If that file is missing, it bootstraps a date envelope from matching
-`sources/*/query.json` snapshots (modes are not confirmed until a full
-manifest is written). The effective search window is the union of prior
-coverage and the current `--start`/`--end`:
+present. The effective search window is the union of prior coverage and the
+current `--start`/`--end`:
 
 ```text
 min(prior.date_start, --start) … max(prior.date_end, --end)
 ```
 
-That expanded window is used for the primary CDX search and for redirect
-expansion. The operator still sees the request dates on the `Fetch` line;
-expansion is reported as:
+That expanded window is used for the primary CDX search. The operator still
+sees the request dates on the `Fetch` line; expansion is reported as:
 
 ```text
 Merge: expanding search 2005-2010 using prior coverage 1995-2005 -> 1995-2010
 ```
 
 After WARC construction completes, coverage is rewritten to the effective
-window plus `url_pattern`, `warc_mode`, `files_mode`, and
-`redirect_capture`. Mode mismatches against a confirmed prior manifest raise
-an error; use `--fresh` to ignore prior coverage and build only the current
-window (today's non-merge semantics).
+window plus `url_pattern` and `files_mode`. WARC output is not part of coverage
+identity. Older coverage schema versions are rejected rather than migrated.
 
 Staging `1995–2000` then `2000–2005` is therefore equivalent to one `1995–2005`
 search for stable IA CDX data. Extending `--end` a month later re-searches the
-union window; existing exact responses are reused from on-disk WARCs and only
-missing captures are fetched. WARCs are still rewritten (temp + atomic
-replace), not binary-appended: reuse is per-response identity, not gzip
-append.
-
-Use `--fresh` when the operator intentionally wants a replace of an earlier
-date slice without retaining prior ranges.
+union window. The desired collection is the semantic union of the validated
+local WARC inventory and current IA CDX rows. IA removals therefore never
+delete local captures. Unchanged WARCs are retained byte-for-byte; affected
+WARCs are rebuilt through a temporary and atomically replaced.
 
 ## Search and selection
 
@@ -147,8 +138,8 @@ it is used downstream.
 (normalized domain folder, CDX urlkey)
 ```
 
-and orders each history by capture time. `select_captures()` applies the WARC
-and loose-file modes independently:
+and orders each history by capture time. WARC output retains every logical
+capture. `select_captures()` applies only the loose-file modes:
 
 - `none`: select nothing;
 - `all`: retain every capture;
@@ -157,47 +148,23 @@ and loose-file modes independently:
 - `latest`: prefer the newest 200, then the newest known non-redirect,
   then the newest known redirect.
 
-Primary WARC and file selection happens before WARC construction. Redirect
-expansion runs inline while those WARCs are written: only **new** URL
-histories introduced by Location targets are enqueued, with their full CDX
-histories, and they are never added to loose website-file output. Already
-selected primary histories keep their original selection mode.
+WARC and loose-file selection happens before construction. Redirect targets
+never introduce CDX searches or additional WARC work.
 
-## Redirect discovery
+## Redirect reporting
 
-Redirect discovery is inline with WARC construction when
-`--redirect-capture` is `page` or `website`.
+Every selected historical 3xx response is stored with its actual status and
+`Location` header. Fetch does not follow that Location or broaden capture
+scope. After final WARC and replay-index construction it scans the complete
+collection and writes a versioned `redirects.json` beside the run's source
+query and log.
 
-When a WARC worker successfully stores a 301 or 308 response, it reuses that
-downloaded response to resolve an HTTP or HTTPS `Location` relative to the
-captured URL (fragment removed). Missing or invalid `Location` values are
-warnings. Statuses such as 302, 303, and 307 are still preserved in final
-WARCs when selected, but never introduce searches.
-
-The coordinator translates each unseen target into either:
-
-- an exact page search for `--redirect-capture page`; or
-- for `--redirect-capture website`, a normalized host search when the
-  Location is a site root (`/` with no query), otherwise an exact page search.
-
-Deep Location paths never trigger host-wide CDX, so an asset CDN permanent
-redirect cannot pull an entire third-party host. Site-root Locations still
-expand to host history when website mode is selected. The CLI default is
-`--redirect-capture page`.
-
-These CDX searches run on a dedicated single-thread expand executor, not on
-the WARC coordinator. WARC workers keep filling from the pending queue while
-an expand is in flight. Expands stay serial on the shared main Wayback client.
-Every nonempty result is saved as source files. Only URL histories that were
-not already selected from the primary search are allocated as new WARC batches
-and pushed onto the live work queue. Search scopes are deduplicated, so cycles
-terminate. Discovery stops when finished WARCs yield no unseen redirect
-searches. Long redirect CDX pulls print a start line and periodic fetch
-progress so they are not mistaken for a stalled WARC build.
-
-Redirect responses are downloaded once for final WARC storage; there is no
-separate discarded probe pass. Existing valid WARC responses may still be
-reused during a rebuild and still contribute Location targets.
+The report resolves relative HTTP(S) Locations, removes fragments, aggregates
+occurrences by normalized target URL, and classifies the exact target as
+already covered or skipped. It covers 301, 302, 303, 307, 308, and any other
+3xx with a usable Location; 304 is excluded. Missing or invalid Locations are
+listed separately. The operator can use skipped targets to choose a subsequent
+explicit Fetch query.
 
 ## WARC ownership
 
@@ -226,21 +193,15 @@ up URL keys in collection-wide capture dictionaries.
 
 One worker owns one `WarcBatch` from start to finish:
 
-1. inventory an existing WARC when present;
-2. replace any leftover temporary WARC, then open one exclusive temporary on demand;
-3. process the batch's URL histories sequentially;
-4. preserve capture order and per-history digest/revisit state;
-5. validate the completed temporary WARC;
+1. validate and inventory every existing collection WARC;
+2. return an unchanged WARC directly when it already covers the selection;
+3. otherwise copy its response/revisit baseline to an exclusive temporary;
+4. process new logical captures sequentially with normalized cache lookup;
+5. validate the temporary and assert every prior identity remains present;
 6. atomically replace the final path once.
 
 Different WARC batches run concurrently and may finish out of allocation
-order. Redirect expansion is scheduled off the coordinator when a finished
-expandable WARC (`WarcBatch.expand=True`) yields Location targets; additional
-batches are appended when that expand completes, and the completion counter's
-denominator grows when that happens. Same-site targets (apex and subdomains of
-the seed pattern) keep ``expand=True``. Off-site targets use ``expand=False``:
-their 301/308 responses are still stored in WARC, but are not expanded further
-(one hop beyond the seed site).
+order.
 A URL history never has two WARC owners. Histories selected for both WARC and
 loose-file output stay attached to the WARC batch and use the same downloaded
 body. Histories selected only for files run as `WebsiteBatch` values in a
@@ -285,19 +246,19 @@ keeps URLs that were only built in earlier stages in the replay index.
 The console reports phases and completed files, not successful captures:
 
 ```text
-Fetch example.com/* (1995-20260803): WARC all, files none, redirects page, 8 workers
+Fetch example.com/* (1995-20260803): build WARC true, files none, 8 workers
 Search: 120 captures in 18 URL histories
 WARC files: building 18 with 8 workers
 [1/18] http://web.archive.org/web/*/https://example.com/
   4 responses, 3 revisits, 0 failed
-Redirect: +2 histories from https://target.org/
-[2/20] http://web.archive.org/web/*/https://example.com/about
+[2/18] http://web.archive.org/web/*/https://example.com/about
   1 responses, 0 revisits, 0 failed
-[3/20] http://web.archive.org/web/*/https://target.org/
+[3/18] http://web.archive.org/web/*/https://example.com/contact
   8 responses, 1 revisits, 1 failed
   https://web.archive.org/...
     truncated after 9 attempts over 12.0s (1,000/2,000 bytes)
-Replay index: replay/index.cdxj from 20 WARC files
+Replay index: replay/index.cdxj from 18 WARC files
+Redirects: 2 targets skipped, 1 already captured, 1 unresolved; sources/.../redirects.json
 Done in 2.3 minutes: 155 selected, 120 responses, 34 revisits, 1 failed
 ```
 
@@ -305,9 +266,8 @@ Retries print immediately because a worker may wait through a long backoff.
 WARC completions print a Wayback calendar URL, then an indented stats line.
 Capture failures and warnings print the capture URL on one line and a single
 indented detail line beneath it. File counts are appended to their owning WARC
-stats line. Redirect expansion prints a short `Redirect: +N histories from <url>`
-line when new WARC work is queued. File-only histories appear in a separate
-`Website files` phase.
+stats line. The final redirect summary points to the durable report. File-only
+histories appear in a separate `Website files` phase.
 
 There are no successful per-capture lines, URL alignment, per-history summary
 blocks, verbose mode, or second event log. The same compact output is mirrored
@@ -317,9 +277,9 @@ to the primary source log.
 
 | Module | Responsibility |
 | --- | --- |
-| `fetch.py` | Settings, phase orchestration, redirect enqueue callback |
+| `fetch.py` | Settings and phase orchestration |
 | `search.py` | CDX search, grouping, primary selection |
-| `redirects.py` | Location resolution and redirect CDX expansion helpers |
+| `redirects.py` | Final-collection redirect resolution and reporting |
 | `collection_paths.py` | Collection/domain paths and collision handling |
 | `collection_coverage.py` | Merge/resume coverage envelope and date window union |
 | `source_files.py` | Saved CDX search results and query metadata |
@@ -347,8 +307,8 @@ pytest -q archive-magic-navigator/tests
 ```
 
 Navigator's socket integration tests require permission to bind temporary
-localhost ports. Tests cover redirect status selection, recursive cycles,
-bounded overlapping probes, thread-private clients, exactly-once WARC
+localhost ports. Tests cover redirect reporting, append-only WARC unions,
+normalized cache identity, thread-private clients, exactly-once WARC
 ownership, sequential histories within a WARC, completion-order output,
 domain folders, ports, IDNA, IPv6, collision handling, replay filenames, and
 existing WARC reuse.

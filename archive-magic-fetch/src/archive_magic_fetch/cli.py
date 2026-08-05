@@ -8,9 +8,8 @@ from datetime import datetime, timezone
 from typing import Optional, Sequence
 
 from .console import mirror_console_output
-from .search import FILES_MODES, WARC_MODES
+from .search import FILES_MODES
 from .fetch import FetchSettings, run_fetch
-from .redirects import REDIRECT_CAPTURE_MODES
 from .downloads import DEFAULT_WORKER_COUNT
 from .retry import DEFAULT_RETRIES
 
@@ -39,6 +38,16 @@ def _nonnegative_int(value: str) -> int:
     return parsed
 
 
+def _boolean(value: str) -> bool:
+    """Parse the explicit lowercase true/false CLI vocabulary."""
+
+    if value == "true":
+        return True
+    if value == "false":
+        return False
+    raise argparse.ArgumentTypeError("must be true or false")
+
+
 def parse_args(argv: Optional[Sequence[str]] = None) -> FetchSettings:
     """Parse the deliberately small MVP command-line interface."""
 
@@ -47,10 +56,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> FetchSettings:
     parser.add_argument("--start", metavar="DATE")
     parser.add_argument("--end", metavar="DATE")
     parser.add_argument(
-        "--warc",
-        choices=WARC_MODES,
-        default="all",
-        help="WARC + replay CDXJ output mode (default: all)",
+        "--build-warc",
+        type=_boolean,
+        choices=(True, False),
+        default=True,
+        metavar="true|false",
+        help="Build complete WARC + replay CDXJ output (default: true)",
     )
     parser.add_argument(
         "--files",
@@ -67,22 +78,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> FetchSettings:
         ),
     )
     parser.add_argument(
-        "--redirect-capture",
-        choices=REDIRECT_CAPTURE_MODES,
-        default="page",
-        help=(
-            "Capture permanent redirect targets into WARC as none, exact "
-            "page history, or host history for site-root Locations "
-            "(default: page)"
-        ),
-    )
-    parser.add_argument(
         "--workers",
         type=_positive_int,
         default=DEFAULT_WORKER_COUNT,
         metavar="N",
         help=(
-            "Maximum simultaneous redirect probes or WARC builds "
+            "Maximum simultaneous WARC builds "
             f"(default: {DEFAULT_WORKER_COUNT})"
         ),
     )
@@ -96,14 +97,6 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> FetchSettings:
             f"{DEFAULT_RETRIES}; use 0 to disable retries)"
         ),
     )
-    parser.add_argument(
-        "--fresh",
-        action="store_true",
-        help=(
-            "Ignore prior collection coverage and build only this run's "
-            "date window (default merges with existing coverage)"
-        ),
-    )
     args = parser.parse_args(argv)
     if args.rewrite_local and args.files == "none":
         parser.error(
@@ -113,13 +106,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> FetchSettings:
         url_pattern=args.url_pattern,
         date_start=args.start or "1995",
         date_end=args.end or current_utc_cdx_timestamp(),
-        warc_mode=args.warc,
+        build_warc=args.build_warc,
         files_mode=args.files,
         rewrite_local=args.rewrite_local,
-        redirect_capture=args.redirect_capture,
         worker_count=args.workers,
         retries=args.retries,
-        fresh=args.fresh,
     )
 
 
