@@ -21,7 +21,7 @@ def test_valid_index_accepts_integer_and_digit_string_ranges(
             "org,example)/",
             "20200101000000",
             {
-                "filename": "archive/fixture.warc.gz",
+                "filename": "archive/example.org/index.warc.gz",
                 "offset": 0,
                 "length": 8,
             },
@@ -30,7 +30,7 @@ def test_valid_index_accepts_integer_and_digit_string_ranges(
             "org,example)/",
             "20210101000000",
             {
-                "filename": "archive/fixture.warc.gz",
+                "filename": "archive/example.org/index.warc.gz",
                 "offset": "8",
                 "length": "8",
             },
@@ -50,7 +50,7 @@ def test_valid_index_accepts_integer_and_digit_string_ranges(
         ({"offset": "0", "length": "1"}, "missing required field 'filename'"),
         (
             {
-                "filename": "archive/fixture.warc.gz",
+                "filename": "archive/example.org/index.warc.gz",
                 "offset": True,
                 "length": "1",
             },
@@ -58,7 +58,7 @@ def test_valid_index_accepts_integer_and_digit_string_ranges(
         ),
         (
             {
-                "filename": "archive/fixture.warc.gz",
+                "filename": "archive/example.org/index.warc.gz",
                 "offset": 1.5,
                 "length": "1",
             },
@@ -66,7 +66,7 @@ def test_valid_index_accepts_integer_and_digit_string_ranges(
         ),
         (
             {
-                "filename": "archive/fixture.warc.gz",
+                "filename": "archive/example.org/index.warc.gz",
                 "offset": "-1",
                 "length": "1",
             },
@@ -74,7 +74,7 @@ def test_valid_index_accepts_integer_and_digit_string_ranges(
         ),
         (
             {
-                "filename": "archive/fixture.warc.gz",
+                "filename": "archive/example.org/index.warc.gz",
                 "offset": "0",
                 "length": "0",
             },
@@ -82,7 +82,7 @@ def test_valid_index_accepts_integer_and_digit_string_ranges(
         ),
         (
             {
-                "filename": "archive/fixture.warc.gz",
+                "filename": "archive/example.org/index.warc.gz",
                 "offset": "120",
                 "length": "16",
             },
@@ -110,12 +110,13 @@ def test_invalid_record_ranges_include_line_context(
 @pytest.mark.parametrize(
     "filename",
     (
-        "/archive/fixture.warc.gz",
-        "../archive/fixture.warc.gz",
+        "/archive/example.org/index.warc.gz",
+        "../archive/example.org/index.warc.gz",
+        "archive/fixture.warc.gz",
         "archive/../fixture.warc.gz",
         "archive//fixture.warc.gz",
         r"archive\fixture.warc.gz",
-        "C:/archive/fixture.warc.gz",
+        "C:/archive/example.org/index.warc.gz",
         "archive/C:/fixture.warc.gz",
         "https://example.test/fixture.warc.gz",
         "website/fixture.warc.gz",
@@ -164,7 +165,7 @@ def test_index_must_be_nonempty_valid_utf8_and_sorted(collection_factory):
         validation.validate_collection(selected(collection))
 
     payload = {
-        "filename": "archive/fixture.warc.gz",
+        "filename": "archive/example.org/index.warc.gz",
         "offset": "0",
         "length": "1",
     }
@@ -199,7 +200,7 @@ def test_each_distinct_warc_is_validated_once(
             "org,example)/",
             f"20200{number}01000000",
             {
-                "filename": "archive/fixture.warc.gz",
+                "filename": "archive/example.org/index.warc.gz",
                 "offset": str(number),
                 "length": "1",
             },
@@ -218,4 +219,4 @@ def test_each_distinct_warc_is_validated_once(
 
     validation.validate_collection(selected(collection))
 
-    assert calls == ["archive/fixture.warc.gz"]
+    assert calls == ["archive/example.org/index.warc.gz"]

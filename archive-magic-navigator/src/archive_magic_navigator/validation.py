@@ -207,6 +207,7 @@ def _validate_warc_path(
         or any(PureWindowsPath(part).drive for part in parts)
         or any(part in {"", ".", ".."} for part in parts)
         or parts[0] != "archive"
+        or len(parts) < 3
     ):
         context.fail(f"unsafe WARC filename {filename!r}")
 

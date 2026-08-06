@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from archive_magic_fetch import rewrite_local
+from archive_magic_fetch import local_links
 
 
 def _write_tree(root: Path, files: dict[str, str]) -> None:
@@ -10,7 +10,7 @@ def _write_tree(root: Path, files: dict[str, str]) -> None:
         path.write_text(content, encoding="utf-8")
 
 
-def test_rewrite_root_relative_href_to_relative(tmp_path):
+def test_local_links_root_relative_href_to_relative(tmp_path):
     website = tmp_path / "website"
     _write_tree(
         website,
@@ -22,7 +22,7 @@ def test_rewrite_root_relative_href_to_relative(tmp_path):
         },
     )
 
-    summary = rewrite_local.rewrite_local_website(website)
+    summary = local_links.rewrite_local_links(website)
 
     assert summary.rewritten == 1
     assert (
@@ -32,7 +32,7 @@ def test_rewrite_root_relative_href_to_relative(tmp_path):
     )
 
 
-def test_rewrite_does_not_guess_mime_derived_target(tmp_path):
+def test_local_links_does_not_guess_mime_derived_target(tmp_path):
     website = tmp_path / "website"
     original = '<a href="/download/report/">Report</a>'
     _write_tree(
@@ -43,7 +43,7 @@ def test_rewrite_does_not_guess_mime_derived_target(tmp_path):
         },
     )
 
-    summary = rewrite_local.rewrite_local_website(website)
+    summary = local_links.rewrite_local_links(website)
 
     assert summary.rewritten == 0
     assert (
@@ -51,7 +51,7 @@ def test_rewrite_does_not_guess_mime_derived_target(tmp_path):
     ).read_text(encoding="utf-8") == original
 
 
-def test_rewrite_leaves_offsite_and_missing_unchanged(tmp_path):
+def test_local_links_leaves_offsite_and_missing_unchanged(tmp_path):
     website = tmp_path / "website"
     original = (
         '<script src="https://cdn.example.com/x.js"></script>'
@@ -66,7 +66,7 @@ def test_rewrite_leaves_offsite_and_missing_unchanged(tmp_path):
         },
     )
 
-    summary = rewrite_local.rewrite_local_website(website)
+    summary = local_links.rewrite_local_links(website)
 
     assert summary.rewritten == 0
     assert (
@@ -74,7 +74,7 @@ def test_rewrite_leaves_offsite_and_missing_unchanged(tmp_path):
     ).read_text(encoding="utf-8") == original
 
 
-def test_rewrite_absolute_same_host_and_css_url(tmp_path):
+def test_local_links_absolute_same_host_and_css_url(tmp_path):
     website = tmp_path / "website"
     _write_tree(
         website,
@@ -89,7 +89,7 @@ def test_rewrite_absolute_same_host_and_css_url(tmp_path):
         },
     )
 
-    summary = rewrite_local.rewrite_local_website(website)
+    summary = local_links.rewrite_local_links(website)
 
     assert summary.rewritten == 2
     assert (
@@ -104,7 +104,7 @@ def test_rewrite_absolute_same_host_and_css_url(tmp_path):
     )
 
 
-def test_rewrite_is_idempotent_for_relative_links(tmp_path):
+def test_local_links_is_idempotent_for_relative_links(tmp_path):
     website = tmp_path / "website"
     _write_tree(
         website,
@@ -114,8 +114,8 @@ def test_rewrite_is_idempotent_for_relative_links(tmp_path):
         },
     )
 
-    first = rewrite_local.rewrite_local_website(website)
-    second = rewrite_local.rewrite_local_website(website)
+    first = local_links.rewrite_local_links(website)
+    second = local_links.rewrite_local_links(website)
 
     assert first.rewritten == 0
     assert second.rewritten == 0
@@ -126,14 +126,14 @@ def test_rewrite_is_idempotent_for_relative_links(tmp_path):
     )
 
 
-def test_rewrite_reference_helper_resolves_homepage(tmp_path):
+def test_local_links_reference_helper_resolves_homepage(tmp_path):
     website = tmp_path / "website"
     page = website / "example.com" / "contact.html"
     page.parent.mkdir(parents=True)
     page.write_text("page", encoding="utf-8")
     (website / "example.com" / "index.html").write_text("home", encoding="utf-8")
 
-    rewritten = rewrite_local.rewrite_reference(
+    rewritten = local_links.rewrite_reference(
         "/",
         current_file=page,
         website_root=website,
@@ -157,7 +157,7 @@ def test_write_and_rewrite_produces_openable_relative_links(tmp_path):
         },
     )
 
-    rewrite_local.rewrite_local_website(website)
+    local_links.rewrite_local_links(website)
     home = (website / "example.com" / "index.html").read_text(encoding="utf-8")
 
     assert 'href="contact.html"' in home
@@ -166,7 +166,7 @@ def test_write_and_rewrite_produces_openable_relative_links(tmp_path):
     assert (website / "example.com" / "files" / "main_style.css").is_file()
 
 
-def test_rewrite_does_not_alter_js_url_helper_calls(tmp_path):
+def test_local_links_does_not_alter_js_url_helper_calls(tmp_path):
     website = tmp_path / "website"
     original = (
         'function url(path) { return path; }\n'
@@ -183,7 +183,7 @@ def test_rewrite_does_not_alter_js_url_helper_calls(tmp_path):
         },
     )
 
-    summary = rewrite_local.rewrite_local_website(website)
+    summary = local_links.rewrite_local_links(website)
 
     assert (website / "example.com" / "app.js").read_text(
         encoding="utf-8"
@@ -196,7 +196,7 @@ def test_rewrite_does_not_alter_js_url_helper_calls(tmp_path):
     assert summary.rewritten == 1
 
 
-def test_rewrite_latest_ignores_fourteen_digit_path_segments(tmp_path):
+def test_local_links_latest_ignores_fourteen_digit_path_segments(tmp_path):
     website = tmp_path / "website"
     _write_tree(
         website,
@@ -208,7 +208,7 @@ def test_rewrite_latest_ignores_fourteen_digit_path_segments(tmp_path):
         },
     )
 
-    summary = rewrite_local.rewrite_local_website(
+    summary = local_links.rewrite_local_links(
         website,
         include_timestamps=False,
     )
@@ -221,7 +221,7 @@ def test_rewrite_latest_ignores_fourteen_digit_path_segments(tmp_path):
     )
 
 
-def test_rewrite_all_scopes_root_relative_to_timestamp_directory(tmp_path):
+def test_local_links_all_scopes_root_relative_to_timestamp_directory(tmp_path):
     website = tmp_path / "website"
     _write_tree(
         website,
@@ -234,7 +234,7 @@ def test_rewrite_all_scopes_root_relative_to_timestamp_directory(tmp_path):
         },
     )
 
-    summary = rewrite_local.rewrite_local_website(
+    summary = local_links.rewrite_local_links(
         website,
         include_timestamps=True,
     )

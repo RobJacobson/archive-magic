@@ -13,10 +13,17 @@ def test_parse_args_defaults_and_modes():
         archives=Path("./archives"),
         bind="127.0.0.1",
         port=8080,
+        wayback_fallback=True,
         open_browser=False,
         debug=False,
     )
     assert cli.parse_args(["--all"]).collection_id is None
+    assert cli.parse_args(
+        ["example.org", "--wayback-fallback", "on"]
+    ).wayback_fallback is True
+    assert cli.parse_args(
+        ["example.org", "--wayback-fallback", "off"]
+    ).wayback_fallback is False
 
 
 @pytest.mark.parametrize(
@@ -28,12 +35,22 @@ def test_parse_args_defaults_and_modes():
         ["example.org", "--port", "65536"],
         ["example.org", "--port", "not-a-port"],
         ["example.org", "--bind", ""],
+        ["example.org", "--wayback-fallback", "sometimes"],
     ),
 )
 def test_parser_errors_exit_two(arguments):
     with pytest.raises(SystemExit) as raised:
         cli.parse_args(arguments)
     assert raised.value.code == 2
+
+
+def test_help_documents_wayback_fallback(capsys):
+    with pytest.raises(SystemExit) as raised:
+        cli.parse_args(["--help"])
+    assert raised.value.code == 0
+    help_text = capsys.readouterr().out
+    assert "--wayback-fallback {on,off}" in help_text
+    assert "default: on" in help_text
 
 
 def test_main_validates_before_start_and_opens_after_ready(
@@ -70,7 +87,49 @@ def test_main_validates_before_start_and_opens_after_ready(
         ("run", True),
         ("open", "http://127.0.0.1:8080/"),
     ]
-    assert "Serving 1 collection" in capsys.readouterr().out
+    output = capsys.readouterr().out
+    assert "Serving 1 collection" in output
+    assert "Wayback fallback: on" in output
+
+
+def test_main_passes_disabled_wayback_fallback_to_config(
+    collection_factory,
+    monkeypatch,
+    capsys,
+):
+    root, _, _, _ = collection_factory()
+    generated = []
+    real_build_config = cli.build_config
+
+    def capture_config(collections, *, wayback_fallback):
+        generated.append(wayback_fallback)
+        return real_build_config(
+            collections,
+            wayback_fallback=wayback_fallback,
+        )
+
+    monkeypatch.setattr(cli, "build_config", capture_config)
+
+    def fake_run(runtime, bind, port, *, debug, on_ready):
+        on_ready("http://127.0.0.1:8080/")
+        return 0
+
+    monkeypatch.setattr(cli, "run_wayback", fake_run)
+
+    assert (
+        cli.main(
+            [
+                "example.org",
+                "--archives",
+                str(root),
+                "--wayback-fallback",
+                "off",
+            ]
+        )
+        == 0
+    )
+    assert generated == [False]
+    assert "Wayback fallback: off" in capsys.readouterr().out
 
 
 def test_main_warns_for_non_loopback_bind(

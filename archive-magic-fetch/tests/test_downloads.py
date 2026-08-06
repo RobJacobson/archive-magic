@@ -21,7 +21,8 @@ from wayback.exceptions import (
     WaybackRetryError,
 )
 
-from archive_magic_fetch import retrieval, retry
+from archive_magic_fetch import downloads
+from archive_magic_fetch import retry
 
 
 def payload_digest(payload):
@@ -158,7 +159,7 @@ class FakeRawSession:
         return self.outcome
 
 
-def test_retrieve_uses_exact_original_memento_and_maps_all_fields():
+def test_download_uses_exact_original_memento_and_maps_all_fields():
     timestamp = datetime(
         2020,
         1,
@@ -180,7 +181,7 @@ def test_retrieve_uses_exact_original_memento_and_maps_all_fields():
     client = FakeClient([memento])
     capture = object()
 
-    response = retrieval.retrieve_response(client, capture)
+    response = downloads.download_response(client, capture)
 
     assert client.calls == [
         (
@@ -212,7 +213,7 @@ def test_retrieve_uses_exact_original_memento_and_maps_all_fields():
     ) == payload_digest(b"<html>semantic</html>")
 
 
-def test_retrieve_removes_representation_headers_and_sets_semantic_length():
+def test_download_removes_representation_headers_and_sets_semantic_length():
     payload = b"decoded"
     memento = FakeMemento(
         headers={
@@ -230,7 +231,7 @@ def test_retrieve_removes_representation_headers_and_sets_semantic_length():
         content=payload,
     )
 
-    response = retrieval.retrieve_response(FakeClient([memento]), object())
+    response = downloads.download_response(FakeClient([memento]), object())
 
     for name in (
         "Content-Encoding",
@@ -249,7 +250,7 @@ def test_retrieve_removes_representation_headers_and_sets_semantic_length():
     assert response.http_headers.get_header("Content-Type") == "text/plain"
 
 
-def test_retrieve_preserves_genuine_historical_redirect():
+def test_download_preserves_genuine_historical_redirect():
     memento = FakeMemento(
         url="http://www.example.com/",
         status_code=301,
@@ -257,7 +258,7 @@ def test_retrieve_preserves_genuine_historical_redirect():
         content=b"redirect body",
     )
 
-    response = retrieval.retrieve_response(FakeClient([memento]), object())
+    response = downloads.download_response(FakeClient([memento]), object())
 
     assert response.http_headers.statusline == "301 Moved Permanently"
     assert (
@@ -267,8 +268,8 @@ def test_retrieve_preserves_genuine_historical_redirect():
     assert response.content_stream().read() == b"redirect body"
 
 
-def test_retrieve_unknown_status_has_no_invented_reason():
-    response = retrieval.retrieve_response(
+def test_download_unknown_status_has_no_invented_reason():
+    response = downloads.download_response(
         FakeClient([FakeMemento(status_code=599)]),
         object(),
     )
@@ -276,7 +277,7 @@ def test_retrieve_unknown_status_has_no_invented_reason():
     assert response.http_headers.statusline == "599"
 
 
-def test_memento_closes_before_warc_construction_fails(monkeypatch):
+def test_capture_closes_before_warc_construction_fails(monkeypatch):
     memento = FakeMemento()
 
     class FailingBuilder:
@@ -286,18 +287,18 @@ def test_memento_closes_before_warc_construction_fails(monkeypatch):
         def create_warc_record(self, *args, **kwargs):
             raise RuntimeError("cannot build WARC")
 
-    monkeypatch.setattr(retrieval, "RecordBuilder", FailingBuilder)
+    monkeypatch.setattr(downloads, "RecordBuilder", FailingBuilder)
 
-    retrieved = retrieval.retrieve_memento(FakeClient([memento]), object())
+    retrieved = downloads.download_capture(FakeClient([memento]), object())
     assert memento.closed is True
     assert memento.exit_error is None
     with pytest.raises(RuntimeError, match="cannot build WARC"):
-        retrieved.to_warc_record()
+        retrieved.to_warc_record(cdx_payload_digest=None)
 
 
 def _make_retries_immediate(monkeypatch):
     delays = []
-    monkeypatch.setattr(retrieval, "sleep_seconds", delays.append)
+    monkeypatch.setattr(downloads, "sleep_seconds", delays.append)
     return delays
 
 
@@ -310,7 +311,7 @@ def test_rate_limit_coordinates_backoff_and_retries_same_capture(
     memento = FakeMemento()
     client = FakeClient([RateLimitError(None, 11), memento])
 
-    retrieval.retrieve_response(client, capture)
+    downloads.download_response(client, capture)
 
     assert delays == [11]
     assert [call[0] for call in client.calls] == [capture, capture]
@@ -323,7 +324,7 @@ def test_missing_retry_after_uses_exponential_backoff(monkeypatch):
     delays = _make_retries_immediate(monkeypatch)
     client = FakeClient([RateLimitError(None, None), FakeMemento()])
 
-    retrieval.retrieve_response(client, object())
+    downloads.download_response(client, object())
 
     assert delays == [10]
 
@@ -338,7 +339,7 @@ def test_repeated_rate_limit_exhausts_bounded_attempts(monkeypatch):
     )
 
     with pytest.raises(retry.RetryExhaustedError) as raised:
-        retrieval.retrieve_response(client, object(), retries=2)
+        downloads.download_response(client, object(), retries=2)
 
     assert delays == [10, 20]
     assert len(client.calls) == 3
@@ -350,7 +351,7 @@ def test_zero_retries_makes_one_attempt_without_sleep(monkeypatch):
     client = FakeClient([_connection_refused_retry_error()])
 
     with pytest.raises(retry.RetryExhaustedError) as raised:
-        retrieval.retrieve_response(client, object(), retries=0)
+        downloads.download_response(client, object(), retries=0)
 
     assert len(client.calls) == 1
     assert delays == []
@@ -366,7 +367,7 @@ def test_retryable_service_status_uses_application_backoff(monkeypatch):
     )
     client = FakeClient([error, FakeMemento()])
 
-    retrieval.retrieve_response(client, object(), retries=1)
+    downloads.download_response(client, object(), retries=1)
 
     assert len(client.calls) == 2
     assert delays == [10]
@@ -414,7 +415,7 @@ def test_connection_failure_backs_off_and_retries(monkeypatch):
         },
     )()
 
-    retrieval.retrieve_response(client, capture)
+    downloads.download_response(client, capture)
 
     assert delays == [10]
     assert [call[0] for call in client.calls] == [capture, capture]
@@ -428,7 +429,7 @@ def test_one_workers_backoff_does_not_pause_another(monkeypatch):
         sleeping.set()
         release.wait(timeout=2)
 
-    monkeypatch.setattr(retrieval, "sleep_seconds", blocking_sleep)
+    monkeypatch.setattr(downloads, "sleep_seconds", blocking_sleep)
     failing = FakeClient(
         [_connection_refused_retry_error(), FakeMemento()]
     )
@@ -436,14 +437,14 @@ def test_one_workers_backoff_does_not_pause_another(monkeypatch):
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         recovering = executor.submit(
-            retrieval.retrieve_memento,
+            downloads.download_capture,
             failing,
             object(),
             retries=1,
         )
         assert sleeping.wait(timeout=1)
         unaffected = executor.submit(
-            retrieval.retrieve_memento,
+            downloads.download_capture,
             healthy,
             object(),
             retries=1,
@@ -464,7 +465,7 @@ def test_sustained_connection_failure_exhausts_bounded_attempts(monkeypatch):
     )
 
     with pytest.raises(retry.RetryExhaustedError):
-        retrieval.retrieve_response(client, object(), retries=2)
+        downloads.download_response(client, object(), retries=2)
     assert delays == [10, 20]
 
 
@@ -473,7 +474,7 @@ def test_timeout_wayback_retry_uses_bounded_retry(monkeypatch):
     error = WaybackRetryError(0, 1.0, ReadTimeout("read timed out"))
     client = FakeClient([error, FakeMemento()])
 
-    retrieval.retrieve_response(client, object())
+    downloads.download_response(client, object())
 
     assert len(client.calls) == 2
 
@@ -486,27 +487,27 @@ def test_repeated_identical_incomplete_read_stops_early(
     client = FakeClient(
         [
             _truncated_retry_error()
-            for _ in range(retrieval.REPEATED_TRUNCATION_ATTEMPTS)
+            for _ in range(downloads.REPEATED_TRUNCATION_ATTEMPTS)
         ]
         + [FakeMemento()]
     )
 
     with pytest.raises(
-        retrieval.TruncatedWaybackResponseError
+        downloads.TruncatedWaybackResponseError
     ) as raised:
-        retrieval.retrieve_response(client, object())
+        downloads.download_response(client, object())
 
     error = raised.value
-    assert len(client.calls) == retrieval.REPEATED_TRUNCATION_ATTEMPTS
+    assert len(client.calls) == downloads.REPEATED_TRUNCATION_ATTEMPTS
     assert delays == []
     assert error.received_bytes == 130810
     assert error.expected_bytes == 275029
-    assert error.attempts == retrieval.REPEATED_TRUNCATION_ATTEMPTS
+    assert error.attempts == downloads.REPEATED_TRUNCATION_ATTEMPTS
     assert (
-        "truncated Wayback response after 2 attempts over "
+        "truncated after 2 attempts over "
         in str(error)
     )
-    assert "received 130,810 of 275,029 bytes" in str(error)
+    assert "130,810/275,029 bytes" in str(error)
     output = capsys.readouterr().out
     assert "retrying after incomplete response" in output
     assert "retry 1/8" not in output
@@ -522,7 +523,7 @@ def test_changing_incomplete_read_boundaries_keep_retrying(monkeypatch):
         ]
     )
 
-    response = retrieval.retrieve_response(client, object())
+    response = downloads.download_response(client, object())
 
     assert response.content_stream().read() == b"recovered"
     assert len(client.calls) == 3
@@ -539,10 +540,9 @@ def test_content_decoding_error_recovers_one_digest_verified_raw_replay():
     client = FakeClient([broken], session=session)
     capture = SimpleNamespace(digest=payload_digest(payload))
 
-    retrieved = retrieval.retrieve_memento(client, capture)
+    retrieved = downloads.download_capture(client, capture)
 
     assert retrieved.body == payload
-    assert retrieved.recovered_content_encoding is True
     assert broken.closed is True
     assert len(client.calls) == 1
     assert session.calls == [
@@ -570,10 +570,10 @@ def test_content_decoding_error_discards_raw_digest_mismatch():
     capture = SimpleNamespace(digest=payload_digest(expected))
 
     with pytest.raises(
-        retrieval.MalformedContentEncodingError,
-        match="raw recovery was not verified by the CDX digest",
+        downloads.MalformedContentEncodingError,
+        match="raw recovery digest mismatch",
     ):
-        retrieval.retrieve_response(client, capture)
+        downloads.download_response(client, capture)
 
     assert len(client.calls) == 1
     assert len(session.calls) == 1
@@ -587,22 +587,16 @@ def test_content_decoding_error_discards_without_valid_cdx_digest():
     client = FakeClient([broken, FakeMemento(content=b"unused")])
 
     with pytest.raises(
-        retrieval.MalformedContentEncodingError,
-        match=(
-            "original Wayback replay could not be decoded "
-            "by the HTTP client"
-        ),
+        downloads.MalformedContentEncodingError,
+        match="gzip decode failed",
     ) as raised:
-        retrieval.retrieve_response(client, object())
+        downloads.download_response(client, object())
 
     assert len(client.calls) == 1
     assert broken.closed is True
-    assert (
-        "raw recovery was not verified by the CDX digest"
-        in str(raised.value)
-    )
-    assert "(Content-Encoding: gzip)" in str(raised.value)
+    assert "raw recovery digest mismatch" in str(raised.value)
     assert "incorrect gzip header" in str(raised.value)
+    assert "Content-Encoding:" not in str(raised.value)
 
 
 def test_content_decoding_raw_recovery_does_not_retry_transport_failure(
@@ -617,8 +611,8 @@ def test_content_decoding_raw_recovery_does_not_retry_transport_failure(
     client = FakeClient([broken, FakeMemento(content=b"unused")], session=session)
     capture = SimpleNamespace(digest=payload_digest(payload))
 
-    with pytest.raises(retrieval.MalformedContentEncodingError):
-        retrieval.retrieve_response(client, capture)
+    with pytest.raises(downloads.MalformedContentEncodingError):
+        downloads.download_response(client, capture)
 
     assert len(client.calls) == 1
     assert len(session.calls) == 1
@@ -637,13 +631,13 @@ def test_make_client_factory_uses_application_owned_session(monkeypatch):
             self.session = session
 
     monkeypatch.setattr(
-        retrieval,
+        downloads,
         "ArchiveMagicWaybackSession",
         FakeSession,
     )
-    monkeypatch.setattr(retrieval, "WaybackClient", FakeWaybackClient)
+    monkeypatch.setattr(downloads, "WaybackClient", FakeWaybackClient)
 
-    client = retrieval.make_client_factory("test-agent")()
+    client = downloads.make_client_factory("test-agent")()
     assert captured["user_agent"] == "test-agent"
     assert client.session is not None
 
@@ -655,6 +649,6 @@ def test_make_client_factory_uses_application_owned_session(monkeypatch):
         UnexpectedResponseFormat("malformed"),
     ],
 )
-def test_retrieve_does_not_swallow_wayback_errors(error):
+def test_download_does_not_swallow_wayback_errors(error):
     with pytest.raises(type(error), match=str(error)):
-        retrieval.retrieve_response(FakeClient([error]), object())
+        downloads.download_response(FakeClient([error]), object())

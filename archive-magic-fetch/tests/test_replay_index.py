@@ -11,11 +11,13 @@ from warcio.statusandheaders import StatusAndHeaders
 from warcio.warcwriter import WARCWriter
 from wayback import CdxRecord, WaybackSession
 
-from archive_magic_fetch import paths, provenance, replay
+from archive_magic_fetch import collection_paths
+from archive_magic_fetch import replay_index
+from archive_magic_fetch import source_files
 
 
 def collection(tmp_path):
-    return paths.collection_layout(
+    return collection_paths.collection_paths(
         "https://example.com/*",
         root=tmp_path / "archives",
     )
@@ -27,10 +29,14 @@ def create_warc(
     target="https://played.example/posts/",
     first_date="2020-01-02T03:04:05Z",
     second_date="2020-01-03T03:04:05Z",
+    cdx_digest=None,
 ):
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("xb") as stream:
         writer = WARCWriter(stream, gzip=True, warc_version="1.0")
+        first_headers = {"WARC-Date": first_date}
+        if cdx_digest is not None:
+            first_headers["CDX-Payload-Digest"] = cdx_digest
         response = writer.create_warc_record(
             target,
             "response",
@@ -40,10 +46,13 @@ def create_warc(
                 [("Content-Type", "text/plain")],
                 protocol="HTTP/1.1",
             ),
-            warc_headers_dict={"WARC-Date": first_date},
+            warc_headers_dict=first_headers,
         )
         writer.write_record(response)
         digest = response.rec_headers.get_header("WARC-Payload-Digest")
+        second_headers = {"WARC-Date": second_date}
+        if cdx_digest is not None:
+            second_headers["CDX-Payload-Digest"] = cdx_digest
         second = writer.create_warc_record(
             target,
             "response",
@@ -53,7 +62,7 @@ def create_warc(
                 [("Content-Type", "text/plain")],
                 protocol="HTTP/1.1",
             ),
-            warc_headers_dict={"WARC-Date": second_date},
+            warc_headers_dict=second_headers,
         )
         writer.write_record(second)
     return digest
@@ -67,12 +76,43 @@ def read_index(path):
     return entries
 
 
+def test_list_collection_warcs_is_sorted_and_recursive(tmp_path):
+    selected_layout = collection(tmp_path)
+    later = (
+        selected_layout.archive_root
+        / "played.example"
+        / "z.warc.gz"
+    )
+    earlier = (
+        selected_layout.archive_root
+        / "played.example"
+        / "posts"
+        / "index.warc.gz"
+    )
+    later.parent.mkdir(parents=True)
+    earlier.parent.mkdir(parents=True)
+    later.write_bytes(b"later")
+    earlier.write_bytes(b"earlier")
+    (selected_layout.archive_root / "ignore.txt").write_text("nope")
+
+    assert replay_index.list_collection_warcs(selected_layout) == [
+        earlier,
+        later,
+    ]
+
+
 def test_replay_index_uses_warc_identity_and_real_record_ranges(tmp_path):
     selected_layout = collection(tmp_path)
-    warc = selected_layout.archive_root / "posts" / "index.warc.gz"
-    digest = create_warc(warc)
+    warc = (
+        selected_layout.archive_root
+        / "played.example"
+        / "posts"
+        / "index.warc.gz"
+    )
+    cdx_digest = "sha1:" + "A" * 32
+    digest = create_warc(warc, cdx_digest=cdx_digest)
 
-    result = replay.generate_replay_index([warc], layout=selected_layout)
+    result = replay_index.build_replay_index([warc], layout=selected_layout)
 
     assert result == selected_layout.replay_index
     entries = read_index(result)
@@ -89,7 +129,7 @@ def test_replay_index_uses_warc_identity_and_real_record_ranges(tmp_path):
         "digest": digest,
         "length": response["length"],
         "offset": response["offset"],
-        "filename": "archive/posts/index.warc.gz",
+        "filename": "archive/played.example/posts/index.warc.gz",
     }
     assert second == {
         "url": "https://played.example/posts/",
@@ -98,8 +138,9 @@ def test_replay_index_uses_warc_identity_and_real_record_ranges(tmp_path):
         "digest": digest,
         "length": second["length"],
         "offset": second["offset"],
-        "filename": "archive/posts/index.warc.gz",
+        "filename": "archive/played.example/posts/index.warc.gz",
     }
+    assert digest != cdx_digest
 
     for _, _, entry in entries:
         with warc.open("rb") as stream:
@@ -112,8 +153,9 @@ def test_replay_index_uses_warc_identity_and_real_record_ranges(tmp_path):
 
 def test_nested_index_warcs_keep_distinct_collection_relative_names(tmp_path):
     selected_layout = collection(tmp_path)
-    root_warc = selected_layout.archive_root / "index.warc.gz"
-    nested_warc = selected_layout.archive_root / "posts" / "index.warc.gz"
+    domain_root = selected_layout.archive_root / "example.com"
+    root_warc = domain_root / "index.warc.gz"
+    nested_warc = domain_root / "posts" / "index.warc.gz"
     create_warc(
         root_warc,
         target="https://example.com/",
@@ -122,35 +164,35 @@ def test_nested_index_warcs_keep_distinct_collection_relative_names(tmp_path):
     )
     create_warc(nested_warc)
 
-    result = replay.generate_replay_index(
+    result = replay_index.build_replay_index(
         [nested_warc, root_warc],
         layout=selected_layout,
     )
 
     filenames = {entry["filename"] for _, _, entry in read_index(result)}
     assert filenames == {
-        "archive/index.warc.gz",
-        "archive/posts/index.warc.gz",
+        "archive/example.com/index.warc.gz",
+        "archive/example.com/posts/index.warc.gz",
     }
 
 
 def test_shared_warc_entries_have_distinct_offsets(tmp_path):
     selected_layout = collection(tmp_path)
-    warc = selected_layout.archive_root / "index.warc.gz"
+    warc = selected_layout.archive_root / "example.com" / "index.warc.gz"
     create_warc(warc)
 
-    result = replay.generate_replay_index([warc], layout=selected_layout)
+    result = replay_index.build_replay_index([warc], layout=selected_layout)
     entries = read_index(result)
 
     assert {entry["filename"] for _, _, entry in entries} == {
-        "archive/index.warc.gz"
+        "archive/example.com/index.warc.gz"
     }
     assert len({entry["offset"] for _, _, entry in entries}) == 2
 
 
 def test_replay_index_includes_revisit_records(tmp_path):
     selected_layout = collection(tmp_path)
-    warc = selected_layout.archive_root / "revisits.warc.gz"
+    warc = selected_layout.archive_root / "example.com" / "revisits.warc.gz"
     warc.parent.mkdir(parents=True)
     target = "https://example.com/document.pdf"
     with warc.open("xb") as stream:
@@ -181,7 +223,7 @@ def test_replay_index_includes_revisit_records(tmp_path):
         )
         writer.write_record(revisit)
 
-    result = replay.generate_replay_index([warc], layout=selected_layout)
+    result = replay_index.build_replay_index([warc], layout=selected_layout)
     entries = read_index(result)
 
     assert [timestamp for _, timestamp, _ in entries] == [
@@ -195,12 +237,12 @@ def test_replay_index_includes_revisit_records(tmp_path):
 
 def test_replay_publication_replaces_existing_index(tmp_path):
     selected_layout = collection(tmp_path)
-    warc = selected_layout.archive_root / "index.warc.gz"
+    warc = selected_layout.archive_root / "example.com" / "index.warc.gz"
     create_warc(warc)
     selected_layout.replay_index.parent.mkdir(parents=True)
     selected_layout.replay_index.write_text("old index\n")
 
-    result = replay.generate_replay_index([warc], layout=selected_layout)
+    result = replay_index.build_replay_index([warc], layout=selected_layout)
 
     assert result == selected_layout.replay_index
     assert selected_layout.replay_index.read_text() != "old index\n"
@@ -212,7 +254,7 @@ def test_failed_indexing_leaves_no_final_or_temporary_index(
     monkeypatch,
 ):
     selected_layout = collection(tmp_path)
-    warc = selected_layout.archive_root / "index.warc.gz"
+    warc = selected_layout.archive_root / "example.com" / "index.warc.gz"
     create_warc(warc)
 
     class FailingIndexer:
@@ -222,17 +264,17 @@ def test_failed_indexing_leaves_no_final_or_temporary_index(
         def process_all(self):
             raise RuntimeError("index failed")
 
-    monkeypatch.setattr(replay, "CDXJIndexer", FailingIndexer)
+    monkeypatch.setattr(replay_index, "CDXJIndexer", FailingIndexer)
 
     with pytest.raises(RuntimeError, match="index failed"):
-        replay.generate_replay_index([warc], layout=selected_layout)
+        replay_index.build_replay_index([warc], layout=selected_layout)
     assert not selected_layout.replay_index.exists()
     assert not list(selected_layout.replay_index.parent.glob(".index-*"))
 
 
 def test_failed_reindex_keeps_existing_index(tmp_path, monkeypatch):
     selected_layout = collection(tmp_path)
-    warc = selected_layout.archive_root / "index.warc.gz"
+    warc = selected_layout.archive_root / "example.com" / "index.warc.gz"
     create_warc(warc)
     selected_layout.replay_index.parent.mkdir(parents=True)
     selected_layout.replay_index.write_text("previous valid index\n")
@@ -244,10 +286,10 @@ def test_failed_reindex_keeps_existing_index(tmp_path, monkeypatch):
         def process_all(self):
             raise RuntimeError("index failed")
 
-    monkeypatch.setattr(replay, "CDXJIndexer", FailingIndexer)
+    monkeypatch.setattr(replay_index, "CDXJIndexer", FailingIndexer)
 
     with pytest.raises(RuntimeError, match="index failed"):
-        replay.generate_replay_index([warc], layout=selected_layout)
+        replay_index.build_replay_index([warc], layout=selected_layout)
     assert (
         selected_layout.replay_index.read_text()
         == "previous valid index\n"
@@ -258,7 +300,7 @@ def test_failed_reindex_keeps_existing_index(tmp_path, monkeypatch):
 def test_no_warcs_create_no_replay_directory(tmp_path):
     selected_layout = collection(tmp_path)
 
-    assert replay.generate_replay_index([], layout=selected_layout) is None
+    assert replay_index.build_replay_index([], layout=selected_layout) is None
     assert not selected_layout.replay_index.parent.exists()
 
 
@@ -273,7 +315,9 @@ def test_wayback_requests_prepares_internationalized_hostname_with_locked_idna()
 
     assert prepared.url == "https://xn--mnich-kva.example/archive"
     assert (
-        paths.normalize_collection_name("https://münich.example/archive")
+        collection_paths.normalize_collection_name(
+            "https://münich.example/archive"
+        )
         == "xn--mnich-kva.example"
     )
 
@@ -289,7 +333,7 @@ def test_complete_fixture_collection_is_self_consistent(tmp_path):
         digest="A" * 32,
         length=100,
     )
-    acquisition = provenance.save_acquisition(
+    acquisition = source_files.save_search_results(
         [capture],
         layout=selected_layout,
         url_pattern="https://example.com/*",
@@ -306,9 +350,9 @@ def test_complete_fixture_collection_is_self_consistent(tmp_path):
             tzinfo=timezone.utc,
         ),
     )
-    warc = selected_layout.archive_root / "index.warc.gz"
+    warc = selected_layout.archive_root / "example.com" / "index.warc.gz"
     create_warc(warc, target="https://example.com/")
-    index = replay.generate_replay_index([warc], layout=selected_layout)
+    index = replay_index.build_replay_index([warc], layout=selected_layout)
 
     assert {
         path.relative_to(selected_layout.collection_root).as_posix()
@@ -317,11 +361,11 @@ def test_complete_fixture_collection_is_self_consistent(tmp_path):
     } == {
         "sources/20260723T184501.123456Z/captures.cdx.gz",
         "sources/20260723T184501.123456Z/query.json",
-        "archive/index.warc.gz",
+        "archive/example.com/index.warc.gz",
         "replay/index.cdxj",
     }
     with gzip.open(acquisition.captures_path, "rt", encoding="utf-8") as stream:
-        assert stream.readline().rstrip() == provenance.CDX_HEADER
+        assert stream.readline().rstrip() == source_files.CDX_HEADER
     with warc.open("rb") as stream:
         assert [record.rec_type for record in ArchiveIterator(stream)] == [
             "response",

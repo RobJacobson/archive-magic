@@ -1,10 +1,10 @@
-"""Wayback Memento retrieval and semantic WARC response construction."""
+"""Download and validate Wayback captures."""
 
 from __future__ import annotations
 
 import base64
 import hashlib
-import re
+import threading
 import time
 from dataclasses import dataclass
 from http import HTTPStatus
@@ -21,12 +21,14 @@ from warcio.recordbuilder import RecordBuilder
 from warcio.statusandheaders import StatusAndHeaders
 from wayback import Mode, WaybackClient
 from wayback.exceptions import (
+    BlockedByRobotsError,
+    BlockedSiteError,
     MementoPlaybackError,
     RateLimitError,
     WaybackRetryError,
 )
 
-from .console import capture_result_line, print_progress
+from .console import print_progress
 from .retry import (
     DEFAULT_RETRIES,
     ArchiveMagicWaybackSession,
@@ -37,14 +39,25 @@ from .retry import (
     retry_delay_seconds,
     sleep_seconds,
 )
-from .warc import timestamp_to_warc_date
+from .capture_identity import (
+    CDX_PAYLOAD_DIGEST_HEADER,
+    cdx_payload_digest_header_value,
+    normalize_payload_digest,
+)
+from .warc_records import timestamp_to_warc_date
 
 
-DEFAULT_CONCURRENCY = 8
+DEFAULT_WORKER_COUNT = 8
+
+PLAYBACK_ERRORS = (
+    MementoPlaybackError,
+    RetryExhaustedError,
+    BlockedByRobotsError,
+    BlockedSiteError,
+    WaybackRetryError,
+)
 
 REPEATED_TRUNCATION_ATTEMPTS = 2
-
-_VALID_CDX_SHA1 = re.compile(r"[A-Z2-7]{32}")
 
 _REPRESENTATION_HEADERS = {
     "content-digest",
@@ -59,6 +72,49 @@ _REPRESENTATION_HEADERS = {
 }
 
 
+def _one_line(value: object) -> str:
+    """Collapse one value to a single console line."""
+
+    return " ".join(str(value).split())
+
+
+class ThreadClientPool:
+    """Lazily own and reuse one Wayback client per worker thread."""
+
+    def __init__(self, factory: Callable) -> None:
+        self._factory = factory
+        self._local = threading.local()
+        self._lock = threading.Lock()
+        self._clients: list[object] = []
+
+    def get(self):
+        active = getattr(self._local, "active", None)
+        if active is not None:
+            return active
+
+        client = self._factory()
+        enter = getattr(client, "__enter__", None)
+        active = enter() if callable(enter) else client
+        if active is None:
+            active = client
+        self._local.active = active
+        with self._lock:
+            self._clients.append(client)
+        return active
+
+    def close(self) -> None:
+        """Close every client after all worker threads have stopped."""
+
+        for client in self._clients:
+            exit_fn = getattr(client, "__exit__", None)
+            if callable(exit_fn):
+                exit_fn(None, None, None)
+            else:
+                close = getattr(client, "close", None)
+                if callable(close):
+                    close()
+
+
 class MalformedContentEncodingError(MementoPlaybackError):
     """The HTTP client could not decode an original Wayback replay."""
 
@@ -70,17 +126,13 @@ class MalformedContentEncodingError(MementoPlaybackError):
     ) -> None:
         self.encoding = encoding
         self.cause = cause
-        if encoding:
-            encoding_detail = f" (Content-Encoding: {encoding})"
-        else:
-            encoding_detail = ""
-        cause_text = str(cause).strip() if cause is not None else ""
-        cause_detail = f": {cause_text}" if cause_text else ""
-        super().__init__(
-            "original Wayback replay could not be decoded by the HTTP client"
-            f"{encoding_detail}{cause_detail}; raw recovery was not verified "
-            "by the CDX digest, so the capture was discarded"
-        )
+        label = encoding or "content"
+        detail = f"{label} decode failed"
+        if cause is not None:
+            cause_text = _one_line(cause)
+            if cause_text:
+                detail = f"{detail} ({cause_text})"
+        super().__init__(f"{detail}; raw recovery digest mismatch")
 
 
 class TruncatedWaybackResponseError(MementoPlaybackError):
@@ -98,10 +150,11 @@ class TruncatedWaybackResponseError(MementoPlaybackError):
         self.expected_bytes = expected_bytes
         self.attempts = attempts
         self.elapsed_seconds = elapsed_seconds
+        noun = "attempt" if attempts == 1 else "attempts"
         super().__init__(
-            "truncated Wayback response after "
-            f"{attempts} attempts over {elapsed_seconds:.1f}s "
-            f"(received {received_bytes:,} of {expected_bytes:,} bytes)"
+            f"truncated after {attempts} {noun} over "
+            f"{elapsed_seconds:.1f}s "
+            f"({received_bytes:,}/{expected_bytes:,} bytes)"
         )
 
 
@@ -112,51 +165,30 @@ def format_playback_failure(error: Exception) -> str:
         error,
         (
             MalformedContentEncodingError,
-            RetryExhaustedError,
             TruncatedWaybackResponseError,
         ),
     ):
         return str(error)
+    if isinstance(error, RetryExhaustedError):
+        noun = "attempt" if error.attempts == 1 else "attempts"
+        cause = _one_line(error.cause)
+        detail = (
+            f"failed after {error.attempts} {noun} over "
+            f"{error.elapsed_seconds:.1f}s"
+        )
+        return f"{detail}: {cause}" if cause else detail
     if isinstance(error, WaybackRetryError):
         elapsed = (
             f"{float(error.time):.1f}s"
             if isinstance(error.time, (int, float))
-            else "an unknown duration"
+            else "?"
         )
-        attempts = "attempt" if error.retries == 1 else "attempts"
-        return (
-            f"Wayback request failed after {error.retries} {attempts} over "
-            f"{elapsed}: {error.cause}"
-        )
-    return str(error) or type(error).__name__
-
-
-def format_playback_failure_summary(
-    total: int,
-    *,
-    invalid_content_encoding: int,
-    truncated_response: int,
-) -> str:
-    """Format a total with complete category detail when useful."""
-
-    noun = "failure" if total == 1 else "failures"
-    base = f"{total} playback {noun}"
-    categorized = invalid_content_encoding + truncated_response
-    if total == 0 or categorized == 0:
-        return base
-
-    categories = []
-    if invalid_content_encoding:
-        categories.append(
-            f"{invalid_content_encoding} invalid content encoding"
-        )
-    if truncated_response:
-        categories.append(f"{truncated_response} truncated response")
-    other = total - categorized
-    if other > 0:
-        categories.append(f"{other} other")
-    return f"{base} ({', '.join(categories)})"
-
+        noun = "attempt" if error.retries == 1 else "attempts"
+        nested = getattr(error, "cause", None)
+        cause = _one_line(nested) if nested is not None else ""
+        detail = f"failed after {error.retries} {noun} over {elapsed}"
+        return f"{detail}: {cause}" if cause else detail
+    return _one_line(error) or type(error).__name__
 
 def _content_encoding(memento) -> Optional[str]:
     """Return the replay response encoding involved in a decode failure."""
@@ -176,17 +208,10 @@ def _content_encoding(memento) -> Optional[str]:
 def normalize_cdx_digest(digest: object) -> Optional[str]:
     """Return a canonical CDX SHA-1 payload digest when valid."""
 
-    if not isinstance(digest, str):
-        return None
-    value = digest.strip().upper()
-    if value.startswith("SHA1:"):
-        value = value[5:]
-    if not _VALID_CDX_SHA1.fullmatch(value):
-        return None
-    return f"sha1:{value}"
+    return normalize_payload_digest(digest)
 
 
-def _payload_digest(payload: bytes) -> str:
+def payload_digest(payload: bytes) -> str:
     """Return one CDX-compatible SHA-1 digest for semantic payload bytes."""
 
     encoded = base64.b32encode(hashlib.sha1(payload).digest()).decode(
@@ -231,7 +256,7 @@ def _recover_raw_payload(
     ):
         return None
 
-    if _payload_digest(payload) != expected_digest:
+    if payload_digest(payload) != expected_digest:
         return None
     return payload
 
@@ -282,7 +307,7 @@ def _incomplete_read_boundary(
 
 
 @dataclass(frozen=True)
-class RetrievedMemento:
+class DownloadedCapture:
     """Semantic playback result reusable by WARC and loose-file writers."""
 
     body: bytes
@@ -291,9 +316,13 @@ class RetrievedMemento:
     source_uri: str
     status_code: int
     headers: tuple[tuple[str, str], ...]
-    recovered_content_encoding: bool = False
 
-    def to_warc_record(self, *, target_url: Optional[str] = None):
+    def to_warc_record(
+        self,
+        *,
+        cdx_payload_digest: object,
+        target_url: Optional[str] = None,
+    ):
         """Build a fresh WARC response record over the semantic body."""
 
         http_headers = StatusAndHeaders(
@@ -309,6 +338,8 @@ class RetrievedMemento:
             length=len(self.body),
             http_headers=http_headers,
             warc_headers_dict={
+                CDX_PAYLOAD_DIGEST_HEADER:
+                    cdx_payload_digest_header_value(cdx_payload_digest),
                 "WARC-Date": self.capture_date,
                 "WARC-Source-URI": self.source_uri,
             },
@@ -332,18 +363,19 @@ def make_client_factory(user_agent: str) -> Callable[[], WaybackClient]:
     return factory
 
 
-def _retrieve_memento_with_retry(
+def _download_capture_with_retry(
     client,
     capture,
     *,
     retries: int,
-) -> RetrievedMemento:
+) -> DownloadedCapture:
     """Retrieve and consume one Memento with application-owned retries."""
 
     started_at = time.monotonic()
     attempt_number = 0
     previous_truncation = None
     repeated_truncations = 0
+    capture_label = getattr(capture, "view_url", str(capture))
     while attempt_number <= retries:
         attempt_number += 1
         memento = None
@@ -359,7 +391,7 @@ def _retrieve_memento_with_retry(
                 headers = tuple(
                     _semantic_headers(memento.headers, len(payload))
                 )
-                result = RetrievedMemento(
+                result = DownloadedCapture(
                     body=payload,
                     url=memento.url,
                     capture_date=timestamp_to_warc_date(
@@ -385,7 +417,7 @@ def _retrieve_memento_with_retry(
                     _content_encoding(memento),
                     cause=error,
                 ) from error
-            return RetrievedMemento(
+            return DownloadedCapture(
                 body=payload,
                 url=memento.url,
                 capture_date=timestamp_to_warc_date(memento.timestamp),
@@ -394,7 +426,6 @@ def _retrieve_memento_with_retry(
                 headers=tuple(
                     _semantic_headers(memento.headers, len(payload))
                 ),
-                recovered_content_encoding=True,
             )
         except (
             RateLimitError,
@@ -447,10 +478,7 @@ def _retrieve_memento_with_retry(
 
             if truncation is not None:
                 print_progress(
-                    capture_result_line(
-                        capture,
-                        "retrying after incomplete response",
-                    )
+                    f"{capture_label}\n  retrying after incomplete response"
                 )
                 continue
 
@@ -458,12 +486,11 @@ def _retrieve_memento_with_retry(
                 attempt_number,
                 retry_after=decision.retry_after,
             )
+            cause = _one_line(decision.cause)
+            after = f" after {cause}" if cause else ""
             print_progress(
-                capture_result_line(
-                    capture,
-                    f"retry {attempt_number}/{retries} in "
-                    f"{format_seconds(delay)}s after {decision.cause}",
-                )
+                f"{capture_label}\n  retry {attempt_number}/{retries} in "
+                f"{format_seconds(delay)}s{after}"
             )
             sleep_seconds(delay)
         else:
@@ -497,24 +524,24 @@ def _status_line(status_code: int) -> str:
     return f"{status_code} {reason}".rstrip()
 
 
-def retrieve_memento(
+def download_capture(
     client,
     capture,
     *,
     retries: int = DEFAULT_RETRIES,
-) -> RetrievedMemento:
+) -> DownloadedCapture:
     """Retrieve one Memento as reusable semantic body and metadata."""
 
     if retries < 0:
         raise ValueError("retries cannot be negative")
-    return _retrieve_memento_with_retry(
+    return _download_capture_with_retry(
         client,
         capture,
         retries=retries,
     )
 
 
-def retrieve_response(
+def download_response(
     client,
     capture,
     *,
@@ -522,8 +549,8 @@ def retrieve_response(
 ):
     """Retrieve one Memento and construct the semantic WARC response."""
 
-    return retrieve_memento(
+    return download_capture(
         client,
         capture,
         retries=retries,
-    ).to_warc_record()
+    ).to_warc_record(cdx_payload_digest=getattr(capture, "digest", None))

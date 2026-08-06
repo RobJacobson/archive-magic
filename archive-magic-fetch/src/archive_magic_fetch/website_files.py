@@ -1,4 +1,4 @@
-"""Loose website-file export under ``website/``."""
+"""Loose website-file output under ``website/``."""
 
 from __future__ import annotations
 
@@ -6,30 +6,31 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from .retrieval import (
+from .downloads import (
     MalformedContentEncodingError,
     TruncatedWaybackResponseError,
-    format_playback_failure_summary,
 )
 
 
 @dataclass
-class FilesSummary:
-    """Aggregate outcomes for one loose-file export operation."""
+class WebsiteFileCounts:
+    """Aggregate outcomes for loose website files."""
 
     selected: int = 0
     written: int = 0
+    digest_recoveries: int = 0
     redirects_omitted: int = 0
     playback_failures: int = 0
     invalid_content_encoding_failures: int = 0
     truncated_response_failures: int = 0
     content_type_mismatches: int = 0
 
-    def add(self, other: FilesSummary) -> None:
-        """Accumulate another URL group's outcomes."""
+    def add(self, other: WebsiteFileCounts) -> None:
+        """Accumulate another URL history's outcomes."""
 
         self.selected += other.selected
         self.written += other.written
+        self.digest_recoveries += other.digest_recoveries
         self.redirects_omitted += other.redirects_omitted
         self.playback_failures += other.playback_failures
         self.invalid_content_encoding_failures += (
@@ -103,25 +104,3 @@ def write_body(path: Path, body: bytes) -> None:
     _ensure_parent_directory(path)
     with path.open("xb") as handle:
         handle.write(body)
-
-
-def print_files_summary(summary: FilesSummary, *, files_mode: str) -> None:
-    """Print the loose-file aggregate summary."""
-
-    if files_mode == "none":
-        print("Files: disabled (none)")
-        return
-
-    failures = format_playback_failure_summary(
-        summary.playback_failures,
-        invalid_content_encoding=(
-            summary.invalid_content_encoding_failures
-        ),
-        truncated_response=summary.truncated_response_failures,
-    )
-    print(
-        f"Files: {summary.written} written ({files_mode}); "
-        f"{failures}; "
-        f"{summary.content_type_mismatches} content-type mismatches; "
-        f"{summary.redirects_omitted} redirects omitted"
-    )

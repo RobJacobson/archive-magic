@@ -5,11 +5,12 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "archive-magic-fetch"
 version = "0.1.0"
-description = "Export Internet Archive captures into self-contained WARC collections"
+description = "Search Internet Archive URL histories and build WARC collections"
 requires-python = ">=3.12"
 license = { text = "MIT" }
 dependencies = [
     "cdxj-indexer==1.4.6",
+    "surt==0.3.1",
     "wayback==0.5.1",
     "warcio==1.8.1",
 ]

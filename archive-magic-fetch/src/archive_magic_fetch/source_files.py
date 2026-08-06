@@ -1,4 +1,4 @@
-"""Persist normalized Wayback discovery provenance."""
+"""Persist normalized Internet Archive search results."""
 
 from __future__ import annotations
 
@@ -15,8 +15,8 @@ from typing import Sequence
 
 from wayback import CdxRecord
 
-from .paths import CollectionLayout
-from .publication import publish_directory_noreplace
+from .collection_paths import CollectionPaths
+from .atomic_files import publish_directory_noreplace
 
 
 CDX_HEADER = "CDX N b a m s k S"
@@ -32,8 +32,8 @@ CDX_FIELDS = (
 
 
 @dataclass(frozen=True)
-class AcquisitionResult:
-    """Published files for one successful discovery acquisition."""
+class SearchFiles:
+    """Published source files for one successful CDX search."""
 
     path: Path
     captures_path: Path
@@ -42,7 +42,7 @@ class AcquisitionResult:
 
 def _utc_datetime(value: datetime) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
-        raise ValueError("acquisition and capture times must be timezone-aware")
+        raise ValueError("search and capture times must be timezone-aware")
     return value.astimezone(timezone.utc)
 
 
@@ -98,7 +98,7 @@ def _write_cdx_gzip(
     return count
 
 
-def _acquisition_id(acquired_at: datetime) -> str:
+def _search_id(acquired_at: datetime) -> str:
     return acquired_at.strftime("%Y%m%dT%H%M%S.%fZ")
 
 
@@ -115,7 +115,7 @@ def _build_manifest(
     date_end: str,
     acquired_at: datetime,
 ) -> dict[str, object]:
-    """Build the deterministic manifest for one completed source CDX."""
+    """Build the deterministic manifest for one saved source CDX."""
 
     return {
         "archive_magic_fetch_version": version("archive-magic-fetch"),
@@ -136,15 +136,15 @@ def _build_manifest(
     }
 
 
-def _publish_acquisition(
+def _publish_search(
     temporary: Path,
     *,
     source_root: Path,
     acquired_at: datetime,
 ) -> Path:
-    """Publish a complete acquisition, retrying concurrent ID collisions."""
+    """Publish complete search files, retrying concurrent ID collisions."""
 
-    base = _acquisition_id(acquired_at)
+    base = _search_id(acquired_at)
     suffix = 1
     while True:
         identifier = base if suffix == 1 else f"{base}-{suffix}"
@@ -157,25 +157,25 @@ def _publish_acquisition(
         return final
 
 
-def save_acquisition(
+def save_search_results(
     captures: Sequence[CdxRecord],
     *,
-    layout: CollectionLayout,
+    layout: CollectionPaths,
     url_pattern: str,
     date_start: str,
     date_end: str,
     acquired_at: datetime,
-) -> AcquisitionResult:
-    """Write and atomically publish one complete source acquisition."""
+) -> SearchFiles:
+    """Write and atomically publish one complete set of search files."""
 
     if not captures:
-        raise ValueError("cannot save an empty source acquisition")
+        raise ValueError("cannot save empty search results")
 
     acquired_at = _utc_datetime(acquired_at)
     source_root = layout.sources_root
     source_root.mkdir(parents=True, exist_ok=True)
     temporary = Path(
-        tempfile.mkdtemp(prefix=".acquisition-", dir=source_root)
+        tempfile.mkdtemp(prefix=".search-", dir=source_root)
     )
     try:
         captures_path = temporary / "captures.cdx.gz"
@@ -184,8 +184,8 @@ def save_acquisition(
             captures,
             acquired_at,
         )
-        with captures_path.open("rb") as completed:
-            cdx_sha256 = hashlib.file_digest(completed, "sha256").hexdigest()
+        with captures_path.open("rb") as capture_file:
+            cdx_sha256 = hashlib.file_digest(capture_file, "sha256").hexdigest()
         manifest = _build_manifest(
             record_count=record_count,
             cdx_sha256=cdx_sha256,
@@ -200,12 +200,12 @@ def save_acquisition(
         ).encode("utf-8")
         (temporary / "query.json").write_bytes(query_json)
 
-        final = _publish_acquisition(
+        final = _publish_search(
             temporary,
             source_root=source_root,
             acquired_at=acquired_at,
         )
-        return AcquisitionResult(
+        return SearchFiles(
             path=final,
             captures_path=final / "captures.cdx.gz",
             query_path=final / "query.json",

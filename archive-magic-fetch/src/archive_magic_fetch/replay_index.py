@@ -1,4 +1,4 @@
-"""Generate the site replay index from final WARC bytes."""
+"""Build the collection-wide replay index from final WARC files."""
 
 from __future__ import annotations
 
@@ -9,17 +9,35 @@ from typing import Sequence
 
 from cdxj_indexer.main import CDXJIndexer
 
-from .paths import CollectionLayout, validate_path_limits
+from .collection_paths import CollectionPaths, validate_path_limits
 
 
-def generate_replay_index(
-    final_warcs: Sequence[Path],
+def list_collection_warcs(layout: CollectionPaths) -> list[Path]:
+    """Return every final WARC under archive/, sorted by relative path."""
+
+    archive_root = layout.archive_root
+    if not archive_root.is_dir():
+        return []
+    warcs = [
+        path
+        for path in archive_root.rglob("*.warc.gz")
+        if path.is_file() and not path.name.endswith(".warc.gz.tmp")
+    ]
+    return sorted(
+        warcs,
+        key=lambda path: path.relative_to(layout.collection_root).as_posix(),
+    )
+
+
+def build_replay_index(
+    built_warcs: Sequence[Path],
     *,
-    layout: CollectionLayout,
+    layout: CollectionPaths,
 ) -> Path | None:
     """Build and atomically publish one sorted site-level CDXJ."""
 
-    if not final_warcs:
+    inputs = list(built_warcs) if built_warcs else []
+    if not inputs:
         return None
 
     replay_dir = layout.replay_index.parent
@@ -37,7 +55,7 @@ def generate_replay_index(
         os.close(descriptor)
         CDXJIndexer(
             output=str(temporary),
-            inputs=[str(path) for path in final_warcs],
+            inputs=[str(path) for path in inputs],
             sort=True,
             records="response,revisit",
             dir_root=str(layout.collection_root),

@@ -1,4 +1,4 @@
-"""Thread-safe console formatting for concurrent export work."""
+"""Thread-safe console output and source-log mirroring."""
 
 from __future__ import annotations
 
@@ -8,9 +8,6 @@ import threading
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import Iterator, Optional, TextIO
-from urllib.parse import urlsplit
-
-from .paths import normalize_url_authority
 
 
 _OUTPUT_LOCK = threading.Lock()
@@ -85,7 +82,7 @@ class _MirroredTextIO:
 
 @contextmanager
 def mirror_console_output() -> Iterator[ConsoleMirror]:
-    """Mirror all process console writes during one CLI job."""
+    """Mirror all process console writes during one CLI request."""
 
     mirror = ConsoleMirror()
     stdout = _MirroredTextIO(sys.stdout, mirror)
@@ -97,63 +94,8 @@ def mirror_console_output() -> Iterator[ConsoleMirror]:
         mirror.close()
 
 
-def readable_url(original_url: str) -> str:
-    """Return a compact, non-SURT URL label for one capture group."""
-
-    parsed = urlsplit(original_url)
-    host, port = normalize_url_authority(original_url)
-    if port is not None:
-        host = f"{host}:{port}"
-
-    path = parsed.path or "/"
-    query = f"?{parsed.query}" if parsed.query else ""
-    return f"{host}{path}{query}"
-
-
-def capture_result_line(capture: object, result: str) -> str:
-    """Format a capture URL and its result with URL-aware alignment."""
-
-    view_url = getattr(capture, "view_url", str(capture))
-    original_url = getattr(capture, "original", "")
-    parsed = urlsplit(original_url) if isinstance(original_url, str) else None
-    scheme = parsed.scheme.lower() if parsed is not None else ""
-    host = (parsed.hostname or parsed.netloc) if parsed is not None else ""
-    host_padding = "" if host.lower().startswith("www.") else " " * 4
-    scheme_padding = "  " if scheme == "http" else " "
-    separator = f"{host_padding}{scheme_padding}: "
-    return f"{view_url}{separator}{result}"
-
-
 def print_progress(message: str) -> None:
     """Print one immediate line without interleaving another output block."""
 
     with _OUTPUT_LOCK:
         print(message, flush=True)
-
-
-class GroupReporter:
-    """Emit completed URL-group blocks atomically in completion order."""
-
-    def __init__(self, total: int) -> None:
-        self._total = total
-        self._completed = 0
-
-    def emit(
-        self,
-        original_url: str,
-        lines: list[str],
-        summary: str,
-    ) -> None:
-        """Print one completed group and assign its completion number."""
-
-        with _OUTPUT_LOCK:
-            self._completed += 1
-            block = [
-                (
-                    f"[completed {self._completed}/{self._total}] "
-                    f"{readable_url(original_url)}"
-                ),
-                *lines,
-                summary,
-            ]
-            print("\n".join(block), flush=True)
