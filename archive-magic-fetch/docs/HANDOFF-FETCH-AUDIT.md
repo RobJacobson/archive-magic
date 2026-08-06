@@ -1,360 +1,679 @@
-# Archive Magic Fetch audit handoff
+# Archive Magic Fetch clean-sheet rewrite handoff
 
-## Purpose
+## Status and authority
 
-This memo hands the Fetch audit to a new reviewer who should reassess the
-remaining issues against the current code rather than continue the design
-momentum of the earlier review. The user's priorities are, in order:
+This is the authoritative implementation handoff for the clean-sheet rewrite
+of `archive-magic-fetch`. It replaces the earlier audit-oriented contents of
+this file and supersedes the current Fetch architecture document wherever the
+two disagree.
 
-1. preserve every capture that can reliably be obtained from Internet Archive;
-2. avoid duplicate or unnecessary network retrieval;
-3. obtain major performance improvements without sacrificing correctness;
-4. keep the implementation DRY, YAGNI, and KISS.
+The user has approved the decisions below. Do not reopen them casually, add
+compatibility behavior for the implementation being replaced, or preserve old
+features merely because code and tests for them already exist.
 
-The current branch is `refactor-fetch-code`. At the time of this memo, its tip
-is `7807138` (`feat(fetch): enhance capture identity and playback handling`).
-The Fetch suite has 272 passing tests and the Navigator suite has 82 passing
-tests.
+At the time this handoff was written:
 
-Start with [ARCHITECTURE-FETCH.md](ARCHITECTURE-FETCH.md), then inspect the
-implementation. Treat this memo as a list of questions and evidence, not as a
-preapproved implementation plan.
+- the active rewrite branch is `refactor-fetch-code`;
+- `main` retains the implementation being replaced and may be consulted with
+  `git show main:<path>`;
+- `refactor-fetch-code` and `main` currently point at the same commit, so this
+  handoff must be committed before the old implementation is deleted from the
+  rewrite branch;
+- existing collections contain test data only and will be deleted by the
+  user; and
+- no old collection layout, manifest, CLI option, or output needs migration or
+  backward compatibility.
 
-## Decisions already made
+The desired result is a replacement, not a parallel `v2`. Delete the existing
+Fetch implementation and obsolete tests on the rewrite branch. Keep the same
+package and command name. Refer to `main` when a proven low-level detail is
+useful, but do not preserve the old module structure by default. If visual
+side-by-side inspection is necessary, use Git or a separate worktree, never a
+`legacy/`, `v1/`, or duplicate package inside the rewrite tree.
 
-Do not casually reopen these decisions:
+## Objective
 
-- This is a clean-slate project. There is no compatibility code for old
-  manifests, old WARC headers, or removed CLI options.
-- `--build-warc true|false` replaces `--warc`; it defaults to `true`.
-- WARC output includes the complete selected IA history. There is no
-  `latest` WARC mode.
-- `--fresh` and `--redirect-capture` were removed without aliases.
-- Playback is exact-only: `Mode.original`, `exact=True`, and
-  `follow_redirects=False`. Do not introduce nearest playback or a separate
-  "CDX Prime" mapping without a new design discussion.
-- Existing local captures are retained even if IA no longer returns them.
-- Append-only means a semantic superset of capture identities, not byte-for-
-  byte preservation of WARC records.
-- Redirects are stored but not followed. `redirects.json` lets the operator
-  decide which external sites to capture in another pass.
-- Whole-collection staging and folder-layout changes were explicitly deferred.
-- Cross-URL digest deduplication, retry scheduling, worker/rate experiments,
-  and WARC sharding were left outside the completed identity refactor.
+Archive Magic Fetch has one primary job:
 
-## What the earlier audit resolved
+1. Query Internet Archive CDX metadata using the `wayback` library.
+2. Determine which exact captures require Internet Archive playback.
+3. Download only those captures through a polite, bounded fetch queue.
+4. Write the selected history into annual, size-bounded WARC 1.1 files.
+5. Build annual and collection-wide CDXJ indexes for pywb playback.
 
-| Earlier concern | Current disposition |
-| --- | --- |
-| Duplicate CDX rows or spelling-only URL differences could cause duplicate work | Resolved through deterministic CDX/WARC identities and normalized URL keys. |
-| Existing captures absent from the current CDX result could be lost | Resolved: affected WARCs are rebuilt from the union of validated local records and current CDX rows. |
-| Cache lookup used inconsistent identities | Resolved through `get_cdx_identity()` and `get_warc_identity()`. See the statusless exception below. |
-| An unreadable existing WARC might be replaced by an IA-only reconstruction | Resolved: inventory failure is fatal and the old WARC remains untouched. |
-| Partial rebuilding could drop old records | Resolved per WARC: the temporary is validated and must contain every prior logical identity before atomic replacement. |
-| Replay-index offsets could refer to pre-rebuild WARCs | Resolved: the final replay index is regenerated from all final WARCs. |
-| CDX and downloaded payload digests were conflated | Resolved: `CDX-Payload-Digest` represents IA's index value; `WARC-Payload-Digest` validates stored bytes and drives replay/revisit references. |
-| An exact replay failure could be avoidable when a later capture proves the same payload | Mitigated: same-URL, same-CDX-digest failures can be recovered locally as revisits after another exact success. |
-| Nearest playback could silently substitute a remote capture | Resolved by exact-only requests plus explicit returned URL, timestamp, and status validation. |
-| Redirect expansion was too blunt and could explode scope | Resolved: automatic expansion was removed and a final-collection redirect report was added. |
-| Failure headline and detail counts disagreed | Resolved by identity-based accounting. The old nclr.org log predates this fix. |
-| `--fresh` semantics and staging-directory design were distracting the audit | `--fresh` was removed; staging remains a separately deferred reliability project. |
-| Old revisits might be regenerated rather than byte-preserved | Accepted as inconsequential so long as semantic identities and payload references remain correct. |
-| IA removals could leave obsolete local records | Accepted and desirable: local history is intentionally not deleted. |
+The governing principles are KISS, YAGNI, and DRY. The current implementation
+is approximately 5,529 production lines and 6,143 test lines. A useful rewrite
+guardrail is fewer than roughly 2,750 production lines, but line count is not
+a substitute for clear ownership and correctness. Prefer a small number of
+cohesive modules and one obvious path through the pipeline.
 
-## Highest-priority correctness checks
+## Core invariants
 
-### 1. Statusless CDX rows appear non-idempotent
+The rewrite must preserve these invariants:
 
-This should be reproduced before any more performance work.
+- A selected capture is either represented in the collection or reported as
+  an unresolved failure.
+- No capture is downloaded when the exact capture is already available in the
+  current collection.
+- Same-URL payload reuse never invents redirect headers or silently substitutes
+  a different capture.
+- Requests are exact: no nearest-capture fallback and no followed redirects.
+- Every published CDXJ locator points to an immutable, finalized WARC byte
+  range.
+- Every annual WARC set is independently playable with its annual CDXJ.
+- Every revisit can resolve a full response within the same annual WARC set.
+- A crash may require repeatable local indexing or a bounded amount of network
+  refetching from an unfinalized WARC, but it must never corrupt or replace a
+  previously published WARC or index.
+- Collection metadata never describes a partial run as complete.
 
-`CaptureIdentity.status_code` is part of identity. `get_cdx_identity()` retains
-`None` for a CDX row whose status is `-`, which is common for IA revisit rows.
-Generated response/revisit records must contain a numeric HTTP status, so
-`get_warc_identity()` reads an integer from the WARC. The same capture can
-therefore have these two identities:
+## Features deliberately removed
 
-```text
-CDX:  (..., status=None, digest=D)
-WARC: (..., status=200,  digest=D)
-```
+The following are out of scope and must not survive as dormant code, CLI
+aliases, deprecation shims, empty folders, compatibility branches, or copied
+tests:
 
-The existing test `test_statusless_captures_with_matching_digest_use_revisit`
-only checks the first build. Add a second and third identical build and verify:
+- loose `website/` file output;
+- `--files latest|unique|all`;
+- `--rewrite-local` and local-link rewriting;
+- `--build-warc` or a mode that performs CDX search without the core WARC
+  output;
+- redirect-report generation and a `redirects.json` artifact;
+- automatic redirect expansion or following redirect targets;
+- old coverage-window merging and optimization based on a previously queried
+  date envelope;
+- old per-resource WARC allocation and path collision machinery;
+- one-WARC-per-resource output;
+- persistent per-WARC/shard CDXJ files;
+- cross-URL payload-digest deduplication;
+- a generalized database, Redis, or durable job queue;
+- a generalized cloud-storage provider layer;
+- R2 uploads or downloads in this rewrite;
+- old collection migration or compatibility; and
+- broad test matrices for deleted flags, path spellings, formatting helpers,
+  or implementation details.
 
-- no playback request occurs;
-- no duplicate revisit is appended during each semantic rebuild;
-- response/revisit counts remain stable;
-- every selected CDX identity is represented in the final WARC inventory.
+Redirect captures themselves remain ordinary historical captures. Store their
+actual 3xx status and `Location` header in WARC response records, do not follow
+them, and do not deduplicate them through payload digests.
 
-Likely solutions include a required `CDX-Status-Code` header with a null
-sentinel, or a carefully revised identity definition. Do not paper over this
-by dropping status from identity: distinct same-time captures with different
-known statuses must remain distinguishable. Prefer one small deterministic
-rule shared by the two identity functions.
+Loose files can later be implemented as a separate extractor that reads the
+finished WARC/CDXJ collection. They do not belong in the fetch pipeline.
 
-Also consider adding `selected identities ⊆ rebuilt identities` as a publication
-postcondition. The current superset assertion only protects prior local
-identities.
+## Minimal command-line contract
 
-### 2. Saved "source CDX" is not actually raw IA CDX
-
-The approved design says raw IA CDX remains authoritative and unchanged, but
-the current search path materializes `wayback.CdxRecord` objects and later
-serializes them again. The installed `wayback` library transforms input while
-parsing:
-
-- it heuristically repairs invalid month/day `00` timestamps;
-- it removes redundant HTTP/HTTPS ports from original URLs;
-- with the default `skip_malformed_results=True`, it omits URLs it considers
-  malformed;
-- it converts raw status/length tokens into typed values.
-
-The nclr.org log contains:
+Keep the command name:
 
 ```text
-found invalid timestamp with day 00: 20000800310551
+archive-magic-fetch URL_PATTERN [--start DATE] [--end DATE]
 ```
 
-The saved file contains the library's approximation instead:
+Retain the current stable default output-root convention unless a repository
+integration requirement proves that one small output option is necessary.
+The initial rewrite should not expose rate, concurrency, retry, WARC size,
+files, rewrite, storage-provider, or index-publication policy as CLI options.
+Use named constants for policies that may need tuning after measurement.
+
+The accepted URL-pattern scope remains one website collection, including the
+currently documented exact host, path-prefix, and `*.example.com` forms. Keep
+normalization necessary to derive a safe, stable collection ID and canonical
+CDX query. Do not restore the old readable-per-URL WARC path allocation logic.
+
+Defaults remain the beginning of practical Wayback history (1995) through the
+current UTC time. Interpret year boundaries in UTC. Reject an invalid or
+reversed range before any network or filesystem mutation.
+
+Return behavior:
+
+- `0`: all selected captures were represented and all required publications
+  succeeded;
+- nonzero: a fatal error or one or more unresolved captures occurred;
+- successfully finalized WARCs and indexes remain usable after a partial run;
+  and
+- the manifest and failure artifact distinguish partial success from complete
+  success.
+
+## Collection layout
+
+Use this permanent local layout:
 
 ```text
-org,nclr)/about/me.html 20000831055100 ...
+<archives-root>/
+└── example.org/
+    ├── collection.json
+    ├── failures.json                 # only when unresolved failures exist
+    ├── archive/
+    │   ├── 2004/
+    │   │   ├── example.org-2004-001.warc.gz
+    │   │   ├── example.org-2004-002.warc.gz
+    │   │   └── example.org-2004-003.warc.gz
+    │   └── 2005/
+    │       └── example.org-2005-001.warc.gz
+    ├── indexes/
+    │   ├── years/
+    │   │   ├── 2004.cdxj
+    │   │   └── 2005.cdxj
+    │   └── index.cdxj
+    └── sources/
+        └── <UTC-run-id>/
+            ├── query.json
+            ├── 2004.cdx
+            └── 2005.cdx
 ```
 
-This is not merely presentation normalization. It changes the timestamp used
-for exact playback and means the durable source file cannot prove what IA
-actually returned. Review whether Fetch should save the byte-exact CDX
-response before parsing, or use a minimal local parser that retains raw fields
-alongside typed values. Malformed rows should at least be preserved and
-reported as unresolved rather than silently disappearing from completeness
-accounting.
+The exact raw-CDX extension may be `.cdx.gz` when the preserved response body
+is compressed. Do not decompress and then claim that the file is byte-exact.
+Record the encoding and checksum in `query.json`.
 
-Keep the solution small. Replacing the entire Wayback client is not justified
-unless the reviewer first demonstrates that a narrow raw-response hook cannot
-work.
+R2 uses flat object keys with slash-delimited prefixes, so every permanent
+path must also be a valid environment-independent object key. CDXJ `filename`
+values are collection-relative POSIX paths such as:
 
-## Highest-priority performance work
+```json
+{"filename":"archive/2004/example.org-2004-003.warc.gz"}
+```
 
-### 3. Separate the 8 requests/second limit from in-flight concurrency
+Never store absolute paths in CDXJ or `collection.json`.
 
-The current bounded worker pool conflates two different controls:
+Temporary WARC and CDXJ files must live outside the visible permanent layout,
+or use unmistakable temporary names that are ignored and cleaned on startup.
+They are implementation artifacts, not collection objects.
 
-- how many requests may start per second; and
-- how many slow requests may remain in flight.
+## Year partitioning and work order
 
-The installed Wayback library already has a process-wide default memento rate
-limiter that spaces starts at 8 requests/second. However, the default Fetch
-pool also has only eight workers. If a response takes two seconds, eight
-workers can sustain only about four requests/second even though the start-rate
-budget is eight.
+Partition both CDX acquisition and WARC publication by capture year. Process
+years in ascending order. A partial `--start` or `--end` year uses the exact
+requested boundary, not the whole calendar year.
 
-The desired model is a central download scheduler:
+Within a year:
 
-1. queue the captures that truly require playback;
-2. release starts smoothly at no more than 8/second (roughly one every 125 ms,
-   not a burst of eight on each second boundary);
-3. allow a separately bounded number of requests to remain in flight;
-4. put retryable work into a delayed priority queue instead of sleeping while
-   holding a download slot;
-5. make `Retry-After`/429 capable of closing a global gate, rather than letting
-   every worker back off independently;
-6. prefer first attempts over due retries unless evidence supports another
-   fairness policy;
-7. apply backpressure so increased concurrency cannot retain an unbounded
-   number of large response bodies in memory.
+1. Parse and validate CDX rows.
+2. Group non-redirect captures by normalized URL and valid CDX payload digest.
+3. Order candidate captures within a group by timestamp.
+4. Prefer exact local captures before scheduling network work.
+5. Schedule one representative candidate for each URL/digest group.
+6. If the representative fails, schedule the next candidate in that group.
+7. After a representative succeeds, write later matching captures as revisits.
+8. Schedule every redirect and every capture without a usable digest
+   individually.
 
-Do not enqueue every selected CDX row naively. That would destroy the current
-digest savings by starting duplicate downloads before a representative
-finishes. For each normalized URL and valid non-redirect CDX digest, schedule
-one representative candidate; if it fails, schedule the next candidate.
-Redirects still require individual playback because the payload digest does
-not validate `Location` or other HTTP headers.
-
-Before redesigning, run a KISS experiment with 16, 24, and 32 workers. The
-existing shared 8/second limiter should make that safe and will reveal the
-in-flight concurrency needed to saturate the allowed start rate. This is a
-benchmark, not necessarily the final architecture: sleeping retries still
-consume those worker slots.
-
-### 4. Add phase and request telemetry before claiming the bottleneck
-
-The original nclr.org run took 788.1 minutes for 281,374 selected captures:
+Give ready first-attempt jobs a deterministic priority of:
 
 ```text
-195,068 responses, 84,087 revisits, 2,218 failed
+(capture timestamp, canonical URL, stable capture identity)
 ```
 
-The log records 2,432 scheduled retries totaling 64,421 worker-seconds of
-requested backoff. Even with perfect eight-way overlap, that consumes at least
-about 2.2 hours of worker capacity. The log also shows periods of widespread
-503 and connection-refused responses, so "network time" includes server
-outages and retry policy, not merely transferring bytes.
+Retries enter a separate delayed queue and do not jump ahead of ready first
+attempts. This scheduling order is deterministic; physical WARC record order
+need not be.
 
-Add inexpensive aggregate metrics, preferably to `query.json` or a separate
-machine-readable run summary:
+Do not sort WARC payloads after download. Parallel requests finish out of
+order, and enforcing physical order would require unbounded memory, a second
+spooling phase, or head-of-line blocking behind a slow request. The CDXJ, not
+WARC byte order, supplies playback ordering.
 
-- CDX search duration and request count;
-- queue wait, rate-limit wait, connect/first-byte/body duration;
-- requests started/completed per minute and peak in-flight count;
-- response bytes and throughput;
-- attempts and scheduled delay by failure/status category;
-- time spent writing/copying/validating WARCs;
-- existing-WARC inventory time;
-- replay-index generation time;
-- redirect-report time.
+## CDX acquisition and raw preservation
 
-Avoid per-request durable telemetry unless sampled or aggregated; the old log
-already had 113,756 lines.
+Continue using `wayback` as the supported Internet Archive client boundary.
+Do not replace it wholesale merely to avoid a narrow response hook. Direct
+calls to the documented public CDX endpoint are acceptable only when required
+to preserve the unmodified response body and should reuse the same session,
+user agent, timeout, rate-limit, and error handling policy.
 
-### 5. Revisit WARC allocation and full-tree rescans
+For every annual query:
 
-The old nclr.org collection has 51,458 WARC files totaling about 1.24 GB:
+1. Create the run source directory before parsing results.
+2. Save the exact response entity bytes before `wayback.CdxRecord` or any local
+   parser normalizes fields.
+3. Record query URL/parameters, requested bounds, response encoding, byte
+   length, checksum, retrieval time, and client version in `query.json`.
+4. Parse from the saved bytes so the durable source and processed input cannot
+   diverge.
+5. Preserve malformed rows in the source and add a deterministic failure entry
+   rather than silently dropping them.
+
+The installed `wayback` library is known to repair invalid month/day `00`
+timestamps, remove redundant ports, convert tokens to typed values, and skip
+some malformed URLs. The saved source must precede those transformations.
+
+One annual partition is the basic CDX retry/resume boundary. Do not add a
+database just to checkpoint searches. If a representative annual query is too
+large or repeatedly fails late, use deterministic documented CDX pagination
+or smaller date partitions within that year, save every raw page, and collapse
+overlapping boundary rows by stable capture identity.
+
+The CDX search limit is separate from playback. Preserve the `wayback`
+library's shared default CDX pacing unless current official guidance requires
+a lower limit.
+
+## Stable capture identity
+
+Define one capture identity in one module and use it for CDX deduplication,
+existing-WARC inventory, failure accounting, and publication validation.
+
+At minimum, identity must preserve enough raw information to distinguish:
+
+- canonical CDX URL key;
+- original URL spelling when IA returns distinct rows for it;
+- raw 14-digit capture timestamp;
+- raw CDX status token, including the `-`/unknown sentinel; and
+- raw normalized CDX payload digest, including an explicit missing sentinel.
+
+Identical duplicate CDX rows collapse to one logical capture. Known distinct
+statuses at the same URL and timestamp remain distinct.
+
+The statusless-row bug must be resolved explicitly:
+
+- persist the original CDX status token on every generated response/revisit in
+  a small WARC extension header;
+- use that extension header, not the numeric HTTP status alone, when rebuilding
+  identity from a WARC;
+- allow the actual archived HTTP block to retain the numeric status returned by
+  exact playback; and
+- prove on second and third identical runs that no network request or duplicate
+  revisit is created.
+
+Similarly, retain the distinction between:
+
+- IA's CDX payload digest, stored in a WARC extension header; and
+- the digest of the actual stored WARC payload, stored as the standard
+  `WARC-Payload-Digest` and used for validation and revisit references.
+
+Do not silently drop status, timestamp, or digest from identity to make a test
+pass.
+
+## Exact playback and validation
+
+Playback requests remain exact-only:
+
+- original/raw mode;
+- `exact=True`;
+- `follow_redirects=False`;
+- no nearest capture; and
+- no automatic expansion to redirect targets.
+
+For a CDX row with known values, validate returned URL, timestamp, and status
+against that row. For a statusless CDX row, accept the returned numeric HTTP
+status but preserve the original unknown status token separately in identity.
+
+A response with a mismatched timestamp, URL, or known status is not the
+requested capture. Do not store it as though it were exact. Retry only when the
+failure category is plausibly transient, then report it.
+
+Redirects require individual playback because the CDX payload digest does not
+validate `Location` or the rest of the response headers.
+
+## Existing-content reuse and annual self-containment
+
+Every run inventories the current-format collection before scheduling network
+work. Existing exact captures are reused regardless of which annual shard
+contains them. Finalized WARC objects are immutable; do not rewrite them merely
+to sort records or consolidate free space.
+
+The year, not each 1 GB WARC, is the portability boundary:
+
+- store at least one full response per normalized URL/CDX-digest/year;
+- same-year revisits may refer to a full response in an earlier shard, such as
+  a revisit in `003` referring to a response in `001`;
+- never create an ordinary revisit that requires a WARC from another year; and
+- validate that every annual revisit resolves within the annual WARC set.
+
+If a logo or stylesheet has the same payload digest in several years, duplicate
+one full representative in each year. Do not infer current-capture response
+headers merely from an earlier year's matching body. Normally, fetch one exact
+representative in the current year, then use revisits for the remaining
+same-year captures.
+
+An exact capture already present in the current collection never needs another
+request. If every current-year representative fails but an earlier year holds
+a verified matching payload, do not synthesize a successful current-year
+response silently. Preserve the unresolved capture in `failures.json`. A later
+explicit recovery design may copy a complete support record, but that is not
+part of this KISS rewrite.
+
+Cross-URL digest deduplication remains out of scope. Prior measurement found a
+maximum additional saving below 1% for the representative large collection,
+while it complicates annual dependency closure.
+
+## Fetch scheduler and rate policy
+
+Separate request-start rate from in-flight concurrency.
+
+The current `wayback` defaults are process-wide and shared across sessions:
+
+- Memento/playback starts: 8 per second;
+- CDX search starts: 0.4 per second.
+
+Use smooth playback pacing, approximately one new start every 125 ms. Do not
+burst eight requests on a wall-clock second boundary and do not implement a
+sliding timestamp list when the library's shared `RateLimit` already provides
+the necessary gate. There must be exactly one owner of normal pacing.
+
+Use a separately bounded in-flight limit. Benchmark 16, 24, and 32 on a
+representative subset and choose the smallest value that sustains the allowed
+start rate without excessive memory or open connections. Keep it as a named
+constant initially rather than a CLI option.
+
+The scheduler needs only:
+
+- a deterministic ready queue;
+- a delayed retry priority queue keyed by monotonic eligibility time;
+- a bounded set of in-flight requests;
+- a collection-wide `blocked_until` monotonic deadline for 429 responses; and
+- bounded handoff/backpressure between completed downloads and the WARC writer.
+
+Workers never sleep while owning an in-flight slot. A retryable result returns
+the slot and enters the delayed queue.
+
+On HTTP 429:
+
+- parse and honor `Retry-After`;
+- close the global start gate for all requests;
+- use a conservative default cooldown when the header is absent;
+- increase the cooldown after repeated 429s; and
+- resume smooth pacing after the deadline.
+
+On transient connection errors and retryable 5xx responses, back off the
+individual job rather than stopping all starts, unless evidence shows a broad
+service outage. Cap retry delay and total attempts with named constants so a
+single capture cannot wait for days. Permanent policy, malformed-response,
+exact-mismatch, decoding, and validation failures do not retry indefinitely.
+
+Use monotonic time for scheduling. Respect cancellation/fatal errors promptly.
+Aggregate telemetry is useful; per-request durable event logs are not.
+
+## WARC construction
+
+Write WARC 1.1 using `warcio`. Pywb supports playback of WARC 1.1. Each file
+contains a valid `warcinfo` record and uses a correct `WARC-Filename` basename.
+
+Use one named size constant with a default target of 1 GB. Measure the
+compressed `.warc.gz` file size. Rotate after completing a record once the
+target has been reached; never split a WARC record merely to meet the target.
+A single unusually large record may therefore make a shard exceed 1 GB.
+
+Names use exactly three sequence digits, starting at `001`:
 
 ```text
-average WARC size: 24,106 bytes
-WARCs smaller than 4 KiB: 5,438
+example.org-2004-001.warc.gz
+example.org-2004-002.warc.gz
+...
+example.org-2004-999.warc.gz
 ```
 
-That shape is locally expensive even when network playback dominates:
+If another shard would require `1000`, fail loudly before creating it. The
+approved assumption is that a website exceeding approximately 1 TB in one
+year indicates a scope or data problem requiring operator review.
 
-- initial creation opens, compresses, validates, and publishes tens of
-  thousands of tiny files;
-- a merge inventories every existing WARC before scheduling builds;
-- affected WARCs copy their complete baseline;
-- every finalization rescans the full tree to regenerate replay CDXJ;
-- filesystem metadata and backup costs are amplified.
+Use one WARC writer owner. Download workers return validated results through a
+bounded queue; they never write concurrently to the open WARC. Physical record
+order follows bounded completion flow, not a post-download sort.
 
-Navigator relies on CDXJ filenames, not on one-WARC-per-resource, so larger
-size-bounded or count-bounded shards are technically possible. Propose the
-simplest deterministic sharding that preserves atomic replacement and limits
-rewrite amplification. Measure current inventory/index time first, and keep
-this separate from the download scheduler unless one design truly requires
-the other.
+Write to an exclusive temporary path. Finalization must close the gzip stream,
+validate the WARC, flush durable local state as appropriate, and atomically
+publish the final path. A finalized WARC is immutable.
 
-### 6. Make large CDX searches resumable or partitioned
+If a run appends newly discovered captures to an already indexed year, use the
+next sequence number. Do not repack old shards to restore chronology.
 
-`search_captures()` materializes the entire result. If a paginated search is
-rate-limited, its retry discards the partial result and starts the full query
-again. A late failure in a 281,000-row query can therefore repeat substantial
-IA work.
+## CDXJ construction
 
-Investigate deterministic date partitions or durable resume keys. Preserve a
-byte-exact source response as required by correctness item 2, detect duplicate
-boundary rows by logical identity, and avoid adding a general database merely
-to checkpoint one query.
+Maintain exactly two permanent index granularities:
 
-## Failure recovery and completeness still to assess
+1. `indexes/years/YYYY.cdxj`: all published WARCs required to replay that
+   annual set.
+2. `indexes/index.cdxj`: the whole collection.
 
-### 7. Re-run the nclr.org failure analysis on the clean-slate format
+There are no permanent per-WARC or shard indexes.
 
-The old log predates the new identity and accounting code. Its detail lines
-break down approximately as follows:
+After each WARC closes:
 
-| Old detail | Count |
-| --- | ---: |
-| Generic "Memento ... could not be played" | 1,849 |
-| "has no mementos and was never archived" | 269 |
-| Repeated truncation | 71 |
-| Unexpected empty body | 18 |
-| CDX 404 / playback 200 status mismatch | 8 |
-| Robots denial | 4 |
+1. Generate a sorted CDXJ fragment for that WARC in a temporary location.
+2. Merge it with the existing sorted annual CDXJ into a new temporary annual
+   CDXJ.
+3. Remove exact duplicate index entries deterministically if recovery repeats
+   the merge.
+4. Validate filename, offset, and length against every referenced finalized
+   WARC.
+5. Validate annual revisit dependency closure.
+6. Atomically replace the annual CDXJ.
+7. Delete the temporary fragment.
 
-These total 2,219 while the old headline said 2,218, which was the accounting
-bug already fixed. Do not use the discrepancy as evidence of a current bug.
+If a crash publishes a WARC before its annual-index merge, resume compares the
+year's finalized WARC filenames with filenames represented in the annual CDXJ
+and indexes only missing WARCs. Losing a temporary fragment costs at most a
+repeatable scan of the newly finalized WARC; it never loses downloaded data.
 
-On a clean subset or a carefully bounded rerun, determine how many failures
-are now:
+After each year completes, merge all current annual indexes into a sorted
+temporary collection index and atomically replace `indexes/index.cdxj`. Repeat
+once at successful final completion. Never append annual index text directly
+to the global file: CDXJ must be globally ordered by URL key and timestamp.
 
-- recovered locally through a same-URL CDX digest;
-- exact-playback timestamp, URL, or status mismatches;
-- unavailable playback despite a live CDX row;
-- corrupt/truncated stored content;
-- blocked by IA policy;
-- malformed raw CDX rows that never reached selection.
+Index response and revisit records used for replay. Keep indexes plain and
+uncompressed initially so pywb can binary-search them efficiently. ZipNum or
+another sharded query index is a future scaling decision, not part of this
+rewrite.
 
-The current exact-only policy is intentional. Do not substitute a capture days
-or months away. For non-redirects, payload-digest recovery is the approved
-local substitute. Redirect failures cannot use it because the digest does not
-cover `Location`.
+## Publication, manifest, and failures
 
-### 8. Research an exact raw-record retrieval path
+`collection.json` is the small authoritative publication manifest, not a claim
+that a date envelope was queried successfully. Keep its schema minimal and
+versioned. It should identify at least:
 
-As a fresh alternative, determine whether IA can expose the indexed WARC
-filename, byte offset, and compressed length for public CDX results, and
-whether authorized HTTP range retrieval of that exact WARC member is stable
-and permitted. If available, it might avoid the CDX-versus-replay mismatch,
-preserve original headers, and reduce Wayback replay work. It may also be
-unavailable for public indexes or impose different rate limits.
+- collection/schema version;
+- normalized collection ID and requested URL pattern;
+- WARC version and configured size target;
+- every finalized WARC's relative key, year, byte size, checksum, and record
+  count;
+- every annual index's relative key, byte size, checksum, and capture count;
+- the collection index key, size, checksum, and capture count when present;
+- the current run source/query directory;
+- counts of selected, represented, locally reused, downloaded, revisited, and
+  unresolved captures; and
+- collection status: `complete` or `partial`.
 
-Treat this as a feasibility study. Do not implement against undocumented
-internal endpoints or assume it is faster without a representative benchmark.
+Do not use the manifest to skip future CDX queries merely because a year or
+date range was queried before. Current IA metadata is re-queried for the
+requested run, then exact existing captures suppress network playback.
 
-### 9. Produce a structured failure artifact
+`failures.json` exists only when unresolved failures remain. It is a compact,
+versioned, deterministically sorted final-state ledger keyed by capture
+identity. Distinguish at least:
 
-The human log is not an ideal completeness ledger. Consider a versioned
-`failures.json` beside `redirects.json`, derived from final outcomes and keyed
-by capture identity. It should distinguish playback failure, exact metadata
-mismatch, malformed CDX, digest ambiguity, corruption, and policy blocks, and
-record whether a failure was recovered locally.
+- malformed raw CDX;
+- blocked/policy denial;
+- exact URL/timestamp/status mismatch;
+- unavailable playback;
+- retry exhaustion by HTTP or connection category;
+- truncated/corrupt response;
+- digest ambiguity or validation failure; and
+- publication/index validation failure where capture scope is known.
 
-This is useful only if compact and deterministic. Do not create a second event
-log or duplicate all console text.
+Do not duplicate console prose or create a durable per-attempt event log. A
+later run that successfully represents a previously failed capture removes it
+from the current unresolved ledger.
 
-## Deferred or lower-value work
+Publication order for a normal shard is:
 
-### Whole-run staging
+1. finalized immutable WARC;
+2. atomically updated annual CDXJ;
+3. updated manifest describing the partial or complete current state;
+4. collection CDXJ after the year completes; and
+5. final manifest/failure publication.
 
-Per-WARC publication is atomic, but the whole collection is not transactional.
-A crash or fatal worker error can leave some new WARCs published before replay
-index and coverage finalization. A subsequent run should repair this, and the
-user explicitly deferred staging/folder changes. Keep it as a reliability
-project, not a prerequisite for the scheduler.
+A fatal error before a publication boundary leaves the previous published
+state valid. Startup removes abandoned temporary files and reconciles any
+finalized WARC missing from its annual index.
 
-### Coverage semantics after partial success
+## R2 future compatibility
 
-`collection.json` is currently saved even when some captures fail. Under the
-current implementation this is not a completeness bug: the manifest is only a
-query-window envelope, and every later merge re-queries the entire union
-window. It must never be treated as proof that every capture succeeded. If a
-future optimization skips covered ranges, redesign the manifest first or
-persist incomplete identities.
+R2 will eventually be the single source of truth for WARC and CDXJ objects,
+while the collection CDXJ will be cached locally for query performance. Do not
+implement R2 in this rewrite.
 
-### Cross-URL digest deduplication
+Design local publication so the later mapping is direct:
 
-This remains conceptually possible but is not a major nclr.org opportunity.
-Offline counts from its saved CDX show:
+- local relative path equals future R2 object key;
+- WARC and versioned data objects are treated as immutable;
+- CDXJ locators remain collection-relative;
+- publication logic is concentrated in a small filesystem boundary; and
+- no code assumes all WARC bytes must be downloaded for playback.
+
+R2 supports ranged reads, so future playback can translate CDXJ filename,
+offset, and length into one object-range request. The future local cache needs
+only `collection.json` and `indexes/index.cdxj` for whole-collection querying;
+annual indexes are downloaded only for annual-package work.
+
+Do not invent a provider interface with multiple hypothetical backends. A
+small cohesive local publication component is enough preparation.
+
+## Navigator change required in this branch
+
+Navigator currently expects:
 
 ```text
-unique non-redirect (URL key, digest) pairs: 196,321
-unique non-redirect digests collection-wide: 194,626
-maximum additional cross-URL savings: 1,695 requests (<1%)
+replay/index.cdxj
 ```
 
-By contrast, same-URL digest reuse avoided roughly 84,000 requests. Do not add
-cross-WARC reference complexity for this collection without evidence from
-other representative sites.
+Change it to:
 
-### Optional Navigator redirect page
+```text
+indexes/index.cdxj
+```
 
-Fetch now retains redirect status and `Location` and emits `redirects.json`.
-A custom Navigator page saying "redirected to ..." was explicitly left for a
-later pass. It is a UX enhancement, not a Fetch correctness blocker.
+Update collection discovery/validation, pywb configuration, fixtures,
+integration tests, README material, and architecture documentation that refer
+to the old path. Navigator continues resolving CDXJ `filename` beneath the
+collection root for this local-only rewrite.
 
-## Suggested review order
+Retain one real pywb integration test proving that Navigator can replay WARC
+1.1 responses and revisits when the full response and revisit occupy different
+WARC files in the same year.
 
-1. Reproduce and resolve the statusless-identity idempotence problem.
-2. Decide how to preserve raw CDX bytes and account for malformed rows.
-3. Add minimal aggregate timing/request instrumentation.
-4. Benchmark higher in-flight concurrency under the existing shared 8/second
-   limiter.
-5. Design the central rate-limited queue and delayed retry scheduler using the
-   benchmark results.
-6. Measure merge inventory, WARC publication, and replay indexing on the old
-   51,458-file collection; then assess sharding.
-7. Re-run a bounded failure sample and evaluate exact raw-record retrieval.
-8. Revisit structured failure reporting, whole-run staging, and Navigator UX.
+## Suggested code shape
 
-For each recommendation, state the expected correctness benefit or measured
-wall-time reduction. Reject changes that merely move code around, add flags
-without an operator need, or optimize a component that measurements show is
-minor.
+Prefer approximately these responsibilities, combining modules further when
+the result remains clearer:
+
+- `cli.py`: minimal argument parsing and exit status;
+- `models.py`: small immutable capture/job/result types;
+- `cdx.py`: annual query, raw persistence, parsing, identity input;
+- `scheduler.py`: ready/delayed queues, shared rate gate, concurrency, 429;
+- `warc.py`: existing inventory, reuse, WARC 1.1 response/revisit writing and
+  rollover;
+- `index.py`: temporary WARC indexing, annual merge, collection merge;
+- `collection.py`: paths, atomic publication, manifest, failure ledger;
+- `fetch.py`: the short orchestration pipeline.
+
+Do not create layers merely to match this list. Avoid manager/factory/service
+class proliferation. Prefer functions and small immutable records. One state
+machine for the scheduler and one writer owner are enough.
+
+Review every retained dependency after the rewrite. Keep `wayback`, `warcio`,
+and `cdxj-indexer` when used. Remove old dependencies and helpers that no
+longer serve the core path.
+
+## Test policy
+
+There is no line-coverage target. Tests must protect likely expensive or silent
+failures: data loss, duplicate playback, rate-limit abuse, corrupt publication,
+or broken replay. Delete the old unit suite rather than making the new design
+simulate old internals.
+
+Required high-value tests are:
+
+1. Raw CDX bytes are saved before normalization; a malformed row remains in
+   source and appears in `failures.json`.
+2. A statusless CDX capture run three times produces one logical capture and no
+   network request after the first successful run.
+3. A fake-monotonic-clock scheduler proves starts are smoothly spaced, in-flight
+   concurrency is separate, delayed retries release slots, and one 429 closes
+   the global gate through `Retry-After`.
+4. An exact existing-WARC capture prevents a network call.
+5. Same URL/digest captures in one year require one successful representative
+   playback and produce valid revisits; redirects still fetch individually.
+6. Matching payloads in different years each have an annual full response and
+   no cross-year revisit dependency.
+7. WARC rollover uses WARC 1.1, three-digit names, the configured compressed
+   size target, and rejects a required shard `1000`.
+8. Crash recovery indexes a finalized-but-unindexed WARC without downloading
+   it again and does not expose an incomplete WARC.
+9. Annual-index incremental merge and collection-index merge remain globally
+   sorted, reference valid ranges, and are idempotent.
+10. Real pywb/Navigator integration replays a response in `001` through a
+    revisit in a later same-year WARC.
+11. A partial run publishes usable successes, a truthful partial manifest, a
+    deterministic failure ledger, and a nonzero exit.
+
+Use tiny fixture WARCs and fake network responses. Do not add exhaustive tests
+for every path character, every console sentence, every dataclass field, or
+third-party library behavior already covered upstream. Add another test only
+when it protects a demonstrated bug or a high-consequence invariant.
+
+## Aggregate observability
+
+Keep machine-readable aggregate run metrics in the manifest or `query.json`:
+
+- CDX request count and duration;
+- playback starts/completions, bytes, and peak in-flight count;
+- time waiting for rate gate and global 429 cooldown;
+- attempts and scheduled delay by broad failure category;
+- exact local reuse and digest/revisit savings;
+- WARC write/finalization time;
+- annual and collection index time; and
+- total unresolved failures.
+
+Do not emit a durable line per successful capture. Human console output should
+show phase progress, finalized WARC/year boundaries, aggregate rates, and final
+status.
+
+## Implementation sequence
+
+Recommended order:
+
+1. Commit this handoff on `refactor-fetch-code`.
+2. Delete the old Fetch modules, old Fetch tests, and obsolete Fetch
+   architecture text on the rewrite branch. Leave `main` untouched as the
+   reference.
+3. Build the collection paths, manifest skeleton, raw annual CDX persistence,
+   and stable capture identity.
+4. Build a synchronous exact-download-to-one-WARC vertical slice.
+5. Add WARC 1.1 rollover and annual CDXJ publication.
+6. Add existing-capture inventory and same-year representative/revisit reuse.
+7. Add the central scheduler, bounded concurrency, delayed retries, and global
+   429 gate.
+8. Add multi-year collection-index merge, partial-failure publication, and
+   crash reconciliation.
+9. Update Navigator to `indexes/index.cdxj` and pass the real pywb integration
+   test.
+10. Benchmark concurrency, inspect production/test line counts, remove unused
+    abstractions and dependencies, and rewrite the architecture documentation
+    to describe only the finished implementation.
+
+Keep the system runnable after each vertical milestone where practical. Do not
+restore deleted features to make an old test pass.
+
+## Definition of done
+
+The rewrite is complete only when:
+
+- the CLI performs the five-stage core workflow without deprecated modes;
+- raw annual CDX is durably preserved before normalization;
+- malformed and statusless CDX rows are handled deterministically;
+- exact existing captures prevent playback requests;
+- the scheduler sustains polite smooth starts with bounded memory and a global
+  429 cooldown;
+- WARC 1.1 files roll at the named 1 GB target and use `001`-`999` names;
+- every annual set is self-contained even when it contains multiple WARCs;
+- annual CDXJ is updated after each WARC without permanent shard indexes;
+- collection CDXJ is globally sorted and atomically published;
+- partial success is usable, truthfully described, and returns nonzero;
+- Navigator reads `indexes/index.cdxj` and real pywb playback passes;
+- no legacy Fetch implementation or parallel `v2` remains in the tree;
+- no loose-file, rewrite, redirect-report, coverage-merge, migration, or R2
+  feature has crept back in;
+- the focused high-value tests pass; and
+- documentation describes the new system rather than the deleted one.
+
+If an implementation detail is not specified here, choose the option with the
+fewest persistent concepts, fewest public knobs, and clearest failure mode.
