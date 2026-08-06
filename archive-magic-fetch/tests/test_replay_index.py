@@ -29,10 +29,14 @@ def create_warc(
     target="https://played.example/posts/",
     first_date="2020-01-02T03:04:05Z",
     second_date="2020-01-03T03:04:05Z",
+    cdx_digest=None,
 ):
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("xb") as stream:
         writer = WARCWriter(stream, gzip=True, warc_version="1.0")
+        first_headers = {"WARC-Date": first_date}
+        if cdx_digest is not None:
+            first_headers["CDX-Payload-Digest"] = cdx_digest
         response = writer.create_warc_record(
             target,
             "response",
@@ -42,10 +46,13 @@ def create_warc(
                 [("Content-Type", "text/plain")],
                 protocol="HTTP/1.1",
             ),
-            warc_headers_dict={"WARC-Date": first_date},
+            warc_headers_dict=first_headers,
         )
         writer.write_record(response)
         digest = response.rec_headers.get_header("WARC-Payload-Digest")
+        second_headers = {"WARC-Date": second_date}
+        if cdx_digest is not None:
+            second_headers["CDX-Payload-Digest"] = cdx_digest
         second = writer.create_warc_record(
             target,
             "response",
@@ -55,7 +62,7 @@ def create_warc(
                 [("Content-Type", "text/plain")],
                 protocol="HTTP/1.1",
             ),
-            warc_headers_dict={"WARC-Date": second_date},
+            warc_headers_dict=second_headers,
         )
         writer.write_record(second)
     return digest
@@ -102,7 +109,8 @@ def test_replay_index_uses_warc_identity_and_real_record_ranges(tmp_path):
         / "posts"
         / "index.warc.gz"
     )
-    digest = create_warc(warc)
+    cdx_digest = "sha1:" + "A" * 32
+    digest = create_warc(warc, cdx_digest=cdx_digest)
 
     result = replay_index.build_replay_index([warc], layout=selected_layout)
 
@@ -132,6 +140,7 @@ def test_replay_index_uses_warc_identity_and_real_record_ranges(tmp_path):
         "offset": second["offset"],
         "filename": "archive/played.example/posts/index.warc.gz",
     }
+    assert digest != cdx_digest
 
     for _, _, entry in entries:
         with warc.open("rb") as stream:

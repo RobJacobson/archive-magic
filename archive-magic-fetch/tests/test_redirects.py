@@ -37,7 +37,7 @@ def response(
         source_uri=f"https://web.archive.org/web/{captured}/{url}",
         status_code=status,
         headers=tuple(headers),
-    ).to_warc_record(target_url=url)
+    ).to_warc_record(cdx_payload_digest=None, target_url=url)
 
 
 def test_report_aggregates_and_classifies_full_collection_redirects(tmp_path):

@@ -39,7 +39,11 @@ from .retry import (
     retry_delay_seconds,
     sleep_seconds,
 )
-from .capture_identity import normalize_payload_digest
+from .capture_identity import (
+    CDX_PAYLOAD_DIGEST_HEADER,
+    cdx_payload_digest_header_value,
+    normalize_payload_digest,
+)
 from .warc_records import timestamp_to_warc_date
 
 
@@ -207,7 +211,7 @@ def normalize_cdx_digest(digest: object) -> Optional[str]:
     return normalize_payload_digest(digest)
 
 
-def _payload_digest(payload: bytes) -> str:
+def payload_digest(payload: bytes) -> str:
     """Return one CDX-compatible SHA-1 digest for semantic payload bytes."""
 
     encoded = base64.b32encode(hashlib.sha1(payload).digest()).decode(
@@ -252,7 +256,7 @@ def _recover_raw_payload(
     ):
         return None
 
-    if _payload_digest(payload) != expected_digest:
+    if payload_digest(payload) != expected_digest:
         return None
     return payload
 
@@ -313,7 +317,12 @@ class DownloadedCapture:
     status_code: int
     headers: tuple[tuple[str, str], ...]
 
-    def to_warc_record(self, *, target_url: Optional[str] = None):
+    def to_warc_record(
+        self,
+        *,
+        cdx_payload_digest: object,
+        target_url: Optional[str] = None,
+    ):
         """Build a fresh WARC response record over the semantic body."""
 
         http_headers = StatusAndHeaders(
@@ -329,6 +338,8 @@ class DownloadedCapture:
             length=len(self.body),
             http_headers=http_headers,
             warc_headers_dict={
+                CDX_PAYLOAD_DIGEST_HEADER:
+                    cdx_payload_digest_header_value(cdx_payload_digest),
                 "WARC-Date": self.capture_date,
                 "WARC-Source-URI": self.source_uri,
             },
@@ -542,4 +553,4 @@ def download_response(
         client,
         capture,
         retries=retries,
-    ).to_warc_record()
+    ).to_warc_record(cdx_payload_digest=getattr(capture, "digest", None))

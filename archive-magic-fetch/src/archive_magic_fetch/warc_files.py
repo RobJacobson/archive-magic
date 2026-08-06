@@ -29,9 +29,10 @@ from .downloads import (
     TruncatedWaybackResponseError,
     format_playback_failure,
     normalize_cdx_digest,
+    payload_digest,
     download_capture,
 )
-from .capture_identity import identity_for_capture, normalized_urlkey
+from .capture_identity import get_cdx_identity, normalized_urlkey
 from .retry import DEFAULT_RETRIES
 from .replay_index import list_collection_warcs
 from .warc_records import (
@@ -113,6 +114,7 @@ class WarcCounts:
     selected: int = 0
     responses: int = 0
     revisits: int = 0
+    digest_recoveries: int = 0
     playback_failures: int = 0
     invalid_content_encoding_failures: int = 0
     truncated_response_failures: int = 0
@@ -121,6 +123,7 @@ class WarcCounts:
         self.selected += other.selected
         self.responses += other.responses
         self.revisits += other.revisits
+        self.digest_recoveries += other.digest_recoveries
         self.playback_failures += other.playback_failures
         self.invalid_content_encoding_failures += (
             other.invalid_content_encoding_failures
@@ -194,11 +197,30 @@ class _UrlHistoryState:
     warc: WarcCounts
     files: WebsiteFileCounts
     response_refs_by_digest: dict[str, Optional[RevisitReference]]
+    downloaded_by_digest: dict[str, DownloadedCapture]
+    ambiguous_digests: set[str]
     file_paths_by_digest: dict[str, list[tuple[CdxRecord, Path]]]
     written_files: set[Path]
     failed_files: set[Path]
     messages: list[str]
     failed_capture_urls: list[str]
+
+
+@dataclass(frozen=True)
+class _PendingFailure:
+    """One capture whose exact failure may be locally recoverable."""
+
+    capture: CdxRecord
+    error: Exception
+    wants_warc: bool
+    capture_paths: tuple[Path, ...]
+
+
+class _PlaybackMismatch(ValueError):
+    """Exact playback returned a response that does not match its CDX row."""
+
+
+_EXPECTED_PLAYBACK_FAILURES = PLAYBACK_ERRORS + (_PlaybackMismatch,)
 
 
 @dataclass
@@ -264,16 +286,6 @@ def _failure_lines(capture: CdxRecord, error: Exception) -> list[str]:
     return _url_messages(capture.view_url, detail)
 
 
-def _status_failure_lines(
-    capture: CdxRecord,
-    actual_status: int,
-) -> list[str]:
-    return _url_messages(
-        capture.view_url,
-        f"CDX status {capture.statuscode} but playback returned {actual_status}",
-    )
-
-
 def _file_targets(
     website_files: Sequence[WebsiteFile],
 ) -> dict[int, tuple[CdxRecord, list[Path]]]:
@@ -334,6 +346,25 @@ def _count_failure(
         failed_capture_urls.append(capture.view_url)
 
 
+def _record_failure(
+    state: _UrlHistoryState,
+    pending: _PendingFailure,
+) -> None:
+    """Report and count one playback failure."""
+
+    state.messages.extend(_failure_lines(pending.capture, pending.error))
+    _count_failure(
+        pending.capture,
+        pending.error,
+        wants_warc=pending.wants_warc,
+        capture_paths=pending.capture_paths,
+        warc_summary=state.warc,
+        files_summary=state.files,
+        failed_files=state.failed_files,
+        failed_capture_urls=state.failed_capture_urls,
+    )
+
+
 def _write_response_record(
     capture: CdxRecord,
     downloaded,
@@ -344,7 +375,10 @@ def _write_response_record(
     writer = writer_factory() if writer_factory is not None else None
     if writer is None:
         raise RuntimeError("response has no WARC writer")
-    response = downloaded.to_warc_record(target_url=capture.original)
+    response = downloaded.to_warc_record(
+        cdx_payload_digest=capture.digest,
+        target_url=capture.original,
+    )
     write_response(writer, response)
     return response_reference(response)
 
@@ -366,6 +400,7 @@ def _write_revisit_record(
         source_uri=capture.raw_url,
         mimetype=capture.mimetype,
         status_code=capture.statuscode,
+        cdx_payload_digest=capture.digest,
         reference=reference,
     )
 
@@ -456,6 +491,7 @@ def _response_mimetype(
 
 
 def _new_history_state(
+    urlkey: str,
     warc_captures: Sequence[CdxRecord],
     file_paths: Mapping[int, tuple[CdxRecord, Sequence[Path]]],
     writer_factory: Optional[Callable[[], object]],
@@ -465,6 +501,11 @@ def _new_history_state(
 ) -> _UrlHistoryState:
     """Initialize isolated mutable state for one URL history."""
 
+    references = (
+        existing_warcs.references_for_urlkey(urlkey)
+        if existing_warcs is not None
+        else {}
+    )
     return _UrlHistoryState(
         warc_ids={id(capture) for capture in warc_captures},
         writer_factory=writer_factory,
@@ -474,13 +515,13 @@ def _new_history_state(
         files=WebsiteFileCounts(
             selected=sum(len(paths) for _capture, paths in file_paths.values())
         ),
-        response_refs_by_digest=(
-            existing_warcs.references_for_urlkey(
-                normalized_urlkey(warc_captures[0].original)
-            )
-            if existing_warcs is not None and warc_captures
-            else {}
-        ),
+        response_refs_by_digest=references,
+        downloaded_by_digest={},
+        ambiguous_digests={
+            digest
+            for digest, reference in references.items()
+            if reference is None
+        },
         file_paths_by_digest=_file_paths_by_digest(file_paths),
         written_files=set(),
         failed_files=set(),
@@ -535,13 +576,11 @@ def _download_validated(
     client,
     *,
     retries: int,
-    wants_warc: bool,
-    capture_paths: Sequence[Path],
 ):
-    """Load one capture locally or record an expected playback failure."""
+    """Load one exact capture locally or raise its playback failure."""
 
     downloaded = None
-    if (wants_warc or capture_paths) and state.existing_warcs is not None:
+    if state.existing_warcs is not None:
         cached = state.existing_warcs.get(capture)
         if cached is not None:
             if (
@@ -563,71 +602,38 @@ def _download_validated(
             )
 
     if downloaded is None:
-        try:
-            downloaded = download_capture(
-                client,
-                capture,
-                retries=retries,
-            )
-        except PLAYBACK_ERRORS as error:
-            state.messages.extend(_failure_lines(capture, error))
-            _count_failure(
-                capture,
-                error,
-                wants_warc=wants_warc,
-                capture_paths=capture_paths,
-                warc_summary=state.warc,
-                files_summary=state.files,
-                failed_files=state.failed_files,
-                failed_capture_urls=state.failed_capture_urls,
-            )
-            return None
+        downloaded = download_capture(client, capture, retries=retries)
+
+    expected_date = timestamp_to_warc_date(capture.timestamp)
+    if downloaded.capture_date != expected_date:
+        raise _PlaybackMismatch(
+            f"CDX timestamp {_cdx_timestamp(capture.timestamp)} but playback "
+            f"returned {downloaded.capture_date}"
+        )
+
+    if normalized_urlkey(downloaded.url) != normalized_urlkey(
+        capture.original
+    ):
+        raise _PlaybackMismatch(
+            f"CDX URL {capture.original} but playback returned "
+            f"{downloaded.url}"
+        )
 
     if (
         capture.statuscode is not None
         and downloaded.status_code != capture.statuscode
     ):
-        state.messages.extend(
-            _status_failure_lines(capture, downloaded.status_code)
+        raise _PlaybackMismatch(
+            f"CDX status {capture.statuscode} but playback returned "
+            f"{downloaded.status_code}"
         )
-        _count_failure(
-            capture,
-            ValueError("playback status differs from CDX"),
-            wants_warc=wants_warc,
-            capture_paths=capture_paths,
-            warc_summary=state.warc,
-            files_summary=state.files,
-            failed_files=state.failed_files,
-            failed_capture_urls=state.failed_capture_urls,
-        )
-        return None
-
-    if _is_redirect(downloaded.status_code):
-        _omit_redirect(
-            state,
-            capture_paths=capture_paths,
-        )
-        if not wants_warc:
-            return None
 
     if (
         not downloaded.body
         and normalize_cdx_digest(capture.digest)
         != _EMPTY_PAYLOAD_DIGEST
     ):
-        error = ValueError("empty playback body")
-        state.messages.extend(_failure_lines(capture, error))
-        _count_failure(
-            capture,
-            error,
-            wants_warc=wants_warc,
-            capture_paths=capture_paths,
-            warc_summary=state.warc,
-            files_summary=state.files,
-            failed_files=state.failed_files,
-            failed_capture_urls=state.failed_capture_urls,
-        )
-        return None
+        raise _PlaybackMismatch("empty playback body")
     return downloaded
 
 
@@ -643,12 +649,21 @@ def _commit_representative(
     """Commit one successful representative to every selected output."""
 
     reference = None
+    known_reference = (
+        state.response_refs_by_digest.get(digest)
+        if digest is not None and digest not in state.ambiguous_digests
+        else None
+    )
+    if (
+        digest is not None
+        and known_reference is not None
+        and known_reference.payload_digest != payload_digest(downloaded.body)
+    ):
+        state.ambiguous_digests.add(digest)
+        state.response_refs_by_digest.pop(digest, None)
+        state.downloaded_by_digest.pop(digest, None)
+        known_reference = None
     if wants_warc:
-        known_reference = (
-            state.response_refs_by_digest.get(digest)
-            if digest is not None
-            else None
-        )
         if known_reference is not None and not _is_redirect(
             downloaded.status_code
         ):
@@ -666,11 +681,16 @@ def _commit_representative(
                 state.writer_factory,
             )
             state.warc.responses += 1
-    if digest is not None and not _is_redirect(downloaded.status_code):
+    if (
+        digest is not None
+        and digest not in state.ambiguous_digests
+        and not _is_redirect(downloaded.status_code)
+    ):
         if reference is not None:
             state.response_refs_by_digest.setdefault(digest, reference)
         else:
             state.response_refs_by_digest.setdefault(digest, None)
+        state.downloaded_by_digest.setdefault(digest, downloaded)
     if _is_redirect(downloaded.status_code):
         capture_paths = ()
     _write_history_files(
@@ -686,6 +706,64 @@ def _commit_representative(
         files_summary=state.files,
         messages=state.messages,
     )
+
+
+def _recover_pending_failure(
+    state: _UrlHistoryState,
+    pending: _PendingFailure,
+) -> bool:
+    """Recover one exact-playback failure from a verified local payload."""
+
+    capture = pending.capture
+    digest = normalize_cdx_digest(capture.digest)
+    if digest is None or digest in state.ambiguous_digests:
+        return False
+    reference = state.response_refs_by_digest.get(digest)
+    if pending.wants_warc and reference is None:
+        return False
+
+    downloaded = state.downloaded_by_digest.get(digest)
+    if pending.capture_paths:
+        if (
+            downloaded is None
+            and reference is not None
+            and state.existing_warcs is not None
+        ):
+            downloaded = state.existing_warcs.get_payload(
+                reference.payload_digest
+            )
+        if downloaded is None:
+            return False
+
+    if pending.wants_warc:
+        _write_revisit_record(
+            capture,
+            reference,
+            state.writer_factory,
+        )
+        state.warc.revisits += 1
+        state.warc.digest_recoveries += 1
+
+    if pending.capture_paths and downloaded is not None:
+        _write_history_files(
+            capture,
+            downloaded.body,
+            pending.capture_paths,
+            digest,
+            actual_mimetype=_response_mimetype(downloaded.headers),
+            files_mode=state.files_mode,
+            file_paths_by_digest=state.file_paths_by_digest,
+            written_files=state.written_files,
+            failed_files=state.failed_files,
+            files_summary=state.files,
+            messages=state.messages,
+        )
+        state.files.digest_recoveries += sum(
+            path in state.written_files for path in pending.capture_paths
+        )
+    return True
+
+
 def _write_url_history(
     urlkey: str,
     warc_captures: Sequence[CdxRecord],
@@ -713,12 +791,13 @@ def _write_url_history(
     unique_warc_ids: set[int] = set()
     seen_warc_identities = set()
     for capture in warc_captures:
-        identity = identity_for_capture(capture)
+        identity = get_cdx_identity(capture)
         if identity not in seen_warc_identities:
             seen_warc_identities.add(identity)
             unique_warc_ids.add(id(capture))
 
     state = _new_history_state(
+        normalized_urlkey(chronological[0].original),
         warc_captures,
         file_capture_paths,
         writer_factory,
@@ -728,9 +807,10 @@ def _write_url_history(
     state.warc_ids = unique_warc_ids
     state.warc.selected = len(unique_warc_ids)
     processed_identities = set()
+    pending_failures = []
 
     for capture in processing:
-        logical_identity = identity_for_capture(capture)
+        logical_identity = get_cdx_identity(capture)
         wants_warc = id(capture) in state.warc_ids
         target = file_capture_paths.get(id(capture))
         capture_paths = list(target[1] if target is not None else ())
@@ -770,24 +850,46 @@ def _write_url_history(
         ):
             continue
 
-        downloaded_result = _download_validated(
+        try:
+            downloaded = _download_validated(
+                state,
+                capture,
+                client,
+                retries=retries,
+            )
+        except _EXPECTED_PLAYBACK_FAILURES as error:
+            pending = _PendingFailure(
+                capture,
+                error,
+                needs_warc,
+                tuple(capture_paths),
+            )
+            if (
+                digest is not None
+                and digest not in state.ambiguous_digests
+                and not known_redirect
+            ):
+                pending_failures.append(pending)
+            else:
+                _record_failure(state, pending)
+            continue
+
+        if _is_redirect(downloaded.status_code):
+            _omit_redirect(state, capture_paths=capture_paths)
+            if not needs_warc:
+                continue
+        _commit_representative(
             state,
             capture,
-            client,
-            retries=retries,
+            downloaded,
+            digest,
             wants_warc=needs_warc,
             capture_paths=capture_paths,
         )
-        if downloaded_result is not None:
-            downloaded = downloaded_result
-            _commit_representative(
-                state,
-                capture,
-                downloaded,
-                digest,
-                wants_warc=needs_warc,
-                capture_paths=capture_paths,
-            )
+
+    for pending in pending_failures:
+        if not _recover_pending_failure(state, pending):
+            _record_failure(state, pending)
 
     return _UrlHistoryResult(
         state.warc,
@@ -825,7 +927,7 @@ def _build_warc(
     files_summary = WebsiteFileCounts()
     failed_capture_urls = []
     selected_identities = {
-        identity_for_capture(capture)
+        get_cdx_identity(capture)
         for history in histories
         for capture in history.warc_captures
     }
@@ -1018,12 +1120,14 @@ def build_warc_files(
         )
         stats = (
             f"{result.warc.responses} responses, "
-            f"{result.warc.revisits} revisits, "
+            f"{result.warc.revisits} revisits "
+            f"({result.warc.digest_recoveries} recovered), "
             f"{result.warc.playback_failures} failed"
         )
         if result.files.selected:
             stats += (
                 f", files {result.files.written} written, "
+                f"{result.files.digest_recoveries} recovered, "
                 f"{result.files.playback_failures} failed"
             )
         print(f"  {stats}")
@@ -1047,6 +1151,7 @@ def build_warc_files(
         )
         print(
             f"  {result.files.written} written, "
+            f"{result.files.digest_recoveries} recovered, "
             f"{result.files.playback_failures} failed"
         )
         for message in result.messages:

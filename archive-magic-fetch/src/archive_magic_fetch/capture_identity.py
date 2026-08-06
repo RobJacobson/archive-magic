@@ -12,6 +12,9 @@ from surt import surt
 
 _VALID_SHA1 = re.compile(r"[A-Z2-7]{32}")
 
+CDX_PAYLOAD_DIGEST_HEADER = "CDX-Payload-Digest"
+MISSING_CDX_PAYLOAD_DIGEST = "-"
+
 
 @dataclass(frozen=True, order=True)
 class CaptureIdentity:
@@ -67,7 +70,13 @@ def warc_date_to_cdx(value: str) -> str:
     return timestamp_to_cdx(timestamp)
 
 
-def identity_for_capture(capture) -> CaptureIdentity:
+def cdx_payload_digest_header_value(digest: object) -> str:
+    """Return the required WARC header value for one CDX digest."""
+
+    return normalize_payload_digest(digest) or MISSING_CDX_PAYLOAD_DIGEST
+
+
+def get_cdx_identity(capture) -> CaptureIdentity:
     """Build a logical identity from an Internet Archive CDX row."""
 
     status_code = capture.statuscode
@@ -81,12 +90,12 @@ def identity_for_capture(capture) -> CaptureIdentity:
     )
 
 
-def identity_for_warc_record(record) -> CaptureIdentity:
+def get_warc_identity(record) -> CaptureIdentity:
     """Build a logical identity from one response or revisit record."""
 
     target_uri = record.rec_headers.get_header("WARC-Target-URI")
     warc_date = record.rec_headers.get_header("WARC-Date")
-    digest = record.rec_headers.get_header("WARC-Payload-Digest")
+    digest = record.rec_headers.get_header(CDX_PAYLOAD_DIGEST_HEADER)
     status_text = (
         record.http_headers.get_statuscode()
         if record.http_headers is not None
@@ -96,9 +105,18 @@ def identity_for_warc_record(record) -> CaptureIdentity:
         raise ValueError("WARC record is missing target URI or date")
     if status_text is None or not status_text.isdigit():
         raise ValueError("WARC record is missing a numeric HTTP status")
+    if digest is None:
+        raise ValueError(
+            f"WARC record is missing {CDX_PAYLOAD_DIGEST_HEADER}"
+        )
     normalized_digest = normalize_payload_digest(digest)
-    if normalized_digest is None:
-        raise ValueError("WARC record is missing a valid payload digest")
+    if (
+        normalized_digest is None
+        and digest.strip() != MISSING_CDX_PAYLOAD_DIGEST
+    ):
+        raise ValueError(
+            f"WARC record has invalid {CDX_PAYLOAD_DIGEST_HEADER}"
+        )
     return CaptureIdentity(
         urlkey=normalized_urlkey(target_uri),
         timestamp=warc_date_to_cdx(warc_date),

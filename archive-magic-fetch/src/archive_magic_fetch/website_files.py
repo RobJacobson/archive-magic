@@ -18,6 +18,7 @@ class WebsiteFileCounts:
 
     selected: int = 0
     written: int = 0
+    digest_recoveries: int = 0
     redirects_omitted: int = 0
     playback_failures: int = 0
     invalid_content_encoding_failures: int = 0
@@ -29,6 +30,7 @@ class WebsiteFileCounts:
 
         self.selected += other.selected
         self.written += other.written
+        self.digest_recoveries += other.digest_recoveries
         self.redirects_omitted += other.redirects_omitted
         self.playback_failures += other.playback_failures
         self.invalid_content_encoding_failures += (

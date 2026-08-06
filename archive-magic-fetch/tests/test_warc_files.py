@@ -159,24 +159,18 @@ def output_path(tmp_path, urlkey=URLKEY):
 
 def test_matching_cdx_digests_write_one_response_and_one_revisit(tmp_path):
     first = capture(
-        original="https://cdx.example/first",
         captured="20170101000000",
     )
     second = capture(
-        original="https://cdx.example/second",
         captured="20180101000000",
     )
     client = FakeClient(
         {
             first: memento_for(
                 first,
-                url="https://played.example/first",
-                captured="20170102030405",
             ),
             second: memento_for(
                 second,
-                url="https://played.example/second",
-                captured="20180102030405",
             ),
         }
     )
@@ -205,6 +199,11 @@ def test_matching_cdx_digests_write_one_response_and_one_revisit(tmp_path):
     assert records[2].rec_headers.get_header(
         "WARC-Refers-To"
     ) == records[1].rec_headers.get_header("WARC-Record-ID")
+    assert all(
+        record.rec_headers.get_header("CDX-Payload-Digest")
+        == payload_digest(b"payload")
+        for record in records[1:]
+    )
 
 
 def test_value_equal_source_rows_collapse_to_one_logical_capture(tmp_path):
@@ -309,7 +308,44 @@ def test_unexpected_empty_playback_body_remains_failure(tmp_path, capsys):
     assert "empty playback body" in capsys.readouterr().out
 
 
-def test_failed_capture_does_not_prevent_later_capture(
+@pytest.mark.parametrize(
+    ("memento_kwargs", "message"),
+    [
+        (
+            {"captured": "20170101000001"},
+            "CDX timestamp 20170101000000 but playback returned",
+        ),
+        (
+            {"url": "https://example.com/different"},
+            "CDX URL https://example.com/resource but playback returned",
+        ),
+    ],
+)
+def test_non_exact_playback_metadata_is_rejected(
+    tmp_path,
+    capsys,
+    memento_kwargs,
+    message,
+):
+    selected = capture()
+    target = output_path(tmp_path)
+
+    summary = warc_files.build_url_history(
+        URLKEY,
+        [selected],
+        target,
+        FakeClient({selected: memento_for(selected, **memento_kwargs)}),
+    )
+
+    assert summary == warc_files.WarcCounts(
+        selected=1,
+        playback_failures=1,
+    )
+    assert not target.exists()
+    assert message in capsys.readouterr().out
+
+
+def test_failed_capture_is_recovered_from_later_matching_digest(
     tmp_path,
     capsys,
 ):
@@ -323,14 +359,33 @@ def test_failed_capture_does_not_prevent_later_capture(
     )
     target = output_path(tmp_path)
 
-    warc_files.build_url_history(URLKEY, [first, second], target, client)
+    summary = warc_files.build_url_history(
+        URLKEY,
+        [first, second],
+        target,
+        client,
+    )
 
     assert client.calls == [first, second]
     assert [record.rec_type for record in read_records(target)] == [
         "warcinfo",
         "response",
+        "revisit",
     ]
-    assert "capture unavailable" in capsys.readouterr().out
+    records = read_records(target)
+    assert records[2].rec_headers.get_header("WARC-Date") == (
+        "2017-01-01T00:00:00Z"
+    )
+    assert records[2].rec_headers.get_header(
+        "CDX-Payload-Digest"
+    ) == payload_digest(b"payload")
+    assert summary == warc_files.WarcCounts(
+        selected=2,
+        responses=1,
+        revisits=1,
+        digest_recoveries=1,
+    )
+    assert capsys.readouterr().out == ""
 
 
 def test_warc_result_lists_failed_capture_view_url(tmp_path):
@@ -365,11 +420,42 @@ def test_matching_bodies_are_stored_as_full_responses(tmp_path):
     warc_files.build_url_history(URLKEY, [first, second], target, client)
 
     assert client.calls == [first, second]
-    assert [record.rec_type for record in read_records(target)] == [
+    records = read_records(target)
+    assert [record.rec_type for record in records] == [
         "warcinfo",
         "response",
         "response",
     ]
+    assert all(
+        record.rec_headers.get_header("CDX-Payload-Digest") == "-"
+        for record in records[1:]
+    )
+
+
+def test_invalid_digest_failure_is_not_recovered(tmp_path):
+    first = capture(captured="20170101000000", digest="-")
+    second = capture(captured="20180101000000", digest="-")
+    target = output_path(tmp_path)
+    client = FakeClient(
+        {
+            first: MementoPlaybackError("capture unavailable"),
+            second: memento_for(second),
+        }
+    )
+
+    summary = warc_files.build_url_history(
+        URLKEY,
+        [first, second],
+        target,
+        client,
+    )
+
+    assert client.calls == [first, second]
+    assert summary == warc_files.WarcCounts(
+        selected=2,
+        responses=1,
+        playback_failures=1,
+    )
 
 
 def test_distinct_statuses_are_preserved(tmp_path):
@@ -614,6 +700,36 @@ def test_matching_cdx_redirect_digests_write_full_responses(tmp_path):
         for record in records[1:]
     ] == ["https://example.com/one", "https://example.com/two"]
     assert summary == warc_files.WarcCounts(selected=2, responses=2)
+
+
+def test_failed_redirect_is_not_digest_recovered(tmp_path):
+    first = capture(captured="20170101000000", statuscode=301)
+    second = capture(captured="20180101000000", statuscode=301)
+    target = output_path(tmp_path)
+    client = FakeClient(
+        {
+            first: MementoPlaybackError("redirect unavailable"),
+            second: memento_for(
+                second,
+                status_code=301,
+                headers={"Location": "https://example.com/target"},
+            ),
+        }
+    )
+
+    summary = warc_files.build_url_history(
+        URLKEY,
+        [first, second],
+        target,
+        client,
+    )
+
+    assert client.calls == [first, second]
+    assert summary == warc_files.WarcCounts(
+        selected=2,
+        responses=1,
+        playback_failures=1,
+    )
 
 
 def test_skippable_wayback_errors_warn_and_unrelated_capture_continues(
@@ -891,7 +1007,9 @@ def test_groups_are_built_independently(tmp_path, capsys):
     )
     output = capsys.readouterr().out
     assert "WARC files: building 2 with 8 workers" in output
-    assert output.count(" responses, 0 revisits, 0 failed") == 2
+    assert output.count(
+        " responses, 0 revisits (0 recovered), 0 failed"
+    ) == 2
 
 
 def test_colliding_groups_share_one_warc(tmp_path):
@@ -1392,6 +1510,63 @@ def test_unchanged_rebuild_reuses_full_responses_without_wayback(
     assert capsys.readouterr().out == ""
 
 
+def test_cdx_digest_mismatch_is_stable_cache_identity(tmp_path):
+    selected = capture(digest="A" * 32)
+    target = output_path(tmp_path)
+
+    warc_files.build_url_history(
+        URLKEY,
+        [selected],
+        target,
+        FakeClient({selected: memento_for(selected, payload=b"actual")}),
+    )
+    record = read_records(target)[1]
+    assert record.rec_headers.get_header(
+        "CDX-Payload-Digest"
+    ) == "sha1:" + "A" * 32
+    assert record.rec_headers.get_header(
+        "WARC-Payload-Digest"
+    ) == payload_digest(b"actual")
+
+    client = FakeClient({})
+    summary = warc_files.build_url_history(
+        URLKEY,
+        [selected],
+        target,
+        client,
+    )
+
+    assert client.calls == []
+    assert summary == warc_files.WarcCounts(selected=1, responses=1)
+
+
+def test_revisit_body_lookup_uses_actual_warc_digest(tmp_path):
+    first = capture(captured="20170101000000", digest="A" * 32)
+    second = capture(captured="20180101000000", digest="A" * 32)
+    target = output_path(tmp_path)
+    warc_files.build_url_history(
+        URLKEY,
+        [first, second],
+        target,
+        FakeClient({first: memento_for(first, payload=b"actual")}),
+    )
+
+    client = FakeClient({})
+    summary = warc_files.build_url_history(
+        URLKEY,
+        [first, second],
+        target,
+        client,
+    )
+
+    assert client.calls == []
+    assert summary == warc_files.WarcCounts(
+        selected=2,
+        responses=1,
+        revisits=1,
+    )
+
+
 def test_rebuild_reuses_old_response_and_fetches_only_missing_capture(
     tmp_path,
 ):
@@ -1604,7 +1779,10 @@ def test_invalid_cached_payload_digest_is_fatal_and_untouched(tmp_path):
         headers=(("Content-Type", "text/plain"),),
     )
     stream, writer = warc_records.open_new_warc(target)
-    response = retrieved.to_warc_record(target_url=selected.original)
+    response = retrieved.to_warc_record(
+        cdx_payload_digest=selected.digest,
+        target_url=selected.original,
+    )
     response.rec_headers.replace_header(
         "WARC-Payload-Digest",
         "sha1:" + "A" * 32,
@@ -1619,6 +1797,81 @@ def test_invalid_cached_payload_digest_is_fatal_and_untouched(tmp_path):
 
     assert client.calls == []
     assert target.read_bytes() == original
+
+
+def test_cached_record_without_cdx_digest_is_fatal_and_untouched(tmp_path):
+    selected = capture()
+    target = output_path(tmp_path)
+    retrieved = downloads.DownloadedCapture(
+        body=b"payload",
+        url=selected.original,
+        capture_date="2017-01-01T00:00:00Z",
+        source_uri=selected.raw_url,
+        status_code=200,
+        headers=(("Content-Type", "text/plain"),),
+    )
+    stream, writer = warc_records.open_new_warc(target)
+    response = retrieved.to_warc_record(
+        cdx_payload_digest=selected.digest,
+        target_url=selected.original,
+    )
+    response.rec_headers.remove_header("CDX-Payload-Digest")
+    writer.write_record(response)
+    stream.close()
+
+    original = target.read_bytes()
+    client = FakeClient({selected: memento_for(selected)})
+    with pytest.raises(
+        ValueError,
+        match="missing CDX-Payload-Digest",
+    ):
+        warc_files.build_url_history(URLKEY, [selected], target, client)
+
+    assert client.calls == []
+    assert target.read_bytes() == original
+
+
+def test_ambiguous_cached_cdx_digest_disables_revisit_reuse(tmp_path):
+    first = capture(captured="20170101000000", digest="A" * 32)
+    second = capture(captured="20180101000000", digest="A" * 32)
+    third = capture(captured="20190101000000", digest="A" * 32)
+    target = output_path(tmp_path)
+    stream, writer = warc_records.open_new_warc(target)
+    for selected, body in ((first, b"alpha"), (second, b"beta")):
+        response = downloads.DownloadedCapture(
+            body=body,
+            url=selected.original,
+            capture_date=warc_records.timestamp_to_warc_date(
+                selected.timestamp
+            ),
+            source_uri=selected.raw_url,
+            status_code=200,
+            headers=(("Content-Type", "text/plain"),),
+        ).to_warc_record(
+            cdx_payload_digest=selected.digest,
+            target_url=selected.original,
+        )
+        writer.write_record(response)
+    stream.close()
+
+    client = FakeClient(
+        {third: memento_for(third, payload=b"gamma")}
+    )
+    summary = warc_files.build_url_history(
+        URLKEY,
+        [third],
+        target,
+        client,
+    )
+
+    assert client.calls == [third]
+    assert summary == warc_files.WarcCounts(selected=1, responses=3)
+    assert [record.rec_type for record in read_records(target)] == [
+        "warcinfo",
+        "response",
+        "response",
+        "response",
+    ]
 
 
 def test_temporary_validation_failure_preserves_existing_warc(

@@ -293,7 +293,7 @@ def test_capture_closes_before_warc_construction_fails(monkeypatch):
     assert memento.closed is True
     assert memento.exit_error is None
     with pytest.raises(RuntimeError, match="cannot build WARC"):
-        retrieved.to_warc_record()
+        retrieved.to_warc_record(cdx_payload_digest=None)
 
 
 def _make_retries_immediate(monkeypatch):

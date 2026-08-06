@@ -6,7 +6,6 @@ from wayback.exceptions import MementoPlaybackError
 
 from archive_magic_fetch import collection_paths
 from archive_magic_fetch import warc_files
-from archive_magic_fetch import website_files
 from archive_magic_fetch.search import group_by_url, select_captures
 
 
@@ -149,7 +148,7 @@ def test_files_latest_writes_website_without_timestamps(tmp_path, capsys):
         headers[0].split("] ", 1)[1],
         headers[1].split("] ", 1)[1],
     ))
-    assert output.count("  1 written, 0 failed") == 2
+    assert output.count("  1 written, 0 recovered, 0 failed") == 2
 
 
 def test_files_all_writes_timestamp_directories(tmp_path):
@@ -295,7 +294,7 @@ def test_dual_mode_reuses_one_representative_download(tmp_path, capsys):
     ).read_bytes() == b"shared-body"
     output = capsys.readouterr().out
     assert "http://web.archive.org/web/*/https://example.com/" in output
-    assert "files 1 written, 0 failed" in output
+    assert "files 1 written, 0 recovered, 0 failed" in output
     assert "Website files:" not in output
 
 
@@ -401,6 +400,47 @@ def test_files_all_materializes_revisit_body_without_refetch(tmp_path):
         for path in layout.website_root.rglob("index.html")
     } == {b"same"}
     assert len(list(layout.website_root.rglob("index.html"))) == 2
+
+
+def test_files_all_recovers_early_failure_from_later_digest(tmp_path):
+    first = capture(captured="20170101000000", payload=b"same")
+    second = capture(captured="20180101000000", payload=b"same")
+    groups = {first.urlkey: [first, second]}
+    layout = collection_paths.collection_paths(
+        "https://example.com/*",
+        root=tmp_path / "archives",
+    )
+    website_plan = collection_paths.prepare_website_files(
+        groups,
+        layout,
+        include_timestamps=True,
+    )
+    client = FakeClient(
+        {
+            first: MementoPlaybackError("temporarily unavailable"),
+            second: memento_for(second, payload=b"same"),
+        }
+    )
+
+    result = warc_files.build_warc_files(
+        groups,
+        client,
+        layout=layout,
+        file_captures_by_url=groups,
+        website_files=website_plan,
+        files_mode="all",
+    )
+
+    assert client.calls == [first, second]
+    assert result.warc_counts.playback_failures == 0
+    assert result.warc_counts.digest_recoveries == 1
+    assert result.file_counts.playback_failures == 0
+    assert result.file_counts.written == 2
+    assert result.file_counts.digest_recoveries == 1
+    assert {
+        path.read_bytes()
+        for path in layout.website_root.rglob("index.html")
+    } == {b"same"}
 
 
 def test_empty_playback_body_writes_zero_byte_file(tmp_path, capsys):

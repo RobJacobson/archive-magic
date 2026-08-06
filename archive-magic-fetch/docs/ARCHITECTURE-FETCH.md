@@ -151,6 +151,39 @@ capture. `select_captures()` applies only the loose-file modes:
 WARC and loose-file selection happens before construction. Redirect targets
 never introduce CDX searches or additional WARC work.
 
+## Exact playback and digest identity
+
+Every playback request uses original mode with `exact=True` and
+`follow_redirects=False`. Fetch additionally requires the returned normalized
+URL, timestamp, and HTTP status to match the selected CDX row. It never asks
+Wayback for a nearest capture and never rewrites the saved IA search into a
+resolved or "CDX Prime" index.
+
+IA's CDX payload digest and the digest of the bytes returned by exact playback
+can disagree. Every generated response and revisit therefore records both
+meanings:
+
+```text
+CDX-Payload-Digest: sha1:<digest selected from IA CDX> (or -)
+WARC-Payload-Digest: sha1:<digest of the stored semantic payload>
+```
+
+Logical capture/cache identity uses the CDX digest. WARC validation, replay
+indexing, response-body lookup, and revisit references use the actual WARC
+digest. Source CDX rows without a usable digest store the explicit
+`CDX-Payload-Digest: -` sentinel. Generated response or revisit records without
+this header are invalid; there is no legacy fallback.
+
+Within one normalized URL history, one exact response establishes a mapping
+from its CDX digest to its actual stored payload and permits later captures to
+be written as revisits without playback. Exact failures with a valid digest are
+deferred until the history's first pass completes, allowing a later exact
+response to recover an earlier failure as a revisit. Loose files reuse the same
+verified local body. If the local inventory shows one CDX digest mapping to
+multiple actual payload digests, that mapping is ambiguous and reuse is
+disabled. Redirects, invalid digests, and different URL histories are never
+recovered through this mechanism.
+
 ## Redirect reporting
 
 Every selected historical 3xx response is stored with its actual status and
@@ -250,11 +283,11 @@ Fetch example.com/* (1995-20260803): build WARC true, files none, 8 workers
 Search: 120 captures in 18 URL histories
 WARC files: building 18 with 8 workers
 [1/18] http://web.archive.org/web/*/https://example.com/
-  4 responses, 3 revisits, 0 failed
+  4 responses, 3 revisits (0 recovered), 0 failed
 [2/18] http://web.archive.org/web/*/https://example.com/about
-  1 responses, 0 revisits, 0 failed
+  1 responses, 0 revisits (0 recovered), 0 failed
 [3/18] http://web.archive.org/web/*/https://example.com/contact
-  8 responses, 1 revisits, 1 failed
+  8 responses, 1 revisits (0 recovered), 1 failed
   https://web.archive.org/...
     truncated after 9 attempts over 12.0s (1,000/2,000 bytes)
 Replay index: replay/index.cdxj from 18 WARC files

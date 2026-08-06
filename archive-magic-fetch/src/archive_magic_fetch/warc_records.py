@@ -14,9 +14,12 @@ from warcio.statusandheaders import StatusAndHeaders
 from warcio.warcwriter import WARCWriter
 
 from .capture_identity import (
+    CDX_PAYLOAD_DIGEST_HEADER,
     CaptureIdentity,
-    identity_for_capture,
-    identity_for_warc_record,
+    cdx_payload_digest_header_value,
+    get_cdx_identity,
+    get_warc_identity,
+    normalize_payload_digest,
 )
 
 
@@ -32,6 +35,7 @@ class CachedWarcResponse:
 @dataclass(frozen=True)
 class _StoredRecordLocation:
     identity: CaptureIdentity
+    payload_digest: str
     offset: int
     length: int
     record_type: str
@@ -46,7 +50,9 @@ class ExistingWarcCache:
         entries: dict[CaptureIdentity, _StoredRecordLocation],
         records: tuple[_StoredRecordLocation, ...],
         responses_by_digest: dict[str, _StoredRecordLocation],
-        references_by_urlkey: dict[str, dict[str, RevisitReference]],
+        references_by_urlkey: dict[
+            str, dict[str, Optional[RevisitReference]]
+        ],
     ) -> None:
         self.path = path
         self._entries = entries
@@ -61,7 +67,10 @@ class ExistingWarcCache:
         entries: dict[CaptureIdentity, _StoredRecordLocation] = {}
         records: list[_StoredRecordLocation] = []
         responses_by_digest: dict[str, _StoredRecordLocation] = {}
-        references_by_urlkey: dict[str, dict[str, RevisitReference]] = {}
+        references_by_urlkey: dict[
+            str, dict[str, Optional[RevisitReference]]
+        ] = {}
+        response_references: dict[tuple[str, str], RevisitReference] = {}
         record_types: list[str] = []
         stream = path.open("rb")
         try:
@@ -71,28 +80,41 @@ class ExistingWarcCache:
                 if record.rec_type not in {"response", "revisit"}:
                     record.raw_stream.read()
                     continue
-                identity = identity_for_warc_record(record)
+                identity = get_warc_identity(record)
+                payload_digest = normalize_payload_digest(
+                    record.rec_headers.get_header("WARC-Payload-Digest")
+                )
+                if payload_digest is None:
+                    raise ValueError(
+                        "WARC record is missing a valid WARC-Payload-Digest"
+                    )
                 offset = iterator.get_record_offset()
                 length = iterator.get_record_length()
                 location = _StoredRecordLocation(
                     identity=identity,
+                    payload_digest=payload_digest,
                     offset=offset,
                     length=length,
                     record_type=record.rec_type,
                 )
-                if identity not in entries:
+                prior = entries.get(identity)
+                if prior is None:
                     entries[identity] = location
                     records.append(location)
+                elif prior.payload_digest != payload_digest:
+                    raise ValueError(
+                        "one logical capture has conflicting payload digests"
+                    )
                 if record.rec_type == "response":
                     reference = response_reference(record)
                     responses_by_digest.setdefault(
-                        identity.payload_digest,
+                        payload_digest,
                         location,
                     )
-                    references_by_urlkey.setdefault(
-                        identity.urlkey,
-                        {},
-                    ).setdefault(identity.payload_digest, reference)
+                    response_references.setdefault(
+                        (identity.urlkey, payload_digest),
+                        reference,
+                    )
                 record.raw_stream.read()
             if iterator.err_count:
                 raise ValueError(
@@ -103,6 +125,30 @@ class ExistingWarcCache:
                 raise ValueError("existing WARC is missing its initial warcinfo")
             if not records:
                 raise ValueError("existing WARC contains no response or revisit")
+            for location in records:
+                cdx_digest = location.identity.payload_digest
+                if cdx_digest is None:
+                    continue
+                reference = response_references.get(
+                    (location.identity.urlkey, location.payload_digest)
+                )
+                if reference is None:
+                    raise ValueError(
+                        "revisit has no local full-response representative"
+                    )
+                references = references_by_urlkey.setdefault(
+                    location.identity.urlkey,
+                    {},
+                )
+                prior = references.get(cdx_digest)
+                if cdx_digest not in references:
+                    references[cdx_digest] = reference
+                elif (
+                    prior is not None
+                    and prior.payload_digest != location.payload_digest
+                ):
+                    references[cdx_digest] = None
+
             return cls(
                 path,
                 entries,
@@ -131,15 +177,10 @@ class ExistingWarcCache:
     def revisit_count(self) -> int:
         return sum(record.record_type == "revisit" for record in self._records)
 
-    def reference_groups(self):
-        """Iterate normalized URL keys and their response representatives."""
-
-        return self._references_by_urlkey.items()
-
     def contains(self, capture) -> bool:
         """Return whether this WARC already contains a logical capture."""
 
-        return identity_for_capture(capture) in self._entries
+        return get_cdx_identity(capture) in self._entries
 
     def _member(self, location: _StoredRecordLocation) -> bytes:
         with self.path.open("rb") as stream:
@@ -155,8 +196,12 @@ class ExistingWarcCache:
             check_digests="raise",
         )
         record = next(iterator)
-        if identity_for_warc_record(record) != location.identity:
+        if get_warc_identity(record) != location.identity:
             raise ValueError("cached record identity changed")
+        if normalize_payload_digest(
+            record.rec_headers.get_header("WARC-Payload-Digest")
+        ) != location.payload_digest:
+            raise ValueError("cached record payload digest changed")
         return iterator, record
 
     def copy_records(self, writer: WARCWriter) -> None:
@@ -173,8 +218,12 @@ class ExistingWarcCache:
                     check_digests="raise",
                 )
                 record = next(iterator)
-                if identity_for_warc_record(record) != location.identity:
+                if get_warc_identity(record) != location.identity:
                     raise ValueError("cached record identity changed")
+                if normalize_payload_digest(
+                    record.rec_headers.get_header("WARC-Payload-Digest")
+                ) != location.payload_digest:
+                    raise ValueError("cached record payload digest changed")
                 writer.write_record(record)
                 try:
                     next(iterator)
@@ -188,7 +237,7 @@ class ExistingWarcCache:
     def get(self, capture) -> Optional[CachedWarcResponse]:
         """Load the payload represented by an exact logical capture."""
 
-        identity = identity_for_capture(capture)
+        identity = get_cdx_identity(capture)
         location = self._entries.get(identity)
         if location is None:
             return None
@@ -201,7 +250,7 @@ class ExistingWarcCache:
                 body = exact_record.content_stream().read()
             else:
                 body_location = self._responses_by_digest.get(
-                    identity.payload_digest
+                    location.payload_digest
                 )
                 if body_location is None:
                     raise ValueError(
@@ -221,20 +270,55 @@ class ExistingWarcCache:
                 f"cannot reuse response from {self.path}: {error}"
             ) from error
 
+    def get_payload(self, payload_digest: str) -> Optional[CachedWarcResponse]:
+        """Load one full response by its actual WARC payload digest."""
+
+        location = self._responses_by_digest.get(payload_digest)
+        if location is None:
+            return None
+        try:
+            _iterator, record = self._record(location)
+            return CachedWarcResponse(
+                body=record.content_stream().read(),
+                status_code=int(record.http_headers.get_statuscode()),
+                headers=tuple(record.http_headers.headers),
+            )
+        except Exception as error:
+            raise ValueError(
+                f"cannot reuse payload from {self.path}: {error}"
+            ) from error
+
+
 class ExistingWarcCollection:
     """One validated, normalized cache spanning every collection WARC."""
 
     def __init__(self, caches: dict[Path, ExistingWarcCache]) -> None:
         self._caches = caches
         self._identity_caches: dict[CaptureIdentity, ExistingWarcCache] = {}
-        self._references_by_urlkey: dict[str, dict[str, RevisitReference]] = {}
+        self._references_by_urlkey: dict[
+            str, dict[str, Optional[RevisitReference]]
+        ] = {}
+        self._payload_caches: dict[str, ExistingWarcCache] = {}
         for cache in caches.values():
             for identity in cache.identities:
                 self._identity_caches.setdefault(identity, cache)
-            for urlkey, references in cache.reference_groups():
+            for digest in cache._responses_by_digest:
+                self._payload_caches.setdefault(digest, cache)
+            for urlkey, references in cache._references_by_urlkey.items():
                 target = self._references_by_urlkey.setdefault(urlkey, {})
                 for digest, reference in references.items():
-                    target.setdefault(digest, reference)
+                    prior = target.get(digest)
+                    if digest not in target:
+                        target[digest] = reference
+                    elif (
+                        reference is None
+                        or (
+                            prior is not None
+                            and prior.payload_digest
+                            != reference.payload_digest
+                        )
+                    ):
+                        target[digest] = None
 
     @classmethod
     def inventory(cls, paths) -> ExistingWarcCollection:
@@ -254,17 +338,23 @@ class ExistingWarcCollection:
         return self._caches.get(path)
 
     def contains(self, capture) -> bool:
-        return identity_for_capture(capture) in self._identity_caches
+        return get_cdx_identity(capture) in self._identity_caches
 
     def get(self, capture) -> Optional[CachedWarcResponse]:
-        cache = self._identity_caches.get(identity_for_capture(capture))
+        cache = self._identity_caches.get(get_cdx_identity(capture))
         return cache.get(capture) if cache is not None else None
 
     def references_for_urlkey(
         self,
         urlkey: str,
-    ) -> dict[str, RevisitReference]:
+    ) -> dict[str, Optional[RevisitReference]]:
         return dict(self._references_by_urlkey.get(urlkey, {}))
+
+    def get_payload(self, payload_digest: str) -> Optional[CachedWarcResponse]:
+        """Load one collection-wide response by actual payload digest."""
+
+        cache = self._payload_caches.get(payload_digest)
+        return cache.get_payload(payload_digest) if cache is not None else None
 
 def timestamp_to_warc_date(timestamp: datetime) -> str:
     """Normalize an aware timestamp to second-precision WARC UTC form."""
@@ -385,6 +475,7 @@ def write_revisit(
     source_uri: str,
     mimetype: Optional[str],
     status_code: Optional[int],
+    cdx_payload_digest: object,
     reference: RevisitReference,
 ):
     """Write one identical-payload-digest revisit record."""
@@ -405,6 +496,8 @@ def write_revisit(
         reference.warc_date,
         http_headers=http_headers,
         warc_headers_dict={
+            CDX_PAYLOAD_DIGEST_HEADER:
+                cdx_payload_digest_header_value(cdx_payload_digest),
             "WARC-Date": timestamp_to_warc_date(capture_date),
             "WARC-Source-URI": source_uri,
             "WARC-Refers-To": reference.record_id,
