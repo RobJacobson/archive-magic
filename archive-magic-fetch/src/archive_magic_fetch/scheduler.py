@@ -7,7 +7,7 @@ import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
-from queue import Empty, Full, Queue
+from queue import Full, Queue
 from typing import Callable, Optional, Sequence
 
 from .models import (
@@ -103,6 +103,7 @@ class PlaybackScheduler:
                 self._ready,
                 ReadyJob(sort_key=identity.sort_key(), identity=identity),
             )
+        self._retry_ready: list[ReadyJob] = []
         self._delayed: list[DelayedJob] = []
         self._in_flight = 0
         self._blocked_until = 0.0
@@ -113,6 +114,7 @@ class PlaybackScheduler:
         )
         self._stop = threading.Event()
         self._lock = threading.Lock()
+        self._consumer_pending = 0
         self._local = threading.local()
         self._clients: list[object] = []
 
@@ -128,15 +130,19 @@ class PlaybackScheduler:
                 with self._lock:
                     idle = (
                         not self._ready
+                        and not self._retry_ready
                         and not self._delayed
                         and self._in_flight == 0
+                        and self._consumer_pending == 0
                     )
                 if idle and not futures:
                     break
 
-                # Wait for capacity / readiness.
-                if self._in_flight >= self._max_in_flight or not self._ready:
-                    if self._delayed and not self._ready:
+                # Wait for capacity / readiness. First attempts always precede
+                # promoted retries so delayed work cannot jump the ready queue.
+                has_runnable = bool(self._ready or self._retry_ready)
+                if self._in_flight >= self._max_in_flight or not has_runnable:
+                    if self._delayed and not has_runnable:
                         delay = max(0.0, self._delayed[0].ready_at - now)
                         self._wait_briefly(min(delay, 0.05))
                     else:
@@ -152,7 +158,10 @@ class PlaybackScheduler:
                         self.metrics.cooldown_wait_s += min(wait, 0.05)
                     continue
 
-                job = heapq.heappop(self._ready)
+                if self._ready:
+                    job = heapq.heappop(self._ready)
+                else:
+                    job = heapq.heappop(self._retry_ready)
                 with self._lock:
                     self._in_flight += 1
                     self.metrics.peak_in_flight = max(
@@ -171,7 +180,7 @@ class PlaybackScheduler:
                 if futures:
                     self._wait_briefly(0.01)
 
-        self._results.put(None)
+        self._put_result(None)
         for client in self._clients:
             close = getattr(client, "close", None)
             if callable(close):
@@ -192,6 +201,25 @@ class PlaybackScheduler:
     def stop(self) -> None:
         self._stop.set()
 
+    def enqueue(self, identity: CaptureIdentity, *, attempt: int = 1) -> None:
+        """Add a first-attempt identity while the scheduler is running."""
+
+        with self._lock:
+            heapq.heappush(
+                self._ready,
+                ReadyJob(
+                    sort_key=identity.sort_key(),
+                    identity=identity,
+                    attempt=attempt,
+                ),
+            )
+
+    def acknowledge(self) -> None:
+        """Mark one consumed result as fully handled by the writer."""
+
+        with self._lock:
+            self._consumer_pending = max(0, self._consumer_pending - 1)
+
     def _worker(self, job: ReadyJob) -> JobSuccess | JobFailure:
         identity = job.identity
         try:
@@ -200,12 +228,12 @@ class PlaybackScheduler:
             success = JobSuccess(identity=identity, result=result)
             self.metrics.playback_completions += 1
             self.metrics.playback_bytes += len(result.body)
-            self._results.put(success)
+            self._put_result(success)
             return success
         except Exception as error:  # noqa: BLE001 - boundary classification
             category, retryable = classify_playback_error(error)
             retry_after = getattr(error, "retry_after", None)
-            if category == FailureCategory.RETRY_EXHAUSTED and "429" in str(error):
+            if _is_rate_limit_error(error):
                 self._note_429(retry_after)
             failure = JobFailure(
                 identity=identity,
@@ -239,10 +267,7 @@ class PlaybackScheduler:
             )
             return
         # Permanent or exhausted: surface to consumer.
-        try:
-            self._results.put(failure, timeout=30)
-        except Full:
-            self._results.put(failure)
+        self._put_result(failure)
 
     def _retry_delay(self, failure: JobFailure) -> float:
         if failure.retry_after is not None:
@@ -268,7 +293,7 @@ class PlaybackScheduler:
         while self._delayed and self._delayed[0].ready_at <= now:
             delayed = heapq.heappop(self._delayed)
             heapq.heappush(
-                self._ready,
+                self._retry_ready,
                 ReadyJob(
                     sort_key=delayed.identity.sort_key(),
                     identity=delayed.identity,
@@ -307,6 +332,34 @@ class PlaybackScheduler:
     def _wait_briefly(self, seconds: float) -> None:
         if seconds > 0:
             self._sleep(seconds)
+
+    def _put_result(self, item: JobSuccess | JobFailure | None) -> None:
+        """Enqueue a result without deadlocking after stop()."""
+
+        if item is not None:
+            with self._lock:
+                self._consumer_pending += 1
+        while True:
+            try:
+                self._results.put(item, timeout=0.1)
+                return
+            except Full:
+                if item is not None and self._stop.is_set():
+                    with self._lock:
+                        self._consumer_pending = max(
+                            0, self._consumer_pending - 1
+                        )
+                    return
+                continue
+
+
+def _is_rate_limit_error(error: BaseException) -> bool:
+    if "RateLimit" in type(error).__name__:
+        return True
+    if getattr(error, "status_code", None) == 429:
+        return True
+    message = str(error)
+    return "429" in message or "rate limit" in message.lower()
 
 
 def failure_from_job(failure: JobFailure) -> UnresolvedFailure:

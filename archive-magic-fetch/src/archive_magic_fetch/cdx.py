@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import calendar
+import gzip
 import hashlib
 import importlib.metadata
 import json
@@ -11,7 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import mktime_tz, parsedate_tz
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Literal, Optional
 from urllib.parse import urlencode
 
 import requests
@@ -48,6 +50,7 @@ _CDX_FIELDS = (
     "length",
 )
 _CDX_TIMESTAMP = re.compile(r"^\d{1,14}$")
+_DATE_BOUND = re.compile(r"^\d{4,14}$")
 
 
 class ArchiveMagicWaybackSession(WaybackSession):
@@ -97,16 +100,77 @@ def _domain_wildcard_target(url_pattern: str) -> Optional[str]:
     return f"{host}:{port}"
 
 
-def parse_date_bound(value: Optional[str], *, default: str) -> str:
-    """Parse a CDX date bound into a 14-digit UTC timestamp."""
+def _validate_calendar_date(year: int, month: int, day: int) -> None:
+    if year < 1991 or year > 9999:
+        raise ValueError(f"invalid date year: {year}")
+    if month < 1 or month > 12:
+        raise ValueError(f"invalid date month: {month}")
+    last_day = calendar.monthrange(year, month)[1]
+    if day < 1 or day > last_day:
+        raise ValueError(f"invalid date day: {year:04d}-{month:02d}-{day:02d}")
+
+
+def parse_date_bound(
+    value: Optional[str],
+    *,
+    default: str,
+    bound: Literal["start", "end"] = "start",
+) -> str:
+    """Parse a CDX date bound into a validated 14-digit UTC timestamp.
+
+    Partial values expand to the start or end of that precision in UTC.
+    For example, ``2004`` as an end bound becomes ``20041231235959``.
+    """
 
     if value is None or value == "":
         return default
     text = value.strip()
-    if not re.fullmatch(r"\d{4,14}", text):
+    if not _DATE_BOUND.fullmatch(text):
         raise ValueError(f"invalid date bound: {value!r}")
-    if len(text) < 14:
-        text = text.ljust(14, "0")
+    if len(text) not in {4, 6, 8, 10, 12, 14}:
+        raise ValueError(f"invalid date bound length: {value!r}")
+
+    year = int(text[0:4])
+    if len(text) == 4:
+        _validate_calendar_date(year, 1, 1)
+        if bound == "end":
+            return f"{year:04d}1231235959"
+        return f"{year:04d}0101000000"
+
+    month = int(text[4:6])
+    if len(text) == 6:
+        _validate_calendar_date(year, month, 1)
+        if bound == "end":
+            last = calendar.monthrange(year, month)[1]
+            return f"{year:04d}{month:02d}{last:02d}235959"
+        return f"{year:04d}{month:02d}01000000"
+
+    day = int(text[6:8])
+    _validate_calendar_date(year, month, day)
+    if len(text) == 8:
+        if bound == "end":
+            return f"{text}235959"
+        return f"{text}000000"
+
+    hour = int(text[8:10])
+    if hour > 23:
+        raise ValueError(f"invalid date hour: {value!r}")
+    if len(text) == 10:
+        if bound == "end":
+            return f"{text}5959"
+        return f"{text}0000"
+
+    minute = int(text[10:12])
+    if minute > 59:
+        raise ValueError(f"invalid date minute: {value!r}")
+    if len(text) == 12:
+        if bound == "end":
+            return f"{text}59"
+        return f"{text}00"
+
+    second = int(text[12:14])
+    if second > 59:
+        raise ValueError(f"invalid date second: {value!r}")
     return text
 
 
@@ -209,11 +273,12 @@ def fetch_year_cdx(
 
     owned_session = session is None
     session = session or ArchiveMagicWaybackSession(user_agent=USER_AGENT)
-    raw_pages: list[bytes] = []
+    page_metas: list[dict[str, object]] = []
     page = 0
     resume_key: Optional[str] = None
     started = time.time()
     request_count = 0
+    raw_path: Optional[Path] = None
 
     try:
         while True:
@@ -224,18 +289,35 @@ def fetch_year_cdx(
                 "https://web.archive.org/cdx/search/cdx?"
                 + urlencode(page_params)
             )
-            body, encoding = _get_cdx_bytes(
+            entity, content_encoding = _get_cdx_entity_bytes(
                 session,
                 query_url,
                 sleep=sleep,
             )
             request_count += 1
-            raw_pages.append(body)
             page += 1
-            rows, next_key = _split_cdx_json_pages(body)
-            # Persist every page as separate fragments then concatenate.
-            page_path = source_dir / f"{year:04d}.page{page:03d}.cdx.json"
-            page_path.write_bytes(body)
+            page_path = _write_raw_cdx_page(
+                source_dir,
+                year=year,
+                page=page,
+                entity=entity,
+                content_encoding=content_encoding,
+            )
+            if raw_path is None:
+                raw_path = page_path
+            page_metas.append(
+                {
+                    "page": page,
+                    "raw_file": page_path.name,
+                    "response_encoding": content_encoding,
+                    "byte_length": len(entity),
+                    "sha256": hashlib.sha256(entity).hexdigest(),
+                    "query_url": query_url,
+                }
+            )
+            # Resume-key discovery only; durable parse happens from disk below.
+            parse_body = _decode_cdx_entity(entity, content_encoding)
+            _rows, next_key = _split_cdx_json_pages(parse_body)
             if not next_key:
                 break
             resume_key = next_key
@@ -243,22 +325,34 @@ def fetch_year_cdx(
         if owned_session:
             session.close()
 
-    # Materialize one durable annual entity: concatenated page JSON arrays
-    # would not be valid JSON, so keep newline-delimited raw page bytes with a
-    # separator that is not a CDX field character and record that encoding.
-    separator = b"\n#PAGE\n"
-    entity = separator.join(raw_pages)
-    encoding_label = "nd-json-pages"
-    raw_path = source_dir / f"{year:04d}.cdx"
-    tmp = exclusive_temp_path(source_dir, suffix=f".{year}.cdx.tmp")
-    tmp.write_bytes(entity)
-    publish_file_atomically(tmp, raw_path)
+    if raw_path is None:
+        raise RuntimeError(f"CDX query for {year} returned no response pages")
 
+    # Single-page years use the stable annual name; multi-page years keep
+    # durable per-page files and point raw_path at page 001.
+    if len(page_metas) == 1:
+        stable_name = (
+            f"{year:04d}.cdx.gz"
+            if str(page_metas[0]["response_encoding"]).startswith("gzip")
+            else f"{year:04d}.cdx"
+        )
+        stable_path = source_dir / stable_name
+        if raw_path != stable_path:
+            publish_file_atomically(raw_path, stable_path)
+            raw_path = stable_path
+            page_metas[0]["raw_file"] = stable_name
+
+    # Parse from durable published pages so source and processed input match.
     captures: list[ParsedCapture] = []
     failures: list[UnresolvedFailure] = []
     seen: set[CaptureIdentity] = set()
-    for page_body in raw_pages:
-        page_rows, _ = _split_cdx_json_pages(page_body)
+    for page_meta in page_metas:
+        page_path = source_dir / str(page_meta["raw_file"])
+        entity = page_path.read_bytes()
+        parse_body = _decode_cdx_entity(
+            entity, str(page_meta["response_encoding"])
+        )
+        page_rows, _ = _split_cdx_json_pages(parse_body)
         for raw_line, fields in page_rows:
             parsed = _parse_row(fields, raw_line=raw_line)
             if isinstance(parsed, UnresolvedFailure):
@@ -270,6 +364,9 @@ def fetch_year_cdx(
             captures.append(parsed)
 
     captures.sort(key=lambda item: item.identity.sort_key())
+    # Top-level byte_length/sha256/raw_file always describe page one so they
+    # stay coherent; pages[] carries per-page totals for multi-page years.
+    primary = page_metas[0]
     query_meta = {
         "year": year,
         "url_pattern": url_pattern,
@@ -277,9 +374,9 @@ def fetch_year_cdx(
         "match_type": match_type,
         "from": year_start,
         "to": year_end,
-        "response_encoding": encoding_label,
-        "byte_length": len(entity),
-        "sha256": hashlib.sha256(entity).hexdigest(),
+        "response_encoding": str(primary["response_encoding"]),
+        "byte_length": int(primary["byte_length"]),
+        "sha256": str(primary["sha256"]),
         "retrieved_at": datetime.now(timezone.utc).strftime(
             "%Y-%m-%dT%H:%M:%SZ"
         ),
@@ -287,8 +384,9 @@ def fetch_year_cdx(
         "wayback_version": _wayback_version(),
         "request_count": request_count,
         "duration_s": round(time.time() - started, 3),
-        "page_count": len(raw_pages),
-        "raw_file": raw_path.name,
+        "page_count": len(page_metas),
+        "raw_file": str(primary["raw_file"]),
+        "pages": page_metas,
     }
     _merge_query_json(source_dir, year, query_meta)
 
@@ -302,38 +400,66 @@ def fetch_year_cdx(
     )
 
 
-def parse_raw_cdx_bytes(entity: bytes) -> tuple[list[ParsedCapture], list[UnresolvedFailure]]:
-    """Parse one or more raw CDX JSON page bodies separated by #PAGE."""
+def parse_raw_cdx_bytes(
+    entity: bytes,
+    *,
+    content_encoding: str = "identity",
+) -> tuple[list[ParsedCapture], list[UnresolvedFailure]]:
+    """Parse raw CDX entity bytes, optionally gzip-compressed."""
 
+    body = _decode_cdx_entity(entity, content_encoding)
     captures: list[ParsedCapture] = []
     failures: list[UnresolvedFailure] = []
     seen: set[CaptureIdentity] = set()
-    for page_body in entity.split(b"\n#PAGE\n"):
-        page_body = page_body.strip()
-        if not page_body:
+    rows, _ = _split_cdx_json_pages(body)
+    for raw_line, fields in rows:
+        parsed = _parse_row(fields, raw_line=raw_line)
+        if isinstance(parsed, UnresolvedFailure):
+            failures.append(parsed)
             continue
-        rows, _ = _split_cdx_json_pages(page_body)
-        for raw_line, fields in rows:
-            parsed = _parse_row(fields, raw_line=raw_line)
-            if isinstance(parsed, UnresolvedFailure):
-                failures.append(parsed)
-                continue
-            if parsed.identity in seen:
-                continue
-            seen.add(parsed.identity)
-            captures.append(parsed)
+        if parsed.identity in seen:
+            continue
+        seen.add(parsed.identity)
+        captures.append(parsed)
     captures.sort(key=lambda item: item.identity.sort_key())
     return captures, failures
 
 
-def _get_cdx_bytes(
+def _write_raw_cdx_page(
+    source_dir: Path,
+    *,
+    year: int,
+    page: int,
+    entity: bytes,
+    content_encoding: str,
+) -> Path:
+    """Persist one CDX HTTP entity before any parsing."""
+
+    suffix = ".cdx.gz" if content_encoding.startswith("gzip") else ".cdx"
+    page_path = source_dir / f"{year:04d}.page{page:03d}{suffix}"
+    tmp = exclusive_temp_path(source_dir, suffix=f".{page_path.name}.tmp")
+    tmp.write_bytes(entity)
+    publish_file_atomically(tmp, page_path)
+    return page_path
+
+
+def _decode_cdx_entity(entity: bytes, content_encoding: str) -> bytes:
+    encoding = content_encoding.lower().strip() or "identity"
+    if encoding in {"identity", "utf-8", "json"}:
+        return entity
+    if encoding.startswith("gzip"):
+        return gzip.decompress(entity)
+    raise ValueError(f"unsupported CDX content encoding: {content_encoding!r}")
+
+
+def _get_cdx_entity_bytes(
     session: requests.Session,
     url: str,
     *,
     sleep: Callable[[float], None],
     max_attempts: int = 8,
 ) -> tuple[bytes, str]:
-    """GET raw CDX entity bytes with simple retry handling."""
+    """GET exact CDX HTTP entity bytes without content-encoding decode."""
 
     attempt = 0
     while True:
@@ -359,14 +485,38 @@ def _get_cdx_bytes(
                 sleep(min(5 * (2**attempt), 300))
                 continue
             response.raise_for_status()
-            body = response.content
-            encoding = response.encoding or "utf-8"
+            headers = getattr(response, "headers", {}) or {}
+            content_encoding = str(
+                headers.get("Content-Encoding")
+                or headers.get("content-encoding")
+                or "identity"
+            ).lower()
+            body = _read_raw_entity_bytes(response)
             response.close()
-            return body, encoding
+            return body, content_encoding
         except (requests.ConnectionError, requests.Timeout):
             if attempt >= max_attempts:
                 raise
             sleep(min(5 * (2**attempt), 300))
+
+
+def _read_raw_entity_bytes(response: object) -> bytes:
+    """Return the HTTP entity body without decoding Content-Encoding."""
+
+    raw = getattr(response, "raw", None)
+    if raw is not None:
+        read = getattr(raw, "read", None)
+        if callable(read):
+            try:
+                body = read(decode_content=False)
+            except TypeError:
+                body = read()
+            if isinstance(body, (bytes, bytearray)):
+                return bytes(body)
+    content = getattr(response, "content", None)
+    if isinstance(content, (bytes, bytearray)):
+        return bytes(content)
+    raise TypeError("CDX response did not provide readable entity bytes")
 
 
 def _split_cdx_json_pages(
@@ -403,6 +553,10 @@ def _split_cdx_json_pages(
                     resume_key = key_row[0]
             break
         if not isinstance(item, list):
+            # Preserve unexpected JSON entries as deterministic malformed rows
+            # rather than silently dropping them from the durable source parse.
+            raw_line = json.dumps(item, sort_keys=True, default=str)
+            rows.append((raw_line, []))
             continue
         # Skip header row when present.
         if item and item[0] == "urlkey":
@@ -469,23 +623,26 @@ def _parse_row(
 
 
 def _malformed(raw_line: str, message: str) -> UnresolvedFailure:
-    # Synthetic identity for malformed rows that lack valid fields.
+    # Distinct synthetic identity per malformed source row so publication
+    # cannot collapse unrelated bad rows into one failure ledger entry.
+    row_digest = hashlib.sha1(raw_line.encode("utf-8", errors="replace")).hexdigest()
     identity = CaptureIdentity(
-        urlkey="-",
+        urlkey=f"malformed:{row_digest}",
         original_url="-",
         timestamp="00000000000000",
         status_token="-",
-        payload_digest="-",
+        payload_digest=f"malformed:{row_digest}",
     )
-    # Try to surface timestamp/url when present for stable sorting.
     parts = raw_line.split(" ")
     if len(parts) >= 3 and re.fullmatch(r"\d{14}", parts[1]):
         identity = CaptureIdentity(
-            urlkey=parts[0] or "-",
+            urlkey=parts[0] or f"malformed:{row_digest}",
             original_url=parts[2] or "-",
             timestamp=parts[1],
             status_token=parts[4] if len(parts) > 4 else "-",
-            payload_digest=parts[5] if len(parts) > 5 else "-",
+            # Always keep the row hash so distinct malformed rows that share
+            # timestamp/url fields cannot collide in failures.json.
+            payload_digest=f"malformed:{row_digest}",
         )
     return UnresolvedFailure(
         identity=identity,
@@ -516,10 +673,25 @@ def _merge_query_json(
 
 
 def init_run_source(layout: CollectionLayout, run_id: str | None = None) -> Path:
-    """Create the run source directory and return it."""
+    """Create the run source directory and return it.
+
+    When ``run_id`` is omitted, allocate a unique directory. Explicit run IDs
+    (tests, resume tooling) may reuse an existing directory.
+    """
 
     ensure_collection_dirs(layout)
-    run_id = run_id or current_run_id()
-    source_dir = layout.sources_root / run_id
-    source_dir.mkdir(parents=True, exist_ok=True)
-    return source_dir
+    if run_id is not None:
+        source_dir = layout.sources_root / run_id
+        source_dir.mkdir(parents=True, exist_ok=True)
+        return source_dir
+
+    # Auto-allocate: microsecond IDs usually suffice; bump on collision.
+    for attempt in range(1000):
+        candidate = current_run_id() if attempt == 0 else f"{current_run_id()}-{attempt:02d}"
+        source_dir = layout.sources_root / candidate
+        try:
+            source_dir.mkdir(parents=True, exist_ok=False)
+            return source_dir
+        except FileExistsError:
+            continue
+    raise RuntimeError("unable to allocate a unique run source directory")

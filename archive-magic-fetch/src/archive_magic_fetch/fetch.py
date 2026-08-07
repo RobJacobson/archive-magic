@@ -25,6 +25,7 @@ from .collection import (
     index_artifact_from_path,
     list_all_warcs,
     list_year_warcs,
+    load_failures,
     warc_artifact_from_path,
     write_failures,
     write_manifest,
@@ -43,7 +44,6 @@ from .models import (
     RunMetrics,
     UnresolvedFailure,
     WarcArtifact,
-    current_run_id,
     current_utc_cdx_timestamp,
 )
 from .scheduler import JobFailure, JobSuccess, PlaybackScheduler, failure_from_job
@@ -51,6 +51,7 @@ from .warc import (
     CollectionInventory,
     StoredResponse,
     YearWarcWriter,
+    count_warc_records,
     inventory_collection,
     revisit_from_stored,
     stored_from_playback,
@@ -93,11 +94,12 @@ def run_fetch(
     reconcile_missing_indexes(layout)
 
     metrics = RunMetrics()
-    run_id = current_run_id()
-    source_dir = init_run_source(layout, run_id)
-    all_failures: list[UnresolvedFailure] = []
+    source_dir = init_run_source(layout)
+    run_id = source_dir.name
+    # Retain unresolved failures from prior runs until they are represented.
+    all_failures: list[UnresolvedFailure] = list(load_failures(layout))
     all_warcs: list[WarcArtifact] = []
-    annual_indexes: list[IndexArtifact] = []
+    annual_indexes: list[IndexArtifact] = _existing_annual_indexes(layout)
 
     # Baseline inventory of previously published WARCs.
     inventory = inventory_collection(layout)
@@ -182,23 +184,13 @@ def run_fetch(
             )
             metrics.index_s += time.monotonic() - idx_started
             if annual is not None:
-                # replace annual entry for this year
-                annual_indexes = [
-                    item
-                    for item in annual_indexes
-                    if not item.relative_key.endswith(f"/{year:04d}.cdxj")
-                ]
-                annual_indexes.append(annual)
+                annual_indexes = _replace_annual_index(annual_indexes, annual)
 
         # Ensure annual index exists even if no new warcs this year.
         if list_year_warcs(layout, year):
             annual = publish_annual_index(layout, year)
             if annual is not None:
-                annual_indexes = [
-                    item
-                    for item in annual_indexes
-                    if not item.relative_key.endswith(f"/{year:04d}.cdxj")
-                ] + [annual]
+                annual_indexes = _replace_annual_index(annual_indexes, annual)
 
         coll = publish_collection_index(layout)
         _publish_state(
@@ -206,7 +198,7 @@ def run_fetch(
             settings=settings,
             run_source=f"sources/{run_id}",
             warcs=_collect_warc_artifacts(layout, all_warcs),
-            annual_indexes=annual_indexes,
+            annual_indexes=_merge_annual_indexes(layout, annual_indexes),
             collection_index=coll,
             metrics=metrics,
             failures=all_failures,
@@ -215,14 +207,13 @@ def run_fetch(
 
     coll = publish_collection_index(layout)
     final_warcs = _collect_warc_artifacts(layout, all_warcs)
-    metrics.unresolved = len({f.identity for f in all_failures})
-    status = "complete" if metrics.unresolved == 0 else "partial"
-    _publish_state(
+    final_annual = _merge_annual_indexes(layout, annual_indexes)
+    unresolved = _publish_state(
         layout,
         settings=settings,
         run_source=f"sources/{run_id}",
         warcs=final_warcs,
-        annual_indexes=annual_indexes or _existing_annual_indexes(layout),
+        annual_indexes=final_annual,
         collection_index=coll or (
             index_artifact_from_path(layout, layout.collection_index)
             if layout.collection_index.is_file()
@@ -232,6 +223,7 @@ def run_fetch(
         failures=all_failures,
         final=True,
     )
+    status = "complete" if metrics.unresolved == 0 else "partial"
     print(
         f"done: status={status} represented={metrics.represented} "
         f"unresolved={metrics.unresolved}",
@@ -242,7 +234,7 @@ def run_fetch(
         exit_code=exit_code,
         layout=layout,
         metrics=metrics,
-        failures=all_failures,
+        failures=unresolved,
     )
 
 
@@ -288,11 +280,7 @@ def _plan_year_work(
         # remaining stay as deferred revisits after success (handled live).
         representative = group[0]
         network.append(representative.identity)
-        # Stash later members by attaching to network pipeline via pending map
-        # encoded as pseudo sequence: we'll handle group members after download.
         for capture in group[1:]:
-            # They need the representative first; if representative fails, try next.
-            # Store as additional network candidates (retry order).
             network.append(capture.identity)
 
     for capture in redirect_or_nodigest:
@@ -338,9 +326,8 @@ def _run_year_downloads(
         by_key[(identity.urlkey, identity.payload_digest)].append(identity)
 
     # Only the first pending member of each group is an actual download job at
-    # a time; others wait. For simplicity/KISS: schedule first of each group +
-    # all singles. On success, write revisits for remaining. On failure of first,
-    # try next candidate for that group.
+    # a time; others wait. On success, write revisits for remaining. On failure
+    # of first, enqueue the next candidate through the same scheduler.
     active: list[CaptureIdentity] = []
     remaining_groups: dict[tuple[str, str], list[CaptureIdentity]] = {}
     for key, members in by_key.items():
@@ -375,133 +362,56 @@ def _run_year_downloads(
     scheduler = PlaybackScheduler(**scheduler_kwargs)
 
     failures: list[UnresolvedFailure] = []
-    # Run scheduler on a background thread so the writer can consume results.
     import threading
 
     thread = threading.Thread(target=scheduler.run, name="playback-scheduler")
     thread.start()
+    writer_error: BaseException | None = None
     try:
         for item in scheduler.results():
-            if isinstance(item, JobSuccess):
-                result = item.result
-                if inventory.contains(result.identity):
-                    metrics.local_reuses += 1
-                    continue
-                key = (
-                    result.identity.urlkey,
-                    result.identity.payload_digest,
-                )
-                # Same-year digest revisit if representative already stored.
-                stored = year_index.by_url_digest.get(key)
-                if (
-                    stored is not None
-                    and result.identity.payload_digest != MISSING_CDX_PAYLOAD_DIGEST
-                    and not (
-                        result.identity.status_token.isdigit()
-                        and 300 <= int(result.identity.status_token) < 400
+            try:
+                if isinstance(item, JobSuccess):
+                    _handle_download_success(
+                        item=item,
+                        layout=layout,
+                        year=year,
+                        inventory=inventory,
+                        year_index=year_index,
+                        writer=writer,
+                        metrics=metrics,
+                        remaining_groups=remaining_groups,
                     )
-                ):
-                    writer.write_revisit(
-                        revisit_from_stored(
-                            result.identity,
-                            stored,
-                            http_status_code=result.status_code,
-                            http_headers=result.headers,
-                        )
-                    )
-                    inventory.identities.add(result.identity)
-                    metrics.revisits += 1
-                    metrics.represented += 1
-                    continue
-
-                writer.write_playback(result)
-                metrics.downloads += 1
-                metrics.represented += 1
-                inventory.identities.add(result.identity)
-                # Update year response index with provisional relative key.
-                # Sequence may rotate; use last finalized or current open sequence.
-                relative = _current_relative_key(layout, year, writer)
-                stored_resp = stored_from_playback(
-                    layout, year, result, relative
-                )
-                year_index.by_identity[result.identity] = stored_resp
-                if result.identity.payload_digest != MISSING_CDX_PAYLOAD_DIGEST:
-                    year_index.by_url_digest[key] = stored_resp
-
-                # Write pending same-group members as revisits.
-                for identity in remaining_groups.pop(key, []):
-                    if inventory.contains(identity):
-                        continue
-                    writer.write_revisit(
-                        revisit_from_stored(
-                            identity,
-                            stored_resp,
-                            http_status_code=result.status_code,
-                            http_headers=result.headers,
-                        )
-                    )
-                    inventory.identities.add(identity)
-                    metrics.revisits += 1
-                    metrics.represented += 1
+                else:
+                    assert isinstance(item, JobFailure)
+                    identity = item.identity
+                    key = (identity.urlkey, identity.payload_digest)
+                    candidates = remaining_groups.get(key)
+                    if candidates:
+                        next_id = candidates.pop(0)
+                        remaining_groups[key] = candidates
+                        scheduler.enqueue(next_id)
+                    failures.append(failure_from_job(item))
+            except BaseException as error:  # noqa: BLE001 - stop scheduler
+                writer_error = error
+                scheduler.stop()
+                scheduler.acknowledge()
+                break
             else:
-                assert isinstance(item, JobFailure)
-                identity = item.identity
-                key = (identity.urlkey, identity.payload_digest)
-                # Try next candidate in group if any.
-                candidates = remaining_groups.get(key)
-                if candidates:
-                    next_id = candidates.pop(0)
-                    remaining_groups[key] = candidates
-                    # Inline retry of next representative is done by folding into
-                    # failure list only if we can't schedule more dynamically.
-                    # Simple approach: download next synchronously.
-                    try:
-                        client = client_factory()
-                        enter = getattr(client, "__enter__", None)
-                        active_client = enter() if callable(enter) else client
-                        if active_client is None:
-                            active_client = client
-                        fn = download_fn
-                        if fn is None:
-                            from .warc import download_exact_for_identity as fn
-                        result = fn(active_client, next_id)
-                        # Re-inject as success path.
-                        success = JobSuccess(identity=next_id, result=result)
-                        # process by recursive tail via queue simulation:
-                        writer.write_playback(success.result)
-                        metrics.downloads += 1
-                        metrics.represented += 1
-                        inventory.identities.add(next_id)
-                        relative = _current_relative_key(layout, year, writer)
-                        stored_resp = stored_from_playback(
-                            layout, year, success.result, relative
-                        )
-                        year_index.by_identity[next_id] = stored_resp
-                        year_index.by_url_digest[key] = stored_resp
-                        for identity2 in remaining_groups.pop(key, []):
-                            if inventory.contains(identity2):
-                                continue
-                            writer.write_revisit(
-                                revisit_from_stored(identity2, stored_resp)
-                            )
-                            inventory.identities.add(identity2)
-                            metrics.revisits += 1
-                            metrics.represented += 1
-                        close = getattr(client, "close", None)
-                        if callable(close):
-                            close()
-                        continue
-                    except Exception as error:  # noqa: BLE001
-                        failures.append(
-                            UnresolvedFailure(
-                                identity=next_id,
-                                category=FailureCategory.UNAVAILABLE,
-                                message=str(error),
-                            )
-                        )
-                failures.append(failure_from_job(item))
+                scheduler.acknowledge()
     finally:
-        thread.join()
+        scheduler.stop()
+        # Drain results so workers blocked on the bounded queue can exit.
+        while thread.is_alive():
+            try:
+                while True:
+                    scheduler._results.get_nowait()
+            except Exception:  # noqa: BLE001 - Empty or shutdown
+                pass
+            thread.join(timeout=0.05)
+        thread.join(timeout=5)
+
+    if writer_error is not None:
+        raise writer_error
 
     # Mark unresolved remaining group members.
     for key, members in remaining_groups.items():
@@ -516,6 +426,74 @@ def _run_year_downloads(
                 )
             )
     return failures
+
+
+def _handle_download_success(
+    *,
+    item: JobSuccess,
+    layout: CollectionLayout,
+    year: int,
+    inventory: CollectionInventory,
+    year_index,
+    writer: YearWarcWriter,
+    metrics: RunMetrics,
+    remaining_groups: dict[tuple[str, str], list[CaptureIdentity]],
+) -> None:
+    result = item.result
+    if inventory.contains(result.identity):
+        metrics.local_reuses += 1
+        return
+    key = (
+        result.identity.urlkey,
+        result.identity.payload_digest,
+    )
+    # Same-year digest revisit if representative already stored.
+    stored = year_index.by_url_digest.get(key)
+    if (
+        stored is not None
+        and result.identity.payload_digest != MISSING_CDX_PAYLOAD_DIGEST
+        and not (
+            result.identity.status_token.isdigit()
+            and 300 <= int(result.identity.status_token) < 400
+        )
+    ):
+        writer.write_revisit(
+            revisit_from_stored(
+                result.identity,
+                stored,
+                http_status_code=result.status_code,
+                http_headers=result.headers,
+            )
+        )
+        inventory.identities.add(result.identity)
+        metrics.revisits += 1
+        metrics.represented += 1
+        return
+
+    writer.write_playback(result)
+    metrics.downloads += 1
+    metrics.represented += 1
+    inventory.identities.add(result.identity)
+    relative = _current_relative_key(layout, year, writer)
+    stored_resp = stored_from_playback(layout, year, result, relative)
+    year_index.by_identity[result.identity] = stored_resp
+    if result.identity.payload_digest != MISSING_CDX_PAYLOAD_DIGEST:
+        year_index.by_url_digest[key] = stored_resp
+
+    for identity in remaining_groups.pop(key, []):
+        if inventory.contains(identity):
+            continue
+        writer.write_revisit(
+            revisit_from_stored(
+                identity,
+                stored_resp,
+                http_status_code=result.status_code,
+                http_headers=result.headers,
+            )
+        )
+        inventory.identities.add(identity)
+        metrics.revisits += 1
+        metrics.represented += 1
 
 
 def _current_relative_key(
@@ -555,7 +533,11 @@ def _collect_warc_artifacts(
             artifacts.append(known[rel])
         else:
             artifacts.append(
-                warc_artifact_from_path(layout, path, record_count=0)
+                warc_artifact_from_path(
+                    layout,
+                    path,
+                    record_count=count_warc_records(path),
+                )
             )
     return artifacts
 
@@ -571,6 +553,29 @@ def _existing_annual_indexes(layout: CollectionLayout) -> list[IndexArtifact]:
     return result
 
 
+def _replace_annual_index(
+    annual_indexes: list[IndexArtifact],
+    annual: IndexArtifact,
+) -> list[IndexArtifact]:
+    return [
+        item
+        for item in annual_indexes
+        if item.relative_key != annual.relative_key
+    ] + [annual]
+
+
+def _merge_annual_indexes(
+    layout: CollectionLayout,
+    annual_indexes: Sequence[IndexArtifact],
+) -> list[IndexArtifact]:
+    """Prefer in-run artifacts, then include every on-disk annual index."""
+
+    by_key = {item.relative_key: item for item in annual_indexes}
+    for item in _existing_annual_indexes(layout):
+        by_key.setdefault(item.relative_key, item)
+    return sorted(by_key.values(), key=lambda item: item.relative_key)
+
+
 def _publish_state(
     layout: CollectionLayout,
     *,
@@ -582,11 +587,12 @@ def _publish_state(
     metrics: RunMetrics,
     failures: Sequence[UnresolvedFailure],
     final: bool,
-) -> None:
-    # Collapse failures by identity; drop any now represented in inventory.
+) -> list[UnresolvedFailure]:
+    # Collapse failures by identity; later details replace stale ones.
+    # Drop any identity now represented in the collection inventory.
     by_id: dict[CaptureIdentity, UnresolvedFailure] = {}
     for failure in failures:
-        by_id.setdefault(failure.identity, failure)
+        by_id[failure.identity] = failure
 
     inv = inventory_collection(layout)
     unresolved_list = [
@@ -607,6 +613,7 @@ def _publish_state(
         collection_index=collection_index,
         metrics=metrics,
     )
+    return unresolved_list
 
 
 def build_settings(
@@ -617,8 +624,12 @@ def build_settings(
 ) -> FetchSettings:
     """Validate CLI-facing inputs into settings."""
 
-    start = parse_date_bound(date_start, default=DEFAULT_DATE_START)
-    end = parse_date_bound(date_end, default=current_utc_cdx_timestamp())
+    start = parse_date_bound(
+        date_start, default=DEFAULT_DATE_START, bound="start"
+    )
+    end = parse_date_bound(
+        date_end, default=current_utc_cdx_timestamp(), bound="end"
+    )
     validate_date_range(start, end)
     return FetchSettings(
         url_pattern=url_pattern.strip(),

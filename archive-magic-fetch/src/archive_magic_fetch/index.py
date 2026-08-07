@@ -240,21 +240,21 @@ def validate_annual_revisit_closure(
         mime = str(meta.get("mime", ""))
         # cdxj-indexer sets warc record type sometimes as "mime" warc/revisit
         if "revisit" in mime or meta.get("mime") == "warc/revisit":
+            # Redirects are fetched as individual responses, never as
+            # revisits. Every revisit — including any with a 3xx status —
+            # must resolve to a same-year response.
             digest = meta.get("digest")
             if isinstance(digest, str) and digest:
-                # Revisit may still resolve if a response with that digest exists
-                # in the year. Empty digests are accepted for status redirects.
-                if digest.lower() not in response_digests and not _is_redirect_meta(
-                    meta
-                ):
-                    # Soft check: some revisits are written with profile headers
-                    # and still play when target is present by refers-to.
-                    pass
-
-
-def _is_redirect_meta(meta: dict) -> bool:
-    status = str(meta.get("status", ""))
-    return status.isdigit() and 300 <= int(status) < 400
+                if digest.lower() not in response_digests:
+                    raise ValueError(
+                        f"annual revisit in {year} has no same-year response "
+                        f"for digest {digest}"
+                    )
+            else:
+                raise ValueError(
+                    f"annual revisit in {year} is missing a resolvable "
+                    f"same-year response digest"
+                )
 
 
 def reconcile_missing_indexes(layout: CollectionLayout) -> list[int]:

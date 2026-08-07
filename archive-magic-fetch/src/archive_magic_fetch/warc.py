@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import re
 from dataclasses import dataclass, field
 from http import HTTPStatus
 from io import BytesIO
@@ -32,6 +33,7 @@ from .collection import (
 from .models import (
     CDX_PAYLOAD_DIGEST_HEADER,
     CDX_STATUS_HEADER,
+    CDX_URLKEY_HEADER,
     MISSING_CDX_PAYLOAD_DIGEST,
     MISSING_CDX_STATUS,
     SOFTWARE_ID,
@@ -57,7 +59,6 @@ _REPRESENTATION_HEADERS = {
     "content-encoding",
     "content-length",
     "content-md5",
-    "content-range",
     "digest",
     "etag",
     "repr-digest",
@@ -120,6 +121,7 @@ def get_warc_identity(record) -> CaptureIdentity:
     warc_date = record.rec_headers.get_header("WARC-Date")
     cdx_digest = record.rec_headers.get_header(CDX_PAYLOAD_DIGEST_HEADER)
     cdx_status = record.rec_headers.get_header(CDX_STATUS_HEADER)
+    cdx_urlkey = record.rec_headers.get_header(CDX_URLKEY_HEADER)
     if not target_uri or not warc_date:
         raise ValueError("WARC record is missing target URI or date")
     if cdx_digest is None:
@@ -139,6 +141,7 @@ def get_warc_identity(record) -> CaptureIdentity:
         timestamp=warc_date_to_cdx(warc_date),
         status_token=cdx_status_token(cdx_status),
         payload_digest=digest_token,
+        urlkey=cdx_urlkey or None,
     )
 
 
@@ -206,7 +209,9 @@ def download_exact(
         status_code = memento.status_code
         memento_url = memento.memento_url
         memento_timestamp = memento.timestamp
-        headers = tuple(_semantic_headers(memento.headers, len(body)))
+        headers = tuple(
+            _semantic_headers(memento.headers, len(body), status_code=status_code)
+        )
         url = memento.url
 
     returned_ts = timestamp_to_warc_date(memento_timestamp)
@@ -215,7 +220,7 @@ def download_exact(
         raise ExactMismatchError(
             f"timestamp mismatch: requested {timestamp}, got {returned_cdx}"
         )
-    if _urls_equivalent(url, expected_url) is False:
+    if url != expected_url:
         raise ExactMismatchError(
             f"URL mismatch: requested {expected_url}, got {url}"
         )
@@ -257,6 +262,13 @@ def download_exact_for_identity(client, identity: CaptureIdentity) -> PlaybackRe
         expected_status=expected_status,
         expected_url=identity.original_url,
     )
+    actual_digest = result.warc_payload_digest
+    expected_digest = normalize_payload_digest(identity.payload_digest)
+    if expected_digest is not None and actual_digest != expected_digest:
+        raise DigestValidationError(
+            f"payload digest mismatch: CDX {expected_digest}, "
+            f"downloaded {actual_digest}"
+        )
     return PlaybackResult(
         identity=identity,
         body=result.body,
@@ -264,7 +276,7 @@ def download_exact_for_identity(client, identity: CaptureIdentity) -> PlaybackRe
         headers=result.headers,
         warc_date=result.warc_date,
         source_uri=result.source_uri,
-        warc_payload_digest=result.warc_payload_digest,
+        warc_payload_digest=actual_digest,
     )
 
 
@@ -272,40 +284,59 @@ class ExactMismatchError(MementoPlaybackError):
     """Returned memento is not the requested capture."""
 
 
+class DigestValidationError(Exception):
+    """Downloaded payload does not match the CDX payload digest."""
+
+
+_RETRYABLE_HTTP_STATUSES = frozenset({413, 421, 429, 500, 502, 503, 504, 599})
+_STATUS_IN_MESSAGE = re.compile(r"\b([45]\d\d)\b")
+
+
 def classify_playback_error(error: BaseException) -> tuple[FailureCategory, bool]:
     """Return (category, retryable) for a playback error."""
 
     if isinstance(error, ExactMismatchError):
         return FailureCategory.EXACT_MISMATCH, False
+    if isinstance(error, DigestValidationError):
+        return FailureCategory.DIGEST_VALIDATION, False
     if isinstance(error, (BlockedByRobotsError, BlockedSiteError)):
         return FailureCategory.BLOCKED, False
+    name = type(error).__name__
+    if "RateLimit" in name:
+        return FailureCategory.RETRY_EXHAUSTED, True
+    if "Retryable" in name:
+        return FailureCategory.RETRY_EXHAUSTED, True
+    status = getattr(error, "status_code", None)
+    if status is None:
+        match = _STATUS_IN_MESSAGE.search(str(error))
+        if match:
+            status = int(match.group(1))
+    if status in _RETRYABLE_HTTP_STATUSES:
+        return FailureCategory.RETRY_EXHAUSTED, True
     if isinstance(error, MementoPlaybackError):
         return FailureCategory.UNAVAILABLE, False
-    name = type(error).__name__
-    if "RateLimit" in name or "Retryable" in name:
-        return FailureCategory.RETRY_EXHAUSTED, True
     if "Timeout" in name or "Connection" in name or "Chunked" in name:
         return FailureCategory.RETRY_EXHAUSTED, True
     if "IncompleteRead" in name or "Truncat" in name:
         return FailureCategory.TRUNCATED, True
-    status = getattr(error, "status_code", None)
-    if status in {413, 421, 429, 500, 502, 503, 504, 599}:
-        return FailureCategory.RETRY_EXHAUSTED, True
     return FailureCategory.UNAVAILABLE, False
-
-
-def _urls_equivalent(left: str, right: str) -> bool:
-    return left.rstrip("/") == right.rstrip("/")
 
 
 def _semantic_headers(
     headers: Mapping[str, str],
     payload_length: int,
+    *,
+    status_code: int,
 ) -> list[tuple[str, str]]:
+    skip = set(_REPRESENTATION_HEADERS)
+    # Preserve Content-Range for partial responses; the stored body is that
+    # range and replay needs the header to describe it.
+    if status_code != 206:
+        skip.add("content-range")
     semantic = [
         (name, value)
         for name, value in headers.items()
-        if name.lower() not in _REPRESENTATION_HEADERS
+        if name.lower() not in skip
     ]
     semantic.append(("Content-Length", str(payload_length)))
     return semantic
@@ -346,6 +377,7 @@ def build_response_record(result: PlaybackResult):
         warc_headers_dict={
             CDX_PAYLOAD_DIGEST_HEADER: result.identity.payload_digest,
             CDX_STATUS_HEADER: result.identity.status_token,
+            CDX_URLKEY_HEADER: result.identity.urlkey,
             "WARC-Date": result.warc_date,
             "WARC-Source-URI": result.source_uri,
             "WARC-Payload-Digest": result.warc_payload_digest,
@@ -369,6 +401,7 @@ def build_revisit_record(result: RevisitResult):
         warc_headers_dict={
             CDX_PAYLOAD_DIGEST_HEADER: result.identity.payload_digest,
             CDX_STATUS_HEADER: result.identity.status_token,
+            CDX_URLKEY_HEADER: result.identity.urlkey,
             "WARC-Date": result.warc_date,
             "WARC-Payload-Digest": result.warc_payload_digest,
             "WARC-Profile": (
@@ -488,6 +521,17 @@ def validate_warc(path: Path) -> None:
             record.raw_stream.read()
     if not types or types[0] != "warcinfo":
         raise ValueError(f"WARC missing leading warcinfo: {path}")
+
+
+def count_warc_records(path: Path) -> int:
+    """Return the number of records in a finalized WARC."""
+
+    count = 0
+    with path.open("rb") as stream:
+        for record in ArchiveIterator(stream, check_digests=False):
+            count += 1
+            record.raw_stream.read()
+    return count
 
 
 def revisit_from_stored(

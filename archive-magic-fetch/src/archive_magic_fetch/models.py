@@ -28,7 +28,7 @@ DEFAULT_429_COOLDOWN_S = 60.0
 MAX_429_COOLDOWN_S = 900.0
 RESULT_QUEUE_SIZE = 64
 CDX_PAGE_LIMIT = 10_000
-DEFAULT_DATE_START = "19960101000000"
+DEFAULT_DATE_START = "19950101000000"
 COLLECTION_SCHEMA_VERSION = 1
 FAILURES_SCHEMA_VERSION = 1
 WARC_VERSION = "1.1"
@@ -40,6 +40,7 @@ USER_AGENT = (
 
 CDX_PAYLOAD_DIGEST_HEADER = "CDX-Payload-Digest"
 CDX_STATUS_HEADER = "CDX-Status"
+CDX_URLKEY_HEADER = "CDX-Urlkey"
 MISSING_CDX_PAYLOAD_DIGEST = "-"
 MISSING_CDX_STATUS = "-"
 
@@ -335,6 +336,9 @@ def current_utc_cdx_timestamp() -> str:
 
 
 def current_run_id() -> str:
-    """Return one UTC run identifier suitable for sources/ directory names."""
+    """Return one UTC run identifier suitable for sources/ directory names.
 
-    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    Uses microsecond precision so rapid consecutive runs do not collide.
+    """
+
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
