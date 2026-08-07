@@ -706,6 +706,22 @@ def test_playback_5xx_is_retryable():
     assert category == FailureCategory.RETRY_EXHAUSTED
 
 
+def test_wrapped_incomplete_read_is_permanent_truncated_failure():
+    from requests.exceptions import ChunkedEncodingError
+    from wayback.exceptions import WaybackRetryError
+
+    incomplete = ChunkedEncodingError(
+        "Connection broken: IncompleteRead(130810 bytes read, "
+        "292753 more expected)"
+    )
+    wrapped = WaybackRetryError(0, 0.08, incomplete)
+
+    category, retryable = classify_playback_error(wrapped)
+
+    assert category == FailureCategory.TRUNCATED
+    assert retryable is False
+
+
 # ---------------------------------------------------------------------------
 # Annual revisit closure rejects orphans
 # ---------------------------------------------------------------------------

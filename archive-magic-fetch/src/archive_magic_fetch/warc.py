@@ -303,6 +303,16 @@ def classify_playback_error(error: BaseException) -> tuple[FailureCategory, bool
     if isinstance(error, (BlockedByRobotsError, BlockedSiteError)):
         return FailureCategory.BLOCKED, False
     name = type(error).__name__
+    # IA can store permanently truncated payloads whose advertised length is
+    # larger than the bytes available. requests commonly wraps IncompleteRead
+    # in ChunkedEncodingError and wayback wraps that again, so inspect the
+    # complete outer message before generic connection-error classification.
+    if (
+        "IncompleteRead" in name
+        or "Truncat" in name
+        or "IncompleteRead" in str(error)
+    ):
+        return FailureCategory.TRUNCATED, False
     if "RateLimit" in name:
         return FailureCategory.RETRY_EXHAUSTED, True
     # Unwrap wayback's retry wrapper so connection/429 causes classify usefully.
@@ -326,8 +336,6 @@ def classify_playback_error(error: BaseException) -> tuple[FailureCategory, bool
         return FailureCategory.UNAVAILABLE, False
     if "Timeout" in name or "Connection" in name or "Chunked" in name:
         return FailureCategory.RETRY_EXHAUSTED, True
-    if "IncompleteRead" in name or "Truncat" in name:
-        return FailureCategory.TRUNCATED, True
     return FailureCategory.UNAVAILABLE, False
 
 
