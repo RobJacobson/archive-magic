@@ -14,7 +14,9 @@ from typing import Callable, Optional, Sequence
 
 from .models import (
     DEFAULT_429_COOLDOWN_S,
+    DEFAULT_CONNECTION_REFUSAL_COOLDOWN_S,
     MAX_429_COOLDOWN_S,
+    MAX_CONNECTION_REFUSAL_COOLDOWN_S,
     MAX_IN_FLIGHT,
     MAX_PLAYBACK_ATTEMPTS,
     MAX_RETRY_DELAY_S,
@@ -75,7 +77,7 @@ DownloadFn = Callable[[object, CaptureIdentity], PlaybackResult]
 
 
 class PlaybackScheduler:
-    """Own start pacing, in-flight slots, delayed retries, and 429 gate."""
+    """Own start pacing, in-flight slots, delayed retries, and global gates."""
 
     def __init__(
         self,
@@ -112,6 +114,8 @@ class PlaybackScheduler:
         self._in_flight = 0
         self._blocked_until = 0.0
         self._consecutive_429 = 0
+        self._connection_blocked_until = 0.0
+        self._connection_refusal_waves = 0
         self._next_start_at = 0.0
         self._results: Queue[JobSuccess | JobFailure | None] = Queue(
             maxsize=result_queue_size
@@ -226,6 +230,7 @@ class PlaybackScheduler:
 
     def _worker(self, job: ReadyJob) -> JobSuccess | JobFailure:
         identity = job.identity
+        request_started_at = self._clock()
         try:
             client = self._thread_client()
             result = self._download_fn(client, identity)
@@ -240,6 +245,12 @@ class PlaybackScheduler:
             retry_after = _retry_after_from_error(error)
             if _is_rate_limit_error(error):
                 self._note_429(retry_after, identity=identity, error=error)
+            elif _is_connection_refused_error(error):
+                self._note_connection_refusal(
+                    identity=identity,
+                    error=error,
+                    request_started_at=request_started_at,
+                )
             failure = JobFailure(
                 identity=identity,
                 category=category,
@@ -271,8 +282,6 @@ class PlaybackScheduler:
                 ),
             )
             message = failure.message or failure.category.value
-            if len(message) > 80:
-                message = message[:77] + "..."
             print(
                 f"  retry: deferred {delay:g}s "
                 f"(attempt {failure.attempt}/{self._max_attempts}) "
@@ -317,13 +326,52 @@ class PlaybackScheduler:
         detail = ""
         if error is not None:
             message = str(error) or type(error).__name__
-            if len(message) > 80:
-                message = message[:77] + "..."
             detail = f" [{type(error).__name__}: {message}]"
         print(
             f"  rate limit: pausing {cooldown:g}s ({source}, "
             f"consecutive={self._consecutive_429}) "
             f"{identity.original_url}{detail}",
+            flush=True,
+        )
+
+    def _note_connection_refusal(
+        self,
+        *,
+        identity: CaptureIdentity,
+        error: BaseException,
+        request_started_at: float,
+    ) -> None:
+        """Globally pause after one TCP-refusal wave.
+
+        Workers already in flight can report the same refusal concurrently.
+        Only the first refusal after the previous cooldown starts a new wave
+        and doubles the fallback delay.
+        """
+
+        now = self._clock()
+        with self._lock:
+            # A request that began before this wave's cooldown expired belongs
+            # to that same wave, even if its failure arrives after the timer.
+            if request_started_at < self._connection_blocked_until:
+                return
+            self._connection_refusal_waves += 1
+            cooldown = min(
+                DEFAULT_CONNECTION_REFUSAL_COOLDOWN_S
+                * (2 ** (self._connection_refusal_waves - 1)),
+                MAX_CONNECTION_REFUSAL_COOLDOWN_S,
+            )
+            self._connection_blocked_until = now + cooldown
+            self._blocked_until = max(
+                self._blocked_until,
+                self._connection_blocked_until,
+            )
+            wave = self._connection_refusal_waves
+
+        message = str(error) or type(error).__name__
+        print(
+            f"  connection refused: pausing all requests {cooldown:g}s "
+            f"(wave={wave}) {identity.original_url} "
+            f"[{type(error).__name__}: {message}]",
             flush=True,
         )
 
@@ -340,7 +388,8 @@ class PlaybackScheduler:
             )
 
     def _gate_wait(self, now: float) -> float:
-        blocked = max(0.0, self._blocked_until - now)
+        with self._lock:
+            blocked = max(0.0, self._blocked_until - now)
         spacing = max(0.0, self._next_start_at - now)
         return max(blocked, spacing)
 
@@ -411,6 +460,17 @@ def _is_rate_limit_error(error: BaseException) -> bool:
         if "rate limit" in message or "too many requests" in message:
             return True
         if re.search(r"\b429\b", message):
+            return True
+    return False
+
+
+def _is_connection_refused_error(error: BaseException) -> bool:
+    """Return whether an error chain ends in a refused TCP connection."""
+
+    for candidate in _iter_error_chain(error):
+        if isinstance(candidate, ConnectionRefusedError):
+            return True
+        if "connection refused" in str(candidate).lower():
             return True
     return False
 

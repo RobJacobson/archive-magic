@@ -18,15 +18,15 @@ from surt import surt
 
 DEFAULT_OUTPUT_ROOT = Path("../archives")
 WARC_TARGET_BYTES = 1_000_000_000
-PLAYBACK_REQUESTS_PER_SECOND = 8.0
-# Bounded concurrency separate from start rate. 24 sustains 8 starts/s for
-# typical archive responses without excessive open connections; re-measure
-# on large collections before changing.
-MAX_IN_FLIGHT = 16
+PLAYBACK_REQUESTS_PER_SECOND = 4.0
+# Bounded concurrency is separate from the request start rate.
+MAX_IN_FLIGHT = 8
 MAX_PLAYBACK_ATTEMPTS = 9  # first try + 8 retries
 MAX_RETRY_DELAY_S = 3600
 DEFAULT_429_COOLDOWN_S = 60.0
 MAX_429_COOLDOWN_S = 900.0
+DEFAULT_CONNECTION_REFUSAL_COOLDOWN_S = 5.0
+MAX_CONNECTION_REFUSAL_COOLDOWN_S = 60.0
 RESULT_QUEUE_SIZE = 64
 CDX_PAGE_LIMIT = 10_000
 DEFAULT_DATE_START = "19950101000000"

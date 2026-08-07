@@ -431,6 +431,51 @@ def test_rate_limit_uses_error_retry_after_without_exponential_default():
     assert scheduler._consecutive_429 == 2
 
 
+def test_connection_refusal_waves_gate_globally_and_escalate():
+    from archive_magic_fetch.scheduler import PlaybackScheduler
+
+    clock = {"t": 100.0}
+    identity = _identity()
+    scheduler = PlaybackScheduler(
+        client_factory=lambda: MagicMock(),
+        identities=[identity],
+        clock=lambda: clock["t"],
+        sleep=lambda _s: None,
+    )
+    error = ConnectionRefusedError(61, "Connection refused")
+
+    scheduler._note_connection_refusal(
+        identity=identity,
+        error=error,
+        request_started_at=99.0,
+    )
+    assert scheduler._blocked_until == pytest.approx(105.0)
+    assert scheduler._connection_refusal_waves == 1
+
+    # A concurrent request remains part of the same wave even if its failure
+    # does not arrive until after the initial cooldown expires.
+    clock["t"] = 106.0
+    scheduler._note_connection_refusal(
+        identity=identity,
+        error=error,
+        request_started_at=99.5,
+    )
+    assert scheduler._blocked_until == pytest.approx(105.0)
+    assert scheduler._connection_refusal_waves == 1
+
+    expected = ((105.0, 115.0), (115.0, 135.0), (135.0, 175.0), (175.0, 235.0))
+    for now, blocked_until in expected:
+        clock["t"] = now
+        scheduler._note_connection_refusal(
+            identity=identity,
+            error=error,
+            request_started_at=now,
+        )
+        assert scheduler._blocked_until == pytest.approx(blocked_until)
+
+    assert scheduler._connection_refusal_waves == 5
+
+
 def test_session_raises_rate_limit_for_429_memento_response():
     from archive_magic_fetch.cdx import ArchiveMagicWaybackSession
     from wayback import WaybackSession
@@ -474,18 +519,23 @@ def test_retry_after_extracted_from_rate_limit_error_and_message():
 
 
 def test_connection_error_with_429_in_timestamp_is_not_rate_limit():
-    from archive_magic_fetch.scheduler import _is_rate_limit_error
+    from archive_magic_fetch.scheduler import (
+        _is_connection_refused_error,
+        _is_rate_limit_error,
+    )
     from wayback.exceptions import WaybackRetryError
 
     # Timestamps like 20080429 contain the digits 429 but are not HTTP 429s.
-    causal = ConnectionError(
+    causal = ConnectionRefusedError(
+        61,
         "HTTPSConnectionPool(host='web.archive.org', port=443): "
         "Max retries exceeded with url: "
-        "/web/20080429120000id_/http://example.org/page"
+        "/web/20080429120000id_/http://example.org/page: Connection refused",
     )
     wrapped = WaybackRetryError(0, 0.08, causal)
     assert not _is_rate_limit_error(wrapped)
     assert not _is_rate_limit_error(causal)
+    assert _is_connection_refused_error(wrapped)
 
     real = RateLimitError(response=MagicMock(headers={}), retry_after=60)
     assert _is_rate_limit_error(real)
