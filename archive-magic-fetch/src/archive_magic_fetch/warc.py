@@ -305,6 +305,14 @@ def classify_playback_error(error: BaseException) -> tuple[FailureCategory, bool
     name = type(error).__name__
     if "RateLimit" in name:
         return FailureCategory.RETRY_EXHAUSTED, True
+    # Unwrap wayback's retry wrapper so connection/429 causes classify usefully.
+    if "WaybackRetry" in name:
+        nested = getattr(error, "cause", None)
+        if isinstance(nested, BaseException):
+            return classify_playback_error(nested)
+        if isinstance(error.__cause__, BaseException):
+            return classify_playback_error(error.__cause__)
+        return FailureCategory.RETRY_EXHAUSTED, True
     if "Retryable" in name:
         return FailureCategory.RETRY_EXHAUSTED, True
     status = getattr(error, "status_code", None)

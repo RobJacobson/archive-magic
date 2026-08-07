@@ -18,6 +18,8 @@ from urllib.parse import urlencode
 
 import requests
 from wayback import WaybackClient, WaybackSession
+from wayback._client import read_and_close
+from wayback.exceptions import RateLimitError, WaybackRetryError
 
 from .collection import CollectionLayout, ensure_collection_dirs, exclusive_temp_path, publish_file_atomically
 from .models import (
@@ -54,17 +56,44 @@ _DATE_BOUND = re.compile(r"^\d{4,14}$")
 
 
 class ArchiveMagicWaybackSession(WaybackSession):
-    """Wayback session with library-owned retries disabled."""
+    """Wayback session tuned for Archive Magic fetch.
+
+    Playback clients keep ``retries=0`` so the scheduler owns backoff. CDX
+    queries opt into library retries for transient connect failures.
+
+    Wayback treats any response with ``Memento-Datetime`` as a successful
+    memento, which can let HTTP 429 slip through as a playback error with no
+    ``retry_after``. Always surface 429 as ``RateLimitError`` with the
+    session's recommended delay (header or wayback's 60s default).
+    """
 
     def __init__(self, *args, **kwargs) -> None:
-        kwargs["retries"] = 0
+        kwargs.setdefault("retries", 0)
         super().__init__(*args, **kwargs)
+
+    def send(self, request, **kwargs):
+        response = super().send(request, **kwargs)
+        if getattr(response, "status_code", None) == 429:
+            delay = self.get_retry_delay(0, response)
+            read_and_close(response)
+            raise RateLimitError(response, delay)
+        return response
 
 
 def make_client() -> WaybackClient:
     """Return a Wayback client using the shared process rate limits."""
 
     return WaybackClient(session=ArchiveMagicWaybackSession(user_agent=USER_AGENT))
+
+
+def make_cdx_session() -> ArchiveMagicWaybackSession:
+    """Return a Wayback session for CDX queries.
+
+    Retries stay at 0 here; ``_get_cdx_entity_bytes`` owns transient backoff so
+    connect failures are logged and retried without nesting wayback's loop.
+    """
+
+    return ArchiveMagicWaybackSession(user_agent=USER_AGENT)
 
 
 def normalize_cdx_search(url_pattern: str) -> tuple[str, Optional[str]]:
@@ -272,7 +301,7 @@ def fetch_year_cdx(
         params["matchType"] = match_type
 
     owned_session = session is None
-    session = session or ArchiveMagicWaybackSession(user_agent=USER_AGENT)
+    session = session or make_cdx_session()
     page_metas: list[dict[str, object]] = []
     page = 0
     resume_key: Optional[str] = None
@@ -487,7 +516,14 @@ def _get_cdx_entity_bytes(
                 if attempt >= max_attempts:
                     response.raise_for_status()
                 response.close()
-                sleep(min(5 * (2**attempt), 300))
+                delay = min(5 * (2 ** (attempt - 1)), 300)
+                print(
+                    f"  CDX server error {response.status_code}: "
+                    f"retrying in {delay:g}s "
+                    f"(attempt {attempt}/{max_attempts})",
+                    flush=True,
+                )
+                sleep(delay)
                 continue
             response.raise_for_status()
             headers = getattr(response, "headers", {}) or {}
@@ -499,10 +535,22 @@ def _get_cdx_entity_bytes(
             body = _read_raw_entity_bytes(response)
             response.close()
             return body, content_encoding
-        except (requests.ConnectionError, requests.Timeout):
+        except (
+            requests.ConnectionError,
+            requests.Timeout,
+            WaybackRetryError,
+            OSError,
+        ) as error:
             if attempt >= max_attempts:
                 raise
-            sleep(min(5 * (2**attempt), 300))
+            delay = min(5 * (2 ** (attempt - 1)), 300)
+            print(
+                f"  CDX connection error: retrying in {delay:g}s "
+                f"(attempt {attempt}/{max_attempts}) "
+                f"[{type(error).__name__}: {error}]",
+                flush=True,
+            )
+            sleep(delay)
 
 
 def _read_raw_entity_bytes(response: object) -> bytes:

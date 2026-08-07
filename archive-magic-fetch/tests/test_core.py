@@ -383,7 +383,7 @@ def test_scheduler_smooth_spacing_concurrency_retry_and_429():
         client_factory=lambda: MagicMock(),
         identities=identities,
         max_in_flight=2,
-        start_interval=0.125,
+        requests_per_second=8.0,
         max_attempts=4,
         download_fn=download_fn,
         clock=mono,
@@ -407,6 +407,90 @@ def test_scheduler_smooth_spacing_concurrency_retry_and_429():
     successes = [r for r in results if hasattr(r, "result")]
     assert len(successes) >= 2
     assert attempts["n"] >= 3
+
+
+def test_rate_limit_uses_error_retry_after_without_exponential_default():
+    from archive_magic_fetch.scheduler import PlaybackScheduler
+
+    clock = {"t": 100.0}
+    identity = _identity()
+
+    scheduler = PlaybackScheduler(
+        client_factory=lambda: MagicMock(),
+        identities=[identity],
+        clock=lambda: clock["t"],
+        sleep=lambda _s: None,
+    )
+    scheduler._note_429(12.0, identity=identity)
+    assert scheduler._blocked_until == pytest.approx(112.0)
+
+    # A second 429 without Retry-After must stay at the fixed default, not 120s.
+    clock["t"] = 200.0
+    scheduler._note_429(None, identity=identity)
+    assert scheduler._blocked_until == pytest.approx(260.0)
+    assert scheduler._consecutive_429 == 2
+
+
+def test_session_raises_rate_limit_for_429_memento_response():
+    from archive_magic_fetch.cdx import ArchiveMagicWaybackSession
+    from wayback import WaybackSession
+    from wayback.exceptions import RateLimitError
+
+    session = ArchiveMagicWaybackSession()
+    response = MagicMock()
+    response.status_code = 429
+    response.headers = {"Memento-Datetime": "Wed, 01 Jun 2004 00:00:00 GMT"}
+    # Parent would treat this as a successful memento; our session must not.
+
+    original_send = WaybackSession.send
+
+    def fake_send(self, request, **kwargs):
+        return response
+
+    WaybackSession.send = fake_send  # type: ignore[method-assign]
+    try:
+        with pytest.raises(RateLimitError) as raised:
+            session.send(MagicMock())
+        assert raised.value.retry_after == 60
+    finally:
+        WaybackSession.send = original_send  # type: ignore[method-assign]
+        session.close()
+
+
+def test_retry_after_extracted_from_rate_limit_error_and_message():
+    from archive_magic_fetch.scheduler import _retry_after_from_error
+
+    err = RateLimitError(response=MagicMock(headers={}), retry_after=7)
+    assert _retry_after_from_error(err) == 7.0
+
+    header_response = MagicMock()
+    header_response.headers = {"Retry-After": "9"}
+    bare = RuntimeError("429 too many requests")
+    bare.response = header_response  # type: ignore[attr-defined]
+    assert _retry_after_from_error(bare) == 9.0
+
+    msg = RuntimeError("Wayback rate limit exceeded, retry after 15 s")
+    assert _retry_after_from_error(msg) == 15.0
+
+
+def test_connection_error_with_429_in_timestamp_is_not_rate_limit():
+    from archive_magic_fetch.scheduler import _is_rate_limit_error
+    from wayback.exceptions import WaybackRetryError
+
+    # Timestamps like 20080429 contain the digits 429 but are not HTTP 429s.
+    causal = ConnectionError(
+        "HTTPSConnectionPool(host='web.archive.org', port=443): "
+        "Max retries exceeded with url: "
+        "/web/20080429120000id_/http://example.org/page"
+    )
+    wrapped = WaybackRetryError(0, 0.08, causal)
+    assert not _is_rate_limit_error(wrapped)
+    assert not _is_rate_limit_error(causal)
+
+    real = RateLimitError(response=MagicMock(headers={}), retry_after=60)
+    assert _is_rate_limit_error(real)
+    assert _is_rate_limit_error(WaybackRetryError(0, 0.1, real))
+    assert _is_rate_limit_error(RuntimeError("429 error while loading memento"))
 
 
 def test_retries_do_not_jump_ahead_of_first_attempts():
@@ -435,7 +519,7 @@ def test_retries_do_not_jump_ahead_of_first_attempts():
         client_factory=lambda: MagicMock(),
         identities=[first, second],
         max_in_flight=1,
-        start_interval=0.0,
+        requests_per_second=float("inf"),
         max_attempts=3,
         download_fn=download_fn,
         clock=mono,

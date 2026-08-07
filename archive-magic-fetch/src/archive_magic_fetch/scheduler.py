@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import heapq
+import re
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
+from email.utils import mktime_tz, parsedate_tz
 from queue import Full, Queue
 from typing import Callable, Optional, Sequence
 
@@ -16,7 +18,7 @@ from .models import (
     MAX_IN_FLIGHT,
     MAX_PLAYBACK_ATTEMPTS,
     MAX_RETRY_DELAY_S,
-    PLAYBACK_START_INTERVAL_S,
+    PLAYBACK_REQUESTS_PER_SECOND,
     RESULT_QUEUE_SIZE,
     CaptureIdentity,
     FailureCategory,
@@ -81,7 +83,7 @@ class PlaybackScheduler:
         *,
         identities: Sequence[CaptureIdentity],
         max_in_flight: int = MAX_IN_FLIGHT,
-        start_interval: float = PLAYBACK_START_INTERVAL_S,
+        requests_per_second: float = PLAYBACK_REQUESTS_PER_SECOND,
         max_attempts: int = MAX_PLAYBACK_ATTEMPTS,
         result_queue_size: int = RESULT_QUEUE_SIZE,
         metrics: Optional[RunMetrics] = None,
@@ -89,9 +91,11 @@ class PlaybackScheduler:
         clock: Clock = time.monotonic,
         sleep: Sleep = time.sleep,
     ) -> None:
+        if requests_per_second <= 0:
+            raise ValueError("requests_per_second must be greater than zero")
         self._client_factory = client_factory
         self._max_in_flight = max_in_flight
-        self._start_interval = start_interval
+        self._start_interval = 1.0 / requests_per_second
         self._max_attempts = max_attempts
         self._download_fn = download_fn
         self._clock = clock
@@ -228,20 +232,21 @@ class PlaybackScheduler:
             success = JobSuccess(identity=identity, result=result)
             self.metrics.playback_completions += 1
             self.metrics.playback_bytes += len(result.body)
+            self._consecutive_429 = 0
             self._put_result(success)
             return success
         except Exception as error:  # noqa: BLE001 - boundary classification
             category, retryable = classify_playback_error(error)
-            retry_after = getattr(error, "retry_after", None)
+            retry_after = _retry_after_from_error(error)
             if _is_rate_limit_error(error):
-                self._note_429(retry_after, identity=identity)
+                self._note_429(retry_after, identity=identity, error=error)
             failure = JobFailure(
                 identity=identity,
                 category=category,
                 message=str(error) or type(error).__name__,
                 retryable=retryable,
                 attempt=job.attempt,
-                retry_after=float(retry_after) if retry_after else None,
+                retry_after=retry_after,
             )
             self.metrics.bump_attempt(category.value)
             self._handle_failure(failure)
@@ -265,6 +270,15 @@ class PlaybackScheduler:
                     category=failure.category.value,
                 ),
             )
+            message = failure.message or failure.category.value
+            if len(message) > 80:
+                message = message[:77] + "..."
+            print(
+                f"  retry: deferred {delay:g}s "
+                f"(attempt {failure.attempt}/{self._max_attempts}) "
+                f"{failure.identity.original_url} [{message}]",
+                flush=True,
+            )
             return
         # Permanent or exhausted: surface to consumer.
         self._put_result(failure)
@@ -280,25 +294,36 @@ class PlaybackScheduler:
         retry_after: Optional[float],
         *,
         identity: CaptureIdentity,
+        error: Optional[BaseException] = None,
     ) -> None:
         self._consecutive_429 += 1
-        if retry_after is not None:
-            cooldown = float(retry_after)
+        header_delay = _retry_after_from_response(
+            getattr(error, "response", None) if error is not None else None
+        )
+        if header_delay is not None:
+            cooldown = min(header_delay, MAX_429_COOLDOWN_S)
             source = "Retry-After"
+        elif retry_after is not None:
+            cooldown = min(float(retry_after), MAX_429_COOLDOWN_S)
+            source = "error"
         else:
-            cooldown = min(
-                DEFAULT_429_COOLDOWN_S * (2 ** (self._consecutive_429 - 1)),
-                MAX_429_COOLDOWN_S,
-            )
+            # IA often omits the header; wayback recommends a fixed pause.
+            cooldown = DEFAULT_429_COOLDOWN_S
             source = "default"
         self._blocked_until = max(
             self._blocked_until,
             self._clock() + cooldown,
         )
+        detail = ""
+        if error is not None:
+            message = str(error) or type(error).__name__
+            if len(message) > 80:
+                message = message[:77] + "..."
+            detail = f" [{type(error).__name__}: {message}]"
         print(
             f"  rate limit: pausing {cooldown:g}s ({source}, "
             f"consecutive={self._consecutive_429}) "
-            f"{identity.original_url}",
+            f"{identity.original_url}{detail}",
             flush=True,
         )
 
@@ -367,12 +392,96 @@ class PlaybackScheduler:
 
 
 def _is_rate_limit_error(error: BaseException) -> bool:
-    if "RateLimit" in type(error).__name__:
-        return True
-    if getattr(error, "status_code", None) == 429:
-        return True
-    message = str(error)
-    return "429" in message or "rate limit" in message.lower()
+    """Return whether error represents an HTTP 429 / rate-limit response.
+
+    Avoid bare ``\"429\" in message`` checks: capture timestamps and URLs often
+    contain that digit sequence (e.g. ``20080429``) and were falsely tripping
+    the global cooldown on ordinary connection errors.
+    """
+
+    for candidate in _iter_error_chain(error):
+        if "RateLimit" in type(candidate).__name__:
+            return True
+        if getattr(candidate, "status_code", None) == 429:
+            return True
+        response = getattr(candidate, "response", None)
+        if getattr(response, "status_code", None) == 429:
+            return True
+        message = str(candidate).lower()
+        if "rate limit" in message or "too many requests" in message:
+            return True
+        if re.search(r"\b429\b", message):
+            return True
+    return False
+
+
+def _iter_error_chain(error: BaseException):
+    """Yield an error and its wrapped causes without looping forever."""
+
+    seen: set[int] = set()
+    current: Optional[BaseException] = error
+    while current is not None and id(current) not in seen:
+        yield current
+        seen.add(id(current))
+        nested = getattr(current, "cause", None)
+        if isinstance(nested, BaseException):
+            current = nested
+            continue
+        if isinstance(current.__cause__, BaseException):
+            current = current.__cause__
+            continue
+        if isinstance(current.__context__, BaseException):
+            current = current.__context__
+            continue
+        break
+
+
+_RETRY_AFTER_IN_MESSAGE = re.compile(
+    r"retry after\s+(\d+(?:\.\d+)?)\s*s",
+    re.IGNORECASE,
+)
+
+
+def _parse_retry_after_header(value: object) -> Optional[float]:
+    if isinstance(value, (int, float)):
+        return float(max(0.0, value))
+    if not isinstance(value, str):
+        return None
+    try:
+        return float(max(0, int(value)))
+    except ValueError:
+        retry_date = parsedate_tz(value)
+        if retry_date is None:
+            return None
+        return float(max(0, mktime_tz(retry_date) - int(time.time())))
+
+
+def _retry_after_from_response(response: object) -> Optional[float]:
+    headers = getattr(response, "headers", None) or {}
+    if not headers:
+        return None
+    return _parse_retry_after_header(
+        headers.get("Retry-After") or headers.get("retry-after")
+    )
+
+
+def _retry_after_from_error(error: BaseException) -> Optional[float]:
+    """Return the pause recommended by a rate-limit or HTTP error, if any."""
+
+    for candidate in _iter_error_chain(error):
+        value = getattr(candidate, "retry_after", None)
+        parsed = _parse_retry_after_header(value)
+        if parsed is not None:
+            return parsed
+
+        parsed = _retry_after_from_response(getattr(candidate, "response", None))
+        if parsed is not None:
+            return parsed
+
+        match = _RETRY_AFTER_IN_MESSAGE.search(str(candidate))
+        if match:
+            return float(match.group(1))
+    return None
 
 
 def failure_from_job(failure: JobFailure) -> UnresolvedFailure:
