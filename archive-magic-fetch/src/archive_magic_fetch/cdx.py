@@ -476,6 +476,11 @@ def _get_cdx_entity_bytes(
                         f"CDX rate limited after {attempt} attempts "
                         f"(retry_after={delay})"
                     )
+                print(
+                    f"  rate limit: CDX pausing {delay:g}s "
+                    f"(attempt {attempt}/{max_attempts})",
+                    flush=True,
+                )
                 sleep(delay)
                 continue
             if response.status_code >= 500:

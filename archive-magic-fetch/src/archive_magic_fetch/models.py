@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlsplit, urlunsplit
 
 from surt import surt
 
@@ -227,6 +228,51 @@ def normalized_urlkey(url: str) -> str:
         raise ValueError(f"cannot normalize capture URL {url!r}") from error
 
 
+_DEFAULT_PORTS = {
+    "http": 80,
+    "https": 443,
+    "ws": 80,
+    "wss": 443,
+}
+
+
+def normalize_original_url(url: str) -> str:
+    """Strip scheme-default ports from a capture URL; leave other spelling intact.
+
+    ``http://host:80/path`` and ``https://host:443/path`` become
+    ``http://host/path`` and ``https://host/path``. Non-default ports are kept.
+    """
+
+    if not isinstance(url, str) or not url:
+        raise ValueError("capture URL must be a non-empty string")
+    parts = urlsplit(url)
+    scheme = parts.scheme.lower()
+    default_port = _DEFAULT_PORTS.get(scheme)
+    if default_port is None or not parts.netloc:
+        return url
+    try:
+        port = parts.port
+    except ValueError:
+        return url
+    if port != default_port:
+        return url
+
+    suffix = f":{default_port}"
+    netloc = parts.netloc
+    if "@" in netloc:
+        userinfo, hostport = netloc.rsplit("@", 1)
+        if not hostport.endswith(suffix):
+            return url
+        netloc = f"{userinfo}@{hostport[: -len(suffix)]}"
+    else:
+        if not netloc.endswith(suffix):
+            return url
+        netloc = netloc[: -len(suffix)]
+    return urlunsplit(
+        (parts.scheme, netloc, parts.path, parts.query, parts.fragment)
+    )
+
+
 def timestamp_to_cdx(timestamp: datetime) -> str:
     """Normalize an aware datetime to a 14-digit CDX timestamp."""
 
@@ -296,9 +342,10 @@ def make_identity(
 
     if not _CDX_TIMESTAMP.fullmatch(timestamp):
         raise ValueError(f"invalid CDX timestamp: {timestamp!r}")
+    canonical_url = normalize_original_url(original_url)
     return CaptureIdentity(
-        urlkey=urlkey or normalized_urlkey(original_url),
-        original_url=original_url,
+        urlkey=urlkey or normalized_urlkey(canonical_url),
+        original_url=canonical_url,
         timestamp=timestamp,
         status_token=cdx_status_token(status_token),
         payload_digest=cdx_payload_digest_token(payload_digest),
@@ -322,7 +369,7 @@ def identity_from_dict(data: dict[str, object]) -> CaptureIdentity:
 
     return CaptureIdentity(
         urlkey=str(data["urlkey"]),
-        original_url=str(data["original_url"]),
+        original_url=normalize_original_url(str(data["original_url"])),
         timestamp=str(data["timestamp"]),
         status_token=str(data["status_token"]),
         payload_digest=str(data["payload_digest"]),

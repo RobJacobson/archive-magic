@@ -234,7 +234,7 @@ class PlaybackScheduler:
             category, retryable = classify_playback_error(error)
             retry_after = getattr(error, "retry_after", None)
             if _is_rate_limit_error(error):
-                self._note_429(retry_after)
+                self._note_429(retry_after, identity=identity)
             failure = JobFailure(
                 identity=identity,
                 category=category,
@@ -275,18 +275,31 @@ class PlaybackScheduler:
         delay = 5 * (2 ** failure.attempt)
         return float(min(delay, MAX_RETRY_DELAY_S))
 
-    def _note_429(self, retry_after: Optional[float]) -> None:
+    def _note_429(
+        self,
+        retry_after: Optional[float],
+        *,
+        identity: CaptureIdentity,
+    ) -> None:
         self._consecutive_429 += 1
         if retry_after is not None:
             cooldown = float(retry_after)
+            source = "Retry-After"
         else:
             cooldown = min(
                 DEFAULT_429_COOLDOWN_S * (2 ** (self._consecutive_429 - 1)),
                 MAX_429_COOLDOWN_S,
             )
+            source = "default"
         self._blocked_until = max(
             self._blocked_until,
             self._clock() + cooldown,
+        )
+        print(
+            f"  rate limit: pausing {cooldown:g}s ({source}, "
+            f"consecutive={self._consecutive_429}) "
+            f"{identity.original_url}",
+            flush=True,
         )
 
     def _promote_delayed(self, now: float) -> None:

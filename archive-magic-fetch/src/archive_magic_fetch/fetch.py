@@ -163,6 +163,7 @@ def run_fetch(
                 layout=layout,
                 year=year,
                 jobs=work_plan.network_jobs,
+                pending_revisits=work_plan.pending_revisits,
                 inventory=inventory,
                 year_index=year_index,
                 writer=writer,
@@ -256,6 +257,7 @@ def _plan_year_work(
     year_index = inventory.year_index(year)
     network: list[CaptureIdentity] = []
     revisits: list[tuple[CaptureIdentity, StoredResponse]] = []
+    pending: dict[tuple[str, str], list[CaptureIdentity]] = {}
 
     # Redirects and digests-missing always individual.
     redirect_or_nodigest: list[ParsedCapture] = []
@@ -277,11 +279,12 @@ def _plan_year_work(
                     revisits.append((capture.identity, stored))
             continue
         # No in-year representative yet: schedule earliest as network job;
-        # remaining stay as deferred revisits after success (handled live).
+        # remaining become revisits after that representative succeeds.
         representative = group[0]
         network.append(representative.identity)
-        for capture in group[1:]:
-            network.append(capture.identity)
+        deferred = [capture.identity for capture in group[1:]]
+        if deferred:
+            pending[key] = deferred
 
     for capture in redirect_or_nodigest:
         network.append(capture.identity)
@@ -292,7 +295,7 @@ def _plan_year_work(
     return _YearPlan(
         network_jobs=network,
         revisit_jobs=revisits,
-        pending_revisits={},
+        pending_revisits=pending,
     )
 
 
@@ -301,6 +304,7 @@ def _run_year_downloads(
     layout: CollectionLayout,
     year: int,
     jobs: Sequence[CaptureIdentity],
+    pending_revisits: dict[tuple[str, str], list[CaptureIdentity]],
     inventory: CollectionInventory,
     year_index,
     writer: YearWarcWriter,
@@ -310,43 +314,38 @@ def _run_year_downloads(
 ) -> list[UnresolvedFailure]:
     """Download scheduled identities and write responses/revisits."""
 
-    # Build digest groups for post-success revisits.
-    by_key: dict[tuple[str, str], list[CaptureIdentity]] = defaultdict(list)
-    singles: list[CaptureIdentity] = []
-    for identity in jobs:
-        if (
-            identity.payload_digest == MISSING_CDX_PAYLOAD_DIGEST
-            or (
-                identity.status_token.isdigit()
-                and 300 <= int(identity.status_token) < 400
-            )
-        ):
-            singles.append(identity)
-            continue
-        by_key[(identity.urlkey, identity.payload_digest)].append(identity)
+    remaining_groups: dict[tuple[str, str], list[CaptureIdentity]] = {
+        key: list(members) for key, members in pending_revisits.items()
+    }
 
-    # Only the first pending member of each group is an actual download job at
-    # a time; others wait. On success, write revisits for remaining. On failure
-    # of first, enqueue the next candidate through the same scheduler.
+    # jobs are one download candidate each (group representative or
+    # redirect/no-digest single). Deferred same-digest members live in
+    # remaining_groups and become revisits after a successful representative.
     active: list[CaptureIdentity] = []
-    remaining_groups: dict[tuple[str, str], list[CaptureIdentity]] = {}
-    for key, members in by_key.items():
-        members = sorted(members, key=lambda i: i.timestamp)
-        # Skip already represented mid-run.
-        members = [m for m in members if not inventory.contains(m)]
-        if not members:
+    for identity in jobs:
+        if inventory.contains(identity):
             continue
-        stored = year_index.by_url_digest.get(key)
-        if stored is not None:
-            for identity in members:
+        key = (identity.urlkey, identity.payload_digest)
+        is_single = identity.payload_digest == MISSING_CDX_PAYLOAD_DIGEST or (
+            identity.status_token.isdigit()
+            and 300 <= int(identity.status_token) < 400
+        )
+        if not is_single:
+            stored = year_index.by_url_digest.get(key)
+            if stored is not None:
                 writer.write_revisit(revisit_from_stored(identity, stored))
                 inventory.identities.add(identity)
                 metrics.revisits += 1
                 metrics.represented += 1
-            continue
-        remaining_groups[key] = members[1:]
-        active.append(members[0])
-    active.extend(m for m in singles if not inventory.contains(m))
+                for deferred in remaining_groups.pop(key, []):
+                    if inventory.contains(deferred):
+                        continue
+                    writer.write_revisit(revisit_from_stored(deferred, stored))
+                    inventory.identities.add(deferred)
+                    metrics.revisits += 1
+                    metrics.represented += 1
+                continue
+        active.append(identity)
     active = sorted(active, key=lambda i: i.sort_key())
 
     if not active:
@@ -364,6 +363,10 @@ def _run_year_downloads(
     failures: list[UnresolvedFailure] = []
     import threading
 
+    download_total = len(active)
+    download_done = 0
+    progress_width = len(str(download_total))
+
     thread = threading.Thread(target=scheduler.run, name="playback-scheduler")
     thread.start()
     writer_error: BaseException | None = None
@@ -380,6 +383,12 @@ def _run_year_downloads(
                         writer=writer,
                         metrics=metrics,
                         remaining_groups=remaining_groups,
+                    )
+                    download_done += 1
+                    print(
+                        f"  {download_done:{progress_width}d}/{download_total}: "
+                        f"Downloaded {item.identity.original_url}",
+                        flush=True,
                     )
                 else:
                     assert isinstance(item, JobFailure)

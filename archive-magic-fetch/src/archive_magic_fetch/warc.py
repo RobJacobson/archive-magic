@@ -48,6 +48,7 @@ from .models import (
     cdx_status_token,
     cdx_timestamp_to_warc_date,
     make_identity,
+    normalize_original_url,
     normalize_payload_digest,
     timestamp_to_warc_date,
     warc_date_to_cdx,
@@ -220,7 +221,7 @@ def download_exact(
         raise ExactMismatchError(
             f"timestamp mismatch: requested {timestamp}, got {returned_cdx}"
         )
-    if url != expected_url:
+    if normalize_original_url(url) != normalize_original_url(expected_url):
         raise ExactMismatchError(
             f"URL mismatch: requested {expected_url}, got {url}"
         )
