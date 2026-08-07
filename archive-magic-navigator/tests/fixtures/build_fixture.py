@@ -19,7 +19,7 @@ LOCAL_REDIRECT_WARC = (
 LOCAL_TARGET_WARC = (
     ROOT / "archive" / "local-target.test" / "index.warc.gz"
 )
-INDEX = ROOT / "replay" / "index.cdxj"
+INDEX = ROOT / "indexes" / "index.cdxj"
 HASHES = ROOT / "SHA256SUMS"
 MAIN_URL = "http://example.test/"
 CSS_URL = "http://example.test/assets/site.css"

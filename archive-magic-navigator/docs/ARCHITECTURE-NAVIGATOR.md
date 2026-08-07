@@ -125,7 +125,7 @@ The applications have separate ownership:
 | --- | --- | --- |
 | `sources/` | Fetch | Ignore |
 | `archive/**/*.warc.gz` | Fetch | Read by indexed byte range |
-| `replay/index.cdxj` | Fetch | Query as the authoritative replay index |
+| `indexes/index.cdxj` | Fetch | Query as the authoritative replay index |
 | `website/` | Fetch | Ignore |
 | Navigator runtime config | Navigator | Generate outside the collection tree |
 | Navigator templates/static assets | Navigator | Ship inside the Navigator package |
@@ -188,18 +188,19 @@ archives/
 └── example.com/
     ├── sources/
     ├── archive/
-    │   ├── index.warc.gz
-    │   └── posts/
-    │       └── index.warc.gz
-    ├── replay/
-    │   └── index.cdxj
-    └── website/
+    │   └── 2004/
+    │       ├── example.com-2004-001.warc.gz
+    │       └── example.com-2004-002.warc.gz
+    └── indexes/
+        ├── years/
+        │   └── 2004.cdxj
+        └── index.cdxj
 ```
 
 A locally replayable collection has, at minimum:
 
 ```text
-<collection-root>/replay/index.cdxj
+<collection-root>/indexes/index.cdxj
 <collection-root>/<each CDXJ filename>
 ```
 
@@ -253,7 +254,7 @@ Before starting pywb, Navigator validates the selected input without changing it
 
 1. The archives root and selected collection are directories.
 2. The collection resolves beneath the configured archives root.
-3. `replay/index.cdxj` resolves beneath the collection root and is a regular,
+3. `indexes/index.cdxj` resolves beneath the collection root and is a regular,
    readable UTF-8 file.
 4. Each non-empty CDXJ line splits into a URL key, 14-digit timestamp, and JSON
    object.
@@ -446,7 +447,7 @@ collections:
   example.com:
     sequence:
       - name: local
-        index: /absolute/path/archives/example.com/replay/index.cdxj
+        index: /absolute/path/archives/example.com/indexes/index.cdxj
         archive_paths:
           - /absolute/path/archives/example.com/
       - name: wayback
@@ -481,7 +482,7 @@ collections:
   example.com:
     sequence:
       - name: local
-        index: /absolute/path/archives/example.com/replay/index.cdxj
+        index: /absolute/path/archives/example.com/indexes/index.cdxj
         archive_paths:
           - /absolute/path/archives/example.com/
       - name: wayback
@@ -491,7 +492,7 @@ collections:
   example.net:
     sequence:
       - name: local
-        index: /absolute/path/archives/example.net/replay/index.cdxj
+        index: /absolute/path/archives/example.net/indexes/index.cdxj
         archive_paths:
           - /absolute/path/archives/example.net/
       - name: wayback
@@ -603,7 +604,7 @@ concurrency warning.
 ### 10.2 Why current atomic files are insufficient
 
 Fetch atomically replaces each completed WARC and later atomically replaces
-`replay/index.cdxj`. Those individual publications are safe, but the collection
+`indexes/index.cdxj`. Those individual publications are safe, but the collection
 is not one transaction.
 
 During a concurrent update, these unsafe combinations are possible:
@@ -642,10 +643,10 @@ example.com/
 ├── generations/
 │   ├── 01...A/
 │   │   ├── archive/...
-│   │   └── replay/index.cdxj
+│   │   └── indexes/index.cdxj
 │   └── 01...B/
 │       ├── archive/...
-│       └── replay/index.cdxj
+│       └── indexes/index.cdxj
 └── current.json
 ```
 

@@ -31,7 +31,7 @@ def collection_factory(tmp_path):
                     },
                 )
             ]
-        index = collection / "replay" / "index.cdxj"
+        index = collection / "indexes" / "index.cdxj"
         index.parent.mkdir(parents=True, exist_ok=True)
         index.write_text(
             "".join(

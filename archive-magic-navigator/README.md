@@ -65,23 +65,23 @@ Each collection must contain:
 ```text
 <collection>/
 ├── archive/
-│   ├── example.com/
-│   │   └── **/*.warc.gz
-│   └── target.org/
+│   ├── 2004/
+│   │   └── example.org-2004-001.warc.gz
+│   └── example.com/
 │       └── **/*.warc.gz
-└── replay/
+└── indexes/
     └── index.cdxj
 ```
 
 CDXJ `filename` values must be safe collection-relative
-`archive/<domain-folder>/...` paths.
+`archive/...` paths (annual shards or legacy domain folders).
 Navigator reads indexed compressed byte ranges directly and never copies,
 repairs, reindexes, or records collection data. It never writes Wayback
 fallback responses into the collection. There is no fallback to the current
 live web.
 
-Fetch writes one direct archive folder per normalized captured domain.
-Navigator follows the domain-folder path in each replay entry's `filename`.
+Fetch publishes annual size-bounded WARC shards under `archive/YYYY/`.
+Navigator follows the collection-relative path in each replay entry's `filename`.
 
 Collection directory names also become browser routes. They must start with an
 ASCII letter or digit, contain only ASCII letters, digits, `.`, `_`, or `-`,
