@@ -38,7 +38,7 @@ framed_replay: true
 client_side_replay: false
 collections:
   wecanstopthehate.org:
-    index: /Users/rob/code/archive-magic/archives/wecanstopthehate.org/replay/index.cdxj
+    index: /Users/rob/code/archive-magic/archives/wecanstopthehate.org/indexes/index.cdxj
     archive_paths:
       - /Users/rob/code/archive-magic/archives/wecanstopthehate.org/
 ```

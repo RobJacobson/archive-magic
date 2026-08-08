@@ -1,347 +1,313 @@
 # Archive Magic Fetch architecture
 
-Archive Magic Fetch performs two concrete operations:
+Archive Magic Fetch builds annual, size-bounded WARC 1.1 collections and CDXJ
+indexes from Internet Archive history for one website pattern.
 
-1. Search Internet Archive for each URL's captures across time.
-2. Build final WARC files from those URL histories.
+Authoritative product decisions live in [HANDOFF-FETCH-AUDIT.md](HANDOFF-FETCH-AUDIT.md).
+This document describes the finished implementation.
 
-The implementation deliberately separates searching from writing. WARC builds
-start from the primary search selection and preserve the complete validated
-local baseline before adding captures currently returned by IA.
+## Job
 
-## Command line
+1. Query Internet Archive CDX metadata (via `wayback` policy, with raw entity
+   bytes preserved before any local normalization).
+2. Decide which exact captures need playback.
+3. Fetch those captures through a polite, bounded scheduler.
+4. Write selected history into annual, size-bounded WARC 1.1 files.
+5. Publish annual and collection-wide CDXJ indexes for pywb/Navigator playback.
 
-```text
-archive-magic-fetch URL_PATTERN
-  [--start DATE]
-  [--end DATE]
-  [--build-warc true|false]
-  [--files none|latest|unique|all]
-  [--workers N]
-  [--retries N]
-  [--rewrite-local]
-```
-
-`URL_PATTERN` seed scope:
-
-| Pattern | CDX meaning |
-|---|---|
-| `*.example.com` | Domain match: apex host plus all subdomains (preferred form) |
-| `*.example.com/*` | Same as `*.example.com` |
-| `example.com/*` | Path prefix on that single host |
-| `example.com` | Exact URL match for that page |
-
-`--build-warc` defaults to `true` and always selects the complete CDX history.
-Use `false` for a loose-files-only run. There is no latest-only WARC mode.
-
-`--workers` defaults to 8. It is the maximum number of simultaneous WARC
-builds. There is no `--concurrency` alias.
-
-CDX searches remain serial because they define the set of work. Independent
-WARC files use a bounded thread pool. Each pool thread lazily creates and
-reuses one Wayback client; all clients retain the shared process-wide
-Internet Archive rate limit.
-
-## Collection paths
-
-The collection directory is derived from the originally requested domain.
-Each captured domain then receives one direct folder under `archive/`:
+## Command
 
 ```text
-<collection>/
-├── collection.json          # merge/resume coverage envelope
-├── archive/
-│   ├── example.com/
-│   │   ├── index.warc.gz
-│   │   └── images/
-│   │       └── logo.png.warc.gz
-│   └── target.org/
-│       └── documents/
-│           └── report.pdf.warc.gz
-├── replay/
-│   └── index.cdxj
-├── sources/
-│   └── <search timestamp>/
-│       ├── captures.cdx.gz
-│       ├── query.json
-│       ├── redirects.json
-│       └── log.txt
-└── website/                 # only when --files is enabled
+archive-magic-fetch URL_PATTERN [--start DATE] [--end DATE]
 ```
 
-Domain folders use these rules:
+Defaults are the practical Wayback start (`19950101000000`) through the current
+UTC time. Date bounds are UTC. Rate, connections, retries, and WARC size are
+named constants in `models.py`, not CLI options.
 
-- lowercase DNS names;
-- remove a trailing DNS dot;
-- convert internationalized DNS names to ASCII IDNA;
-- remove one exact leading `www.`;
-- omit HTTP port 80 and HTTPS port 443;
-- preserve every other explicit port in the authority;
-- bracket normalized IPv6 addresses before encoding;
-- encode the authority with the ordinary filesystem-safe percent encoder.
+Exit status:
 
-Examples:
+- `0`: every selected capture is represented and publications succeeded
+- nonzero: fatal error or unresolved captures remain
+
+Finalized WARCs and indexes from a partial run remain usable.
+
+## Collection layout
 
 ```text
-https://example.com/          -> archive/example.com/index.warc.gz
-https://example.com/about     -> archive/example.com/about.warc.gz
-https://example.com:8443/     -> archive/example.com%3A8443/index.warc.gz
-http://example.com:8080/a     -> archive/example.com%3A8080/a.warc.gz
-https://münich.example/       -> archive/xn--mnich-kva.example/index.warc.gz
+<archives-root>/
+└── example.org/
+    ├── collection.json
+    ├── failures.json                 # only when unresolved failures exist
+    ├── archive/
+    │   └── 2004/
+    │       ├── example.org-2004-001.warc.gz
+    │       └── example.org-2004-002.warc.gz
+    ├── indexes/
+    │   ├── years/
+    │   │   └── 2004.cdxj
+    │   └── index.cdxj
+    └── sources/
+        └── <UTC-run-id>/
+            ├── query.json
+            └── 2004.cdx
 ```
 
-Domains never share WARC files merely because their resource paths match.
-Filesystem-equivalent path and file/directory collision handling is scoped to
-one domain folder. Within that folder, multiple URL histories may share a WARC
-when readable paths collide. Encoded query strings and the existing
-file/directory collision rules remain unchanged.
-
-## Merge and resume
-
-Repeated fetches against the same collection **merge by default**.
-
-Before CDX search, Fetch loads prior coverage from `collection.json` when
-present. The effective search window is the union of prior coverage and the
-current `--start`/`--end`:
-
-```text
-min(prior.date_start, --start) … max(prior.date_end, --end)
-```
-
-That expanded window is used for the primary CDX search. The operator still
-sees the request dates on the `Fetch` line; expansion is reported as:
-
-```text
-Merge: expanding search 2005-2010 using prior coverage 1995-2005 -> 1995-2010
-```
-
-After WARC construction completes, coverage is rewritten to the effective
-window plus `url_pattern` and `files_mode`. WARC output is not part of coverage
-identity. Older coverage schema versions are rejected rather than migrated.
-
-Staging `1995–2000` then `2000–2005` is therefore equivalent to one `1995–2005`
-search for stable IA CDX data. Extending `--end` a month later re-searches the
-union window. The desired collection is the semantic union of the validated
-local WARC inventory and current IA CDX rows. IA removals therefore never
-delete local captures. Unchanged WARCs are retained byte-for-byte; affected
-WARCs are rebuilt through a temporary and atomically replaced.
-
-## Search and selection
-
-`search_captures()` materializes a complete CDX result within the effective
-(merged) date bounds. Every nonempty search is saved under `sources/` before
-it is used downstream.
-
-`group_by_url()` groups records by:
-
-```text
-(normalized domain folder, CDX urlkey)
-```
-
-and orders each history by capture time. WARC output retains every logical
-capture. `select_captures()` applies only the loose-file modes:
-
-- `none`: select nothing;
-- `all`: retain every capture;
-- `unique` for files: retain the full history so digest reuse can choose
-  representative bodies;
-- `latest`: prefer the newest 200, then the newest known non-redirect,
-  then the newest known redirect.
-
-WARC and loose-file selection happens before construction. Redirect targets
-never introduce CDX searches or additional WARC work.
-
-## Exact playback and digest identity
-
-Every playback request uses original mode with `exact=True` and
-`follow_redirects=False`. Fetch additionally requires the returned normalized
-URL, timestamp, and HTTP status to match the selected CDX row. It never asks
-Wayback for a nearest capture and never rewrites the saved IA search into a
-resolved or "CDX Prime" index.
-
-IA's CDX payload digest and the digest of the bytes returned by exact playback
-can disagree. Every generated response and revisit therefore records both
-meanings:
-
-```text
-CDX-Payload-Digest: sha1:<digest selected from IA CDX> (or -)
-WARC-Payload-Digest: sha1:<digest of the stored semantic payload>
-```
-
-Logical capture/cache identity uses the CDX digest. WARC validation, replay
-indexing, response-body lookup, and revisit references use the actual WARC
-digest. Source CDX rows without a usable digest store the explicit
-`CDX-Payload-Digest: -` sentinel. Generated response or revisit records without
-this header are invalid; there is no legacy fallback.
-
-Within one normalized URL history, one exact response establishes a mapping
-from its CDX digest to its actual stored payload and permits later captures to
-be written as revisits without playback. Exact failures with a valid digest are
-deferred until the history's first pass completes, allowing a later exact
-response to recover an earlier failure as a revisit. Loose files reuse the same
-verified local body. If the local inventory shows one CDX digest mapping to
-multiple actual payload digests, that mapping is ambiguous and reuse is
-disabled. Redirects, invalid digests, and different URL histories are never
-recovered through this mechanism.
-
-## Redirect reporting
-
-Every selected historical 3xx response is stored with its actual status and
-`Location` header. Fetch does not follow that Location or broaden capture
-scope. After final WARC and replay-index construction it scans the complete
-collection and writes a versioned `redirects.json` beside the run's source
-query and log.
-
-The report resolves relative HTTP(S) Locations, removes fragments, aggregates
-occurrences by normalized target URL, and classifies the exact target as
-already covered or skipped. It covers 301, 302, 303, 307, 308, and any other
-3xx with a usable Location; 304 is excluded. Missing or invalid Locations are
-listed separately. The operator can use skipped targets to choose a subsequent
-explicit Fetch query.
-
-## WARC ownership
-
-The handoff to WARC construction uses three concrete values:
-
-```python
-@dataclass(frozen=True)
-class UrlHistory:
-    domain: str
-    urlkey: str
-    warc_captures: tuple[CdxRecord, ...]
-    website_files: tuple[WebsiteFile, ...]
-
-@dataclass(frozen=True)
-class WarcBatch:
-    path: Path
-    histories: tuple[UrlHistory, ...]
-
-@dataclass(frozen=True)
-class WebsiteBatch:
-    history: UrlHistory
-```
-
-A `WarcBatch` contains everything its worker needs. The worker does not look
-up URL keys in collection-wide capture dictionaries.
-
-One worker owns one `WarcBatch` from start to finish:
-
-1. validate and inventory every existing collection WARC;
-2. return an unchanged WARC directly when it already covers the selection;
-3. otherwise copy its response/revisit baseline to an exclusive temporary;
-4. process new logical captures sequentially with normalized cache lookup;
-5. validate the temporary and assert every prior identity remains present;
-6. atomically replace the final path once.
-
-Different WARC batches run concurrently and may finish out of allocation
-order.
-A URL history never has two WARC owners. Histories selected for both WARC and
-loose-file output stay attached to the WARC batch and use the same downloaded
-body. Histories selected only for files run as `WebsiteBatch` values in a
-separate phase.
-
-The existing behavior remains authoritative for:
-
-- response and revisit ordering;
-- digest normalization and representative selection;
-- full-response storage for redirects;
-- playback status validation;
-- existing-WARC response reuse;
-- loose-file reuse and MIME path validation;
-- partial failures;
-- atomic WARC replacement.
-
-## Replay index
-
-After every WARC is validated and published, `build_replay_index()` runs once
-as a serial final stage. It indexes response and revisit records from **every**
-final `*.warc.gz` under `archive/` (not only WARCs rewritten in this run) and
-atomically replaces:
-
-```text
-replay/index.cdxj
-```
-
-Each CDXJ `filename` is collection-relative and includes the domain folder,
-for example:
-
-```json
-{"filename":"archive/example.com/index.warc.gz"}
-{"filename":"archive/target.org/index.warc.gz"}
-```
-
-There are no per-WARC CDX shards. Navigator resolves WARC files solely through
-the domain-folder path in the CDXJ `filename` field. Indexing the full tree
-keeps URLs that were only built in earlier stages in the replay index.
-
-## Console output
-
-The console reports phases and completed files, not successful captures:
-
-```text
-Fetch example.com/* (1995-20260803): build WARC true, files none, 8 workers
-Search: 120 captures in 18 URL histories
-WARC files: building 18 with 8 workers
-[1/18] http://web.archive.org/web/*/https://example.com/
-  4 responses, 3 revisits (0 recovered), 0 failed
-[2/18] http://web.archive.org/web/*/https://example.com/about
-  1 responses, 0 revisits (0 recovered), 0 failed
-[3/18] http://web.archive.org/web/*/https://example.com/contact
-  8 responses, 1 revisits (0 recovered), 1 failed
-  https://web.archive.org/...
-    truncated after 9 attempts over 12.0s (1,000/2,000 bytes)
-Replay index: replay/index.cdxj from 18 WARC files
-Redirects: 2 targets skipped, 1 already captured, 1 unresolved; sources/.../redirects.json
-Done in 2.3 minutes: 155 selected, 120 responses, 34 revisits, 1 failed
-```
-
-Retries print immediately because a worker may wait through a long backoff.
-WARC completions print a Wayback calendar URL, then an indented stats line.
-Capture failures and warnings print the capture URL on one line and a single
-indented detail line beneath it. File counts are appended to their owning WARC
-stats line. The final redirect summary points to the durable report. File-only
-histories appear in a separate `Website files` phase.
-
-There are no successful per-capture lines, URL alignment, per-history summary
-blocks, verbose mode, or second event log. The same compact output is mirrored
-to the primary source log.
+CDXJ `filename` values are collection-relative POSIX paths. Temporary work lives
+under `.work/` or `.tmp-*` names cleaned on startup.
 
 ## Modules
 
-| Module | Responsibility |
-| --- | --- |
-| `fetch.py` | Settings and phase orchestration |
-| `search.py` | CDX search, grouping, primary selection |
-| `redirects.py` | Final-collection redirect resolution and reporting |
-| `collection_paths.py` | Collection/domain paths and collision handling |
-| `collection_coverage.py` | Merge/resume coverage envelope and date window union |
-| `source_files.py` | Saved CDX search results and query metadata |
-| `downloads.py` | Exact playback, retries, thread-private clients |
-| `warc_files.py` | URL histories, WARC batches, WARC/file construction |
-| `warc_records.py` | WARC serialization, validation, existing-WARC reads |
-| `website_files.py` | Loose-file counts and body writes |
-| `replay_index.py` | Final collection-wide CDXJ |
-| `atomic_files.py` | Atomic filesystem publication |
-| `local_links.py` | Optional loose-file link rewriting |
-| `console.py` | Thread-safe immediate output and source-log mirroring |
-| `retry.py` | Retry classification and bounded backoff |
+| Module | Role |
+|--------|------|
+| `cli.py` | Argument parsing and exit status |
+| `models.py` | Capture identity, results, policy constants |
+| `cdx.py` | Annual CDX query, raw persistence, parse |
+| `scheduler.py` | Ready/delayed queues, pacing, connection budget, global backpressure gates |
+| `warc.py` | Inventory, exact playback, WARC 1.1 write/rollover |
+| `index.py` | Per-WARC fragments, annual merge, collection merge |
+| `collection.py` | Paths, atomic publish, manifest, failures |
+| `fetch.py` | Year-ascending orchestration |
 
-The old module names have no compatibility shims. The CLI is the supported
-public interface.
+## Pipeline
 
-## Verification
-
-Run Fetch and Navigator separately because both suites contain a top-level
-`test_cli` module:
-
-```bash
-pytest -q archive-magic-fetch/tests
-pytest -q archive-magic-navigator/tests
+```text
+CLI
+ → validate dates / derive collection id
+ → cleanup temps; reconcile missing annual indexes
+ → for each year ascending:
+      CDX raw preserve + parse
+      inventory reuse (exact identity)
+      same-year representative / revisit plan
+      scheduler downloads + single WARC writer
+      finalize WARC → annual CDXJ → partial manifest
+ → collection CDXJ + final manifest/failures
 ```
 
-Navigator's socket integration tests require permission to bind temporary
-localhost ports. Tests cover redirect reporting, append-only WARC unions,
-normalized cache identity, thread-private clients, exactly-once WARC
-ownership, sequential histories within a WARC, completion-order output,
-domain folders, ports, IDNA, IPv6, collision handling, replay filenames, and
-existing WARC reuse.
+### Capture identity
+
+Identity is one type shared by CDX, inventory, failures, and validation:
+
+- canonical URL key and original URL
+- raw 14-digit timestamp
+- raw CDX status token (`-` for statusless)
+- raw CDX payload digest (or missing sentinel)
+
+WARC extension headers:
+
+- `CDX-Status` — raw CDX status token (not the numeric HTTP status alone)
+- `CDX-Payload-Digest` — IA CDX digest (distinct from `WARC-Payload-Digest`)
+
+### Exact playback
+
+Requests use original/raw mode, `exact=True`, and `follow_redirects=False`.
+URL/timestamp mismatches and known-status mismatches are rejections, not
+silent substitutions.
+
+### Network ownership
+
+Archive Magic, rather than `wayback`, owns playback pacing and retries:
+
+- `ArchiveMagicWaybackSession` sets the library retry count to zero. Nested
+  library and scheduler retry loops would make request volume and delays hard
+  to reason about.
+- The scheduler is the single process-wide authority for request starts, the
+  connection budget, delayed retries, HTTP 429 cooldowns, and TCP-refusal
+  cooldowns.
+- `MAX_CONNECTIONS` is the playback TCP budget: the number of concurrent
+  connections Archive Magic may open to `web.archive.org` for memento
+  download. It is implemented as N worker threads, each holding one
+  thread-local `WaybackClient` whose urllib3 pool is capped at size 1. There is
+  no single shared urllib3 pool across threads because `WaybackSession` is not
+  thread-safe.
+- Each active worker lazily creates its client on first use and keeps it for
+  the run. DNS/TCP/TLS begins on that worker's first request, not when the
+  executor is constructed.
+- Persistent per-worker sessions allow urllib3 to reuse HTTP connections.
+  There is never one session per capture. A session may still need a
+  replacement connection when IA closes a socket or a transfer fails.
+- All requests identify Archive Magic with the descriptive `USER_AGENT` from
+  `models.py`.
+
+CDX acquisition is separate from playback scheduling. Annual CDX pages are
+queried serially with one session. That code owns an eight-attempt loop:
+`Retry-After` (or 60 seconds) for 429, and exponential delays from 5 seconds up
+to 300 seconds for connection failures and 5xx responses. Raw HTTP entity bytes
+are durably published before parsing.
+
+### Playback rate and connection pool
+
+`PLAYBACK_REQUESTS_PER_SECOND` is the policy input; the scheduler derives the
+minimum interval as its reciprocal. Expressing policy as requests per second
+keeps configuration and throughput calculations obvious.
+
+`MAX_CONNECTIONS` is the connection budget: how many TCP connections playback
+may use concurrently. Each connection is owned by one worker session.
+
+Current defaults:
+
+- `PLAYBACK_REQUESTS_PER_SECOND = 4.0`
+- `MAX_CONNECTIONS = 8`
+- `MAX_PLAYBACK_ATTEMPTS = 9` (one first attempt and up to eight retries)
+
+The start rate and connection budget are independent:
+
+- The rate controls when work may begin, including retries.
+- The connection budget controls how many transfers may hold a socket at once.
+- If every connection slot is occupied, achieved throughput falls below the
+  configured start rate; the scheduler never creates extra workers to catch up.
+- After any delay, the next interval is measured from the actual request start,
+  so accumulated delay cannot turn into a burst.
+
+There is no token bucket or adaptive boundary-seeking controller. One central
+scheduler already owns every start, so smooth interval pacing is sufficient.
+The fixed baseline is intentionally paired with explicit backpressure handling
+rather than repeatedly probing IA's current limit.
+
+### Why these defaults
+
+Internet Archive's public guidance asks automated clients to add delays, limit
+concurrency, honor HTTP 429 and `Retry-After`, and use exponential backoff. It
+does not publish a stable numeric Wayback playback quota. The old `wayback`
+library assumption of 600 mementos/minute is therefore not treated as a
+contract.
+
+Local measurements established these operational facts:
+
+- Persistent connections completed 2,123 small playbacks through a full minute
+  at 8 requests/second without a 429 or TCP refusal.
+- Creating a fresh session for every request produced a TCP refusal on the
+  eighteenth connection even at only 1 request/second.
+- A persistent test sustained 8 requests/second with nine active sessions. A
+  12 requests/second target increased latency, activated all 24 workers used by
+  that test, and caused new connections to be refused while achieved
+  throughput remained near 8 requests/second.
+- Real heterogeneous workloads eventually replace connections even with
+  persistent sessions. A session or connection cap alone therefore cannot
+  prevent a rolling connection-admission limit from being reached.
+- A single-connection budget (`MAX_CONNECTIONS = 1`) increases idle time
+  between requests, which lets keep-alive sockets die and forces more TCP
+  handshakes—raising refusal rates even at a low start rate.
+
+These observations point to connection creation/churn as an important limit,
+not a simple requests-per-second boundary. They are empirical safeguards, not
+a claim about IA's internal implementation. The production defaults are
+4 starts/second and 8 concurrent connections, while the global refusal gate
+provides recovery when conditions change.
+
+### Backpressure gates
+
+HTTP 429 and TCP connection refusal are distinct signals that share the global
+`blocked_until` gate. The gate applies equally to first attempts and retries.
+
+For HTTP 429:
+
+- `ArchiveMagicWaybackSession.send()` explicitly checks status 429. This is
+  necessary because `wayback` otherwise treats any response carrying
+  `Memento-Datetime` as a successful memento.
+- A `RateLimitError` carries the response and recommended delay into the
+  scheduler.
+- The scheduler prefers the response's `Retry-After`, then a delay carried by
+  the exception, then the 60-second default.
+- The global 429 cooldown is bounded by `MAX_429_COOLDOWN_S` (900 seconds).
+- Error-chain inspection avoids treating the digits `429` inside a capture
+  timestamp such as `20080429...` as a rate-limit response.
+
+For refused TCP connections:
+
+- A refusal occurs before HTTP, so it cannot supply status 429 or
+  `Retry-After`. Archive Magic nevertheless treats `ConnectionRefusedError`,
+  including one wrapped by requests/urllib3/wayback, as IA backpressure.
+- The first refusal pauses all request starts for 5 seconds. A refusal from a
+  request started after that cooldown escalates subsequent waves to 10, 20,
+  40, and finally 60 seconds.
+- Refusals from requests already using a connection slot belong to the wave in
+  which those requests started. Late completions therefore do not multiply the
+  cooldown.
+- The refusal-wave delay remains capped at 60 seconds for the rest of that
+  scheduler run.
+
+The global cooldown prevents a positive-feedback loop: without it, every
+refusal would enqueue a retry while untouched captures continued starting,
+creating more refusals and more delayed work.
+
+### Retry and permanent-failure policy
+
+Retryable playback failures use scheduler-owned exponential delay:
+10, 20, 40, ... seconds, capped at `MAX_RETRY_DELAY_S` (3600 seconds). A supplied
+retry delay takes precedence. Untouched first attempts remain ahead of promoted
+retries so retries cannot monopolize a large run. Every promoted retry still
+passes through start pacing, the connection budget, and global cooldowns.
+
+Not every broken transfer is transient:
+
+- IA may contain permanently truncated captures, commonly PDFs, where the
+  advertised length exceeds the stored bytes and playback repeatedly raises
+  `IncompleteRead`.
+- requests may wrap that as `ChunkedEncodingError`, and `wayback` may wrap it
+  again. Classification inspects the complete outer error before generic
+  connection handling.
+- Such captures are recorded immediately as non-retryable `TRUNCATED`
+  failures. Re-downloading them would consume bandwidth and replacement
+  connections without producing a complete payload.
+
+Blocked captures, exact-playback mismatches, digest mismatches, and ordinary
+permanent playback failures are also not retried. Retryable 5xx, timeout,
+connection, and rate-limit failures remain eligible up to the attempt limit.
+Permanent or exhausted failures flow through the bounded result handoff into
+`failures.json`; they are never silently discarded.
+
+### Logging and metrics
+
+Retry, 429, and connection-refusal messages include the full wrapped exception
+so the terminal preserves the decisive inner cause. Logs distinguish HTTP rate
+limits from pre-HTTP TCP refusal. `collection.json` records playback starts and
+completions, bytes, peak concurrent connections, rate-gate wait, cooldown wait,
+and attempt counts by stable failure category.
+
+### Same-year reuse
+
+Within a year, non-redirect captures with a usable CDX digest share one
+successful representative response; later matches become revisits that resolve
+inside the same annual WARC set. Redirects and digest-less rows are fetched
+individually. Matching digests in different years each store a full response.
+
+### Scheduler
+
+- Ready queue ordered by `(timestamp, URL, identity)`
+- Delayed retry queue by monotonic eligibility time
+- Smooth request-start pacing derived from requests/second
+- Separate `MAX_CONNECTIONS` budget (N worker threads, pool size 1 each)
+- Collection-wide HTTP 429 and TCP-refusal cooldowns
+- Workers release connection slots before waiting on retries
+- First attempts precede promoted retries; both pass through the same gates
+- Thread-local persistent Wayback clients are closed after the scheduler drains
+- One WARC writer consumes validated results through a bounded handoff
+
+### Publication order
+
+1. immutable finalized WARC
+2. atomic annual CDXJ update
+3. `collection.json` describing current partial/complete state
+4. collection CDXJ after the year completes
+5. final manifest and `failures.json` when unresolved entries remain
+
+## Navigator boundary
+
+Navigator expects `indexes/index.cdxj` and resolves CDXJ `filename` values under
+the collection root. It does not reindex or rewrite Fetch output.
+
+## Testing
+
+High-value tests in `tests/test_core.py` cover raw CDX preservation, statusless
+identity reuse, scheduler pacing, HTTP 429 handling, escalating TCP-refusal
+waves, wrapped permanent truncation, inventory skip, same-year revisits,
+cross-year full responses, WARC rollover, crash index recovery, CDXJ merges,
+and partial-run truthfulness. Navigator owns the real-pywb cross-shard revisit
+integration test.
+
+## Out of scope
+
+Loose website files, local-link rewriting, redirect reports, coverage-window
+merging, per-resource WARC paths, persistent shard indexes, cross-URL digest
+deduplication, R2, and generalized job queues are not part of Fetch.
