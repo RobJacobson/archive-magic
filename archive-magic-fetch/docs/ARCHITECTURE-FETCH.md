@@ -40,14 +40,12 @@ Finalized WARCs and indexes from a partial run remain usable.
 └── example.org/
     ├── collection.json
     ├── failures.json                 # only when unresolved failures exist
+    ├── index.cdxj                    # collection-wide replay index
     ├── archive/
     │   └── 2004/
     │       ├── example.org-2004-001.warc.gz
-    │       └── example.org-2004-002.warc.gz
-    ├── indexes/
-    │   ├── years/
-    │   │   └── 2004.cdxj
-    │   └── index.cdxj
+    │       ├── example.org-2004-002.warc.gz
+    │       └── example.org-2004.cdxj   # annual index for all year shards
     └── sources/
         └── <UTC-run-id>/
             ├── query.json
@@ -55,7 +53,7 @@ Finalized WARCs and indexes from a partial run remain usable.
 ```
 
 CDXJ `filename` values are collection-relative POSIX paths. Temporary work lives
-under `.work/` or `.tmp-*` names cleaned on startup.
+under `.work/` or `.tmp-*` names cleaned on startup. Schema version is 2.
 
 ## Modules
 
@@ -349,8 +347,9 @@ Recovery: if years 2000–2015 finalized and 2016 fails, a later run of
 partial shards, indexes any finalized-but-unindexed shards, and short-circuits
 unchanged assets to revisits without re-fetching prior years.
 
-Playback requires the collection chain (`indexes/index.cdxj` plus every
-referenced annual WARC). Single-year CDXJ files list only that year's physical
+Playback requires the collection chain (`index.cdxj` plus every referenced
+annual WARC). Single-year CDXJ files live beside WARC shards under
+`archive/YYYY/{collection_id}-YYYY.cdxj` and list only that year's physical
 records; a revisit in 2005 may refer to a response stored under `archive/2004/`.
 
 ### Scheduler
@@ -375,8 +374,9 @@ records; a revisit in 2005 may refer to a response stored under `archive/2004/`.
 
 ## Navigator boundary
 
-Navigator expects `indexes/index.cdxj` and resolves CDXJ `filename` values under
-the collection root. It does not reindex or rewrite Fetch output.
+Navigator expects `index.cdxj` at the collection root and resolves CDXJ
+`filename` values under the collection root. It does not reindex or rewrite
+Fetch output.
 
 ## Testing
 

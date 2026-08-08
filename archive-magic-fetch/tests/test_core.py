@@ -20,6 +20,7 @@ from archive_magic_fetch.cdx import (
 from archive_magic_fetch.collection import (
     collection_layout,
     ensure_collection_dirs,
+    list_annual_indexes,
     list_year_warcs,
     load_failures,
     next_warc_sequence,
@@ -635,15 +636,58 @@ def test_playback_progress_two_line_format(capsys):
 
     progress = PlaybackProgress(total=2666)
     display = wayback_url("20080503130635", "http://www.example.com/factions/")
-    progress.request_started(display)
-    progress.request_finished("Success (0.3s)")
+    progress.request_finished(display, 0.3, slot_key="example")
     out = capsys.readouterr().out
     assert (
         "  1/2666: https://web.archive.org/web/20080503130635/"
-        "http://www.example.com/factions/ ..."
+        "http://www.example.com/factions/ (0.3s)"
     ) in out
-    assert "Downloading" not in out
-    assert f"{progress._response_indent}Success (0.3s)" in out
+    assert "Success" not in out
+
+    progress.request_finished(
+        display,
+        0.8,
+        slot_key="mismatch",
+        detail="digest mismatch kept",
+    )
+    out = capsys.readouterr().out
+    assert f"  2/2666: {display} (0.8s)" in out
+    assert "           digest mismatch kept" in out
+
+
+def test_playback_progress_retries_reuse_slot_and_promotions_expand_total(capsys):
+    from archive_magic_fetch.models import wayback_url
+    from archive_magic_fetch.scheduler import PlaybackProgress
+
+    progress = PlaybackProgress(total=2)
+    first = wayback_url("20210101000000", "http://example.com/a")
+    second = wayback_url("20210102000000", "http://example.com/b")
+    third = wayback_url("20210103000000", "http://example.com/c")
+
+    progress.request_finished(
+        first,
+        0.5,
+        slot_key="a",
+        detail="Warning: WaybackRetry, retrying in 10s",
+    )
+    progress.request_finished(second, 0.2, slot_key="b")
+    progress.request_finished(
+        first,
+        1.2,
+        attempt=2,
+        slot_key="a",
+        detail="Skipped (unavailable)",
+    )
+    progress.note_additional_work()
+    progress.request_finished(third, 0.1, slot_key="c")
+
+    out = capsys.readouterr().out
+    assert f"  1/2: {first} (0.5s)" in out
+    assert f"  2/2: {second} (0.2s)" in out
+    assert f"  1/2: {first} (retry 2) (1.2s)" in out
+    assert f"  3/3: {third} (0.1s)" in out
+    assert "3/2" not in out
+    assert "4/" not in out
 
 
 def test_session_raises_rate_limit_for_429_memento_response():
@@ -1983,10 +2027,67 @@ def test_warc_rollover_naming_and_rejects_1000(tmp_path):
         next_warc_sequence(layout, 2005)
 
 
+def test_annual_index_beside_warcs_covers_multi_shard_year(tmp_path):
+    layout = collection_layout("http://example.org/", tmp_path)
+    ensure_collection_dirs(layout)
+    writer = YearWarcWriter(layout, 2004, target_bytes=1)
+    for i in range(2):
+        capt = _identity(
+            ts=f"2004060{i+1}000000",
+            digest="sha1:" + ("F" * 31 + str(i)),
+        )
+        writer.write_playback(_playback(capt, body=b"x" * 100))
+    warcs = writer.close()
+    assert len(warcs) == 2
+
+    annual = publish_annual_index(layout, 2004)
+    assert annual is not None
+    assert annual.relative_key == "archive/2004/example.org-2004.cdxj"
+    assert layout.annual_index(2004) == layout.year_dir(2004) / "example.org-2004.cdxj"
+    assert layout.annual_index(2004).is_file()
+    assert not (layout.root / "indexes").exists()
+
+    names = set()
+    for line in layout.annual_index(2004).read_text().splitlines():
+        if not line.strip():
+            continue
+        meta = json.loads(line.split(" ", 2)[2])
+        names.add(meta["filename"])
+    assert names == {
+        "archive/2004/example.org-2004-001.warc.gz",
+        "archive/2004/example.org-2004-002.warc.gz",
+    }
+
+
+def test_list_annual_indexes_ignores_warcs_and_foreign_names(tmp_path):
+    layout = collection_layout("http://example.org/", tmp_path)
+    ensure_collection_dirs(layout)
+    year_dir = layout.year_dir(2004)
+    year_dir.mkdir(parents=True)
+    layout.warc_path(2004, 1).write_bytes(b"warc")
+    # Correct annual index name.
+    (year_dir / "example.org-2004.cdxj").write_text(
+        "a 20040101000000 {}\n", encoding="utf-8"
+    )
+    # Foreign names must be ignored.
+    (year_dir / "other.org-2004.cdxj").write_text("x\n", encoding="utf-8")
+    (year_dir / "2004.cdxj").write_text("y\n", encoding="utf-8")
+    (year_dir / "example.org-2004-index.cdxj").write_text("z\n", encoding="utf-8")
+    # Another year with matching index.
+    y2005 = layout.year_dir(2005)
+    y2005.mkdir(parents=True)
+    (y2005 / "example.org-2005.cdxj").write_text("b\n", encoding="utf-8")
+
+    found = list_annual_indexes(layout)
+    assert [(year, path.name) for year, path in found] == [
+        (2004, "example.org-2004.cdxj"),
+        (2005, "example.org-2005.cdxj"),
+    ]
+
+
 # ---------------------------------------------------------------------------
 # 8. Crash recovery indexes finalized WARC
 # ---------------------------------------------------------------------------
-
 
 def test_crash_recovery_indexes_finalized_warc_without_redownload(tmp_path):
     layout = collection_layout("http://example.org/", tmp_path)
@@ -1999,6 +2100,7 @@ def test_crash_recovery_indexes_finalized_warc_without_redownload(tmp_path):
     assert not layout.annual_index(2004).exists()
     publish_annual_index(layout, 2004)
     assert layout.annual_index(2004).is_file()
+    assert layout.annual_index(2004).name == "example.org-2004.cdxj"
     inv = inventory_collection(layout)
     assert inv.contains(capt)
 
@@ -2149,8 +2251,8 @@ def test_scoped_rerun_keeps_prior_failures_and_annual_indexes(tmp_path):
     assert prior.identity in remaining
     manifest = json.loads(layout.manifest_path.read_text())
     annual_names = {item["filename"] for item in manifest["annual_indexes"]}
-    assert "indexes/years/2004.cdxj" in annual_names
-    assert "indexes/years/2005.cdxj" in annual_names
+    assert "archive/2004/example.org-2004.cdxj" in annual_names
+    assert "archive/2005/example.org-2005.cdxj" in annual_names
     warc_2004 = [
         item for item in manifest["warcs"] if item["filename"].startswith("archive/2004/")
     ]

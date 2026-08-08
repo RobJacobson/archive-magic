@@ -22,7 +22,7 @@ class Collection:
 
     @property
     def replay_index(self) -> Path:
-        return self.root / "indexes" / "index.cdxj"
+        return self.root / "index.cdxj"
 
 
 def resolve_archives_root(value: Path | str) -> Path:

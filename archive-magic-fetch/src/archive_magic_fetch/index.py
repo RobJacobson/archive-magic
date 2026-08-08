@@ -16,6 +16,7 @@ from .collection import (
     exclusive_temp_path,
     index_artifact_from_path,
     list_all_warcs,
+    list_annual_indexes,
     list_year_warcs,
     publish_file_atomically,
 )
@@ -131,7 +132,7 @@ def publish_annual_index(
         validate_annual_revisit_closure(layout, year, lines)
 
         tmp = exclusive_temp_path(
-            layout.years_index_root,
+            layout.work_root,
             suffix=f".{year}.cdxj.tmp",
         )
         tmp.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
@@ -149,14 +150,7 @@ def publish_annual_index(
 def publish_collection_index(layout: CollectionLayout) -> Optional[IndexArtifact]:
     """Merge all annual indexes into a globally sorted collection CDXJ."""
 
-    if not layout.years_index_root.is_dir():
-        return None
-    annuals = sorted(layout.years_index_root.glob("*.cdxj"))
-    annuals = [
-        path
-        for path in annuals
-        if path.is_file() and not path.name.startswith(".tmp-")
-    ]
+    annuals = [path for _, path in list_annual_indexes(layout)]
     if not annuals:
         layout.collection_index.unlink(missing_ok=True)
         return None
@@ -164,7 +158,7 @@ def publish_collection_index(layout: CollectionLayout) -> Optional[IndexArtifact
     lines = merge_cdxj_lines(annuals)
     validate_cdxj_against_warcs(layout, lines)
     tmp = exclusive_temp_path(
-        layout.indexes_root,
+        layout.work_root,
         suffix=".index.cdxj.tmp",
     )
     tmp.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")

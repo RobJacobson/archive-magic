@@ -145,24 +145,26 @@ Use this permanent local layout:
 └── example.org/
     ├── collection.json
     ├── failures.json                 # only when unresolved failures exist
+    ├── index.cdxj                    # collection-wide replay index
     ├── archive/
     │   ├── 2004/
     │   │   ├── example.org-2004-001.warc.gz
     │   │   ├── example.org-2004-002.warc.gz
-    │   │   └── example.org-2004-003.warc.gz
+    │   │   ├── example.org-2004-003.warc.gz
+    │   │   └── example.org-2004.cdxj
     │   └── 2005/
-    │       └── example.org-2005-001.warc.gz
-    ├── indexes/
-    │   ├── years/
-    │   │   ├── 2004.cdxj
-    │   │   └── 2005.cdxj
-    │   └── index.cdxj
+    │       ├── example.org-2005-001.warc.gz
+    │       └── example.org-2005.cdxj
     └── sources/
         └── <UTC-run-id>/
             ├── query.json
             ├── 2004.cdx
             └── 2005.cdx
 ```
+
+Collection layout schema version is 2. Schema version 1 (`indexes/` tree) is
+unsupported; operators must relocate files manually (see migration note below)
+or re-run Fetch.
 
 The exact raw-CDX extension may be `.cdx.gz` when the preserved response body
 is compressed. Do not decompress and then claim that the file is byte-exact.
@@ -177,6 +179,17 @@ values are collection-relative POSIX paths such as:
 ```
 
 Never store absolute paths in CDXJ or `collection.json`.
+
+### Manual migration from schema v1
+
+For an existing collection that still uses `indexes/`:
+
+1. Move `indexes/index.cdxj` → `index.cdxj` at the collection root.
+2. For each `indexes/years/YYYY.cdxj`, move to
+   `archive/YYYY/{collection_id}-YYYY.cdxj`.
+3. Remove the empty `indexes/` tree.
+4. Update `collection.json` paths and set `schema_version` to 2, or re-run
+   Fetch so reconcile republishes indexes and the manifest.
 
 Temporary WARC and CDXJ files must live outside the visible permanent layout,
 or use unmistakable temporary names that are ignored and cleaned on startup.
@@ -423,11 +436,13 @@ next sequence number. Do not repack old shards to restore chronology.
 
 Maintain exactly two permanent index granularities:
 
-1. `indexes/years/YYYY.cdxj`: all published WARCs required to replay that
-   annual set.
-2. `indexes/index.cdxj`: the whole collection.
+1. `archive/YYYY/{collection_id}-YYYY.cdxj`: all published WARCs required to
+   replay that annual set (one file per year, even when the year has multiple
+   WARC shards).
+2. `index.cdxj` at the collection root: the whole collection.
 
-There are no permanent per-WARC or shard indexes.
+There are no permanent per-WARC or shard indexes. The `indexes/` tree is not
+part of the layout.
 
 After each WARC closes:
 
@@ -448,7 +463,7 @@ and indexes only missing WARCs. Losing a temporary fragment costs at most a
 repeatable scan of the newly finalized WARC; it never loses downloaded data.
 
 After each year completes, merge all current annual indexes into a sorted
-temporary collection index and atomically replace `indexes/index.cdxj`. Repeat
+temporary collection index and atomically replace `index.cdxj`. Repeat
 once at successful final completion. Never append annual index text directly
 to the global file: CDXJ must be globally ordered by URL key and timestamp.
 
@@ -524,7 +539,7 @@ Design local publication so the later mapping is direct:
 
 R2 supports ranged reads, so future playback can translate CDXJ filename,
 offset, and length into one object-range request. The future local cache needs
-only `collection.json` and `indexes/index.cdxj` for whole-collection querying;
+only `collection.json` and `index.cdxj` for whole-collection querying;
 annual indexes are downloaded only for annual-package work.
 
 Do not invent a provider interface with multiple hypothetical backends. A
@@ -535,19 +550,19 @@ small cohesive local publication component is enough preparation.
 Navigator currently expects:
 
 ```text
-replay/index.cdxj
+indexes/index.cdxj
 ```
 
 Change it to:
 
 ```text
-indexes/index.cdxj
+index.cdxj
 ```
 
-Update collection discovery/validation, pywb configuration, fixtures,
-integration tests, README material, and architecture documentation that refer
-to the old path. Navigator continues resolving CDXJ `filename` beneath the
-collection root for this local-only rewrite.
+at the collection root. Update collection discovery/validation, pywb
+configuration, fixtures, integration tests, README material, and architecture
+documentation that refer to the old path. Navigator continues resolving CDXJ
+`filename` beneath the collection root for this local-only rewrite.
 
 Retain one real pywb integration test proving that Navigator can replay WARC
 1.1 responses and revisits when the full response and revisit occupy different
@@ -649,7 +664,7 @@ Recommended order:
    429 gate.
 8. Add multi-year collection-index merge, partial-failure publication, and
    crash reconciliation.
-9. Update Navigator to `indexes/index.cdxj` and pass the real pywb integration
+9. Update Navigator to root `index.cdxj` and pass the real pywb integration
    test.
 10. Benchmark concurrency, inspect production/test line counts, remove unused
     abstractions and dependencies, and rewrite the architecture documentation
@@ -673,7 +688,7 @@ The rewrite is complete only when:
 - annual CDXJ is updated after each WARC without permanent shard indexes;
 - collection CDXJ is globally sorted and atomically published;
 - partial success is usable, truthfully described, and returns nonzero;
-- Navigator reads `indexes/index.cdxj` and real pywb playback passes;
+- Navigator reads root `index.cdxj` and real pywb playback passes;
 - no legacy Fetch implementation or parallel `v2` remains in the tree;
 - no loose-file, rewrite, redirect-report, coverage-merge, migration, or R2
   feature has crept back in;

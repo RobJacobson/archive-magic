@@ -476,8 +476,6 @@ def test_real_pywb_replays_same_year_revisit_across_annual_warc_shards(
     root = archives / "annual"
     year_dir = root / "archive" / "2020"
     year_dir.mkdir(parents=True)
-    indexes = root / "indexes"
-    indexes.mkdir(parents=True)
 
     url = "http://example.org/"
     body = b"<!doctype html><html><body>Annual shard body</body></html>"
@@ -549,7 +547,7 @@ def test_real_pywb_replays_same_year_revisit_across_annual_warc_shards(
         )
 
     entries.sort(key=lambda item: (item[0], item[1]))
-    (indexes / "index.cdxj").write_text(
+    (root / "index.cdxj").write_text(
         "".join(
             f"{key} {ts} {json.dumps(meta, separators=(',', ':'), sort_keys=True)}\n"
             for key, ts, meta in entries
@@ -588,8 +586,6 @@ def test_real_pywb_replays_backward_cross_year_revisit(tmp_path):
     archive = root / "archive"
     (archive / "2004").mkdir(parents=True)
     (archive / "2005").mkdir(parents=True)
-    indexes = root / "indexes"
-    indexes.mkdir(parents=True)
 
     url = "http://example.org/"
     body = b"<!doctype html><html><body>Cross year body</body></html>"
@@ -671,7 +667,7 @@ def test_real_pywb_replays_backward_cross_year_revisit(tmp_path):
         )
 
     entries.sort(key=lambda item: (item[0], item[1]))
-    (indexes / "index.cdxj").write_text(
+    (root / "index.cdxj").write_text(
         "".join(
             f"{key} {ts} {json.dumps(meta, separators=(',', ':'), sort_keys=True)}\n"
             for key, ts, meta in entries

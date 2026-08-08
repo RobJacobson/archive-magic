@@ -125,7 +125,7 @@ The applications have separate ownership:
 | --- | --- | --- |
 | `sources/` | Fetch | Ignore |
 | `archive/**/*.warc.gz` | Fetch | Read by indexed byte range |
-| `indexes/index.cdxj` | Fetch | Query as the authoritative replay index |
+| `index.cdxj` | Fetch | Query as the authoritative replay index |
 | `website/` | Fetch | Ignore |
 | Navigator runtime config | Navigator | Generate outside the collection tree |
 | Navigator templates/static assets | Navigator | Ship inside the Navigator package |
@@ -187,20 +187,18 @@ Navigator consumes the Fetch collection layout:
 archives/
 └── example.com/
     ├── sources/
-    ├── archive/
-    │   └── 2004/
-    │       ├── example.com-2004-001.warc.gz
-    │       └── example.com-2004-002.warc.gz
-    └── indexes/
-        ├── years/
-        │   └── 2004.cdxj
-        └── index.cdxj
+    ├── index.cdxj
+    └── archive/
+        └── 2004/
+            ├── example.com-2004-001.warc.gz
+            ├── example.com-2004-002.warc.gz
+            └── example.com-2004.cdxj
 ```
 
 A locally replayable collection has, at minimum:
 
 ```text
-<collection-root>/indexes/index.cdxj
+<collection-root>/index.cdxj
 <collection-root>/<each CDXJ filename>
 ```
 
@@ -251,9 +249,9 @@ Fetch guarantees that:
   replacement.
 
 Playback therefore requires the full collection chain, not a single annual
-slice of WARCs. Annual `indexes/years/YYYY.cdxj` files remain helpful for
-recovery but are not independently portable when revisits cross year
-boundaries.
+slice of WARCs. Annual `archive/YYYY/{collection_id}-YYYY.cdxj` files remain
+helpful for recovery but are not independently portable when revisits cross
+year boundaries.
 
 ### 4.1 Required preflight
 
@@ -261,7 +259,7 @@ Before starting pywb, Navigator validates the selected input without changing it
 
 1. The archives root and selected collection are directories.
 2. The collection resolves beneath the configured archives root.
-3. `indexes/index.cdxj` resolves beneath the collection root and is a regular,
+3. `index.cdxj` resolves beneath the collection root and is a regular,
    readable UTF-8 file.
 4. Each non-empty CDXJ line splits into a URL key, 14-digit timestamp, and JSON
    object.
@@ -454,7 +452,7 @@ collections:
   example.com:
     sequence:
       - name: local
-        index: /absolute/path/archives/example.com/indexes/index.cdxj
+        index: /absolute/path/archives/example.com/index.cdxj
         archive_paths:
           - /absolute/path/archives/example.com/
       - name: wayback
@@ -489,7 +487,7 @@ collections:
   example.com:
     sequence:
       - name: local
-        index: /absolute/path/archives/example.com/indexes/index.cdxj
+        index: /absolute/path/archives/example.com/index.cdxj
         archive_paths:
           - /absolute/path/archives/example.com/
       - name: wayback
@@ -499,7 +497,7 @@ collections:
   example.net:
     sequence:
       - name: local
-        index: /absolute/path/archives/example.net/indexes/index.cdxj
+        index: /absolute/path/archives/example.net/index.cdxj
         archive_paths:
           - /absolute/path/archives/example.net/
       - name: wayback
@@ -579,7 +577,7 @@ Navigator does not:
 
 - move or copy WARC files into a pywb collection;
 - convert or regenerate CDXJ;
-- create pywb `indexes/`, `archive/`, `acl/`, `metadata.yaml`, or
+- create pywb-owned `indexes/`, `archive/`, `acl/`, `metadata.yaml`, or
   collection-local template directories;
 - update Fetch provenance;
 - append access data to WARCs; or
@@ -611,7 +609,7 @@ concurrency warning.
 ### 10.2 Why current atomic files are insufficient
 
 Fetch atomically replaces each completed WARC and later atomically replaces
-`indexes/index.cdxj`. Those individual publications are safe, but the collection
+`index.cdxj`. Those individual publications are safe, but the collection
 is not one transaction.
 
 During a concurrent update, these unsafe combinations are possible:
@@ -650,10 +648,10 @@ example.com/
 ├── generations/
 │   ├── 01...A/
 │   │   ├── archive/...
-│   │   └── indexes/index.cdxj
+│   │   └── index.cdxj
 │   └── 01...B/
 │       ├── archive/...
-│       └── indexes/index.cdxj
+│       └── index.cdxj
 └── current.json
 ```
 

@@ -24,6 +24,7 @@ from .collection import (
     ensure_collection_dirs,
     index_artifact_from_path,
     list_all_warcs,
+    list_annual_indexes,
     list_year_warcs,
     load_failures,
     warc_artifact_from_path,
@@ -661,14 +662,10 @@ def _collect_warc_artifacts(
 
 
 def _existing_annual_indexes(layout: CollectionLayout) -> list[IndexArtifact]:
-    if not layout.years_index_root.is_dir():
-        return []
-    result = []
-    for path in sorted(layout.years_index_root.glob("*.cdxj")):
-        if path.name.startswith(".tmp-"):
-            continue
-        result.append(index_artifact_from_path(layout, path))
-    return result
+    return [
+        index_artifact_from_path(layout, path)
+        for _, path in list_annual_indexes(layout)
+    ]
 
 
 def _replace_annual_index(

@@ -44,33 +44,37 @@ Sleep = Callable[[float], None]
 
 @dataclass
 class PlaybackProgress:
-    """Two-line terminal progress for playback downloads."""
+    """Deferred terminal progress for playback downloads."""
 
     total: int
     _count: int = 0
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    _slots: dict[str, int] = field(default_factory=dict, repr=False)
 
-    @property
-    def _width(self) -> int:
-        return len(str(self.total))
-
-    @property
-    def _response_indent(self) -> str:
-        # Align under the URL on the request line:
-        # "  {n:>{width}}/{total}: {url} ..."
-        return " " * (2 * self._width + 5)
-
-    def request_started(self, url: str) -> None:
+    def request_finished(
+        self,
+        url: str,
+        duration: float,
+        *,
+        attempt: int = 1,
+        slot_key: str,
+        detail: str | None = None,
+    ) -> None:
         with self._lock:
-            self._count += 1
-            number = self._count
+            if slot_key not in self._slots:
+                self._count += 1
+                self._slots[slot_key] = self._count
+            number = self._slots[slot_key]
+            total = self.total
+            width = len(str(total))
+        retry = f" (retry {attempt})" if attempt > 1 else ""
         print(
-            f"  {number:{self._width}d}/{self.total}: {url} ...",
+            f"  {number:{width}d}/{total}: {url}{retry} ({duration:.1f}s)",
             flush=True,
         )
-
-    def request_finished(self, line: str) -> None:
-        print(f"{self._response_indent}{line}", flush=True)
+        if detail:
+            indent = " " * (2 * width + 5)
+            print(f"{indent}{detail}", flush=True)
 
     def note_additional_work(self, n: int = 1) -> None:
         """Increase the denominator when deferred captures become downloads."""
@@ -283,13 +287,29 @@ class PlaybackScheduler:
         with self._lock:
             self._consumer_pending = max(0, self._consumer_pending - 1)
 
+    def _log_download(
+        self,
+        *,
+        url: str,
+        slot_key: str,
+        attempt: int,
+        started_at: float,
+        detail: str | None = None,
+    ) -> None:
+        if self._progress is not None:
+            self._progress.request_finished(
+                url,
+                self._clock() - started_at,
+                attempt=attempt,
+                slot_key=slot_key,
+                detail=detail,
+            )
+
     def _worker(self, job: ReadyJob) -> JobSuccess | JobFailure:
         identity = job.identity
-        if self._progress is not None:
-            self._progress.request_started(
-                wayback_url(identity.timestamp, identity.original_url)
-            )
-        request_started_at = self._clock()
+        slot_key = f"{identity.timestamp}\0{identity.original_url}"
+        url = wayback_url(identity.timestamp, identity.original_url)
+        started_at = self._clock()
         try:
             if is_invalid_uri_payload_digest(identity.payload_digest):
                 failure = JobFailure(
@@ -299,24 +319,29 @@ class PlaybackScheduler:
                     retryable=False,
                     attempt=job.attempt,
                 )
-                if self._progress is not None:
-                    self._progress.request_finished("Skipped (invalid URI)")
+                self._log_download(
+                    url=url,
+                    slot_key=slot_key,
+                    attempt=job.attempt,
+                    started_at=started_at,
+                    detail="Skipped (invalid URI)",
+                )
                 self.metrics.bump_attempt(failure.category.value)
                 self._handle_failure(failure, will_retry=False, delay=0.0)
                 return failure
             client = self._thread_client()
             result = self._download_fn(client, identity)
-            duration = self._clock() - request_started_at
             success = JobSuccess(identity=identity, result=result)
             self.metrics.playback_completions += 1
             self.metrics.playback_bytes += len(result.body)
             self._consecutive_backpressure = 0
-            if self._progress is not None:
-                if result.digest_matched:
-                    line = f"Success ({duration:.1f}s)"
-                else:
-                    line = f"Success (digest mismatch kept, {duration:.1f}s)"
-                self._progress.request_finished(line)
+            self._log_download(
+                url=url,
+                slot_key=slot_key,
+                attempt=job.attempt,
+                started_at=started_at,
+                detail=None if result.digest_matched else "digest mismatch kept",
+            )
             self._put_result(success)
             return success
         except Exception as error:  # noqa: BLE001 - boundary classification
@@ -336,15 +361,18 @@ class PlaybackScheduler:
                 retry_after=retry_after,
             )
             will_retry, delay = self._retry_plan(failure, error)
-            if self._progress is not None:
-                self._progress.request_finished(
-                    _format_response_line(
-                        error=error,
-                        category=category,
-                        will_retry=will_retry,
-                        retry_delay=delay,
-                    )
-                )
+            self._log_download(
+                url=url,
+                slot_key=slot_key,
+                attempt=job.attempt,
+                started_at=started_at,
+                detail=_format_response_line(
+                    error=error,
+                    category=category,
+                    will_retry=will_retry,
+                    retry_delay=delay,
+                ),
+            )
             self.metrics.bump_attempt(category.value)
             self._handle_failure(failure, will_retry=will_retry, delay=delay)
             return failure
