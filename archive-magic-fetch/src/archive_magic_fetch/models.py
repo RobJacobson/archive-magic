@@ -19,8 +19,8 @@ from surt import surt
 DEFAULT_OUTPUT_ROOT = Path("../archives")
 WARC_TARGET_BYTES = 1_000_000_000
 PLAYBACK_REQUESTS_PER_SECOND = 4.0
-# Bounded concurrency is separate from the request start rate.
-MAX_IN_FLIGHT = 8
+# Connection budget is separate from the request start rate.
+MAX_CONNECTIONS = 1
 MAX_PLAYBACK_ATTEMPTS = 9  # first try + 8 retries
 MAX_RETRY_DELAY_S = 3600
 DEFAULT_429_COOLDOWN_S = 60.0
@@ -166,7 +166,7 @@ class RunMetrics:
     playback_starts: int = 0
     playback_completions: int = 0
     playback_bytes: int = 0
-    peak_in_flight: int = 0
+    peak_connections: int = 0
     rate_gate_wait_s: float = 0.0
     cooldown_wait_s: float = 0.0
     local_reuses: int = 0

@@ -382,7 +382,7 @@ def test_scheduler_smooth_spacing_concurrency_retry_and_429():
     scheduler = PlaybackScheduler(
         client_factory=lambda: MagicMock(),
         identities=identities,
-        max_in_flight=2,
+        max_connections=2,
         requests_per_second=8.0,
         max_attempts=4,
         download_fn=download_fn,
@@ -401,7 +401,7 @@ def test_scheduler_smooth_spacing_concurrency_retry_and_429():
     scheduler.run()
     t.join(timeout=5)
     assert sleeps, "scheduler should wait between starts or on 429"
-    assert scheduler.metrics.peak_in_flight <= 2
+    assert scheduler.metrics.peak_connections <= 2
     assert scheduler._blocked_until > 0.0
     assert scheduler.metrics.cooldown_wait_s > 0
     successes = [r for r in results if hasattr(r, "result")]
@@ -543,6 +543,20 @@ def test_connection_error_with_429_in_timestamp_is_not_rate_limit():
     assert _is_rate_limit_error(RuntimeError("429 error while loading memento"))
 
 
+def test_make_client_mounts_pool_sized_adapter():
+    from archive_magic_fetch.cdx import make_client
+
+    client = make_client(max_connections=1)
+    try:
+        session = client.session
+        for scheme in ("https://", "http://"):
+            adapter = session.get_adapter(f"{scheme}web.archive.org/")
+            assert adapter._pool_connections == 1
+            assert adapter._pool_maxsize == 1
+    finally:
+        client.close()
+
+
 def test_retries_do_not_jump_ahead_of_first_attempts():
     clock = {"t": 0.0}
     order: list[str] = []
@@ -568,7 +582,7 @@ def test_retries_do_not_jump_ahead_of_first_attempts():
     scheduler = PlaybackScheduler(
         client_factory=lambda: MagicMock(),
         identities=[first, second],
-        max_in_flight=1,
+        max_connections=1,
         requests_per_second=float("inf"),
         max_attempts=3,
         download_fn=download_fn,

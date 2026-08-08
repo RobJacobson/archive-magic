@@ -36,7 +36,9 @@ from .index import (
     reconcile_missing_indexes,
 )
 from .models import (
+    MAX_CONNECTIONS,
     MISSING_CDX_PAYLOAD_DIGEST,
+    PLAYBACK_REQUESTS_PER_SECOND,
     CaptureIdentity,
     FailureCategory,
     IndexArtifact,
@@ -108,6 +110,11 @@ def run_fetch(
     years = years_in_range(settings.date_start, settings.date_end)
     print(
         f"collection {layout.collection_id}: years {years[0]}-{years[-1]}",
+        flush=True,
+    )
+    print(
+        f"playback policy: PLAYBACK_REQUESTS_PER_SECOND={PLAYBACK_REQUESTS_PER_SECOND} "
+        f"MAX_CONNECTIONS={MAX_CONNECTIONS}",
         flush=True,
     )
 

@@ -22,7 +22,7 @@ archive-magic-fetch URL_PATTERN [--start DATE] [--end DATE]
 ```
 
 Defaults are the practical Wayback start (`19950101000000`) through the current
-UTC time. Date bounds are UTC. Rate, concurrency, retries, and WARC size are
+UTC time. Date bounds are UTC. Rate, connections, retries, and WARC size are
 named constants in `models.py`, not CLI options.
 
 Exit status:
@@ -63,7 +63,7 @@ under `.work/` or `.tmp-*` names cleaned on startup.
 | `cli.py` | Argument parsing and exit status |
 | `models.py` | Capture identity, results, policy constants |
 | `cdx.py` | Annual CDX query, raw persistence, parse |
-| `scheduler.py` | Ready/delayed queues, pacing, concurrency, global backpressure gates |
+| `scheduler.py` | Ready/delayed queues, pacing, connection budget, global backpressure gates |
 | `warc.py` | Inventory, exact playback, WARC 1.1 write/rollover |
 | `index.py` | Per-WARC fragments, annual merge, collection merge |
 | `collection.py` | Paths, atomic publish, manifest, failures |
@@ -111,14 +111,21 @@ Archive Magic, rather than `wayback`, owns playback pacing and retries:
 - `ArchiveMagicWaybackSession` sets the library retry count to zero. Nested
   library and scheduler retry loops would make request volume and delays hard
   to reason about.
-- The scheduler is the single process-wide authority for request starts,
-  concurrency, delayed retries, HTTP 429 cooldowns, and TCP-refusal cooldowns.
-- Each active worker lazily creates one thread-local `WaybackClient` and keeps
-  it for the run. A session is not opened merely by constructing the executor;
-  DNS/TCP/TLS begins on that worker's first request.
-- Persistent sessions allow urllib3 to reuse HTTP connections. There is never
-  one session per capture. A session may still need replacement connections
-  when IA closes a socket or a transfer fails.
+- The scheduler is the single process-wide authority for request starts, the
+  connection budget, delayed retries, HTTP 429 cooldowns, and TCP-refusal
+  cooldowns.
+- `MAX_CONNECTIONS` is the playback TCP budget: the number of concurrent
+  connections Archive Magic may open to `web.archive.org` for memento
+  download. It is implemented as N worker threads, each holding one
+  thread-local `WaybackClient` whose urllib3 pool is capped at size 1. There is
+  no single shared urllib3 pool across threads because `WaybackSession` is not
+  thread-safe.
+- Each active worker lazily creates its client on first use and keeps it for
+  the run. DNS/TCP/TLS begins on that worker's first request, not when the
+  executor is constructed.
+- Persistent per-worker sessions allow urllib3 to reuse HTTP connections.
+  There is never one session per capture. A session may still need a
+  replacement connection when IA closes a socket or a transfer fails.
 - All requests identify Archive Magic with the descriptive `USER_AGENT` from
   `models.py`.
 
@@ -128,24 +135,27 @@ queried serially with one session. That code owns an eight-attempt loop:
 to 300 seconds for connection failures and 5xx responses. Raw HTTP entity bytes
 are durably published before parsing.
 
-### Playback rate and concurrency
+### Playback rate and connection pool
 
 `PLAYBACK_REQUESTS_PER_SECOND` is the policy input; the scheduler derives the
 minimum interval as its reciprocal. Expressing policy as requests per second
 keeps configuration and throughput calculations obvious.
 
+`MAX_CONNECTIONS` is the connection budget: how many TCP connections playback
+may use concurrently. Each connection is owned by one worker session.
+
 Current defaults:
 
 - `PLAYBACK_REQUESTS_PER_SECOND = 4.0`
-- `MAX_IN_FLIGHT = 8`
+- `MAX_CONNECTIONS = 8`
 - `MAX_PLAYBACK_ATTEMPTS = 9` (one first attempt and up to eight retries)
 
-The start rate and concurrency are independent:
+The start rate and connection budget are independent:
 
 - The rate controls when work may begin, including retries.
-- The concurrency bound controls how many slow responses may remain active.
-- If every slot is occupied, achieved throughput falls below the configured
-  start rate; the scheduler never creates extra workers to catch up.
+- The connection budget controls how many transfers may hold a socket at once.
+- If every connection slot is occupied, achieved throughput falls below the
+  configured start rate; the scheduler never creates extra workers to catch up.
 - After any delay, the next interval is measured from the actual request start,
   so accumulated delay cannot turn into a burst.
 
@@ -173,13 +183,16 @@ Local measurements established these operational facts:
   that test, and caused new connections to be refused while achieved
   throughput remained near 8 requests/second.
 - Real heterogeneous workloads eventually replace connections even with
-  persistent sessions. A session/concurrency cap alone therefore cannot
+  persistent sessions. A session or connection cap alone therefore cannot
   prevent a rolling connection-admission limit from being reached.
+- A single-connection budget (`MAX_CONNECTIONS = 1`) increases idle time
+  between requests, which lets keep-alive sockets die and forces more TCP
+  handshakes—raising refusal rates even at a low start rate.
 
 These observations point to connection creation/churn as an important limit,
 not a simple requests-per-second boundary. They are empirical safeguards, not
-a claim about IA's internal implementation. The production defaults were
-reduced to 4 starts/second and 8 in flight, while the global refusal gate
+a claim about IA's internal implementation. The production defaults are
+4 starts/second and 8 concurrent connections, while the global refusal gate
 provides recovery when conditions change.
 
 ### Backpressure gates
@@ -208,8 +221,9 @@ For refused TCP connections:
 - The first refusal pauses all request starts for 5 seconds. A refusal from a
   request started after that cooldown escalates subsequent waves to 10, 20,
   40, and finally 60 seconds.
-- Refusals from requests already in flight belong to the wave in which those
-  requests started. Late completions therefore do not multiply the cooldown.
+- Refusals from requests already using a connection slot belong to the wave in
+  which those requests started. Late completions therefore do not multiply the
+  cooldown.
 - The refusal-wave delay remains capped at 60 seconds for the rest of that
   scheduler run.
 
@@ -223,7 +237,7 @@ Retryable playback failures use scheduler-owned exponential delay:
 10, 20, 40, ... seconds, capped at `MAX_RETRY_DELAY_S` (3600 seconds). A supplied
 retry delay takes precedence. Untouched first attempts remain ahead of promoted
 retries so retries cannot monopolize a large run. Every promoted retry still
-passes through start pacing, the concurrency bound, and global cooldowns.
+passes through start pacing, the connection budget, and global cooldowns.
 
 Not every broken transfer is transient:
 
@@ -248,8 +262,8 @@ Permanent or exhausted failures flow through the bounded result handoff into
 Retry, 429, and connection-refusal messages include the full wrapped exception
 so the terminal preserves the decisive inner cause. Logs distinguish HTTP rate
 limits from pre-HTTP TCP refusal. `collection.json` records playback starts and
-completions, bytes, peak in-flight work, rate-gate wait, cooldown wait, and
-attempt counts by stable failure category.
+completions, bytes, peak concurrent connections, rate-gate wait, cooldown wait,
+and attempt counts by stable failure category.
 
 ### Same-year reuse
 
@@ -263,9 +277,9 @@ individually. Matching digests in different years each store a full response.
 - Ready queue ordered by `(timestamp, URL, identity)`
 - Delayed retry queue by monotonic eligibility time
 - Smooth request-start pacing derived from requests/second
-- Separate bounded in-flight concurrency
+- Separate `MAX_CONNECTIONS` budget (N worker threads, pool size 1 each)
 - Collection-wide HTTP 429 and TCP-refusal cooldowns
-- Workers release in-flight slots before waiting on retries
+- Workers release connection slots before waiting on retries
 - First attempts precede promoted retries; both pass through the same gates
 - Thread-local persistent Wayback clients are closed after the scheduler drains
 - One WARC writer consumes validated results through a bounded handoff

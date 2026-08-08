@@ -17,6 +17,7 @@ from typing import Callable, Literal, Optional
 from urllib.parse import urlencode
 
 import requests
+from requests.adapters import HTTPAdapter
 from wayback import WaybackClient, WaybackSession
 from wayback._client import read_and_close
 from wayback.exceptions import RateLimitError, WaybackRetryError
@@ -80,10 +81,30 @@ class ArchiveMagicWaybackSession(WaybackSession):
         return response
 
 
-def make_client() -> WaybackClient:
-    """Return a Wayback client using the shared process rate limits."""
+def configure_session_pool(
+    session: ArchiveMagicWaybackSession,
+    *,
+    max_connections: int = 1,
+) -> None:
+    """Cap urllib3 pool size so a session cannot open extra sockets silently."""
 
-    return WaybackClient(session=ArchiveMagicWaybackSession(user_agent=USER_AGENT))
+    if max_connections < 1:
+        raise ValueError("max_connections must be at least 1")
+    adapter = HTTPAdapter(
+        pool_connections=max_connections,
+        pool_maxsize=max_connections,
+        max_retries=0,
+    )
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+
+
+def make_client(*, max_connections: int = 1) -> WaybackClient:
+    """Return a Wayback client with an explicit per-session connection pool."""
+
+    session = ArchiveMagicWaybackSession(user_agent=USER_AGENT)
+    configure_session_pool(session, max_connections=max_connections)
+    return WaybackClient(session=session)
 
 
 def make_cdx_session() -> ArchiveMagicWaybackSession:

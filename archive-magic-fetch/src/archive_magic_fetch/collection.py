@@ -463,7 +463,7 @@ def write_manifest(
             "playback_starts": metrics.playback_starts,
             "playback_completions": metrics.playback_completions,
             "playback_bytes": metrics.playback_bytes,
-            "peak_in_flight": metrics.peak_in_flight,
+            "peak_connections": metrics.peak_connections,
             "rate_gate_wait_s": round(metrics.rate_gate_wait_s, 3),
             "cooldown_wait_s": round(metrics.cooldown_wait_s, 3),
             "warc_write_s": round(metrics.warc_write_s, 3),

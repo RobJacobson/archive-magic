@@ -17,7 +17,7 @@ from .models import (
     DEFAULT_CONNECTION_REFUSAL_COOLDOWN_S,
     MAX_429_COOLDOWN_S,
     MAX_CONNECTION_REFUSAL_COOLDOWN_S,
-    MAX_IN_FLIGHT,
+    MAX_CONNECTIONS,
     MAX_PLAYBACK_ATTEMPTS,
     MAX_RETRY_DELAY_S,
     PLAYBACK_REQUESTS_PER_SECOND,
@@ -77,14 +77,14 @@ DownloadFn = Callable[[object, CaptureIdentity], PlaybackResult]
 
 
 class PlaybackScheduler:
-    """Own start pacing, in-flight slots, delayed retries, and global gates."""
+    """Own start pacing, connection slots, delayed retries, and global gates."""
 
     def __init__(
         self,
         client_factory: Callable[[], object],
         *,
         identities: Sequence[CaptureIdentity],
-        max_in_flight: int = MAX_IN_FLIGHT,
+        max_connections: int = MAX_CONNECTIONS,
         requests_per_second: float = PLAYBACK_REQUESTS_PER_SECOND,
         max_attempts: int = MAX_PLAYBACK_ATTEMPTS,
         result_queue_size: int = RESULT_QUEUE_SIZE,
@@ -95,8 +95,10 @@ class PlaybackScheduler:
     ) -> None:
         if requests_per_second <= 0:
             raise ValueError("requests_per_second must be greater than zero")
+        if max_connections < 1:
+            raise ValueError("max_connections must be at least 1")
         self._client_factory = client_factory
-        self._max_in_flight = max_in_flight
+        self._max_connections = max_connections
         self._start_interval = 1.0 / requests_per_second
         self._max_attempts = max_attempts
         self._download_fn = download_fn
@@ -111,7 +113,7 @@ class PlaybackScheduler:
             )
         self._retry_ready: list[ReadyJob] = []
         self._delayed: list[DelayedJob] = []
-        self._in_flight = 0
+        self._active_connections = 0
         self._blocked_until = 0.0
         self._consecutive_429 = 0
         self._connection_blocked_until = 0.0
@@ -129,7 +131,7 @@ class PlaybackScheduler:
     def run(self) -> None:
         """Process all ready/delayed jobs until drained."""
 
-        with ThreadPoolExecutor(max_workers=self._max_in_flight) as pool:
+        with ThreadPoolExecutor(max_workers=self._max_connections) as pool:
             futures: set[Future] = set()
             while not self._stop.is_set():
                 now = self._clock()
@@ -140,7 +142,7 @@ class PlaybackScheduler:
                         not self._ready
                         and not self._retry_ready
                         and not self._delayed
-                        and self._in_flight == 0
+                        and self._active_connections == 0
                         and self._consumer_pending == 0
                     )
                 if idle and not futures:
@@ -149,7 +151,10 @@ class PlaybackScheduler:
                 # Wait for capacity / readiness. First attempts always precede
                 # promoted retries so delayed work cannot jump the ready queue.
                 has_runnable = bool(self._ready or self._retry_ready)
-                if self._in_flight >= self._max_in_flight or not has_runnable:
+                if (
+                    self._active_connections >= self._max_connections
+                    or not has_runnable
+                ):
                     if self._delayed and not has_runnable:
                         delay = max(0.0, self._delayed[0].ready_at - now)
                         self._wait_briefly(min(delay, 0.05))
@@ -171,10 +176,10 @@ class PlaybackScheduler:
                 else:
                     job = heapq.heappop(self._retry_ready)
                 with self._lock:
-                    self._in_flight += 1
-                    self.metrics.peak_in_flight = max(
-                        self.metrics.peak_in_flight,
-                        self._in_flight,
+                    self._active_connections += 1
+                    self.metrics.peak_connections = max(
+                        self.metrics.peak_connections,
+                        self._active_connections,
                     )
                 self.metrics.playback_starts += 1
                 self._next_start_at = self._clock() + self._start_interval
@@ -264,7 +269,7 @@ class PlaybackScheduler:
             return failure
         finally:
             with self._lock:
-                self._in_flight = max(0, self._in_flight - 1)
+                self._active_connections = max(0, self._active_connections - 1)
 
     def _handle_failure(self, failure: JobFailure) -> None:
         if (
@@ -343,9 +348,9 @@ class PlaybackScheduler:
     ) -> None:
         """Globally pause after one TCP-refusal wave.
 
-        Workers already in flight can report the same refusal concurrently.
-        Only the first refusal after the previous cooldown starts a new wave
-        and doubles the fallback delay.
+        Workers already using a connection slot can report the same refusal
+        concurrently. Only the first refusal after the previous cooldown starts
+        a new wave and doubles the fallback delay.
         """
 
         now = self._clock()
