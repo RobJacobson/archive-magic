@@ -455,6 +455,7 @@ def write_manifest(
             "locally_reused": metrics.local_reuses,
             "downloaded": metrics.downloads,
             "revisited": metrics.revisits,
+            "digest_mismatch_accepted": metrics.digest_mismatch_accepted,
             "unresolved": metrics.unresolved,
         },
         "metrics": {

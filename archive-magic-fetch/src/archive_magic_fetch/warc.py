@@ -31,6 +31,7 @@ from .collection import (
     warc_artifact_from_path,
 )
 from .models import (
+    CDX_DIGEST_MATCH_HEADER,
     CDX_PAYLOAD_DIGEST_HEADER,
     CDX_STATUS_HEADER,
     CDX_URLKEY_HEADER,
@@ -47,6 +48,7 @@ from .models import (
     cdx_payload_digest_token,
     cdx_status_token,
     cdx_timestamp_to_warc_date,
+    is_redirect_status_token,
     make_identity,
     normalize_original_url,
     normalize_payload_digest,
@@ -179,13 +181,48 @@ def inventory_collection(layout: CollectionLayout) -> CollectionInventory:
                     )
                     yindex = inv.year_index(year)
                     yindex.by_identity[identity] = stored
-                    if identity.payload_digest != MISSING_CDX_PAYLOAD_DIGEST:
+                    # Only digest-matched responses may be revisit targets.
+                    if (
+                        identity.payload_digest != MISSING_CDX_PAYLOAD_DIGEST
+                        and _cdx_digest_matches_payload(
+                            identity.payload_digest, warc_payload
+                        )
+                    ):
                         yindex.by_url_digest[
                             (identity.urlkey, identity.payload_digest)
                         ] = stored
                 # consume body stream
                 record.raw_stream.read()
     return inv
+
+
+def _cdx_digest_matches_payload(cdx_digest: str, warc_payload_digest: str) -> bool:
+    """Return whether a CDX digest token names the same payload as WARC."""
+
+    expected = normalize_payload_digest(cdx_digest)
+    actual = normalize_payload_digest(warc_payload_digest)
+    return expected is not None and actual is not None and expected == actual
+
+
+def _is_unusable_playback_body(
+    body: bytes, *, status_code: int
+) -> str | None:
+    """Return a reason when IA served a non-content stub, else None.
+
+    Historical redirects often have an empty entity body with a ``Location``
+    header; those are valid capture records and must not be rejected.
+    """
+
+    if not body:
+        if is_redirect_status_token(str(status_code)):
+            return None
+        return "empty playback body"
+    stripped = body.strip()
+    if stripped in {b"Invalid URI", b"Invalid URL"} or stripped.startswith(
+        (b"Invalid URI", b"Invalid URL")
+    ):
+        return "IA playback stub: Invalid URI"
+    return None
 
 
 def download_exact(
@@ -214,6 +251,11 @@ def download_exact(
             _semantic_headers(memento.headers, len(body), status_code=status_code)
         )
         url = memento.url
+        # Require an explicit True; MagicMock auto-attrs must not count as set.
+        false_gzip_repaired = (
+            getattr(getattr(memento, "_raw", None), "_archive_magic_false_gzip", False)
+            is True
+        )
 
     returned_ts = timestamp_to_warc_date(memento_timestamp)
     returned_cdx = warc_date_to_cdx(returned_ts)
@@ -229,6 +271,9 @@ def download_exact(
         raise ExactMismatchError(
             f"status mismatch: requested {expected_status}, got {status_code}"
         )
+    unusable = _is_unusable_playback_body(body, status_code=status_code)
+    if unusable is not None:
+        raise UnusablePlaybackError(unusable)
 
     return PlaybackResult(
         identity=make_identity(
@@ -247,11 +292,25 @@ def download_exact(
         warc_date=returned_ts,
         source_uri=memento_url,
         warc_payload_digest=payload_digest(body),
+        false_gzip_repaired=false_gzip_repaired,
+        digest_matched=True,
     )
 
 
-def download_exact_for_identity(client, identity: CaptureIdentity) -> PlaybackResult:
-    """Exact-playback one capture identity and attach full identity fields."""
+def download_exact_for_identity(
+    client,
+    identity: CaptureIdentity,
+    *,
+    strict_digests: bool = False,
+) -> PlaybackResult:
+    """Exact-playback one capture identity and attach full identity fields.
+
+    By default, a body that does not match the CDX digest is still kept
+    (imperfect IA captures are better than gaps). Pass ``strict_digests=True``
+    to reject mismatches. Unusable stubs such as ``Invalid URI`` are always
+    rejected. Empty bodies are rejected except for HTTP redirects (3xx), which
+    historically often have an empty entity and a ``Location`` header.
+    """
 
     expected_status = (
         int(identity.status_token) if identity.status_token.isdigit() else None
@@ -265,11 +324,22 @@ def download_exact_for_identity(client, identity: CaptureIdentity) -> PlaybackRe
     )
     actual_digest = result.warc_payload_digest
     expected_digest = normalize_payload_digest(identity.payload_digest)
-    if expected_digest is not None and actual_digest != expected_digest:
-        raise DigestValidationError(
-            f"payload digest mismatch: CDX {expected_digest}, "
-            f"downloaded {actual_digest}"
-        )
+    digest_matched = (
+        expected_digest is None or actual_digest == expected_digest
+    )
+    if not digest_matched:
+        assert expected_digest is not None
+        if strict_digests:
+            if result.false_gzip_repaired:
+                raise FalseGzipPlaybackError(
+                    f"IA Content-Encoding:gzip response was not gzip and does "
+                    f"not match CDX digest: CDX {expected_digest}, "
+                    f"downloaded {actual_digest}"
+                )
+            raise DigestValidationError(
+                f"payload digest mismatch: CDX {expected_digest}, "
+                f"downloaded {actual_digest}"
+            )
     return PlaybackResult(
         identity=identity,
         body=result.body,
@@ -278,6 +348,8 @@ def download_exact_for_identity(client, identity: CaptureIdentity) -> PlaybackRe
         warc_date=result.warc_date,
         source_uri=result.source_uri,
         warc_payload_digest=actual_digest,
+        false_gzip_repaired=result.false_gzip_repaired,
+        digest_matched=digest_matched,
     )
 
 
@@ -289,6 +361,14 @@ class DigestValidationError(Exception):
     """Downloaded payload does not match the CDX payload digest."""
 
 
+class FalseGzipPlaybackError(MementoPlaybackError):
+    """IA claimed gzip, served non-gzip bytes that do not match the CDX digest."""
+
+
+class UnusablePlaybackError(MementoPlaybackError):
+    """IA returned a non-content stub (empty body or Invalid URI)."""
+
+
 _RETRYABLE_HTTP_STATUSES = frozenset({413, 421, 429, 500, 502, 503, 504, 599})
 _STATUS_IN_MESSAGE = re.compile(r"\b([45]\d\d)\b")
 
@@ -298,6 +378,12 @@ def classify_playback_error(error: BaseException) -> tuple[FailureCategory, bool
 
     if isinstance(error, ExactMismatchError):
         return FailureCategory.EXACT_MISMATCH, False
+    if isinstance(error, UnusablePlaybackError):
+        return FailureCategory.UNAVAILABLE, False
+    if isinstance(error, FalseGzipPlaybackError):
+        # Subclass of MementoPlaybackError; keep the explicit branch so the
+        # unavailable classification stays obvious next to digest failures.
+        return FailureCategory.UNAVAILABLE, False
     if isinstance(error, DigestValidationError):
         return FailureCategory.DIGEST_VALIDATION, False
     if isinstance(error, (BlockedByRobotsError, BlockedSiteError)):
@@ -384,6 +470,16 @@ def build_response_record(result: PlaybackResult):
         list(result.headers),
         protocol="HTTP/1.1",
     )
+    warc_headers = {
+        CDX_PAYLOAD_DIGEST_HEADER: result.identity.payload_digest,
+        CDX_STATUS_HEADER: result.identity.status_token,
+        CDX_URLKEY_HEADER: result.identity.urlkey,
+        "WARC-Date": result.warc_date,
+        "WARC-Source-URI": result.source_uri,
+        "WARC-Payload-Digest": result.warc_payload_digest,
+    }
+    if not result.digest_matched:
+        warc_headers[CDX_DIGEST_MATCH_HEADER] = "false"
     builder = RecordBuilder(warc_version=WARC_VERSION)
     return builder.create_warc_record(
         result.identity.original_url,
@@ -391,14 +487,7 @@ def build_response_record(result: PlaybackResult):
         payload=BytesIO(result.body),
         length=len(result.body),
         http_headers=http_headers,
-        warc_headers_dict={
-            CDX_PAYLOAD_DIGEST_HEADER: result.identity.payload_digest,
-            CDX_STATUS_HEADER: result.identity.status_token,
-            CDX_URLKEY_HEADER: result.identity.urlkey,
-            "WARC-Date": result.warc_date,
-            "WARC-Source-URI": result.source_uri,
-            "WARC-Payload-Digest": result.warc_payload_digest,
-        },
+        warc_headers_dict=warc_headers,
     )
 
 

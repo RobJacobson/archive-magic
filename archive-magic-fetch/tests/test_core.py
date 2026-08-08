@@ -40,6 +40,7 @@ from archive_magic_fetch.models import (
     FailureCategory,
     PlaybackResult,
     UnresolvedFailure,
+    INVALID_URI_PAYLOAD_DIGEST,
     make_identity,
     normalize_original_url,
 )
@@ -273,6 +274,64 @@ def test_non_list_cdx_entries_become_malformed_failures(tmp_path):
     assert result.failures[0].identity != result.failures[1].identity
 
 
+def test_cdx_ingest_skips_are_logged(capsys):
+    from archive_magic_fetch.fetch import _report_cdx_ingest_skips
+
+    failures = [
+        UnresolvedFailure(
+            identity=CaptureIdentity(
+                urlkey="malformed:abc",
+                original_url="-",
+                timestamp="00000000000000",
+                status_token="-",
+                payload_digest="malformed:abc",
+            ),
+            category=FailureCategory.MALFORMED_CDX,
+            message="invalid timestamp: bad-row",
+        ),
+    ]
+    _report_cdx_ingest_skips(2008, failures)
+    out = capsys.readouterr().out
+    assert "year 2008: skipping 1 malformed CDX row(s)" in out
+    assert "skip: invalid timestamp: bad-row" in out
+
+
+def test_invalid_uri_cdx_digest_is_skipped_without_download(capsys):
+    from archive_magic_fetch.scheduler import PlaybackProgress, PlaybackScheduler
+
+    identity = _identity(
+        digest=INVALID_URI_PAYLOAD_DIGEST,
+        ts="20081119231212",
+    )
+    download = MagicMock(side_effect=AssertionError("should not download"))
+    progress = PlaybackProgress(total=1)
+    scheduler = PlaybackScheduler(
+        client_factory=lambda: MagicMock(),
+        identities=[identity],
+        download_fn=download,
+        progress=progress,
+        sleep=lambda _s: None,
+    )
+    results = []
+
+    def consumer():
+        for item in scheduler.results():
+            results.append(item)
+            scheduler.acknowledge()
+
+    t = threading.Thread(target=consumer)
+    t.start()
+    scheduler.run()
+    t.join(timeout=5)
+    assert len(results) == 1
+    assert results[0].category == FailureCategory.UNAVAILABLE
+    assert "Invalid URI" in results[0].message
+    download.assert_not_called()
+    out = capsys.readouterr().out
+    assert "Skipped (invalid URI)" in out
+    assert "https://web.archive.org/web/20081119231212/" in out
+
+
 # ---------------------------------------------------------------------------
 # 2 + 4. Statusless identity via three run_fetch passes
 # ---------------------------------------------------------------------------
@@ -410,7 +469,11 @@ def test_scheduler_smooth_spacing_concurrency_retry_and_429():
 
 
 def test_rate_limit_uses_error_retry_after_without_exponential_default():
-    from archive_magic_fetch.scheduler import PlaybackScheduler
+    from archive_magic_fetch.scheduler import (
+        BackpressureKind,
+        BackpressureSignal,
+        PlaybackScheduler,
+    )
 
     clock = {"t": 100.0}
     identity = _identity()
@@ -421,14 +484,67 @@ def test_rate_limit_uses_error_retry_after_without_exponential_default():
         clock=lambda: clock["t"],
         sleep=lambda _s: None,
     )
-    scheduler._note_429(12.0, error=None)
+    scheduler._note_backpressure(
+        BackpressureSignal(kind=BackpressureKind.HTTP, retry_after=12.0)
+    )
     assert scheduler._blocked_until == pytest.approx(112.0)
 
     # A second 429 without Retry-After must stay at the fixed default, not 120s.
     clock["t"] = 200.0
-    scheduler._note_429(None, error=None)
+    scheduler._note_backpressure(BackpressureSignal(kind=BackpressureKind.HTTP))
     assert scheduler._blocked_until == pytest.approx(260.0)
-    assert scheduler._consecutive_429 == 2
+    assert scheduler._consecutive_backpressure == 2
+
+
+def test_connection_refused_pauses_all_downloads_for_sixty_seconds():
+    from archive_magic_fetch.models import CONNECTION_REFUSED_RETRY_S
+    from archive_magic_fetch.scheduler import PlaybackScheduler
+
+    clock = {"t": 0.0}
+    sleeps: list[float] = []
+    start_times: list[tuple[str, float]] = []
+
+    def mono():
+        return clock["t"]
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        clock["t"] += seconds
+
+    first = _identity(ts="20040601000000", digest="sha1:" + ("A" * 32))
+    second = _identity(ts="20040602000000", digest="sha1:" + ("B" * 32))
+
+    def download_fn(_client, identity):
+        start_times.append((identity.timestamp, clock["t"]))
+        if identity.timestamp == first.timestamp:
+            attempt = sum(1 for ts, _ in start_times if ts == first.timestamp)
+            if attempt == 1:
+                raise ConnectionRefusedError(61, "Connection refused")
+        return _playback(identity)
+
+    scheduler = PlaybackScheduler(
+        client_factory=lambda: MagicMock(),
+        identities=[first, second],
+        max_connections=1,
+        requests_per_second=float("inf"),
+        max_attempts=5,
+        download_fn=download_fn,
+        clock=mono,
+        sleep=sleep,
+    )
+
+    def consumer():
+        for _item in scheduler.results():
+            scheduler.acknowledge()
+
+    t = threading.Thread(target=consumer)
+    t.start()
+    scheduler.run()
+    t.join(timeout=5)
+
+    second_start = next(t for ts, t in start_times if ts == second.timestamp)
+    assert second_start >= CONNECTION_REFUSED_RETRY_S
+    assert scheduler.metrics.cooldown_wait_s > 0
 
 
 def test_connection_refused_retries_three_times_at_sixty_seconds():
@@ -466,10 +582,16 @@ def test_connection_refused_retries_three_times_at_sixty_seconds():
             assert failure == (False, 0.0)
 
 
-def test_truncation_pauses_five_seconds():
-    from archive_magic_fetch.models import TRUNCATION_PAUSE_S
-    from archive_magic_fetch.scheduler import PlaybackScheduler
+def test_truncation_skips_without_pause():
+    """Truncated captures fail permanently; no global gate delay by default."""
 
+    from archive_magic_fetch.models import TRUNCATION_PAUSE_S
+    from archive_magic_fetch.scheduler import (
+        PlaybackScheduler,
+        _format_response_line,
+    )
+
+    assert TRUNCATION_PAUSE_S == 0.0
     clock = {"t": 100.0}
     identity = _identity()
     scheduler = PlaybackScheduler(
@@ -480,22 +602,47 @@ def test_truncation_pauses_five_seconds():
     )
     mock_client = MagicMock()
     scheduler._local.client = mock_client
+    blocked_before = scheduler._blocked_until
 
     scheduler._note_truncation()
 
     assert scheduler._local.client is None
-    assert scheduler._blocked_until == pytest.approx(100.0 + TRUNCATION_PAUSE_S)
+    assert scheduler._blocked_until == blocked_before
     mock_client.close.assert_called_once()
+    assert (
+        _format_response_line(
+            error=RuntimeError("incomplete"),
+            category=FailureCategory.TRUNCATED,
+            will_retry=False,
+            retry_delay=0.0,
+        )
+        == "Skipped (truncated response)"
+    )
+    assert (
+        _format_response_line(
+            error=RuntimeError("gone"),
+            category=FailureCategory.UNAVAILABLE,
+            will_retry=False,
+            retry_delay=0.0,
+        )
+        == "Skipped (unavailable)"
+    )
 
 
 def test_playback_progress_two_line_format(capsys):
+    from archive_magic_fetch.models import wayback_url
     from archive_magic_fetch.scheduler import PlaybackProgress
 
     progress = PlaybackProgress(total=2666)
-    progress.request_started("http://www.example.com/factions/")
+    display = wayback_url("20080503130635", "http://www.example.com/factions/")
+    progress.request_started(display)
     progress.request_finished("Success (0.3s)")
     out = capsys.readouterr().out
-    assert "  1/2666: Downloading http://www.example.com/factions/ ..." in out
+    assert (
+        "  1/2666: https://web.archive.org/web/20080503130635/"
+        "http://www.example.com/factions/ ..."
+    ) in out
+    assert "Downloading" not in out
     assert f"{progress._response_indent}Success (0.3s)" in out
 
 
@@ -525,6 +672,261 @@ def test_session_raises_rate_limit_for_429_memento_response():
         session.close()
 
 
+def _urllib3_response(body: bytes, headers: dict[str, str]):
+    from io import BytesIO
+
+    from urllib3 import HTTPResponse
+
+    return HTTPResponse(
+        body=BytesIO(body),
+        headers=headers,
+        status=200,
+        preload_content=False,
+        decode_content=False,
+        original_response=None,
+    )
+
+
+def _requests_response(body: bytes, *, content_encoding: str | None, memento: bool):
+    from requests import Response
+
+    headers: dict[str, str] = {}
+    if content_encoding is not None:
+        headers["Content-Encoding"] = content_encoding
+    if memento:
+        headers["Memento-Datetime"] = "Fri, 09 May 2008 08:22:33 GMT"
+    response = Response()
+    response.status_code = 200
+    response.url = "https://web.archive.org/web/20080509082233id_/http://example.org/"
+    response.headers.update(headers)
+    response.raw = _urllib3_response(body, headers)
+    return response
+
+
+def test_session_repairs_false_gzip_content_encoding_on_mementos():
+    """IA may claim gzip while the memento body is already plaintext HTML."""
+
+    import gzip as gzip_mod
+
+    from archive_magic_fetch.cdx import ArchiveMagicWaybackSession
+    from wayback import WaybackSession
+
+    plaintext = b"<!DOCTYPE html><html><body>ok</body></html>"
+    real_gzip = gzip_mod.compress(b"compressed-payload")
+    session = ArchiveMagicWaybackSession()
+    original_send = WaybackSession.send
+
+    def run(canned, expected):
+        def fake_send(self, request, **kwargs):
+            return canned
+
+        WaybackSession.send = fake_send  # type: ignore[method-assign]
+        repaired = session.send(MagicMock())
+        assert repaired.content == expected
+        assert "Content-Encoding" not in repaired.headers
+
+    try:
+        # False CE:gzip — body is HTML; must not raise ContentDecodingError.
+        run(
+            _requests_response(plaintext, content_encoding="gzip", memento=True),
+            plaintext,
+        )
+        # True CE:gzip — still expose the decompressed payload.
+        run(
+            _requests_response(real_gzip, content_encoding="gzip", memento=True),
+            b"compressed-payload",
+        )
+    finally:
+        WaybackSession.send = original_send  # type: ignore[method-assign]
+        session.close()
+
+
+def test_session_leaves_non_memento_gzip_bodies_unconsumed():
+    """CDX responses must keep streaming; do not eagerly rewrite them."""
+
+    from archive_magic_fetch.cdx import repair_false_gzip_content_encoding
+
+    body = b'[["urlkey","timestamp"]]'
+    response = _requests_response(body, content_encoding="gzip", memento=False)
+    repair_false_gzip_content_encoding(response)
+    assert response._content is False
+    assert response.headers.get("Content-Encoding") == "gzip"
+    # Stream still available for decode_content=False CDX readers.
+    assert response.raw.read() == body
+
+
+def _memento_client(
+    identity,
+    body: bytes,
+    *,
+    false_gzip: bool = False,
+    headers: dict | None = None,
+):
+    from datetime import datetime, timezone
+
+    class Client:
+        def get_memento(self, *args, **kwargs):
+            memento = MagicMock()
+            memento.__enter__ = lambda s: s
+            memento.__exit__ = MagicMock(return_value=False)
+            memento.content = body
+            if identity.status_token.isdigit():
+                memento.status_code = int(identity.status_token)
+            else:
+                memento.status_code = 200
+            memento.memento_url = (
+                f"https://web.archive.org/web/{identity.timestamp}id_/"
+                f"{identity.original_url}"
+            )
+            ts = identity.timestamp
+            memento.timestamp = datetime(
+                int(ts[0:4]),
+                int(ts[4:6]),
+                int(ts[6:8]),
+                int(ts[8:10]),
+                int(ts[10:12]),
+                int(ts[12:14]),
+                tzinfo=timezone.utc,
+            )
+            memento.headers = {"Content-Type": "text/html", **(headers or {})}
+            memento.url = identity.original_url
+            response = MagicMock()
+            if false_gzip:
+                response._archive_magic_false_gzip = True
+            memento._raw = response
+            return memento
+
+    return Client()
+
+
+def test_empty_redirect_playback_is_stored_with_location(tmp_path):
+    """Historical 3xx captures often have an empty body; still archive them."""
+
+    from archive_magic_fetch.collection import collection_layout, ensure_collection_dirs
+    from archive_magic_fetch.warc import (
+        YearWarcWriter,
+        download_exact_for_identity,
+        payload_digest,
+    )
+    from warcio.archiveiterator import ArchiveIterator
+
+    empty_digest = payload_digest(b"")
+    identity = _identity(
+        url="http://example.org/thecase",
+        ts="20080404233814",
+        status="302",
+        digest=empty_digest,
+    )
+    location = "http://example.org/site/page/the_case"
+    result = download_exact_for_identity(
+        _memento_client(identity, b"", headers={"Location": location}),
+        identity,
+    )
+    assert result.status_code == 302
+    assert result.body == b""
+    assert result.digest_matched is True
+    assert result.warc_payload_digest == empty_digest
+    assert any(name.lower() == "location" and value == location for name, value in result.headers)
+
+    layout = collection_layout("http://example.org/", tmp_path)
+    ensure_collection_dirs(layout)
+    writer = YearWarcWriter(layout, 2008)
+    writer.write_playback(result)
+    artifacts = writer.close()
+    with artifacts[0].path.open("rb") as stream:
+        records = list(ArchiveIterator(stream))
+    responses = [rec for rec in records if rec.rec_type == "response"]
+    assert len(responses) == 1
+    rec = responses[0]
+    assert rec.http_headers.get_statuscode() == "302"
+    assert rec.http_headers.get_header("Location") == location
+    assert rec.content_stream().read() == b""
+
+
+def test_empty_non_redirect_playback_is_rejected():
+    from archive_magic_fetch.warc import (
+        UnusablePlaybackError,
+        download_exact_for_identity,
+    )
+
+    identity = _identity(status="200")
+    with pytest.raises(UnusablePlaybackError, match="empty playback body"):
+        download_exact_for_identity(_memento_client(identity, b""), identity)
+
+
+def test_false_gzip_digest_mismatch_kept_by_default():
+    """Permissive policy keeps imperfect false-gzip bodies for that capture."""
+
+    from archive_magic_fetch.warc import download_exact_for_identity, payload_digest
+
+    identity = _identity(digest="sha1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+    body = b"<!DOCTYPE html><html>not-the-cdx-payload</html>"
+    result = download_exact_for_identity(
+        _memento_client(identity, body, false_gzip=True), identity
+    )
+    assert result.body == body
+    assert result.digest_matched is False
+    assert result.false_gzip_repaired is True
+    assert result.warc_payload_digest == payload_digest(body)
+
+
+def test_false_gzip_digest_mismatch_strict_is_unavailable():
+    from archive_magic_fetch.warc import (
+        FalseGzipPlaybackError,
+        classify_playback_error,
+        download_exact_for_identity,
+    )
+
+    identity = _identity(digest="sha1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+    body = b"<!DOCTYPE html><html>not-the-cdx-payload</html>"
+    with pytest.raises(FalseGzipPlaybackError):
+        download_exact_for_identity(
+            _memento_client(identity, body, false_gzip=True),
+            identity,
+            strict_digests=True,
+        )
+    category, retryable = classify_playback_error(
+        FalseGzipPlaybackError("IA Content-Encoding:gzip mismatch")
+    )
+    assert category == FailureCategory.UNAVAILABLE
+    assert retryable is False
+
+
+def test_false_gzip_digest_match_is_accepted():
+    """False-gzip responses whose plaintext matches CDX are kept as matched."""
+
+    from archive_magic_fetch.warc import download_exact_for_identity, payload_digest
+
+    body = b"<!DOCTYPE html><html>authentic</html>"
+    identity = _identity(digest=payload_digest(body))
+    result = download_exact_for_identity(
+        _memento_client(identity, body, false_gzip=True), identity
+    )
+    assert result.body == body
+    assert result.false_gzip_repaired is True
+    assert result.digest_matched is True
+    assert result.warc_payload_digest == payload_digest(body)
+
+
+def test_invalid_uri_playback_is_always_rejected():
+    from archive_magic_fetch.warc import (
+        UnusablePlaybackError,
+        classify_playback_error,
+        download_exact_for_identity,
+    )
+
+    identity = _identity()
+    with pytest.raises(UnusablePlaybackError):
+        download_exact_for_identity(
+            _memento_client(identity, b"Invalid URI"), identity
+        )
+    category, retryable = classify_playback_error(
+        UnusablePlaybackError("IA playback stub: Invalid URI")
+    )
+    assert category == FailureCategory.UNAVAILABLE
+    assert retryable is False
+
+
 def test_retry_after_extracted_from_rate_limit_error_and_message():
     from archive_magic_fetch.scheduler import _retry_after_from_error
 
@@ -543,8 +945,9 @@ def test_retry_after_extracted_from_rate_limit_error_and_message():
 
 def test_connection_error_with_429_in_timestamp_is_not_rate_limit():
     from archive_magic_fetch.scheduler import (
-        _is_connection_refused_error,
-        _is_rate_limit_error,
+        BackpressureKind,
+        BackpressureSignal,
+        _classify_backpressure,
     )
     from wayback.exceptions import WaybackRetryError
 
@@ -556,14 +959,24 @@ def test_connection_error_with_429_in_timestamp_is_not_rate_limit():
         "/web/20080429120000id_/http://example.org/page: Connection refused",
     )
     wrapped = WaybackRetryError(0, 0.08, causal)
-    assert not _is_rate_limit_error(wrapped)
-    assert not _is_rate_limit_error(causal)
-    assert _is_connection_refused_error(wrapped)
+    assert _classify_backpressure(wrapped) == BackpressureSignal(
+        kind=BackpressureKind.TCP
+    )
+    assert _classify_backpressure(causal) == BackpressureSignal(
+        kind=BackpressureKind.TCP
+    )
 
     real = RateLimitError(response=MagicMock(headers={}), retry_after=60)
-    assert _is_rate_limit_error(real)
-    assert _is_rate_limit_error(WaybackRetryError(0, 0.1, real))
-    assert _is_rate_limit_error(RuntimeError("429 error while loading memento"))
+    assert _classify_backpressure(real) == BackpressureSignal(
+        kind=BackpressureKind.HTTP,
+        retry_after=60.0,
+    )
+    assert _classify_backpressure(WaybackRetryError(0, 0.1, real)) == (
+        BackpressureSignal(kind=BackpressureKind.HTTP, retry_after=60.0)
+    )
+    assert _classify_backpressure(
+        RuntimeError("429 error while loading memento")
+    ) == BackpressureSignal(kind=BackpressureKind.HTTP)
 
 
 def test_make_client_mounts_pool_sized_adapter():
@@ -643,10 +1056,10 @@ def test_same_year_representative_revisits_and_redirects_individual(tmp_path):
     def download_fn(_client, identity):
         downloads.append(identity.timestamp)
         if identity.status_token == "302":
-            body = b"redir"
-            return _playback(identity, body=body, status=302)
+            return _playback(identity, body=b"", status=302)
         return _playback(identity, body=shared_body, status=200)
 
+    empty_dig = payload_digest(b"").split(":")[1]
     body = _cdx_json(
         [
             [
@@ -668,13 +1081,13 @@ def test_same_year_representative_revisits_and_redirects_individual(tmp_path):
                 "6",
             ],
             [
-                "com,example)/",
+                "com,example)/thecase",
                 redir_ts,
-                "http://example.org/",
+                "http://example.org/thecase",
                 "text/html",
                 "302",
-                dig,
-                "6",
+                empty_dig,
+                "0",
             ],
         ]
     )
@@ -710,13 +1123,14 @@ def test_same_year_representative_revisits_and_redirects_individual(tmp_path):
 def test_cross_year_matching_payloads_are_full_responses(tmp_path):
     layout = collection_layout("http://example.org/", tmp_path)
     ensure_collection_dirs(layout)
-    dig = "sha1:DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD"
+    body = b"logo"
+    dig = payload_digest(body)
     y2004 = _identity(ts="20040601000000", digest=dig)
     y2005 = _identity(ts="20050601000000", digest=dig)
 
     for year, capt in ((2004, y2004), (2005, y2005)):
         writer = YearWarcWriter(layout, year)
-        writer.write_playback(_playback(capt, body=b"logo"))
+        writer.write_playback(_playback(capt, body=body))
         writer.close()
         publish_annual_index(layout, year)
 
@@ -761,28 +1175,63 @@ def test_custom_cdx_urlkey_survives_warc_inventory(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_digest_mismatch_is_digest_validation_failure():
+def test_digest_mismatch_kept_by_default_rejected_when_strict():
+    from archive_magic_fetch.warc import (
+        DigestValidationError,
+        download_exact_for_identity,
+        payload_digest,
+    )
+
     identity = _identity(digest="sha1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
-
-    class Client:
-        def get_memento(self, *args, **kwargs):
-            memento = MagicMock()
-            memento.__enter__ = lambda s: s
-            memento.__exit__ = MagicMock(return_value=False)
-            memento.content = b"wrong-body"
-            memento.status_code = 200
-            memento.memento_url = "https://web.archive.org/web/x"
-            memento.timestamp = __import__("datetime").datetime(
-                2004, 6, 15, tzinfo=__import__("datetime").timezone.utc
-            )
-            memento.headers = {"Content-Type": "text/html"}
-            memento.url = identity.original_url
-            return memento
-
-    from archive_magic_fetch.warc import DigestValidationError, download_exact_for_identity
+    body = b"wrong-body"
+    kept = download_exact_for_identity(_memento_client(identity, body), identity)
+    assert kept.digest_matched is False
+    assert kept.warc_payload_digest == payload_digest(body)
 
     with pytest.raises(DigestValidationError):
-        download_exact_for_identity(Client(), identity)
+        download_exact_for_identity(
+            _memento_client(identity, body), identity, strict_digests=True
+        )
+
+
+def test_digest_mismatch_warc_not_used_as_revisit_representative(tmp_path):
+    from archive_magic_fetch.models import CDX_DIGEST_MATCH_HEADER
+    from archive_magic_fetch.warc import inventory_collection, payload_digest
+
+    layout = collection_layout("http://example.org/", tmp_path)
+    ensure_collection_dirs(layout)
+    claimed = "sha1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    body = b"imperfect-but-kept"
+    identity = _identity(digest=claimed)
+    result = _playback(identity, body=body)
+    # Simulate permissive accept of a CDX mismatch.
+    result = PlaybackResult(
+        identity=result.identity,
+        body=result.body,
+        status_code=result.status_code,
+        headers=result.headers,
+        warc_date=result.warc_date,
+        source_uri=result.source_uri,
+        warc_payload_digest=payload_digest(body),
+        digest_matched=False,
+    )
+    writer = YearWarcWriter(layout, 2004)
+    writer.write_playback(result)
+    writer.close()
+
+    warc = list_year_warcs(layout, 2004)[0]
+    with warc.open("rb") as stream:
+        for record in ArchiveIterator(stream):
+            if record.rec_type == "response":
+                assert record.rec_headers.get_header(CDX_DIGEST_MATCH_HEADER) == "false"
+                assert record.rec_headers.get_header("WARC-Payload-Digest") == (
+                    payload_digest(body)
+                )
+                break
+
+    inv = inventory_collection(layout)
+    assert inv.contains(identity)
+    assert (identity.urlkey, claimed) not in inv.year_index(2004).by_url_digest
 
 
 def test_playback_5xx_is_retryable():

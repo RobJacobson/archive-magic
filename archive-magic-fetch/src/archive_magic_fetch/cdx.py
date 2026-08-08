@@ -56,6 +56,11 @@ _CDX_TIMESTAMP = re.compile(r"^\d{1,14}$")
 _DATE_BOUND = re.compile(r"^\d{4,14}$")
 
 
+# Gzip member header magic (RFC 1952). Used to detect bodies that are not
+# actually compressed despite a Content-Encoding: gzip claim from IA.
+_GZIP_MAGIC = b"\x1f\x8b"
+
+
 class ArchiveMagicWaybackSession(WaybackSession):
     """Wayback session tuned for Archive Magic fetch.
 
@@ -66,6 +71,13 @@ class ArchiveMagicWaybackSession(WaybackSession):
     memento, which can let HTTP 429 slip through as a playback error with no
     ``retry_after``. Always surface 429 as ``RateLimitError`` with the
     session's recommended delay (header or wayback's 60s default).
+
+    Some memento responses also advertise ``Content-Encoding: gzip`` while the
+    transfer body is already plaintext (for example HTML starting with
+    ``<!DOCTYPE``). ``requests`` then raises ``ContentDecodingError`` when
+    reading ``.content``. This session forces ``stream=True``, and for mementos
+    that claim gzip it reads the raw body and only decompresses when the gzip
+    magic is present.
     """
 
     def __init__(self, *args, **kwargs) -> None:
@@ -73,12 +85,86 @@ class ArchiveMagicWaybackSession(WaybackSession):
         super().__init__(*args, **kwargs)
 
     def send(self, request, **kwargs):
+        # requests.Session.send() eagerly reads ``response.content`` unless
+        # stream=True. That triggers ContentDecodingError on IA's false gzip
+        # claims before we can inspect the raw body, so always defer loading.
+        kwargs["stream"] = True
         response = super().send(request, **kwargs)
         if getattr(response, "status_code", None) == 429:
             delay = self.get_retry_delay(0, response)
             read_and_close(response)
             raise RateLimitError(response, delay)
+        repair_false_gzip_content_encoding(response)
         return response
+
+
+def repair_false_gzip_content_encoding(response: requests.Response) -> None:
+    """Decode memento bodies that falsely claim ``Content-Encoding: gzip``.
+
+    Edge case: Internet Archive occasionally returns a memento with
+    ``Content-Encoding: gzip`` whose on-the-wire body is already uncompressed
+    (magic bytes are HTML/PDF/etc., not ``\\x1f\\x8b``). urllib3/requests then
+    fail with ``ContentDecodingError`` ("incorrect header check").
+
+    Callers must obtain the response with ``stream=True`` (the session
+    ``send()`` override does this) so ``requests`` has not already attempted
+    content decoding.
+
+    Only memento responses (those with ``Memento-Datetime``) are rewritten, and
+    only when they claim gzip. CDX entity downloads keep streaming with
+    ``decode_content=False`` and must not have their bodies eagerly consumed
+    here. After repair, ``Content-Encoding`` is removed and ``response.content``
+    is the logical payload (decompressed when the body was real gzip).
+
+    False-gzip responses are marked with ``_archive_magic_false_gzip``. Under
+    the default permissive digest policy, mismatched bodies are kept for that
+    capture only; ``--strict-digests`` rejects them as unavailable.
+    """
+
+    headers = getattr(response, "headers", None)
+    if headers is None or "Memento-Datetime" not in headers:
+        return
+
+    encoding = (headers.get("Content-Encoding") or "").split(",")[0].strip().lower()
+    if encoding not in {"gzip", "x-gzip"}:
+        return
+
+    # Already materialized (for example by a prior hook); do not re-read.
+    if getattr(response, "_content", False) is not False:
+        return
+
+    raw_stream = getattr(response, "raw", None)
+    if raw_stream is None:
+        return
+
+    # Disable urllib3's content-decoder so we can inspect the true payload.
+    if hasattr(raw_stream, "decode_content"):
+        raw_stream.decode_content = False
+    raw = raw_stream.read()
+    false_gzip = False
+    if raw.startswith(_GZIP_MAGIC):
+        try:
+            body = gzip.decompress(raw)
+        except OSError:
+            # Truncated or corrupt gzip: keep bytes for caller classification.
+            body = raw
+    else:
+        # False Content-Encoding: IA claimed gzip but sent plaintext. Keep the
+        # bytes so digest validation can accept the rare authentic cases; most
+        # of these bodies do not match the CDX digest and are rejected later as
+        # unavailable rather than stored under a false digest-validation label.
+        body = raw
+        false_gzip = True
+
+    # Body is now the logical entity; drop the misleading transfer coding.
+    try:
+        del response.headers["Content-Encoding"]
+    except KeyError:
+        pass
+    response._content = body
+    response._content_consumed = True
+    if false_gzip:
+        setattr(response, "_archive_magic_false_gzip", True)
 
 
 def configure_session_pool(

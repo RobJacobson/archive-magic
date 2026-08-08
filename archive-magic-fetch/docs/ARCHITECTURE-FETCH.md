@@ -18,12 +18,13 @@ This document describes the finished implementation.
 ## Command
 
 ```text
-archive-magic-fetch URL_PATTERN [--start DATE] [--end DATE]
+archive-magic-fetch URL_PATTERN [--start DATE] [--end DATE] [--strict-digests]
 ```
 
 Defaults are the practical Wayback start (`19950101000000`) through the current
 UTC time. Date bounds are UTC. Rate, connections, retries, and WARC size are
-named constants in `models.py`, not CLI options.
+named constants in `models.py`. Digest mismatch handling defaults to
+permissive; `--strict-digests` restores reject-on-mismatch.
 
 Exit status:
 
@@ -104,6 +105,51 @@ Requests use original/raw mode, `exact=True`, and `follow_redirects=False`.
 URL/timestamp mismatches and known-status mismatches are rejections, not
 silent substitutions.
 
+Redirect captures are archive records in their own right: store the historical
+3xx status, `Location` header, and body (often empty) under the original URL.
+Do not follow redirects during fetch. Target pages appear as separate CDX rows
+when the crawler archived them (for example `/thecase` → 302 to
+`/site/page/the_case`, and a distinct 200 capture of that path).
+
+### False `Content-Encoding: gzip` on mementos
+
+Some Wayback memento responses advertise `Content-Encoding: gzip` while the
+transfer body is already plaintext (for example HTML whose first bytes are
+`<!DOCTYPE`, not the gzip magic `1f 8b`). When `requests` later reads
+`.content`, urllib3 raises `ContentDecodingError` ("incorrect header check").
+
+`ArchiveMagicWaybackSession.send()` handles memento responses (those that
+carry `Memento-Datetime`) that claim gzip:
+
+1. Force `stream=True` so `requests` does not eagerly decode the body.
+2. Read the socket body with content-decoding disabled.
+3. If the body starts with gzip magic, decompress it and clear
+   `Content-Encoding`.
+4. If the body is not gzip (the false-encoding edge case), keep the plaintext,
+   clear `Content-Encoding`, and mark the response as
+   `_archive_magic_false_gzip`.
+
+Real gzip and false-gzip bodies then compare against the CDX digest. By
+default Archive Magic **keeps** imperfect payloads whose digest disagrees with
+CDX (common for old Common Crawl ARC playback): something incomplete is better
+than a hole, matching Wayback's own display policy. Kept mismatches:
+
+- store `WARC-Payload-Digest` of the actual body and `CDX-Payload-Digest` of
+  the claimed CDX value, plus `CDX-Digest-Match: false`;
+- count as represented (`digest_mismatch_accepted` in `collection.json`);
+- must **not** become same-year revisit representatives—deferred same-digest
+  captures are downloaded individually instead.
+
+Pass `--strict-digests` to reject mismatches (`digest_validation`, or
+`unavailable` for false-gzip mismatches). Empty non-redirect bodies and IA
+stubs such as `Invalid URI` are always rejected. Empty bodies on HTTP
+redirects (3xx) are kept—crawls often store only status + `Location`. A
+still-live origin URL may show what the page should look like, but Archive
+Magic never substitutes a live fetch for a failed memento.
+
+CDX entity downloads are left alone so they can keep streaming with
+`decode_content=False`.
+
 ### Network ownership
 
 Archive Magic, rather than `wayback`, owns playback pacing and retries:
@@ -134,6 +180,10 @@ queried serially with one session. That code owns an eight-attempt loop:
 `Retry-After` (or 60 seconds) for 429, and exponential delays from 5 seconds up
 to 300 seconds for connection failures and 5xx responses. Raw HTTP entity bytes
 are durably published before parsing.
+
+Captures whose CDX payload digest is the known IA stub for the literal body
+`Invalid URI` (`sha1:L4XNRRGWXWKNIAJFQOC6D2OULYFIDDTC`) are skipped at playback
+without a network request and logged as `Skipped (invalid URI)`.
 
 ### Playback rate and connection pool
 
@@ -242,20 +292,25 @@ passes through start pacing, the connection budget, and global cooldowns.
 Not every broken transfer is transient:
 
 - IA may contain permanently truncated captures, commonly PDFs, where the
-  advertised length exceeds the stored bytes and playback repeatedly raises
-  `IncompleteRead`.
+  advertised length exceeds the stored bytes and playback raises
+  `IncompleteRead`. The same URL often has a later complete capture in CDX;
+  that later capture is downloaded on its own when reached.
 - requests may wrap that as `ChunkedEncodingError`, and `wayback` may wrap it
   again. Classification inspects the complete outer error before generic
   connection handling.
 - Such captures are recorded immediately as non-retryable `TRUNCATED`
-  failures. Re-downloading them would consume bandwidth and replacement
-  connections without producing a complete payload.
+  failures (`Skipped (truncated response)`). Nothing is written to WARC.
+  Re-downloading the same broken capture would not recover complete bytes.
+- A global pause after truncation is currently disabled
+  (`TRUNCATION_PAUSE_S = 0`) while we check whether skip-and-continue triggers
+  TCP backpressure; only the worker session is recycled.
 
-Blocked captures, exact-playback mismatches, digest mismatches, and ordinary
-permanent playback failures are also not retried. Retryable 5xx, timeout,
-connection, and rate-limit failures remain eligible up to the attempt limit.
-Permanent or exhausted failures flow through the bounded result handoff into
-`failures.json`; they are never silently discarded.
+Blocked captures, exact-playback mismatches, unusable stubs, strict-mode
+digest mismatches, and ordinary permanent playback failures are also not
+retried. Permissive digest mismatches are kept rather than failed. Retryable
+5xx, timeout, connection, and rate-limit failures remain eligible up to the
+attempt limit. Permanent or exhausted failures flow through the bounded result
+handoff into `failures.json`; they are never silently discarded.
 
 ### Logging and metrics
 
@@ -268,9 +323,13 @@ and attempt counts by stable failure category.
 ### Same-year reuse
 
 Within a year, non-redirect captures with a usable CDX digest share one
-successful representative response; later matches become revisits that resolve
-inside the same annual WARC set. Redirects and digest-less rows are fetched
-individually. Matching digests in different years each store a full response.
+successful **digest-matched** representative response; later matches become
+revisits that resolve inside the same annual WARC set. A representative whose
+body does not match the CDX digest is stored for its own identity only;
+remaining group members are fetched individually. Redirects and digest-less
+rows are fetched individually (redirects often share the empty-body digest and
+must retain their own `Location` headers). Matching digests in different years
+each store a full response.
 
 ### Scheduler
 

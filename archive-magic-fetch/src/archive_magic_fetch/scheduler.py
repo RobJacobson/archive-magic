@@ -9,6 +9,7 @@ import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from email.utils import mktime_tz, parsedate_tz
+from enum import Enum
 from queue import Full, Queue
 from typing import Callable, Optional, Sequence
 
@@ -28,6 +29,8 @@ from .models import (
     PlaybackResult,
     RunMetrics,
     UnresolvedFailure,
+    is_invalid_uri_payload_digest,
+    wayback_url,
 )
 from .warc import (
     classify_playback_error,
@@ -53,8 +56,8 @@ class PlaybackProgress:
 
     @property
     def _response_indent(self) -> str:
-        # Align with "Downloading" on the request line:
-        # "  {n:>{width}}/{total}: Downloading ..."
+        # Align under the URL on the request line:
+        # "  {n:>{width}}/{total}: {url} ..."
         return " " * (2 * self._width + 5)
 
     def request_started(self, url: str) -> None:
@@ -62,12 +65,20 @@ class PlaybackProgress:
             self._count += 1
             number = self._count
         print(
-            f"  {number:{self._width}d}/{self.total}: Downloading {url} ...",
+            f"  {number:{self._width}d}/{self.total}: {url} ...",
             flush=True,
         )
 
     def request_finished(self, line: str) -> None:
         print(f"{self._response_indent}{line}", flush=True)
+
+    def note_additional_work(self, n: int = 1) -> None:
+        """Increase the denominator when deferred captures become downloads."""
+
+        if n < 1:
+            return
+        with self._lock:
+            self.total += n
 
 
 @dataclass(order=True)
@@ -149,7 +160,7 @@ class PlaybackScheduler:
         self._delayed: list[DelayedJob] = []
         self._active_connections = 0
         self._blocked_until = 0.0
-        self._consecutive_429 = 0
+        self._consecutive_backpressure = 0
         self._next_start_at = 0.0
         self._results: Queue[JobSuccess | JobFailure | None] = Queue(
             maxsize=result_queue_size
@@ -260,6 +271,12 @@ class PlaybackScheduler:
                 ),
             )
 
+    def note_additional_work(self, n: int = 1) -> None:
+        """Account for captures promoted to downloads after the initial plan."""
+
+        if self._progress is not None:
+            self._progress.note_additional_work(n)
+
     def acknowledge(self) -> None:
         """Mark one consumed result as fully handled by the writer."""
 
@@ -269,25 +286,45 @@ class PlaybackScheduler:
     def _worker(self, job: ReadyJob) -> JobSuccess | JobFailure:
         identity = job.identity
         if self._progress is not None:
-            self._progress.request_started(identity.original_url)
+            self._progress.request_started(
+                wayback_url(identity.timestamp, identity.original_url)
+            )
         request_started_at = self._clock()
         try:
+            if is_invalid_uri_payload_digest(identity.payload_digest):
+                failure = JobFailure(
+                    identity=identity,
+                    category=FailureCategory.UNAVAILABLE,
+                    message="CDX digest is IA Invalid URI stub",
+                    retryable=False,
+                    attempt=job.attempt,
+                )
+                if self._progress is not None:
+                    self._progress.request_finished("Skipped (invalid URI)")
+                self.metrics.bump_attempt(failure.category.value)
+                self._handle_failure(failure, will_retry=False, delay=0.0)
+                return failure
             client = self._thread_client()
             result = self._download_fn(client, identity)
             duration = self._clock() - request_started_at
             success = JobSuccess(identity=identity, result=result)
             self.metrics.playback_completions += 1
             self.metrics.playback_bytes += len(result.body)
-            self._consecutive_429 = 0
+            self._consecutive_backpressure = 0
             if self._progress is not None:
-                self._progress.request_finished(f"Success ({duration:.1f}s)")
+                if result.digest_matched:
+                    line = f"Success ({duration:.1f}s)"
+                else:
+                    line = f"Success (digest mismatch kept, {duration:.1f}s)"
+                self._progress.request_finished(line)
             self._put_result(success)
             return success
         except Exception as error:  # noqa: BLE001 - boundary classification
             category, retryable = classify_playback_error(error)
             retry_after = _retry_after_from_error(error)
-            if _is_rate_limit_error(error):
-                self._note_429(retry_after, error=error)
+            backpressure = _classify_backpressure(error)
+            if backpressure is not None:
+                self._note_backpressure(backpressure, error=error)
             elif category == FailureCategory.TRUNCATED:
                 self._note_truncation()
             failure = JobFailure(
@@ -340,9 +377,14 @@ class PlaybackScheduler:
         failure: JobFailure,
         error: BaseException,
     ) -> tuple[bool, float]:
-        if _is_connection_refused_error(error):
-            if failure.attempt <= CONNECTION_REFUSED_MAX_RETRIES:
-                return True, CONNECTION_REFUSED_RETRY_S
+        backpressure = _classify_backpressure(error)
+        if backpressure is not None:
+            if backpressure.kind == BackpressureKind.TCP:
+                if failure.attempt <= CONNECTION_REFUSED_MAX_RETRIES:
+                    return True, CONNECTION_REFUSED_RETRY_S
+                return False, 0.0
+            if failure.retryable and failure.attempt < self._max_attempts:
+                return True, self._retry_delay(failure)
             return False, 0.0
         if failure.category == FailureCategory.TRUNCATED:
             return False, 0.0
@@ -356,32 +398,44 @@ class PlaybackScheduler:
         delay = 5 * (2 ** failure.attempt)
         return float(min(delay, MAX_RETRY_DELAY_S))
 
-    def _note_429(
+    def _note_backpressure(
         self,
-        retry_after: Optional[float],
+        signal: BackpressureSignal,
         *,
         error: Optional[BaseException] = None,
     ) -> None:
-        self._consecutive_429 += 1
-        header_delay = _retry_after_from_response(
-            getattr(error, "response", None) if error is not None else None
-        )
-        if header_delay is not None:
-            cooldown = min(header_delay, MAX_429_COOLDOWN_S)
-        elif retry_after is not None:
-            cooldown = min(float(retry_after), MAX_429_COOLDOWN_S)
+        self._consecutive_backpressure += 1
+        if signal.kind == BackpressureKind.TCP:
+            cooldown = CONNECTION_REFUSED_RETRY_S
         else:
-            cooldown = DEFAULT_429_COOLDOWN_S
+            header_delay = _retry_after_from_response(
+                getattr(error, "response", None) if error is not None else None
+            )
+            if header_delay is not None:
+                cooldown = min(header_delay, MAX_429_COOLDOWN_S)
+            elif signal.retry_after is not None:
+                cooldown = min(float(signal.retry_after), MAX_429_COOLDOWN_S)
+            else:
+                cooldown = DEFAULT_429_COOLDOWN_S
         self._blocked_until = max(
             self._blocked_until,
             self._clock() + cooldown,
         )
 
     def _note_truncation(self) -> None:
-        self._blocked_until = max(
-            self._blocked_until,
-            self._clock() + TRUNCATION_PAUSE_S,
-        )
+        """Handle a permanent incomplete payload without pacing delay.
+
+        When ``TRUNCATION_PAUSE_S`` is positive, open a short global gate pause
+        (historical mitigation for suspected TCP backpressure). Current policy
+        is skip-and-continue (pause is 0); still recycle the thread client in
+        case the transfer left the connection half-closed.
+        """
+
+        if TRUNCATION_PAUSE_S > 0:
+            self._blocked_until = max(
+                self._blocked_until,
+                self._clock() + TRUNCATION_PAUSE_S,
+            )
         self._reset_thread_client()
 
     def _promote_delayed(self, now: float) -> None:
@@ -464,19 +518,28 @@ def _format_response_line(
     retry_delay: float,
 ) -> str:
     if category == FailureCategory.TRUNCATED:
-        return "Error: Truncated Response, pausing for 5s."
-    if _is_connection_refused_error(error):
-        if will_retry:
+        return "Skipped (truncated response)"
+    if category == FailureCategory.UNAVAILABLE:
+        return "Skipped (unavailable)"
+    backpressure = _classify_backpressure(error)
+    if backpressure is not None:
+        if backpressure.kind == BackpressureKind.TCP:
+            if will_retry:
+                return (
+                    f"Warning: Connection Refused (TCP backpressure), "
+                    f"retrying in {int(CONNECTION_REFUSED_RETRY_S)}s"
+                )
             return (
-                f"Warning: Connection Refused, retrying in "
-                f"{int(CONNECTION_REFUSED_RETRY_S)}s"
+                "Error: Connection Refused (TCP backpressure), "
+                f"giving up after {CONNECTION_REFUSED_MAX_RETRIES} retries"
             )
-        return "Error: Connection Refused, giving up after 3 retries"
-    if _is_rate_limit_error(error):
         delay = int(retry_delay) if retry_delay else int(DEFAULT_429_COOLDOWN_S)
         if will_retry:
-            return f"Warning: Rate Limited, retrying in {delay}s"
-        return "Error: Rate Limited, continuing"
+            return (
+                f"Warning: Rate Limited (HTTP backpressure), "
+                f"retrying in {delay}s"
+            )
+        return "Error: Rate Limited (HTTP backpressure), continuing"
     label = _short_error_label(error, category)
     if will_retry:
         delay_text = (
@@ -507,39 +570,71 @@ def _short_error_label(error: BaseException, category: FailureCategory) -> str:
     return category.value.replace("_", " ").title()
 
 
-def _is_rate_limit_error(error: BaseException) -> bool:
-    """Return whether error represents an HTTP 429 / rate-limit response.
+class BackpressureKind(Enum):
+    """Where Internet Archive signaled overload."""
 
-    Avoid bare ``\"429\" in message`` checks: capture timestamps and URLs often
-    contain that digit sequence (e.g. ``20080429``) and were falsely tripping
-    the global cooldown on ordinary connection errors.
+    HTTP = "http"
+    TCP = "tcp"
+
+
+@dataclass(frozen=True)
+class BackpressureSignal:
+    """IA throttling at the application or transport layer."""
+
+    kind: BackpressureKind
+    retry_after: Optional[float] = None
+
+
+def _classify_backpressure(error: BaseException) -> Optional[BackpressureSignal]:
+    """Return IA backpressure at HTTP or TCP layer, if present.
+
+    Internet Archive may rate-limit with HTTP 429 or by refusing TCP
+    connections. Both share the same scheduler cooldown gate. Avoid bare
+    ``\"429\" in message`` checks: capture timestamps and URLs often contain
+    that digit sequence (e.g. ``20080429``).
     """
 
-    for candidate in _iter_error_chain(error):
-        if "RateLimit" in type(candidate).__name__:
-            return True
-        if getattr(candidate, "status_code", None) == 429:
-            return True
-        response = getattr(candidate, "response", None)
-        if getattr(response, "status_code", None) == 429:
-            return True
-        message = str(candidate).lower()
-        if "rate limit" in message or "too many requests" in message:
-            return True
-        if re.search(r"\b429\b", message):
-            return True
-    return False
-
-
-def _is_connection_refused_error(error: BaseException) -> bool:
-    """Return whether an error chain ends in a refused TCP connection."""
+    tcp = False
+    http = False
+    retry_after: Optional[float] = None
 
     for candidate in _iter_error_chain(error):
         if isinstance(candidate, ConnectionRefusedError):
-            return True
-        if "connection refused" in str(candidate).lower():
-            return True
-    return False
+            tcp = True
+            continue
+        message = str(candidate).lower()
+        if "connection refused" in message:
+            tcp = True
+            continue
+
+        candidate_http = False
+        if "RateLimit" in type(candidate).__name__:
+            candidate_http = True
+        elif getattr(candidate, "status_code", None) == 429:
+            candidate_http = True
+        else:
+            response = getattr(candidate, "response", None)
+            if getattr(response, "status_code", None) == 429:
+                candidate_http = True
+            elif "rate limit" in message or "too many requests" in message:
+                candidate_http = True
+            elif re.search(r"\b429\b", message):
+                candidate_http = True
+
+        if candidate_http:
+            http = True
+            parsed = _retry_after_from_error(candidate)
+            if parsed is not None:
+                retry_after = parsed
+
+    if http:
+        return BackpressureSignal(
+            kind=BackpressureKind.HTTP,
+            retry_after=retry_after,
+        )
+    if tcp:
+        return BackpressureSignal(kind=BackpressureKind.TCP)
+    return None
 
 
 def _iter_error_chain(error: BaseException):
