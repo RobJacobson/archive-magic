@@ -244,9 +244,16 @@ Fetch guarantees that:
 - the index is sorted by URL key and timestamp;
 - `filename` is relative to the collection root;
 - offsets and lengths address independently compressed WARC members;
-- response and revisit records are indexed; and
+- response and revisit records are indexed;
+- revisits may reference full responses in the same year or an earlier year
+  under other `archive/YYYY/` paths; and
 - completed WARC files and the CDXJ file are each published with atomic
   replacement.
+
+Playback therefore requires the full collection chain, not a single annual
+slice of WARCs. Annual `indexes/years/YYYY.cdxj` files remain helpful for
+recovery but are not independently portable when revisits cross year
+boundaries.
 
 ### 4.1 Required preflight
 

@@ -71,7 +71,12 @@ _REPRESENTATION_HEADERS = {
 
 @dataclass(frozen=True)
 class StoredResponse:
-    """Location of one full response within a year."""
+    """Compact locator for one full response.
+
+    Never retain payload bytes. HTTP headers are optional metadata only;
+    revisit records do not need to copy them because pywb resolves headers
+    from the referenced full response.
+    """
 
     identity: CaptureIdentity
     relative_key: str
@@ -79,35 +84,84 @@ class StoredResponse:
     warc_payload_digest: str
     target_uri: str
     status_code: int
-    headers: tuple[tuple[str, str], ...]
+    headers: tuple[tuple[str, str], ...] = ()
     body: bytes | None = None
 
 
 @dataclass
 class YearResponseIndex:
-    """In-year full responses available for revisit targets."""
+    """Per-year full responses keyed by capture identity."""
 
     by_identity: dict[CaptureIdentity, StoredResponse] = field(
-        default_factory=dict
-    )
-    by_url_digest: dict[tuple[str, str], StoredResponse] = field(
         default_factory=dict
     )
 
 
 @dataclass
 class CollectionInventory:
-    """Exact captures already present in the collection."""
+    """Exact captures and collection-wide deduplication representatives.
+
+    ``by_url_digest`` maps ``(urlkey, IA/CDX payload digest)`` to the oldest
+    successful full response with that key. Entries store compact locator
+    metadata only (never payloads), rebuilt from finalized WARCs on resume.
+    """
 
     identities: set[CaptureIdentity] = field(default_factory=set)
-    # year -> urlkey/digest -> stored response metadata for revisits
     year_responses: dict[int, YearResponseIndex] = field(default_factory=dict)
+    # Collection-wide representative map: oldest successful store wins.
+    by_url_digest: dict[tuple[str, str], StoredResponse] = field(
+        default_factory=dict
+    )
 
     def contains(self, identity: CaptureIdentity) -> bool:
         return identity in self.identities
 
     def year_index(self, year: int) -> YearResponseIndex:
         return self.year_responses.setdefault(year, YearResponseIndex())
+
+    def lookup_representative(
+        self,
+        urlkey: str,
+        ia_digest: str,
+        *,
+        not_after_timestamp: str,
+    ) -> StoredResponse | None:
+        """Return a prior successful response usable for a capture timestamp.
+
+        Backward-only: rejects representatives whose own capture timestamp is
+        after ``not_after_timestamp`` so later years never repair earlier ones.
+        """
+
+        if ia_digest == MISSING_CDX_PAYLOAD_DIGEST:
+            return None
+        stored = self.by_url_digest.get((urlkey, ia_digest))
+        if stored is None:
+            return None
+        if stored.identity.timestamp > not_after_timestamp:
+            return None
+        return stored
+
+    def remember_representative(self, stored: StoredResponse) -> None:
+        """Record a successful full response for later revisit short-circuits.
+
+        Keeps the oldest representative for each ``(urlkey, IA digest)``.
+        Failed downloads must never call this. Redirects and missing IA digests
+        are ignored. Permissively accepted digest mismatches are allowed:
+        revisits reference the stored local ``WARC-Payload-Digest``.
+        """
+
+        ia_digest = stored.identity.payload_digest
+        if ia_digest == MISSING_CDX_PAYLOAD_DIGEST:
+            return
+        if is_redirect_status_token(stored.identity.status_token):
+            return
+        key = (stored.identity.urlkey, ia_digest)
+        existing = self.by_url_digest.get(key)
+        if (
+            existing is None
+            or stored.identity.timestamp < existing.identity.timestamp
+        ):
+            self.by_url_digest[key] = stored
 
 
 def payload_digest(payload: bytes) -> str:
@@ -149,7 +203,13 @@ def get_warc_identity(record) -> CaptureIdentity:
 
 
 def inventory_collection(layout: CollectionLayout) -> CollectionInventory:
-    """Validate and inventory every existing collection WARC."""
+    """Validate and inventory every existing collection WARC.
+
+    Finalized WARCs are the recovery source of truth. Rebuild identity
+    membership and the compact ``(urlkey, IA digest)`` representative map
+    without loading payload bodies so resumed runs (for example ``2016-present``
+    after ``2000-2015`` completed) can short-circuit to revisits.
+    """
 
     inv = CollectionInventory()
     for path in list_all_warcs(layout):
@@ -166,42 +226,30 @@ def inventory_collection(layout: CollectionLayout) -> CollectionInventory:
                     record.rec_headers.get_header("WARC-Payload-Digest")
                 )
                 if record.rec_type == "response" and warc_payload is not None:
-                    status = int(record.http_headers.get_statuscode())
-                    headers = tuple(record.http_headers.headers)
-                    # Do not retain full bodies in inventory for memory.
+                    status_code = 200
+                    try:
+                        status_code = int(record.http_headers.get_statuscode())
+                    except (TypeError, ValueError, AttributeError):
+                        if identity.status_token.isdigit():
+                            status_code = int(identity.status_token)
+                    # Compact inventory: no body, no HTTP headers.
                     stored = StoredResponse(
                         identity=identity,
                         relative_key=relative,
                         warc_date=record.rec_headers.get_header("WARC-Date"),
                         warc_payload_digest=warc_payload,
                         target_uri=identity.original_url,
-                        status_code=status,
-                        headers=headers,
+                        status_code=status_code,
+                        headers=(),
                         body=None,
                     )
-                    yindex = inv.year_index(year)
-                    yindex.by_identity[identity] = stored
-                    # Only digest-matched responses may be revisit targets.
-                    if (
-                        identity.payload_digest != MISSING_CDX_PAYLOAD_DIGEST
-                        and _cdx_digest_matches_payload(
-                            identity.payload_digest, warc_payload
-                        )
-                    ):
-                        yindex.by_url_digest[
-                            (identity.urlkey, identity.payload_digest)
-                        ] = stored
+                    inv.year_index(year).by_identity[identity] = stored
+                    # Successful full responses seed the collection-wide map,
+                    # including permissive IA/local digest mismatches.
+                    inv.remember_representative(stored)
                 # consume body stream
                 record.raw_stream.read()
     return inv
-
-
-def _cdx_digest_matches_payload(cdx_digest: str, warc_payload_digest: str) -> bool:
-    """Return whether a CDX digest token names the same payload as WARC."""
-
-    expected = normalize_payload_digest(cdx_digest)
-    actual = normalize_payload_digest(warc_payload_digest)
-    return expected is not None and actual is not None and expected == actual
 
 
 def _is_unusable_playback_body(
@@ -306,10 +354,12 @@ def download_exact_for_identity(
     """Exact-playback one capture identity and attach full identity fields.
 
     By default, a body that does not match the CDX digest is still kept
-    (imperfect IA captures are better than gaps). Pass ``strict_digests=True``
-    to reject mismatches. Unusable stubs such as ``Invalid URI`` are always
-    rejected. Empty bodies are rejected except for HTTP redirects (3xx), which
-    historically often have an empty entity and a ``Location`` header.
+    (imperfect IA captures are better than gaps) and remains eligible as a
+    revisit representative for later same-key captures. Pass
+    ``strict_digests=True`` to reject mismatches. Unusable stubs such as
+    ``Invalid URI`` are always rejected. Empty bodies are rejected except for
+    HTTP redirects (3xx), which historically often have an empty entity and a
+    ``Location`` header.
     """
 
     expected_status = (
@@ -492,7 +542,12 @@ def build_response_record(result: PlaybackResult):
 
 
 def build_revisit_record(result: RevisitResult):
-    """Create a WARC 1.1 revisit record."""
+    """Create a WARC 1.1 revisit record.
+
+    Revisits store current capture identity via CDX extension headers and point
+    at an earlier full response via ``WARC-Refers-To-*``. HTTP headers may be
+    empty; pywb loads missing HTTP headers from the referenced response.
+    """
 
     http_headers = StatusAndHeaders(
         _status_line(result.http_status_code),
@@ -509,6 +564,7 @@ def build_revisit_record(result: RevisitResult):
             CDX_STATUS_HEADER: result.identity.status_token,
             CDX_URLKEY_HEADER: result.identity.urlkey,
             "WARC-Date": result.warc_date,
+            # Local digest of the referenced payload (may differ from CDX).
             "WARC-Payload-Digest": result.warc_payload_digest,
             "WARC-Profile": (
                 "http://netpreserve.org/warc/1.1/revisit/identical-payload-digest"
@@ -647,16 +703,28 @@ def revisit_from_stored(
     http_status_code: int | None = None,
     http_headers: tuple[tuple[str, str], ...] | None = None,
 ) -> RevisitResult:
-    """Build a revisit referencing an in-year full response."""
+    """Build a revisit referencing an earlier successful full response.
 
+    Prefer the current capture's CDX status for the HTTP status line when it is
+    numeric. HTTP headers default to empty so inventory need not retain the
+    representative's full header set; pywb fills them from the referred payload.
+    """
+
+    if http_status_code is None:
+        if identity.status_token.isdigit():
+            http_status_code = int(identity.status_token)
+        else:
+            http_status_code = stored.status_code
+    if http_headers is None:
+        http_headers = ()
     return RevisitResult(
         identity=identity,
         warc_date=cdx_timestamp_to_warc_date(identity.timestamp),
         refers_to_target_uri=stored.target_uri,
         refers_to_date=stored.warc_date,
         warc_payload_digest=stored.warc_payload_digest,
-        http_status_code=http_status_code or stored.status_code,
-        http_headers=http_headers or stored.headers,
+        http_status_code=http_status_code,
+        http_headers=http_headers,
     )
 
 
@@ -666,7 +734,7 @@ def stored_from_playback(
     result: PlaybackResult,
     relative_key: str,
 ) -> StoredResponse:
-    """Create inventory metadata for a just-written full response."""
+    """Create compact inventory metadata for a just-written full response."""
 
     return StoredResponse(
         identity=result.identity,
@@ -675,6 +743,6 @@ def stored_from_playback(
         warc_payload_digest=result.warc_payload_digest,
         target_uri=result.identity.original_url,
         status_code=result.status_code,
-        headers=result.headers,
+        headers=(),
         body=None,
     )

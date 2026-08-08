@@ -1039,7 +1039,7 @@ def test_retries_do_not_jump_ahead_of_first_attempts():
 
 
 # ---------------------------------------------------------------------------
-# 5 + 6. Same-year revisits via run_fetch; cross-year full responses
+# 5 + 6. Same-year and cross-year revisits via run_fetch
 # ---------------------------------------------------------------------------
 
 
@@ -1120,27 +1120,528 @@ def test_same_year_representative_revisits_and_redirects_individual(tmp_path):
     assert types.count("revisit") == 1
 
 
-def test_cross_year_matching_payloads_are_full_responses(tmp_path):
+def _patch_cdx_by_year(bodies_by_year: dict[int, bytes]):
+    from archive_magic_fetch import cdx as cdx_mod
+    from archive_magic_fetch import fetch as fetch_mod
+
+    original = cdx_mod.fetch_year_cdx
+
+    def fake_fetch_year_cdx(layout, **kwargs):
+        kwargs = dict(kwargs)
+        year = int(kwargs["year"])
+        body = bodies_by_year.get(year, b"[]")
+        kwargs["session"] = FakeSession([body])
+        kwargs["sleep"] = lambda _s: None
+        return original(layout, **kwargs)
+
+    cdx_mod.fetch_year_cdx = fake_fetch_year_cdx
+    fetch_mod.fetch_year_cdx = fake_fetch_year_cdx
+    return original, cdx_mod, fetch_mod
+
+
+def test_cross_year_matching_payloads_become_revisits(tmp_path):
     layout = collection_layout("http://example.org/", tmp_path)
     ensure_collection_dirs(layout)
     body = b"logo"
-    dig = payload_digest(body)
-    y2004 = _identity(ts="20040601000000", digest=dig)
-    y2005 = _identity(ts="20050601000000", digest=dig)
+    dig = payload_digest(body).split(":")[1]
+    downloads: list[str] = []
 
-    for year, capt in ((2004, y2004), (2005, y2005)):
-        writer = YearWarcWriter(layout, year)
-        writer.write_playback(_playback(capt, body=body))
-        writer.close()
-        publish_annual_index(layout, year)
+    def download_fn(_client, identity):
+        downloads.append(identity.timestamp)
+        return _playback(identity, body=body)
+
+    bodies = {
+        2004: _cdx_json(
+            [
+                [
+                    "com,example)/",
+                    "20040601000000",
+                    "http://example.org/",
+                    "text/html",
+                    "200",
+                    dig,
+                    "4",
+                ]
+            ]
+        ),
+        2005: _cdx_json(
+            [
+                [
+                    "com,example)/",
+                    "20050601000000",
+                    "http://example.org/",
+                    "text/html",
+                    "200",
+                    dig,
+                    "4",
+                ]
+            ]
+        ),
+    }
+    original, cdx_mod, fetch_mod = _patch_cdx_by_year(bodies)
+    try:
+        result = run_fetch(
+            FetchSettings(
+                url_pattern="http://example.org/",
+                date_start="20040601000000",
+                date_end="20050601000000",
+                archives_root=tmp_path,
+            ),
+            client_factory=lambda: MagicMock(),
+            download_fn=download_fn,
+            sleep=lambda _s: None,
+        )
+    finally:
+        cdx_mod.fetch_year_cdx = original
+        fetch_mod.fetch_year_cdx = original
+
+    assert result.exit_code == 0
+    assert downloads == ["20040601000000"]
+    assert result.metrics.downloads == 1
+    assert result.metrics.revisits == 1
+
+    types_2004 = []
+    with list_year_warcs(layout, 2004)[0].open("rb") as stream:
+        for record in ArchiveIterator(stream):
+            types_2004.append(record.rec_type)
+            record.raw_stream.read()
+    assert types_2004.count("response") == 1
+    assert types_2004.count("revisit") == 0
+
+    types_2005 = []
+    with list_year_warcs(layout, 2005)[0].open("rb") as stream:
+        for record in ArchiveIterator(stream):
+            types_2005.append(record.rec_type)
+            if record.rec_type == "revisit":
+                assert (
+                    record.rec_headers.get_header("WARC-Refers-To-Date")
+                    == "2004-06-01T00:00:00Z"
+                )
+                assert record.rec_headers.get_header("WARC-Payload-Digest") == (
+                    payload_digest(body)
+                )
+            record.raw_stream.read()
+    assert types_2005.count("response") == 0
+    assert types_2005.count("revisit") == 1
 
     inv = inventory_collection(layout)
-    assert inv.contains(y2004)
-    assert inv.contains(y2005)
-    stored_2004 = inv.year_index(2004).by_url_digest[(y2004.urlkey, dig)]
-    stored_2005 = inv.year_index(2005).by_url_digest[(y2005.urlkey, dig)]
-    assert stored_2004.relative_key.startswith("archive/2004/")
-    assert stored_2005.relative_key.startswith("archive/2005/")
+    dig_full = payload_digest(body)
+    stored = inv.lookup_representative(
+        "com,example)/", dig_full, not_after_timestamp="20050601000000"
+    )
+    assert stored is not None
+    assert stored.relative_key.startswith("archive/2004/")
+    # Forward guard: later-year inventory does not seed earlier timestamps.
+    assert (
+        inv.lookup_representative(
+            "com,example)/", dig_full, not_after_timestamp="20030101000000"
+        )
+        is None
+    )
+
+
+def test_different_ia_digest_downloads_twice(tmp_path):
+    layout = collection_layout("http://example.org/", tmp_path)
+    ensure_collection_dirs(layout)
+    body = b"same-bytes"
+    dig_a = payload_digest(body).split(":")[1]
+    dig_b = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+    downloads: list[str] = []
+
+    def download_fn(_client, identity):
+        downloads.append(identity.payload_digest)
+        return _playback(identity, body=body)
+
+    cdx_body = _cdx_json(
+        [
+            [
+                "com,example)/",
+                "20040601000000",
+                "http://example.org/",
+                "text/html",
+                "200",
+                dig_a,
+                "4",
+            ],
+            [
+                "com,example)/",
+                "20040602000000",
+                "http://example.org/",
+                "text/html",
+                "200",
+                dig_b,
+                "4",
+            ],
+        ]
+    )
+    original, cdx_mod, fetch_mod = _patch_cdx(cdx_body)
+    try:
+        result = run_fetch(
+            FetchSettings(
+                url_pattern="http://example.org/",
+                date_start="20040601000000",
+                date_end="20040602000000",
+                archives_root=tmp_path,
+            ),
+            client_factory=lambda: MagicMock(),
+            download_fn=download_fn,
+            sleep=lambda _s: None,
+        )
+    finally:
+        cdx_mod.fetch_year_cdx = original
+        fetch_mod.fetch_year_cdx = original
+
+    assert result.exit_code == 0
+    assert result.metrics.downloads == 2
+    assert len(downloads) == 2
+
+
+def test_failed_older_capture_does_not_use_later_success(tmp_path):
+    layout = collection_layout("http://example.org/", tmp_path)
+    ensure_collection_dirs(layout)
+    body = b"payload"
+    dig = payload_digest(body).split(":")[1]
+
+    def download_fn(_client, identity):
+        if identity.timestamp.startswith("2004"):
+            raise RuntimeError("memento unavailable")
+        return _playback(identity, body=body)
+
+    bodies = {
+        2004: _cdx_json(
+            [
+                [
+                    "com,example)/",
+                    "20040601000000",
+                    "http://example.org/",
+                    "text/html",
+                    "200",
+                    dig,
+                    "4",
+                ]
+            ]
+        ),
+        2005: _cdx_json(
+            [
+                [
+                    "com,example)/",
+                    "20050601000000",
+                    "http://example.org/",
+                    "text/html",
+                    "200",
+                    dig,
+                    "4",
+                ]
+            ]
+        ),
+    }
+    original, cdx_mod, fetch_mod = _patch_cdx_by_year(bodies)
+    try:
+        result = run_fetch(
+            FetchSettings(
+                url_pattern="http://example.org/",
+                date_start="20040601000000",
+                date_end="20050601000000",
+                archives_root=tmp_path,
+            ),
+            client_factory=lambda: MagicMock(),
+            download_fn=download_fn,
+            sleep=lambda _s: None,
+        )
+    finally:
+        cdx_mod.fetch_year_cdx = original
+        fetch_mod.fetch_year_cdx = original
+
+    assert result.exit_code == 1
+    assert result.metrics.downloads == 1
+    assert result.metrics.revisits == 0
+    assert any(
+        f.identity.timestamp == "20040601000000" for f in result.failures
+    )
+    assert list_year_warcs(layout, 2004) == []
+    types = []
+    with list_year_warcs(layout, 2005)[0].open("rb") as stream:
+        for record in ArchiveIterator(stream):
+            types.append(record.rec_type)
+            record.raw_stream.read()
+    assert types.count("response") == 1
+
+
+def test_interrupted_run_rebuilds_cache_for_later_years(tmp_path):
+    """Finalized earlier years seed revisits without re-downloading history."""
+
+    layout = collection_layout("http://example.org/", tmp_path)
+    ensure_collection_dirs(layout)
+    body = b"history"
+    dig_full = payload_digest(body)
+    dig = dig_full.split(":")[1]
+    older = _identity(
+        ts="20150601000000",
+        digest=dig_full,
+        urlkey="com,example)/",
+    )
+    writer = YearWarcWriter(layout, 2015)
+    writer.write_playback(_playback(older, body=body))
+    writer.close()
+    publish_annual_index(layout, 2015)
+
+    downloads: list[str] = []
+
+    def download_fn(_client, identity):
+        downloads.append(identity.timestamp)
+        return _playback(identity, body=body)
+
+    bodies = {
+        2016: _cdx_json(
+            [
+                [
+                    "com,example)/",
+                    "20160601000000",
+                    "http://example.org/",
+                    "text/html",
+                    "200",
+                    dig,
+                    "4",
+                ]
+            ]
+        )
+    }
+    original, cdx_mod, fetch_mod = _patch_cdx_by_year(bodies)
+    try:
+        result = run_fetch(
+            FetchSettings(
+                url_pattern="http://example.org/",
+                date_start="20160601000000",
+                date_end="20160601000000",
+                archives_root=tmp_path,
+            ),
+            client_factory=lambda: MagicMock(),
+            download_fn=download_fn,
+            sleep=lambda _s: None,
+        )
+    finally:
+        cdx_mod.fetch_year_cdx = original
+        fetch_mod.fetch_year_cdx = original
+
+    assert result.exit_code == 0
+    assert downloads == []
+    assert result.metrics.downloads == 0
+    assert result.metrics.revisits == 1
+    types = []
+    with list_year_warcs(layout, 2016)[0].open("rb") as stream:
+        for record in ArchiveIterator(stream):
+            types.append(record.rec_type)
+            record.raw_stream.read()
+    assert types.count("revisit") == 1
+    assert types.count("response") == 0
+
+
+def test_forward_reuse_blocked_on_scoped_earlier_year_rerun(tmp_path):
+    layout = collection_layout("http://example.org/", tmp_path)
+    ensure_collection_dirs(layout)
+    body = b"future"
+    dig_full = payload_digest(body)
+    dig = dig_full.split(":")[1]
+    future = _identity(ts="20050601000000", digest=dig_full)
+    writer = YearWarcWriter(layout, 2005)
+    writer.write_playback(_playback(future, body=body))
+    writer.close()
+    publish_annual_index(layout, 2005)
+
+    downloads: list[str] = []
+
+    def download_fn(_client, identity):
+        downloads.append(identity.timestamp)
+        return _playback(identity, body=body)
+
+    bodies = {
+        2004: _cdx_json(
+            [
+                [
+                    "com,example)/",
+                    "20040601000000",
+                    "http://example.org/",
+                    "text/html",
+                    "200",
+                    dig,
+                    "4",
+                ]
+            ]
+        )
+    }
+    original, cdx_mod, fetch_mod = _patch_cdx_by_year(bodies)
+    try:
+        result = run_fetch(
+            FetchSettings(
+                url_pattern="http://example.org/",
+                date_start="20040601000000",
+                date_end="20040601000000",
+                archives_root=tmp_path,
+            ),
+            client_factory=lambda: MagicMock(),
+            download_fn=download_fn,
+            sleep=lambda _s: None,
+        )
+    finally:
+        cdx_mod.fetch_year_cdx = original
+        fetch_mod.fetch_year_cdx = original
+
+    assert result.exit_code == 0
+    assert downloads == ["20040601000000"]
+    assert result.metrics.downloads == 1
+    assert result.metrics.revisits == 0
+
+
+def test_representative_failure_promotes_next_same_key_candidate(tmp_path):
+    layout = collection_layout("http://example.org/", tmp_path)
+    ensure_collection_dirs(layout)
+    body = b"shared"
+    dig = payload_digest(body).split(":")[1]
+    downloads: list[str] = []
+
+    def download_fn(_client, identity):
+        downloads.append(identity.timestamp)
+        if identity.timestamp == "20040601000000":
+            raise RuntimeError("memento unavailable")
+        return _playback(identity, body=body)
+
+    cdx_body = _cdx_json(
+        [
+            [
+                "com,example)/",
+                "20040601000000",
+                "http://example.org/",
+                "text/html",
+                "200",
+                dig,
+                "4",
+            ],
+            [
+                "com,example)/",
+                "20040602000000",
+                "http://example.org/",
+                "text/html",
+                "200",
+                dig,
+                "4",
+            ],
+            [
+                "com,example)/",
+                "20040603000000",
+                "http://example.org/",
+                "text/html",
+                "200",
+                dig,
+                "4",
+            ],
+        ]
+    )
+    original, cdx_mod, fetch_mod = _patch_cdx(cdx_body)
+    try:
+        result = run_fetch(
+            FetchSettings(
+                url_pattern="http://example.org/",
+                date_start="20040601000000",
+                date_end="20040603000000",
+                archives_root=tmp_path,
+            ),
+            client_factory=lambda: MagicMock(),
+            download_fn=download_fn,
+            sleep=lambda _s: None,
+        )
+    finally:
+        cdx_mod.fetch_year_cdx = original
+        fetch_mod.fetch_year_cdx = original
+
+    # First fails permanently, second downloads as promoted representative,
+    # third becomes a revisit.
+    assert downloads == ["20040601000000", "20040602000000"]
+    assert result.metrics.downloads == 1
+    assert result.metrics.revisits == 1
+    assert any(f.identity.timestamp == "20040601000000" for f in result.failures)
+    types = []
+    with list_year_warcs(layout, 2004)[0].open("rb") as stream:
+        for record in ArchiveIterator(stream):
+            types.append(record.rec_type)
+            record.raw_stream.read()
+    assert types.count("response") == 1
+    assert types.count("revisit") == 1
+
+
+def test_unrelated_keys_proceed_while_same_key_candidate_waits(tmp_path):
+    layout = collection_layout("http://example.org/", tmp_path)
+    ensure_collection_dirs(layout)
+    body_a = b"page-a"
+    body_b = b"page-b"
+    dig_a = payload_digest(body_a).split(":")[1]
+    dig_b = payload_digest(body_b).split(":")[1]
+    order: list[str] = []
+
+    def download_fn(_client, identity):
+        order.append(f"{identity.timestamp}:{identity.urlkey}")
+        if identity.urlkey.endswith(")/a") and identity.timestamp.endswith(
+            "01000000"
+        ):
+            # Permanent unavailability for first a; second a promoted later.
+            raise RuntimeError("unavailable")
+        body = body_a if identity.urlkey.endswith(")/a") else body_b
+        return _playback(identity, body=body)
+
+    cdx_body = _cdx_json(
+        [
+            [
+                "com,example)/a",
+                "20040601000000",
+                "http://example.org/a",
+                "text/html",
+                "200",
+                dig_a,
+                "4",
+            ],
+            [
+                "com,example)/b",
+                "20040601120000",
+                "http://example.org/b",
+                "text/html",
+                "200",
+                dig_b,
+                "4",
+            ],
+            [
+                "com,example)/a",
+                "20040602000000",
+                "http://example.org/a",
+                "text/html",
+                "200",
+                dig_a,
+                "4",
+            ],
+        ]
+    )
+    original, cdx_mod, fetch_mod = _patch_cdx(cdx_body)
+    try:
+        result = run_fetch(
+            FetchSettings(
+                url_pattern="http://example.org/",
+                date_start="20040601000000",
+                date_end="20040602000000",
+                archives_root=tmp_path,
+            ),
+            client_factory=lambda: MagicMock(),
+            download_fn=download_fn,
+            sleep=lambda _s: None,
+        )
+    finally:
+        cdx_mod.fetch_year_cdx = original
+        fetch_mod.fetch_year_cdx = original
+
+    # b proceeds without waiting for a to exhaust; a later candidate is promoted.
+    assert "20040601120000:com,example)/b" in order
+    assert order.index("20040601120000:com,example)/b") < order.index(
+        "20040602000000:com,example)/a"
+    )
+    assert result.metrics.downloads == 2
+    assert result.metrics.revisits == 0
 
 
 # ---------------------------------------------------------------------------
@@ -1194,44 +1695,101 @@ def test_digest_mismatch_kept_by_default_rejected_when_strict():
         )
 
 
-def test_digest_mismatch_warc_not_used_as_revisit_representative(tmp_path):
+def test_digest_mismatch_still_used_as_revisit_representative(tmp_path):
+    """Permissive mismatch is kept and still seeds same-key revisits."""
+
     from archive_magic_fetch.models import CDX_DIGEST_MATCH_HEADER
-    from archive_magic_fetch.warc import inventory_collection, payload_digest
 
     layout = collection_layout("http://example.org/", tmp_path)
     ensure_collection_dirs(layout)
     claimed = "sha1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
     body = b"imperfect-but-kept"
-    identity = _identity(digest=claimed)
-    result = _playback(identity, body=body)
-    # Simulate permissive accept of a CDX mismatch.
-    result = PlaybackResult(
-        identity=result.identity,
-        body=result.body,
-        status_code=result.status_code,
-        headers=result.headers,
-        warc_date=result.warc_date,
-        source_uri=result.source_uri,
-        warc_payload_digest=payload_digest(body),
-        digest_matched=False,
+    dig = claimed.split(":")[1]
+    downloads: list[str] = []
+
+    def download_fn(_client, identity):
+        downloads.append(identity.timestamp)
+        result = _playback(identity, body=body)
+        return PlaybackResult(
+            identity=result.identity,
+            body=result.body,
+            status_code=result.status_code,
+            headers=result.headers,
+            warc_date=result.warc_date,
+            source_uri=result.source_uri,
+            warc_payload_digest=payload_digest(body),
+            digest_matched=False,
+        )
+
+    cdx_body = _cdx_json(
+        [
+            [
+                "com,example)/",
+                "20040601000000",
+                "http://example.org/",
+                "text/html",
+                "200",
+                dig,
+                "4",
+            ],
+            [
+                "com,example)/",
+                "20040602000000",
+                "http://example.org/",
+                "text/html",
+                "200",
+                dig,
+                "4",
+            ],
+        ]
     )
-    writer = YearWarcWriter(layout, 2004)
-    writer.write_playback(result)
-    writer.close()
+    original, cdx_mod, fetch_mod = _patch_cdx(cdx_body)
+    try:
+        result = run_fetch(
+            FetchSettings(
+                url_pattern="http://example.org/",
+                date_start="20040601000000",
+                date_end="20040602000000",
+                archives_root=tmp_path,
+            ),
+            client_factory=lambda: MagicMock(),
+            download_fn=download_fn,
+            sleep=lambda _s: None,
+        )
+    finally:
+        cdx_mod.fetch_year_cdx = original
+        fetch_mod.fetch_year_cdx = original
+
+    assert result.exit_code == 0
+    assert downloads == ["20040601000000"]
+    assert result.metrics.downloads == 1
+    assert result.metrics.revisits == 1
+    assert result.metrics.digest_mismatch_accepted == 1
 
     warc = list_year_warcs(layout, 2004)[0]
     with warc.open("rb") as stream:
+        responses = []
+        revisits = []
         for record in ArchiveIterator(stream):
             if record.rec_type == "response":
+                responses.append(record)
                 assert record.rec_headers.get_header(CDX_DIGEST_MATCH_HEADER) == "false"
                 assert record.rec_headers.get_header("WARC-Payload-Digest") == (
                     payload_digest(body)
                 )
-                break
+            if record.rec_type == "revisit":
+                revisits.append(record)
+                assert record.rec_headers.get_header("WARC-Payload-Digest") == (
+                    payload_digest(body)
+                )
+            record.raw_stream.read()
+    assert len(responses) == 1
+    assert len(revisits) == 1
 
     inv = inventory_collection(layout)
-    assert inv.contains(identity)
-    assert (identity.urlkey, claimed) not in inv.year_index(2004).by_url_digest
+    assert inv.lookup_representative(
+        "com,example)/", claimed, not_after_timestamp="20040602000000"
+    ) is not None
 
 
 def test_playback_5xx_is_retryable():
@@ -1259,7 +1817,7 @@ def test_wrapped_incomplete_read_is_permanent_truncated_failure():
 
 
 # ---------------------------------------------------------------------------
-# Annual revisit closure rejects orphans
+# Backward revisit closure rejects orphans and forward references
 # ---------------------------------------------------------------------------
 
 
@@ -1281,18 +1839,11 @@ def test_orphan_revisit_annual_index_is_rejected(tmp_path):
         warc_payload_digest=payload_digest(b"body"),
         target_uri=response_id.original_url,
         status_code=200,
-        headers=(("Content-Type", "text/html"),),
+        headers=(),
     )
     writer.write_revisit(revisit_from_stored(revisit_id, stored))
     warcs = writer.close()
-    # Build an index, then delete the response WARC content path trick:
-    # create a revisit-only WARC year by indexing only after removing response.
     publish_annual_index(layout, 2004)
-    lines = [
-        line
-        for line in layout.annual_index(2004).read_text().splitlines()
-        if "warc/revisit" in line or '"mime": "warc/revisit"' in line or "revisit" in line
-    ]
     # Force validator with synthetic revisit-only lines referencing missing digest.
     fake_lines = [
         'com,example)/ 20040602000000 {"url":"http://example.org/",'
@@ -1300,7 +1851,7 @@ def test_orphan_revisit_annual_index_is_rejected(tmp_path):
         '"mime":"warc/revisit","status":"200",'
         f'"filename":"{warcs[0].relative_key}","offset":0,"length":10}}'
     ]
-    with pytest.raises(ValueError, match="no same-year response"):
+    with pytest.raises(ValueError, match="no earlier response"):
         validate_annual_revisit_closure(layout, 2004, fake_lines)
 
 
@@ -1315,8 +1866,75 @@ def test_orphan_redirect_revisit_annual_index_is_rejected(tmp_path):
         '"filename":"archive/2004/example.org-2004-001.warc.gz",'
         '"offset":0,"length":10}'
     ]
-    with pytest.raises(ValueError, match="no same-year response"):
+    with pytest.raises(ValueError, match="no earlier response"):
         validate_annual_revisit_closure(layout, 2004, fake_lines)
+
+
+def test_cross_year_revisit_closure_accepts_prior_year_response(tmp_path):
+    layout = collection_layout("http://example.org/", tmp_path)
+    ensure_collection_dirs(layout)
+    body = b"across-years"
+    dig = payload_digest(body)
+    older = _identity(ts="20040601000000", digest=dig)
+    newer = _identity(ts="20050601000000", digest=dig)
+
+    writer = YearWarcWriter(layout, 2004)
+    writer.write_playback(_playback(older, body=body))
+    writer.close()
+    publish_annual_index(layout, 2004)
+
+    from archive_magic_fetch.warc import StoredResponse, revisit_from_stored
+
+    stored = StoredResponse(
+        identity=older,
+        relative_key=layout.warc_relative_key(2004, 1),
+        warc_date="2004-06-01T00:00:00Z",
+        warc_payload_digest=dig,
+        target_uri=older.original_url,
+        status_code=200,
+        headers=(),
+    )
+    writer = YearWarcWriter(layout, 2005)
+    writer.write_revisit(revisit_from_stored(newer, stored))
+    writer.close()
+    annual = publish_annual_index(layout, 2005)
+    assert annual is not None
+
+
+def test_forward_revisit_reference_is_rejected(tmp_path):
+    layout = collection_layout("http://example.org/", tmp_path)
+    ensure_collection_dirs(layout)
+    body = b"body"
+    dig = payload_digest(body)
+    # Create a later-year response first so a forward Refers-To can exist.
+    future = _identity(ts="20050601000000", digest=dig)
+    writer = YearWarcWriter(layout, 2005)
+    writer.write_playback(_playback(future, body=body))
+    writer.close()
+
+    from archive_magic_fetch.warc import StoredResponse, revisit_from_stored
+
+    stored_future = StoredResponse(
+        identity=future,
+        relative_key=layout.warc_relative_key(2005, 1),
+        warc_date="2005-06-01T00:00:00Z",
+        warc_payload_digest=dig,
+        target_uri=future.original_url,
+        status_code=200,
+        headers=(),
+    )
+    earlier = _identity(ts="20040601000000", digest=dig)
+    writer = YearWarcWriter(layout, 2004)
+    writer.write_revisit(revisit_from_stored(earlier, stored_future))
+    writer.close()
+    lines = [
+        'com,example)/ 20040601000000 {"url":"http://example.org/",'
+        f'"digest":"{dig}",'
+        '"mime":"warc/revisit","status":"200",'
+        f'"filename":"{layout.warc_relative_key(2004, 1)}","offset":0,"length":10}}'
+    ]
+    with pytest.raises(ValueError, match="forward reference"):
+        validate_annual_revisit_closure(layout, 2004, lines)
 
 
 # ---------------------------------------------------------------------------

@@ -60,8 +60,11 @@ The rewrite must preserve these invariants:
 - Requests are exact: no nearest-capture fallback and no followed redirects.
 - Every published CDXJ locator points to an immutable, finalized WARC byte
   range.
-- Every annual WARC set is independently playable with its annual CDXJ.
-- Every revisit can resolve a full response within the same annual WARC set.
+- Annual WARCs are organizational and recovery partitions, not independently
+  portable packages. Collection playback requires the collection CDXJ plus
+  every WARC referenced by revisits.
+- Every revisit resolves to a full response in the same year or an earlier
+  year (backward-only).
 - A crash may require repeatable local indexing or a bounded amount of network
   refetching from an unfinalized WARC, but it must never corrupt or replace a
   previously published WARC or index.
@@ -303,37 +306,37 @@ failure category is plausibly transient, then report it.
 Redirects require individual playback because the CDX payload digest does not
 validate `Location` or the rest of the response headers.
 
-## Existing-content reuse and annual self-containment
+## Existing-content reuse and annual recovery boundaries
 
 Every run inventories the current-format collection before scheduling network
 work. Existing exact captures are reused regardless of which annual shard
 contains them. Finalized WARC objects are immutable; do not rewrite them merely
 to sort records or consolidate free space.
 
-The year, not each 1 GB WARC, is the portability boundary:
+Years are CDX query, checkpoint, WARC naming, and annual-index boundaries—not
+deduplication boundaries:
 
-- store at least one full response per normalized URL/CDX-digest/year;
-- same-year revisits may refer to a full response in an earlier shard, such as
-  a revisit in `003` referring to a response in `001`;
-- never create an ordinary revisit that requires a WARC from another year; and
-- validate that every annual revisit resolves within the annual WARC set.
+- build a collection-wide representative map keyed by `(urlkey, IA/CDX digest)`
+  from finalized WARCs (compact locator metadata only; never payload bytes);
+- store one full response for the oldest successful capture of that key;
+- write same-key later captures as WARC revisits that may refer to a response
+  in an earlier shard of the same year or an earlier year;
+- never create a revisit that points forward in time; and
+- validate that every annual revisit resolves against the current year or an
+  earlier year in the collection chain.
 
-If a logo or stylesheet has the same payload digest in several years, duplicate
-one full representative in each year. Do not infer current-capture response
-headers merely from an earlier year's matching body. Normally, fetch one exact
-representative in the current year, then use revisits for the remaining
-same-year captures.
+If a logo or stylesheet keeps the same IA digest across years, later years emit
+revisits rather than re-downloading bytes. Earlier unresolved failures stay in
+`failures.json` even if a later year obtains the payload—backward-only reuse
+never repairs the past.
 
-An exact capture already present in the current collection never needs another
-request. If every current-year representative fails but an earlier year holds
-a verified matching payload, do not synthesize a successful current-year
-response silently. Preserve the unresolved capture in `failures.json`. A later
-explicit recovery design may copy a complete support record, but that is not
-part of this KISS rewrite.
+On restart, discard unpublished partial shards, reconcile finalized-but-
+unindexed WARCs, rebuild the compact map from on-disk responses, and resume the
+requested year range so `2016–present` can reuse finalized `2000–2015` assets.
 
 Cross-URL digest deduplication remains out of scope. Prior measurement found a
 maximum additional saving below 1% for the representative large collection,
-while it complicates annual dependency closure.
+while it complicates dependency closure.
 
 ## Fetch scheduler and rate policy
 
@@ -435,7 +438,7 @@ After each WARC closes:
    the merge.
 4. Validate filename, offset, and length against every referenced finalized
    WARC.
-5. Validate annual revisit dependency closure.
+5. Validate backward revisit dependency closure (current or earlier years).
 6. Atomically replace the annual CDXJ.
 7. Delete the temporary fragment.
 
@@ -590,10 +593,11 @@ Required high-value tests are:
    concurrency is separate, delayed retries release slots, and one 429 closes
    the global gate through `Retry-After`.
 4. An exact existing-WARC capture prevents a network call.
-5. Same URL/digest captures in one year require one successful representative
-   playback and produce valid revisits; redirects still fetch individually.
-6. Matching payloads in different years each have an annual full response and
-   no cross-year revisit dependency.
+5. Same URL/digest captures require one successful representative playback and
+   produce valid revisits (including later years); redirects still fetch
+   individually.
+6. Matching payloads in later years become backward revisits, not full annual
+   duplicates; earlier failures are not repaired by later successes.
 7. WARC rollover uses WARC 1.1, three-digit names, the configured compressed
    size target, and rejects a required shard `1000`.
 8. Crash recovery indexes a finalized-but-unindexed WARC without downloading
@@ -601,7 +605,8 @@ Required high-value tests are:
 9. Annual-index incremental merge and collection-index merge remain globally
    sorted, reference valid ranges, and are idempotent.
 10. Real pywb/Navigator integration replays a response in `001` through a
-    revisit in a later same-year WARC.
+    revisit in a later same-year WARC and a response in one year through a
+    revisit in a later year.
 11. A partial run publishes usable successes, a truthful partial manifest, a
     deterministic failure ledger, and a nonzero exit.
 

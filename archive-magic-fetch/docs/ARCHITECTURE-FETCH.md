@@ -79,7 +79,7 @@ CLI
  → for each year ascending:
       CDX raw preserve + parse
       inventory reuse (exact identity)
-      same-year representative / revisit plan
+      collection-wide representative / revisit plan
       scheduler downloads + single WARC writer
       finalize WARC → annual CDXJ → partial manifest
  → collection CDXJ + final manifest/failures
@@ -98,6 +98,7 @@ WARC extension headers:
 
 - `CDX-Status` — raw CDX status token (not the numeric HTTP status alone)
 - `CDX-Payload-Digest` — IA CDX digest (distinct from `WARC-Payload-Digest`)
+- `WARC-Payload-Digest` — local SHA-1 of stored bytes (pywb/revisit resolution)
 
 ### Exact playback
 
@@ -137,8 +138,9 @@ than a hole, matching Wayback's own display policy. Kept mismatches:
 - store `WARC-Payload-Digest` of the actual body and `CDX-Payload-Digest` of
   the claimed CDX value, plus `CDX-Digest-Match: false`;
 - count as represented (`digest_mismatch_accepted` in `collection.json`);
-- must **not** become same-year revisit representatives—deferred same-digest
-  captures are downloaded individually instead.
+- remain eligible as revisit representatives for later same-key captures.
+  Revisits reference the local `WARC-Payload-Digest`, not the mismatched IA
+  claim.
 
 Pass `--strict-digests` to reject mismatches (`digest_validation`, or
 `unavailable` for false-gzip mismatches). Empty non-redirect bodies and IA
@@ -320,16 +322,36 @@ limits from pre-HTTP TCP refusal. `collection.json` records playback starts and
 completions, bytes, peak concurrent connections, rate-gate wait, cooldown wait,
 and attempt counts by stable failure category.
 
-### Same-year reuse
+### Payload reuse (collection-wide representative cache)
 
-Within a year, non-redirect captures with a usable CDX digest share one
-successful **digest-matched** representative response; later matches become
-revisits that resolve inside the same annual WARC set. A representative whose
-body does not match the CDX digest is stored for its own identity only;
-remaining group members are fetched individually. Redirects and digest-less
-rows are fetched individually (redirects often share the empty-body digest and
-must retain their own `Location` headers). Matching digests in different years
-each store a full response.
+Years remain CDX query, WARC naming, and checkpoint boundaries—not
+deduplication boundaries. Deduplication uses a compact in-memory map keyed by
+`(urlkey, IA/CDX payload digest)`:
+
+- **Value:** oldest successful full-response locator (target URI, WARC date,
+  local payload digest, WARC relative path). Never payload bytes.
+- **Seed:** every finalized response scanned at startup (`inventory_collection`)
+  and updated after each successful download within the run.
+- **Lookup:** backward-only. A capture may reuse only a representative whose
+  own capture timestamp is not later than itself. Later years never repair
+  earlier failures.
+- **Effect:** on hit, write a `warc/revisit` in the current year pointing at the
+  earlier full response (same year or a prior year). On miss, download once;
+  then fan later same-key candidates out as revisits.
+- **Candidates:** only the oldest unresolved capture per key is downloaded at a
+  time. Unrelated keys continue while it retries. On permanent failure, the
+  next same-key candidate is promoted. Failed downloads never enter the map.
+- **Redirects and digest-less rows** download individually.
+- **Cross-URL** same digest is out of scope.
+
+Recovery: if years 2000–2015 finalized and 2016 fails, a later run of
+`2016–present` rebuilds the map from existing WARCs, cleans unpublished
+partial shards, indexes any finalized-but-unindexed shards, and short-circuits
+unchanged assets to revisits without re-fetching prior years.
+
+Playback requires the collection chain (`indexes/index.cdxj` plus every
+referenced annual WARC). Single-year CDXJ files list only that year's physical
+records; a revisit in 2005 may refer to a response stored under `archive/2004/`.
 
 ### Scheduler
 
@@ -360,10 +382,12 @@ the collection root. It does not reindex or rewrite Fetch output.
 
 High-value tests in `tests/test_core.py` cover raw CDX preservation, statusless
 identity reuse, scheduler pacing, HTTP 429 handling, escalating TCP-refusal
-waves, wrapped permanent truncation, inventory skip, same-year revisits,
-cross-year full responses, WARC rollover, crash index recovery, CDXJ merges,
-and partial-run truthfulness. Navigator owns the real-pywb cross-shard revisit
-integration test.
+waves, wrapped permanent truncation, inventory skip, same-year and cross-year
+revisits, representative promotion after failure, recovery from finalized
+earlier years, WARC rollover, crash index recovery, CDXJ merges, backward
+revisit closure, and partial-run truthfulness. Navigator owns real-pywb
+integration tests for same-year cross-shard revisits and backward cross-year
+revisits.
 
 ## Out of scope
 

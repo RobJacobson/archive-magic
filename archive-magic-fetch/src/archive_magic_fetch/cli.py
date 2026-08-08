@@ -28,7 +28,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         action="store_true",
         help=(
             "reject playback bodies whose digest disagrees with CDX "
-            "(default: keep imperfect payloads, but do not use them as "
+            "(default: keep imperfect payloads and still allow them as "
             "revisit representatives)"
         ),
     )

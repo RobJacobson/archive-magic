@@ -82,6 +82,10 @@ live web.
 
 Fetch publishes annual size-bounded WARC shards under `archive/YYYY/`.
 Navigator follows the collection-relative path in each replay entry's `filename`.
+Years build on earlier years: a revisit in a later year may load a full response
+from an earlier annual WARC. Open a complete collection (or leave all required
+prior-year shards in place) before replaying; do not redistribute a single year
+as a standalone package.
 
 Collection directory names also become browser routes. They must start with an
 ASCII letter or digit, contain only ASCII letters, digits, `.`, `_`, or `-`,

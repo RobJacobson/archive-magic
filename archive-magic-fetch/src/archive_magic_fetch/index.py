@@ -15,10 +15,11 @@ from .collection import (
     CollectionLayout,
     exclusive_temp_path,
     index_artifact_from_path,
+    list_all_warcs,
     list_year_warcs,
     publish_file_atomically,
 )
-from .models import IndexArtifact
+from .models import IndexArtifact, normalize_original_url, normalize_payload_digest
 
 
 def index_warc_fragment(
@@ -209,24 +210,68 @@ def validate_cdxj_against_warcs(
             )
 
 
+def _response_reference_key(
+    target_uri: str,
+    warc_date: str,
+    warc_payload_digest: str,
+) -> tuple[str, str, str] | None:
+    """Normalize a response reference used by revisit closure checks."""
+
+    digest = normalize_payload_digest(warc_payload_digest)
+    if digest is None or not target_uri or not warc_date:
+        return None
+    return (
+        normalize_original_url(target_uri),
+        warc_date,
+        digest.lower(),
+    )
+
+
+def _collect_response_references(
+    layout: CollectionLayout,
+    *,
+    through_year: int,
+) -> set[tuple[str, str, str]]:
+    """Collect full-response (uri, date, local digest) tuples through one year."""
+
+    refs: set[tuple[str, str, str]] = set()
+    for path in list_all_warcs(layout):
+        try:
+            year = int(path.parts[path.parts.index("archive") + 1])
+        except (ValueError, IndexError):
+            continue
+        if year > through_year:
+            continue
+        with path.open("rb") as stream:
+            for record in ArchiveIterator(stream, check_digests=False):
+                if record.rec_type != "response":
+                    record.raw_stream.read()
+                    continue
+                key = _response_reference_key(
+                    record.rec_headers.get_header("WARC-Target-URI") or "",
+                    record.rec_headers.get_header("WARC-Date") or "",
+                    record.rec_headers.get_header("WARC-Payload-Digest") or "",
+                )
+                if key is not None:
+                    refs.add(key)
+                record.raw_stream.read()
+    return refs
+
+
 def validate_annual_revisit_closure(
     layout: CollectionLayout,
     year: int,
     lines: Sequence[str],
 ) -> None:
-    """Ensure revisits reference a full response in the same annual set."""
+    """Ensure revisits resolve backward along the collection chain.
+
+    Annual CDXJ lines must still point only at that year's WARC files, but a
+    revisit may reference a full response stored in the current year or any
+    earlier year. Forward references and orphans are rejected.
+    """
 
     year_prefix = f"archive/{year:04d}/"
-    response_digests: set[str] = set()
-    # Collect payload digests of response records in year WARCs.
-    for path in list_year_warcs(layout, year):
-        with path.open("rb") as stream:
-            for record in ArchiveIterator(stream, check_digests=False):
-                if record.rec_type == "response":
-                    digest = record.rec_headers.get_header("WARC-Payload-Digest")
-                    if digest:
-                        response_digests.add(digest.lower())
-                record.raw_stream.read()
+    available = _collect_response_references(layout, through_year=year)
 
     for line in lines:
         parts = line.split(" ", 2)
@@ -236,25 +281,66 @@ def validate_annual_revisit_closure(
             raise ValueError(
                 f"annual index for {year} references other year path: {filename}"
             )
-        # mime and status tell us response vs revisit in CDXJ
-        mime = str(meta.get("mime", ""))
-        # cdxj-indexer sets warc record type sometimes as "mime" warc/revisit
-        if "revisit" in mime or meta.get("mime") == "warc/revisit":
-            # Redirects are fetched as individual responses, never as
-            # revisits. Every revisit — including any with a 3xx status —
-            # must resolve to a same-year response.
-            digest = meta.get("digest")
-            if isinstance(digest, str) and digest:
-                if digest.lower() not in response_digests:
-                    raise ValueError(
-                        f"annual revisit in {year} has no same-year response "
-                        f"for digest {digest}"
-                    )
-            else:
-                raise ValueError(
-                    f"annual revisit in {year} is missing a resolvable "
-                    f"same-year response digest"
+
+    # Validate WARC revisit records themselves: Refers-To must exist earlier
+    # (or equal timestamp) among response records in years <= this year.
+    for path in list_year_warcs(layout, year):
+        with path.open("rb") as stream:
+            for record in ArchiveIterator(stream, check_digests=False):
+                if record.rec_type != "revisit":
+                    record.raw_stream.read()
+                    continue
+                revisit_date = record.rec_headers.get_header("WARC-Date") or ""
+                refers_uri = (
+                    record.rec_headers.get_header("WARC-Refers-To-Target-URI")
+                    or ""
                 )
+                refers_date = (
+                    record.rec_headers.get_header("WARC-Refers-To-Date") or ""
+                )
+                payload = (
+                    record.rec_headers.get_header("WARC-Payload-Digest") or ""
+                )
+                key = _response_reference_key(refers_uri, refers_date, payload)
+                if key is None:
+                    raise ValueError(
+                        f"annual revisit in {year} is missing a resolvable "
+                        f"response reference"
+                    )
+                if refers_date > revisit_date:
+                    raise ValueError(
+                        f"annual revisit in {year} has forward reference "
+                        f"from {revisit_date} to {refers_date}"
+                    )
+                if key not in available:
+                    raise ValueError(
+                        f"annual revisit in {year} has no earlier response "
+                        f"for digest {payload}"
+                    )
+                record.raw_stream.read()
+
+    # Also accept CDXJ-only revisit lines that were not loaded above (defensive
+    # for synthetic tests) by checking their local payload digest appears
+    # somewhere in the backward chain.
+    response_digests = {item[2] for item in available}
+    for line in lines:
+        parts = line.split(" ", 2)
+        meta = json.loads(parts[2])
+        mime = str(meta.get("mime", ""))
+        if "revisit" not in mime and meta.get("mime") != "warc/revisit":
+            continue
+        digest = meta.get("digest")
+        if not isinstance(digest, str) or not digest:
+            raise ValueError(
+                f"annual revisit in {year} is missing a resolvable "
+                f"response digest"
+            )
+        normalized = normalize_payload_digest(digest)
+        if normalized is None or normalized.lower() not in response_digests:
+            raise ValueError(
+                f"annual revisit in {year} has no earlier response "
+                f"for digest {digest}"
+            )
 
 
 def reconcile_missing_indexes(layout: CollectionLayout) -> list[int]:

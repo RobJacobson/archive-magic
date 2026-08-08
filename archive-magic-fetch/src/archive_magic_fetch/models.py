@@ -18,7 +18,7 @@ from surt import surt
 
 DEFAULT_OUTPUT_ROOT = Path("../archives")
 WARC_TARGET_BYTES = 1_000_000_000
-PLAYBACK_REQUESTS_PER_SECOND = 4.0
+PLAYBACK_REQUESTS_PER_SECOND = 8.0
 # Connection budget is separate from the request start rate.
 MAX_CONNECTIONS = 1
 MAX_PLAYBACK_ATTEMPTS = 9  # first try + 8 retries
@@ -113,10 +113,11 @@ class ParsedCapture:
 class PlaybackResult:
     """Exact-playback payload ready for WARC writing.
 
-    ``warc_payload_digest`` is always the digest of ``body``. The capture
-    identity may still carry a different CDX digest when IA served imperfect
-    bytes; ``digest_matched`` records whether those agreed. Mismatched payloads
-    are kept by default but must not become same-year revisit representatives.
+    ``warc_payload_digest`` is always the digest of ``body`` (local SHA-1).
+    The capture identity may still carry a different IA/CDX digest when IA
+    served imperfect bytes; ``digest_matched`` records whether those agreed.
+    Permissively kept mismatches remain successful representatives: revisits
+    reference the stored local payload digest.
     """
 
     identity: CaptureIdentity
@@ -134,7 +135,11 @@ class PlaybackResult:
 
 @dataclass(frozen=True)
 class RevisitResult:
-    """A same-year revisit of an already-stored full response."""
+    """A revisit of an earlier successful full response.
+
+    The referred response may live in the same annual WARC set or an earlier
+    year. ``warc_payload_digest`` is the representative's local payload digest.
+    """
 
     identity: CaptureIdentity
     warc_date: str

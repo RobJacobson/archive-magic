@@ -76,7 +76,7 @@ class FetchSettings:
     date_end: str
     archives_root: Optional[Path] = None
     # When True, reject bodies whose digest disagrees with CDX. Default False:
-    # keep imperfect IA payloads but never use them as revisit representatives.
+    # keep imperfect IA payloads and still allow them as revisit representatives.
     strict_digests: bool = False
 
 
@@ -158,7 +158,7 @@ def run_fetch(
             else:
                 to_schedule.append(capture)
 
-        work_plan = _plan_year_work(to_schedule, inventory, year)
+        work_plan = _plan_year_work(to_schedule, inventory)
         print(
             f"year {year}: {len(selected)} selected, "
             f"{len(work_plan.network_jobs)} to download, "
@@ -169,7 +169,7 @@ def run_fetch(
         writer = YearWarcWriter(layout, year)
         year_index = inventory.year_index(year)
 
-        # Write revisits that already have an in-year representative.
+        # Write revisits that already have an earlier successful representative.
         for identity, stored in work_plan.revisit_jobs:
             writer.write_revisit(revisit_from_stored(identity, stored))
             inventory.identities.add(identity)
@@ -192,7 +192,7 @@ def run_fetch(
                 layout=layout,
                 year=year,
                 jobs=work_plan.network_jobs,
-                pending_revisits=work_plan.pending_revisits,
+                pending_candidates=work_plan.pending_candidates,
                 inventory=inventory,
                 year_index=year_index,
                 writer=writer,
@@ -272,8 +272,8 @@ def run_fetch(
 class _YearPlan:
     network_jobs: list[CaptureIdentity]
     revisit_jobs: list[tuple[CaptureIdentity, StoredResponse]]
-    # group remaining candidates after a representative is chosen:
-    pending_revisits: dict[tuple[str, str], list[CaptureIdentity]]
+    # Same-key candidates waiting behind the oldest network/active capture:
+    pending_candidates: dict[tuple[str, str], list[CaptureIdentity]]
 
 
 def _report_cdx_ingest_skips(
@@ -303,56 +303,106 @@ def _report_cdx_ingest_skips(
         print(f"  ... and {remaining} more", flush=True)
 
 
+def _groupable_digest_key(
+    identity: CaptureIdentity,
+) -> tuple[str, str] | None:
+    """Return ``(urlkey, IA digest)`` when this capture can share a payload."""
+
+    if identity.payload_digest == MISSING_CDX_PAYLOAD_DIGEST:
+        return None
+    if (
+        identity.status_token.isdigit()
+        and 300 <= int(identity.status_token) < 400
+    ):
+        return None
+    return (identity.urlkey, identity.payload_digest)
+
+
 def _plan_year_work(
     captures: Sequence[ParsedCapture],
     inventory: CollectionInventory,
-    year: int,
 ) -> _YearPlan:
-    """Apply same-year representative/revisit grouping rules."""
+    """Plan network and revisit work using the collection-wide representative map.
 
-    year_index = inventory.year_index(year)
+    Groupable captures share ``(urlkey, IA digest)``. The oldest unresolved
+    member of each group becomes the only network job; later members become
+    revisit candidates after that representative succeeds. When an older
+    successful representative already exists (possibly from a prior year),
+    every member is an immediate revisit. Redirects and digest-less rows always
+    download individually.
+    """
+
     network: list[CaptureIdentity] = []
     revisits: list[tuple[CaptureIdentity, StoredResponse]] = []
     pending: dict[tuple[str, str], list[CaptureIdentity]] = {}
 
-    # Redirects and digests-missing always individual.
     redirect_or_nodigest: list[ParsedCapture] = []
     groups: dict[tuple[str, str], list[ParsedCapture]] = defaultdict(list)
 
     for capture in captures:
-        if capture.is_redirect or not capture.has_usable_digest:
+        key = _groupable_digest_key(capture.identity)
+        if key is None:
             redirect_or_nodigest.append(capture)
             continue
-        key = (capture.identity.urlkey, capture.identity.payload_digest)
         groups[key].append(capture)
 
     for key, group in groups.items():
-        group = sorted(group, key=lambda c: c.identity.timestamp)
-        stored = year_index.by_url_digest.get(key)
+        group = sorted(group, key=lambda c: c.identity.sort_key())
+        earliest = group[0].identity
+        stored = inventory.lookup_representative(
+            key[0],
+            key[1],
+            not_after_timestamp=earliest.timestamp,
+        )
         if stored is not None:
             for capture in group:
                 if not inventory.contains(capture.identity):
                     revisits.append((capture.identity, stored))
             continue
-        # No in-year representative yet: schedule earliest as network job;
-        # remaining become revisits after that representative succeeds.
-        representative = group[0]
-        network.append(representative.identity)
-        deferred = [capture.identity for capture in group[1:]]
+        # No reusable prior payload yet: download earliest; rest wait for
+        # success or failure of that representative (then promote).
+        network.append(earliest)
+        deferred = [
+            capture.identity
+            for capture in group[1:]
+            if not inventory.contains(capture.identity)
+        ]
         if deferred:
             pending[key] = deferred
 
     for capture in redirect_or_nodigest:
         network.append(capture.identity)
 
-    # Deterministic network order.
     network = sorted(network, key=lambda identity: identity.sort_key())
     revisits.sort(key=lambda item: item[0].sort_key())
     return _YearPlan(
         network_jobs=network,
         revisit_jobs=revisits,
-        pending_revisits=pending,
+        pending_candidates=pending,
     )
+
+
+def _write_revisit(
+    *,
+    identity: CaptureIdentity,
+    stored: StoredResponse,
+    inventory: CollectionInventory,
+    writer: YearWarcWriter,
+    metrics: RunMetrics,
+    http_status_code: int | None = None,
+    http_headers: tuple[tuple[str, str], ...] | None = None,
+) -> None:
+    writer.write_revisit(
+        revisit_from_stored(
+            identity,
+            stored,
+            http_status_code=http_status_code,
+            http_headers=http_headers,
+        )
+    )
+    inventory.identities.add(identity)
+    metrics.revisits += 1
+    metrics.represented += 1
 
 
 def _run_year_downloads(
@@ -360,7 +410,7 @@ def _run_year_downloads(
     layout: CollectionLayout,
     year: int,
     jobs: Sequence[CaptureIdentity],
-    pending_revisits: dict[tuple[str, str], list[CaptureIdentity]],
+    pending_candidates: dict[tuple[str, str], list[CaptureIdentity]],
     inventory: CollectionInventory,
     year_index,
     writer: YearWarcWriter,
@@ -368,38 +418,43 @@ def _run_year_downloads(
     client_factory: Callable,
     download_fn,
 ) -> list[UnresolvedFailure]:
-    """Download scheduled identities and write responses/revisits."""
+    """Download ordered candidate identities and write responses/revisits."""
 
     remaining_groups: dict[tuple[str, str], list[CaptureIdentity]] = {
-        key: list(members) for key, members in pending_revisits.items()
+        key: list(members) for key, members in pending_candidates.items()
     }
 
-    # jobs are one download candidate each (group representative or
-    # redirect/no-digest single). Deferred same-digest members live in
-    # remaining_groups and become revisits after a successful representative.
+    # Only one active job per groupable key may run: the oldest unresolved
+    # candidate. Deferred same-key members wait in remaining_groups.
     active: list[CaptureIdentity] = []
     for identity in jobs:
         if inventory.contains(identity):
             continue
-        key = (identity.urlkey, identity.payload_digest)
-        is_single = identity.payload_digest == MISSING_CDX_PAYLOAD_DIGEST or (
-            identity.status_token.isdigit()
-            and 300 <= int(identity.status_token) < 400
-        )
-        if not is_single:
-            stored = year_index.by_url_digest.get(key)
+        key = _groupable_digest_key(identity)
+        if key is not None:
+            stored = inventory.lookup_representative(
+                key[0],
+                key[1],
+                not_after_timestamp=identity.timestamp,
+            )
             if stored is not None:
-                writer.write_revisit(revisit_from_stored(identity, stored))
-                inventory.identities.add(identity)
-                metrics.revisits += 1
-                metrics.represented += 1
+                _write_revisit(
+                    identity=identity,
+                    stored=stored,
+                    inventory=inventory,
+                    writer=writer,
+                    metrics=metrics,
+                )
                 for deferred in remaining_groups.pop(key, []):
                     if inventory.contains(deferred):
                         continue
-                    writer.write_revisit(revisit_from_stored(deferred, stored))
-                    inventory.identities.add(deferred)
-                    metrics.revisits += 1
-                    metrics.represented += 1
+                    _write_revisit(
+                        identity=deferred,
+                        stored=stored,
+                        inventory=inventory,
+                        writer=writer,
+                        metrics=metrics,
+                    )
                 continue
         active.append(identity)
     active = sorted(active, key=lambda i: i.sort_key())
@@ -443,13 +498,14 @@ def _run_year_downloads(
                 else:
                     assert isinstance(item, JobFailure)
                     identity = item.identity
-                    key = (identity.urlkey, identity.payload_digest)
-                    candidates = remaining_groups.get(key)
-                    if candidates:
-                        next_id = candidates.pop(0)
-                        remaining_groups[key] = candidates
-                        scheduler.note_additional_work()
-                        scheduler.enqueue(next_id)
+                    key = _groupable_digest_key(identity)
+                    if key is not None:
+                        candidates = remaining_groups.get(key)
+                        if candidates:
+                            next_id = candidates.pop(0)
+                            remaining_groups[key] = candidates
+                            scheduler.note_additional_work()
+                            scheduler.enqueue(next_id)
                     failures.append(failure_from_job(item))
             except BaseException as error:  # noqa: BLE001 - stop scheduler
                 writer_error = error
@@ -473,7 +529,7 @@ def _run_year_downloads(
     if writer_error is not None:
         raise writer_error
 
-    # Mark unresolved remaining group members.
+    # Remaining deferred members never obtained a representative.
     for key, members in remaining_groups.items():
         for identity in members:
             if inventory.contains(identity):
@@ -482,7 +538,7 @@ def _run_year_downloads(
                 UnresolvedFailure(
                     identity=identity,
                     category=FailureCategory.UNAVAILABLE,
-                    message="representative capture failed; no same-year payload",
+                    message="representative capture failed; no reusable payload",
                 )
             )
     return failures
@@ -505,32 +561,27 @@ def _handle_download_success(
     if inventory.contains(result.identity):
         metrics.local_reuses += 1
         return []
-    key = (
-        result.identity.urlkey,
-        result.identity.payload_digest,
-    )
-    # Same-year digest revisit if a digest-matched representative exists.
-    stored = year_index.by_url_digest.get(key)
-    if (
-        stored is not None
-        and result.identity.payload_digest != MISSING_CDX_PAYLOAD_DIGEST
-        and not (
-            result.identity.status_token.isdigit()
-            and 300 <= int(result.identity.status_token) < 400
+    key = _groupable_digest_key(result.identity)
+    # Another capture may already have established a reusable representative
+    # (for example a prior-year success loaded from inventory after this job
+    # was scheduled). Prefer a revisit over a duplicate full payload.
+    if key is not None:
+        stored = inventory.lookup_representative(
+            key[0],
+            key[1],
+            not_after_timestamp=result.identity.timestamp,
         )
-    ):
-        writer.write_revisit(
-            revisit_from_stored(
-                result.identity,
-                stored,
+        if stored is not None:
+            _write_revisit(
+                identity=result.identity,
+                stored=stored,
+                inventory=inventory,
+                writer=writer,
+                metrics=metrics,
                 http_status_code=result.status_code,
-                http_headers=result.headers,
+                http_headers=(),
             )
-        )
-        inventory.identities.add(result.identity)
-        metrics.revisits += 1
-        metrics.represented += 1
-        return []
+            return []
 
     writer.write_playback(result)
     metrics.downloads += 1
@@ -542,32 +593,25 @@ def _handle_download_success(
     stored_resp = stored_from_playback(layout, year, result, relative)
     year_index.by_identity[result.identity] = stored_resp
 
-    deferred = [
-        identity
-        for identity in remaining_groups.pop(key, [])
-        if not inventory.contains(identity)
-    ]
-    # Digest-mismatched bodies must not fan out via revisits; download each
-    # remaining same-digest capture individually instead.
-    if (
-        result.digest_matched
-        and result.identity.payload_digest != MISSING_CDX_PAYLOAD_DIGEST
-    ):
-        year_index.by_url_digest[key] = stored_resp
+    if key is not None:
+        deferred = [
+            identity
+            for identity in remaining_groups.pop(key, [])
+            if not inventory.contains(identity)
+        ]
+        # Successful exact playback seeds the representative map — including
+        # permissive IA/local digest mismatches — so later same-key captures
+        # become revisits. Terminal failures never reach this path.
+        inventory.remember_representative(stored_resp)
         for identity in deferred:
-            writer.write_revisit(
-                revisit_from_stored(
-                    identity,
-                    stored_resp,
-                    http_status_code=result.status_code,
-                    http_headers=result.headers,
-                )
+            _write_revisit(
+                identity=identity,
+                stored=stored_resp,
+                inventory=inventory,
+                writer=writer,
+                metrics=metrics,
             )
-            inventory.identities.add(identity)
-            metrics.revisits += 1
-            metrics.represented += 1
-        return []
-    return deferred
+    return []
 
 
 def _current_relative_key(
