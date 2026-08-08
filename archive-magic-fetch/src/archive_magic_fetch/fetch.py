@@ -60,6 +60,7 @@ from .warc import (
     StoredResponse,
     YearWarcWriter,
     count_warc_records,
+    download_exact_for_identity,
     inventory_collection,
     revisit_from_stored,
     stored_from_playback,
@@ -74,6 +75,9 @@ class FetchSettings:
     date_start: str
     date_end: str
     archives_root: Optional[Path] = None
+    # When True, reject bodies whose digest disagrees with CDX. Default False:
+    # keep imperfect IA payloads but never use them as revisit representatives.
+    strict_digests: bool = False
 
 
 @dataclass
@@ -118,9 +122,10 @@ def run_fetch(
         f"collection {layout.collection_id}: years {years[0]}-{years[-1]}",
         flush=True,
     )
+    digest_policy = "strict" if settings.strict_digests else "permissive"
     print(
         f"playback policy: PLAYBACK_REQUESTS_PER_SECOND={PLAYBACK_REQUESTS_PER_SECOND} "
-        f"MAX_CONNECTIONS={MAX_CONNECTIONS}",
+        f"MAX_CONNECTIONS={MAX_CONNECTIONS} digests={digest_policy}",
         flush=True,
     )
 
@@ -139,6 +144,7 @@ def run_fetch(
         metrics.cdx_requests += int(year_cdx.query_meta.get("request_count", 1))
         metrics.cdx_duration_s += time.monotonic() - cdx_started
         all_failures.extend(year_cdx.failures)
+        _report_cdx_ingest_skips(year, year_cdx.failures)
 
         selected = _dedupe_captures(year_cdx.captures)
         metrics.selected += len(selected)
@@ -172,6 +178,16 @@ def run_fetch(
 
         # Schedule remaining network jobs via central scheduler.
         if work_plan.network_jobs:
+            if download_fn is not None:
+                year_download_fn = download_fn
+            else:
+                strict = settings.strict_digests
+
+                def year_download_fn(client, identity, _strict=strict):
+                    return download_exact_for_identity(
+                        client, identity, strict_digests=_strict
+                    )
+
             year_failures = _run_year_downloads(
                 layout=layout,
                 year=year,
@@ -182,7 +198,7 @@ def run_fetch(
                 writer=writer,
                 metrics=metrics,
                 client_factory=client_factory,
-                download_fn=download_fn,
+                download_fn=year_download_fn,
             )
             all_failures.extend(year_failures)
 
@@ -258,6 +274,33 @@ class _YearPlan:
     revisit_jobs: list[tuple[CaptureIdentity, StoredResponse]]
     # group remaining candidates after a representative is chosen:
     pending_revisits: dict[tuple[str, str], list[CaptureIdentity]]
+
+
+def _report_cdx_ingest_skips(
+    year: int, failures: Sequence[UnresolvedFailure]
+) -> None:
+    """Print malformed CDX rows skipped at ingest."""
+
+    malformed = [
+        item for item in failures if item.category == FailureCategory.MALFORMED_CDX
+    ]
+    if not malformed:
+        return
+    print(
+        f"year {year}: skipping {len(malformed)} malformed CDX row(s)",
+        flush=True,
+    )
+    preview = 5
+    for item in malformed[:preview]:
+        url = item.identity.original_url
+        if url and url != "-":
+            print(f"  skip: {url}", flush=True)
+            print(f"        {item.message}", flush=True)
+        else:
+            print(f"  skip: {item.message}", flush=True)
+    remaining = len(malformed) - preview
+    if remaining > 0:
+        print(f"  ... and {remaining} more", flush=True)
 
 
 def _plan_year_work(
@@ -384,7 +427,7 @@ def _run_year_downloads(
         for item in scheduler.results():
             try:
                 if isinstance(item, JobSuccess):
-                    _handle_download_success(
+                    to_enqueue = _handle_download_success(
                         item=item,
                         layout=layout,
                         year=year,
@@ -394,6 +437,9 @@ def _run_year_downloads(
                         metrics=metrics,
                         remaining_groups=remaining_groups,
                     )
+                    for next_id in to_enqueue:
+                        scheduler.note_additional_work()
+                        scheduler.enqueue(next_id)
                 else:
                     assert isinstance(item, JobFailure)
                     identity = item.identity
@@ -402,6 +448,7 @@ def _run_year_downloads(
                     if candidates:
                         next_id = candidates.pop(0)
                         remaining_groups[key] = candidates
+                        scheduler.note_additional_work()
                         scheduler.enqueue(next_id)
                     failures.append(failure_from_job(item))
             except BaseException as error:  # noqa: BLE001 - stop scheduler
@@ -451,16 +498,18 @@ def _handle_download_success(
     writer: YearWarcWriter,
     metrics: RunMetrics,
     remaining_groups: dict[tuple[str, str], list[CaptureIdentity]],
-) -> None:
+) -> list[CaptureIdentity]:
+    """Write a successful download. Return identities that still need network."""
+
     result = item.result
     if inventory.contains(result.identity):
         metrics.local_reuses += 1
-        return
+        return []
     key = (
         result.identity.urlkey,
         result.identity.payload_digest,
     )
-    # Same-year digest revisit if representative already stored.
+    # Same-year digest revisit if a digest-matched representative exists.
     stored = year_index.by_url_digest.get(key)
     if (
         stored is not None
@@ -481,32 +530,44 @@ def _handle_download_success(
         inventory.identities.add(result.identity)
         metrics.revisits += 1
         metrics.represented += 1
-        return
+        return []
 
     writer.write_playback(result)
     metrics.downloads += 1
     metrics.represented += 1
+    if not result.digest_matched:
+        metrics.digest_mismatch_accepted += 1
     inventory.identities.add(result.identity)
     relative = _current_relative_key(layout, year, writer)
     stored_resp = stored_from_playback(layout, year, result, relative)
     year_index.by_identity[result.identity] = stored_resp
-    if result.identity.payload_digest != MISSING_CDX_PAYLOAD_DIGEST:
-        year_index.by_url_digest[key] = stored_resp
 
-    for identity in remaining_groups.pop(key, []):
-        if inventory.contains(identity):
-            continue
-        writer.write_revisit(
-            revisit_from_stored(
-                identity,
-                stored_resp,
-                http_status_code=result.status_code,
-                http_headers=result.headers,
+    deferred = [
+        identity
+        for identity in remaining_groups.pop(key, [])
+        if not inventory.contains(identity)
+    ]
+    # Digest-mismatched bodies must not fan out via revisits; download each
+    # remaining same-digest capture individually instead.
+    if (
+        result.digest_matched
+        and result.identity.payload_digest != MISSING_CDX_PAYLOAD_DIGEST
+    ):
+        year_index.by_url_digest[key] = stored_resp
+        for identity in deferred:
+            writer.write_revisit(
+                revisit_from_stored(
+                    identity,
+                    stored_resp,
+                    http_status_code=result.status_code,
+                    http_headers=result.headers,
+                )
             )
-        )
-        inventory.identities.add(identity)
-        metrics.revisits += 1
-        metrics.represented += 1
+            inventory.identities.add(identity)
+            metrics.revisits += 1
+            metrics.represented += 1
+        return []
+    return deferred
 
 
 def _current_relative_key(
@@ -634,6 +695,8 @@ def build_settings(
     date_start: Optional[str] = None,
     date_end: Optional[str] = None,
     archives_root: Optional[Path] = None,
+    *,
+    strict_digests: bool = False,
 ) -> FetchSettings:
     """Validate CLI-facing inputs into settings."""
 
@@ -649,4 +712,5 @@ def build_settings(
         date_start=start,
         date_end=end,
         archives_root=archives_root,
+        strict_digests=strict_digests,
     )

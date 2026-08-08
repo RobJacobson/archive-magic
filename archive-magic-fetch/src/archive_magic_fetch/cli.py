@@ -23,6 +23,15 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         default=None,
         help=argparse.SUPPRESS,
     )
+    parser.add_argument(
+        "--strict-digests",
+        action="store_true",
+        help=(
+            "reject playback bodies whose digest disagrees with CDX "
+            "(default: keep imperfect payloads, but do not use them as "
+            "revisit representatives)"
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -36,6 +45,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             date_start=args.start,
             date_end=args.end,
             archives_root=args.archives_root,
+            strict_digests=args.strict_digests,
         )
     except ValueError as error:
         print(f"error: {error}", file=sys.stderr)

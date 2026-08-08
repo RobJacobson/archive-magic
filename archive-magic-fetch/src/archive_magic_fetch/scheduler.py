@@ -29,6 +29,8 @@ from .models import (
     PlaybackResult,
     RunMetrics,
     UnresolvedFailure,
+    is_invalid_uri_payload_digest,
+    wayback_url,
 )
 from .warc import (
     classify_playback_error,
@@ -54,8 +56,8 @@ class PlaybackProgress:
 
     @property
     def _response_indent(self) -> str:
-        # Align with "Downloading" on the request line:
-        # "  {n:>{width}}/{total}: Downloading ..."
+        # Align under the URL on the request line:
+        # "  {n:>{width}}/{total}: {url} ..."
         return " " * (2 * self._width + 5)
 
     def request_started(self, url: str) -> None:
@@ -63,12 +65,20 @@ class PlaybackProgress:
             self._count += 1
             number = self._count
         print(
-            f"  {number:{self._width}d}/{self.total}: Downloading {url} ...",
+            f"  {number:{self._width}d}/{self.total}: {url} ...",
             flush=True,
         )
 
     def request_finished(self, line: str) -> None:
         print(f"{self._response_indent}{line}", flush=True)
+
+    def note_additional_work(self, n: int = 1) -> None:
+        """Increase the denominator when deferred captures become downloads."""
+
+        if n < 1:
+            return
+        with self._lock:
+            self.total += n
 
 
 @dataclass(order=True)
@@ -261,6 +271,12 @@ class PlaybackScheduler:
                 ),
             )
 
+    def note_additional_work(self, n: int = 1) -> None:
+        """Account for captures promoted to downloads after the initial plan."""
+
+        if self._progress is not None:
+            self._progress.note_additional_work(n)
+
     def acknowledge(self) -> None:
         """Mark one consumed result as fully handled by the writer."""
 
@@ -270,9 +286,24 @@ class PlaybackScheduler:
     def _worker(self, job: ReadyJob) -> JobSuccess | JobFailure:
         identity = job.identity
         if self._progress is not None:
-            self._progress.request_started(identity.original_url)
+            self._progress.request_started(
+                wayback_url(identity.timestamp, identity.original_url)
+            )
         request_started_at = self._clock()
         try:
+            if is_invalid_uri_payload_digest(identity.payload_digest):
+                failure = JobFailure(
+                    identity=identity,
+                    category=FailureCategory.UNAVAILABLE,
+                    message="CDX digest is IA Invalid URI stub",
+                    retryable=False,
+                    attempt=job.attempt,
+                )
+                if self._progress is not None:
+                    self._progress.request_finished("Skipped (invalid URI)")
+                self.metrics.bump_attempt(failure.category.value)
+                self._handle_failure(failure, will_retry=False, delay=0.0)
+                return failure
             client = self._thread_client()
             result = self._download_fn(client, identity)
             duration = self._clock() - request_started_at
@@ -281,7 +312,11 @@ class PlaybackScheduler:
             self.metrics.playback_bytes += len(result.body)
             self._consecutive_backpressure = 0
             if self._progress is not None:
-                self._progress.request_finished(f"Success ({duration:.1f}s)")
+                if result.digest_matched:
+                    line = f"Success ({duration:.1f}s)"
+                else:
+                    line = f"Success (digest mismatch kept, {duration:.1f}s)"
+                self._progress.request_finished(line)
             self._put_result(success)
             return success
         except Exception as error:  # noqa: BLE001 - boundary classification
@@ -388,10 +423,19 @@ class PlaybackScheduler:
         )
 
     def _note_truncation(self) -> None:
-        self._blocked_until = max(
-            self._blocked_until,
-            self._clock() + TRUNCATION_PAUSE_S,
-        )
+        """Handle a permanent incomplete payload without pacing delay.
+
+        When ``TRUNCATION_PAUSE_S`` is positive, open a short global gate pause
+        (historical mitigation for suspected TCP backpressure). Current policy
+        is skip-and-continue (pause is 0); still recycle the thread client in
+        case the transfer left the connection half-closed.
+        """
+
+        if TRUNCATION_PAUSE_S > 0:
+            self._blocked_until = max(
+                self._blocked_until,
+                self._clock() + TRUNCATION_PAUSE_S,
+            )
         self._reset_thread_client()
 
     def _promote_delayed(self, now: float) -> None:
@@ -474,7 +518,9 @@ def _format_response_line(
     retry_delay: float,
 ) -> str:
     if category == FailureCategory.TRUNCATED:
-        return "Error: Truncated Response, pausing for 5s."
+        return "Skipped (truncated response)"
+    if category == FailureCategory.UNAVAILABLE:
+        return "Skipped (unavailable)"
     backpressure = _classify_backpressure(error)
     if backpressure is not None:
         if backpressure.kind == BackpressureKind.TCP:

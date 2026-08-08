@@ -25,7 +25,10 @@ MAX_PLAYBACK_ATTEMPTS = 9  # first try + 8 retries
 MAX_RETRY_DELAY_S = 3600
 DEFAULT_429_COOLDOWN_S = 60.0
 MAX_429_COOLDOWN_S = 900.0
-TRUNCATION_PAUSE_S = 5.0
+# Temporarily disabled (was 5.0): truncated payloads are permanent failures;
+# pause is not applied so the next capture starts immediately. Revisit if TCP
+# backpressure returns after truncated IncompleteRead series.
+TRUNCATION_PAUSE_S = 0.0
 CONNECTION_REFUSED_RETRY_S = 60.0
 CONNECTION_REFUSED_MAX_RETRIES = 3
 RESULT_QUEUE_SIZE = 64
@@ -43,6 +46,8 @@ USER_AGENT = (
 CDX_PAYLOAD_DIGEST_HEADER = "CDX-Payload-Digest"
 CDX_STATUS_HEADER = "CDX-Status"
 CDX_URLKEY_HEADER = "CDX-Urlkey"
+# Present on response records when the stored body does not match CDX.
+CDX_DIGEST_MATCH_HEADER = "CDX-Digest-Match"
 MISSING_CDX_PAYLOAD_DIGEST = "-"
 MISSING_CDX_STATUS = "-"
 
@@ -61,6 +66,11 @@ class FailureCategory(str, Enum):
     TRUNCATED = "truncated"
     DIGEST_VALIDATION = "digest_validation"
     PUBLICATION = "publication"
+
+
+# SHA-1 (CDX base32) of the literal IA playback stub body ``Invalid URI``.
+# Captures whose CDX digest equals this are skipped without downloading.
+INVALID_URI_PAYLOAD_DIGEST = "sha1:L4XNRRGWXWKNIAJFQOC6D2OULYFIDDTC"
 
 
 @dataclass(frozen=True, order=True)
@@ -101,7 +111,13 @@ class ParsedCapture:
 
 @dataclass(frozen=True)
 class PlaybackResult:
-    """Validated exact-playback payload ready for WARC writing."""
+    """Exact-playback payload ready for WARC writing.
+
+    ``warc_payload_digest`` is always the digest of ``body``. The capture
+    identity may still carry a different CDX digest when IA served imperfect
+    bytes; ``digest_matched`` records whether those agreed. Mismatched payloads
+    are kept by default but must not become same-year revisit representatives.
+    """
 
     identity: CaptureIdentity
     body: bytes
@@ -110,6 +126,10 @@ class PlaybackResult:
     warc_date: str
     source_uri: str
     warc_payload_digest: str
+    # Set when ArchiveMagicWaybackSession accepted a non-gzip body that IA
+    # advertised as Content-Encoding: gzip.
+    false_gzip_repaired: bool = False
+    digest_matched: bool = True
 
 
 @dataclass(frozen=True)
@@ -173,6 +193,7 @@ class RunMetrics:
     local_reuses: int = 0
     downloads: int = 0
     revisits: int = 0
+    digest_mismatch_accepted: int = 0
     selected: int = 0
     represented: int = 0
     unresolved: int = 0
@@ -235,6 +256,22 @@ _DEFAULT_PORTS = {
     "ws": 80,
     "wss": 443,
 }
+
+
+def is_invalid_uri_payload_digest(digest: object) -> bool:
+    """True when CDX digest is the known IA ``Invalid URI`` stub payload."""
+
+    return normalize_payload_digest(digest) == INVALID_URI_PAYLOAD_DIGEST
+
+
+def wayback_url(timestamp: str, original_url: str) -> str:
+    """Return the Wayback Machine calendar URL for one capture.
+
+    Example:
+    ``https://web.archive.org/web/20080503130635/http://example.org/page``
+    """
+
+    return f"https://web.archive.org/web/{timestamp}/{original_url}"
 
 
 def normalize_original_url(url: str) -> str:
