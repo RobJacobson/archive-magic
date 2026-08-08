@@ -13,15 +13,16 @@ from queue import Full, Queue
 from typing import Callable, Optional, Sequence
 
 from .models import (
+    CONNECTION_REFUSED_MAX_RETRIES,
+    CONNECTION_REFUSED_RETRY_S,
     DEFAULT_429_COOLDOWN_S,
-    DEFAULT_CONNECTION_REFUSAL_COOLDOWN_S,
     MAX_429_COOLDOWN_S,
-    MAX_CONNECTION_REFUSAL_COOLDOWN_S,
     MAX_CONNECTIONS,
     MAX_PLAYBACK_ATTEMPTS,
     MAX_RETRY_DELAY_S,
     PLAYBACK_REQUESTS_PER_SECOND,
     RESULT_QUEUE_SIZE,
+    TRUNCATION_PAUSE_S,
     CaptureIdentity,
     FailureCategory,
     PlaybackResult,
@@ -36,6 +37,37 @@ from .warc import (
 
 Clock = Callable[[], float]
 Sleep = Callable[[float], None]
+
+
+@dataclass
+class PlaybackProgress:
+    """Two-line terminal progress for playback downloads."""
+
+    total: int
+    _count: int = 0
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    @property
+    def _width(self) -> int:
+        return len(str(self.total))
+
+    @property
+    def _response_indent(self) -> str:
+        # Align with "Downloading" on the request line:
+        # "  {n:>{width}}/{total}: Downloading ..."
+        return " " * (2 * self._width + 5)
+
+    def request_started(self, url: str) -> None:
+        with self._lock:
+            self._count += 1
+            number = self._count
+        print(
+            f"  {number:{self._width}d}/{self.total}: Downloading {url} ...",
+            flush=True,
+        )
+
+    def request_finished(self, line: str) -> None:
+        print(f"{self._response_indent}{line}", flush=True)
 
 
 @dataclass(order=True)
@@ -90,6 +122,7 @@ class PlaybackScheduler:
         result_queue_size: int = RESULT_QUEUE_SIZE,
         metrics: Optional[RunMetrics] = None,
         download_fn: DownloadFn = download_exact_for_identity,
+        progress: Optional[PlaybackProgress] = None,
         clock: Clock = time.monotonic,
         sleep: Sleep = time.sleep,
     ) -> None:
@@ -102,6 +135,7 @@ class PlaybackScheduler:
         self._start_interval = 1.0 / requests_per_second
         self._max_attempts = max_attempts
         self._download_fn = download_fn
+        self._progress = progress
         self._clock = clock
         self._sleep = sleep
         self.metrics = metrics or RunMetrics()
@@ -116,8 +150,6 @@ class PlaybackScheduler:
         self._active_connections = 0
         self._blocked_until = 0.0
         self._consecutive_429 = 0
-        self._connection_blocked_until = 0.0
-        self._connection_refusal_waves = 0
         self._next_start_at = 0.0
         self._results: Queue[JobSuccess | JobFailure | None] = Queue(
             maxsize=result_queue_size
@@ -165,10 +197,11 @@ class PlaybackScheduler:
 
                 wait = self._gate_wait(now)
                 if wait > 0:
-                    self._sleep(min(wait, 0.05))
-                    self.metrics.rate_gate_wait_s += min(wait, 0.05)
+                    slept = min(wait, 0.05)
+                    self._sleep(slept)
+                    self.metrics.rate_gate_wait_s += slept
                     if now < self._blocked_until:
-                        self.metrics.cooldown_wait_s += min(wait, 0.05)
+                        self.metrics.cooldown_wait_s += slept
                     continue
 
                 if self._ready:
@@ -235,27 +268,28 @@ class PlaybackScheduler:
 
     def _worker(self, job: ReadyJob) -> JobSuccess | JobFailure:
         identity = job.identity
+        if self._progress is not None:
+            self._progress.request_started(identity.original_url)
         request_started_at = self._clock()
         try:
             client = self._thread_client()
             result = self._download_fn(client, identity)
+            duration = self._clock() - request_started_at
             success = JobSuccess(identity=identity, result=result)
             self.metrics.playback_completions += 1
             self.metrics.playback_bytes += len(result.body)
             self._consecutive_429 = 0
+            if self._progress is not None:
+                self._progress.request_finished(f"Success ({duration:.1f}s)")
             self._put_result(success)
             return success
         except Exception as error:  # noqa: BLE001 - boundary classification
             category, retryable = classify_playback_error(error)
             retry_after = _retry_after_from_error(error)
             if _is_rate_limit_error(error):
-                self._note_429(retry_after, identity=identity, error=error)
-            elif _is_connection_refused_error(error):
-                self._note_connection_refusal(
-                    identity=identity,
-                    error=error,
-                    request_started_at=request_started_at,
-                )
+                self._note_429(retry_after, error=error)
+            elif category == FailureCategory.TRUNCATED:
+                self._note_truncation()
             failure = JobFailure(
                 identity=identity,
                 category=category,
@@ -264,19 +298,31 @@ class PlaybackScheduler:
                 attempt=job.attempt,
                 retry_after=retry_after,
             )
+            will_retry, delay = self._retry_plan(failure, error)
+            if self._progress is not None:
+                self._progress.request_finished(
+                    _format_response_line(
+                        error=error,
+                        category=category,
+                        will_retry=will_retry,
+                        retry_delay=delay,
+                    )
+                )
             self.metrics.bump_attempt(category.value)
-            self._handle_failure(failure)
+            self._handle_failure(failure, will_retry=will_retry, delay=delay)
             return failure
         finally:
             with self._lock:
                 self._active_connections = max(0, self._active_connections - 1)
 
-    def _handle_failure(self, failure: JobFailure) -> None:
-        if (
-            failure.retryable
-            and failure.attempt < self._max_attempts
-        ):
-            delay = self._retry_delay(failure)
+    def _handle_failure(
+        self,
+        failure: JobFailure,
+        *,
+        will_retry: bool,
+        delay: float,
+    ) -> None:
+        if will_retry:
             heapq.heappush(
                 self._delayed,
                 DelayedJob(
@@ -286,16 +332,23 @@ class PlaybackScheduler:
                     category=failure.category.value,
                 ),
             )
-            message = failure.message or failure.category.value
-            print(
-                f"  retry: deferred {delay:g}s "
-                f"(attempt {failure.attempt}/{self._max_attempts}) "
-                f"{failure.identity.original_url} [{message}]",
-                flush=True,
-            )
             return
-        # Permanent or exhausted: surface to consumer.
         self._put_result(failure)
+
+    def _retry_plan(
+        self,
+        failure: JobFailure,
+        error: BaseException,
+    ) -> tuple[bool, float]:
+        if _is_connection_refused_error(error):
+            if failure.attempt <= CONNECTION_REFUSED_MAX_RETRIES:
+                return True, CONNECTION_REFUSED_RETRY_S
+            return False, 0.0
+        if failure.category == FailureCategory.TRUNCATED:
+            return False, 0.0
+        if failure.retryable and failure.attempt < self._max_attempts:
+            return True, self._retry_delay(failure)
+        return False, 0.0
 
     def _retry_delay(self, failure: JobFailure) -> float:
         if failure.retry_after is not None:
@@ -307,7 +360,6 @@ class PlaybackScheduler:
         self,
         retry_after: Optional[float],
         *,
-        identity: CaptureIdentity,
         error: Optional[BaseException] = None,
     ) -> None:
         self._consecutive_429 += 1
@@ -316,69 +368,21 @@ class PlaybackScheduler:
         )
         if header_delay is not None:
             cooldown = min(header_delay, MAX_429_COOLDOWN_S)
-            source = "Retry-After"
         elif retry_after is not None:
             cooldown = min(float(retry_after), MAX_429_COOLDOWN_S)
-            source = "error"
         else:
-            # IA often omits the header; wayback recommends a fixed pause.
             cooldown = DEFAULT_429_COOLDOWN_S
-            source = "default"
         self._blocked_until = max(
             self._blocked_until,
             self._clock() + cooldown,
         )
-        detail = ""
-        if error is not None:
-            message = str(error) or type(error).__name__
-            detail = f" [{type(error).__name__}: {message}]"
-        print(
-            f"  rate limit: pausing {cooldown:g}s ({source}, "
-            f"consecutive={self._consecutive_429}) "
-            f"{identity.original_url}{detail}",
-            flush=True,
+
+    def _note_truncation(self) -> None:
+        self._blocked_until = max(
+            self._blocked_until,
+            self._clock() + TRUNCATION_PAUSE_S,
         )
-
-    def _note_connection_refusal(
-        self,
-        *,
-        identity: CaptureIdentity,
-        error: BaseException,
-        request_started_at: float,
-    ) -> None:
-        """Globally pause after one TCP-refusal wave.
-
-        Workers already using a connection slot can report the same refusal
-        concurrently. Only the first refusal after the previous cooldown starts
-        a new wave and doubles the fallback delay.
-        """
-
-        now = self._clock()
-        with self._lock:
-            # A request that began before this wave's cooldown expired belongs
-            # to that same wave, even if its failure arrives after the timer.
-            if request_started_at < self._connection_blocked_until:
-                return
-            self._connection_refusal_waves += 1
-            cooldown = min(
-                DEFAULT_CONNECTION_REFUSAL_COOLDOWN_S
-                * (2 ** (self._connection_refusal_waves - 1)),
-                MAX_CONNECTION_REFUSAL_COOLDOWN_S,
-            )
-            self._connection_blocked_until = now + cooldown
-            self._blocked_until = max(
-                self._blocked_until,
-                self._connection_blocked_until,
-            )
-            wave = self._connection_refusal_waves
-
-        message = str(error) or type(error).__name__
-        print(
-            f"  connection refused: pausing all requests {cooldown:g}s "
-            f"(wave={wave}) {identity.original_url} "
-            f"[{type(error).__name__}: {message}]",
-            flush=True,
-        )
+        self._reset_thread_client()
 
     def _promote_delayed(self, now: float) -> None:
         while self._delayed and self._delayed[0].ready_at <= now:
@@ -412,11 +416,18 @@ class PlaybackScheduler:
             self._clients.append(client)
         return active
 
+    def _reset_thread_client(self) -> None:
+        active = getattr(self._local, "client", None)
+        if active is not None:
+            close = getattr(active, "close", None)
+            if callable(close):
+                close()
+        self._local.client = None
+
     def _collect_futures(self, futures: set[Future]) -> None:
         done = {future for future in futures if future.done()}
         for future in done:
             futures.remove(future)
-            # Propagate unexpected worker crashes.
             exc = future.exception()
             if exc is not None and not isinstance(exc, Exception):
                 raise exc
@@ -443,6 +454,57 @@ class PlaybackScheduler:
                         )
                     return
                 continue
+
+
+def _format_response_line(
+    *,
+    error: BaseException,
+    category: FailureCategory,
+    will_retry: bool,
+    retry_delay: float,
+) -> str:
+    if category == FailureCategory.TRUNCATED:
+        return "Error: Truncated Response, pausing for 5s."
+    if _is_connection_refused_error(error):
+        if will_retry:
+            return (
+                f"Warning: Connection Refused, retrying in "
+                f"{int(CONNECTION_REFUSED_RETRY_S)}s"
+            )
+        return "Error: Connection Refused, giving up after 3 retries"
+    if _is_rate_limit_error(error):
+        delay = int(retry_delay) if retry_delay else int(DEFAULT_429_COOLDOWN_S)
+        if will_retry:
+            return f"Warning: Rate Limited, retrying in {delay}s"
+        return "Error: Rate Limited, continuing"
+    label = _short_error_label(error, category)
+    if will_retry:
+        delay_text = (
+            f"{int(retry_delay)}s"
+            if retry_delay >= 1
+            else f"{retry_delay:.1f}s"
+        )
+        return f"Warning: {label}, retrying in {delay_text}"
+    return f"Error: {label}, continuing"
+
+
+def _short_error_label(error: BaseException, category: FailureCategory) -> str:
+    if category == FailureCategory.EXACT_MISMATCH:
+        return "Exact Mismatch"
+    if category == FailureCategory.DIGEST_VALIDATION:
+        return "Digest Validation Failed"
+    if category == FailureCategory.BLOCKED:
+        return "Blocked"
+    if category == FailureCategory.UNAVAILABLE:
+        return "Unavailable"
+    name = type(error).__name__
+    if name.endswith("Error"):
+        name = name[: -len("Error")]
+    elif name.endswith("Exception"):
+        name = name[: -len("Exception")]
+    if name:
+        return name
+    return category.value.replace("_", " ").title()
 
 
 def _is_rate_limit_error(error: BaseException) -> bool:

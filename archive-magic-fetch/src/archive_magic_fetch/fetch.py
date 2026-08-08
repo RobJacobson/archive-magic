@@ -48,7 +48,13 @@ from .models import (
     WarcArtifact,
     current_utc_cdx_timestamp,
 )
-from .scheduler import JobFailure, JobSuccess, PlaybackScheduler, failure_from_job
+from .scheduler import (
+    JobFailure,
+    JobSuccess,
+    PlaybackProgress,
+    PlaybackScheduler,
+    failure_from_job,
+)
 from .warc import (
     CollectionInventory,
     StoredResponse,
@@ -362,6 +368,7 @@ def _run_year_downloads(
         "client_factory": client_factory,
         "identities": active,
         "metrics": metrics,
+        "progress": PlaybackProgress(total=len(active)),
     }
     if download_fn is not None:
         scheduler_kwargs["download_fn"] = download_fn
@@ -369,10 +376,6 @@ def _run_year_downloads(
 
     failures: list[UnresolvedFailure] = []
     import threading
-
-    download_total = len(active)
-    download_done = 0
-    progress_width = len(str(download_total))
 
     thread = threading.Thread(target=scheduler.run, name="playback-scheduler")
     thread.start()
@@ -390,12 +393,6 @@ def _run_year_downloads(
                         writer=writer,
                         metrics=metrics,
                         remaining_groups=remaining_groups,
-                    )
-                    download_done += 1
-                    print(
-                        f"  {download_done:{progress_width}d}/{download_total}: "
-                        f"Downloaded {item.identity.original_url}",
-                        flush=True,
                     )
                 else:
                     assert isinstance(item, JobFailure)

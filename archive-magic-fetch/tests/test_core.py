@@ -43,7 +43,7 @@ from archive_magic_fetch.models import (
     make_identity,
     normalize_original_url,
 )
-from archive_magic_fetch.scheduler import PlaybackScheduler
+from archive_magic_fetch.scheduler import JobFailure, PlaybackScheduler
 from archive_magic_fetch.warc import (
     YearWarcWriter,
     classify_playback_error,
@@ -421,17 +421,53 @@ def test_rate_limit_uses_error_retry_after_without_exponential_default():
         clock=lambda: clock["t"],
         sleep=lambda _s: None,
     )
-    scheduler._note_429(12.0, identity=identity)
+    scheduler._note_429(12.0, error=None)
     assert scheduler._blocked_until == pytest.approx(112.0)
 
     # A second 429 without Retry-After must stay at the fixed default, not 120s.
     clock["t"] = 200.0
-    scheduler._note_429(None, identity=identity)
+    scheduler._note_429(None, error=None)
     assert scheduler._blocked_until == pytest.approx(260.0)
     assert scheduler._consecutive_429 == 2
 
 
-def test_connection_refusal_waves_gate_globally_and_escalate():
+def test_connection_refused_retries_three_times_at_sixty_seconds():
+    from archive_magic_fetch.models import (
+        CONNECTION_REFUSED_MAX_RETRIES,
+        CONNECTION_REFUSED_RETRY_S,
+    )
+    from archive_magic_fetch.scheduler import PlaybackScheduler
+
+    clock = {"t": 100.0}
+    sleeps: list[float] = []
+    identity = _identity()
+    scheduler = PlaybackScheduler(
+        client_factory=lambda: MagicMock(),
+        identities=[identity],
+        clock=lambda: clock["t"],
+        sleep=lambda seconds: sleeps.append(seconds),
+    )
+    error = ConnectionRefusedError(61, "Connection refused")
+
+    for attempt in range(1, CONNECTION_REFUSED_MAX_RETRIES + 2):
+        failure = scheduler._retry_plan(
+            JobFailure(
+                identity=identity,
+                category=FailureCategory.RETRY_EXHAUSTED,
+                message=str(error),
+                retryable=True,
+                attempt=attempt,
+            ),
+            error,
+        )
+        if attempt <= CONNECTION_REFUSED_MAX_RETRIES:
+            assert failure == (True, CONNECTION_REFUSED_RETRY_S)
+        else:
+            assert failure == (False, 0.0)
+
+
+def test_truncation_pauses_five_seconds():
+    from archive_magic_fetch.models import TRUNCATION_PAUSE_S
     from archive_magic_fetch.scheduler import PlaybackScheduler
 
     clock = {"t": 100.0}
@@ -442,38 +478,25 @@ def test_connection_refusal_waves_gate_globally_and_escalate():
         clock=lambda: clock["t"],
         sleep=lambda _s: None,
     )
-    error = ConnectionRefusedError(61, "Connection refused")
+    mock_client = MagicMock()
+    scheduler._local.client = mock_client
 
-    scheduler._note_connection_refusal(
-        identity=identity,
-        error=error,
-        request_started_at=99.0,
-    )
-    assert scheduler._blocked_until == pytest.approx(105.0)
-    assert scheduler._connection_refusal_waves == 1
+    scheduler._note_truncation()
 
-    # A concurrent request remains part of the same wave even if its failure
-    # does not arrive until after the initial cooldown expires.
-    clock["t"] = 106.0
-    scheduler._note_connection_refusal(
-        identity=identity,
-        error=error,
-        request_started_at=99.5,
-    )
-    assert scheduler._blocked_until == pytest.approx(105.0)
-    assert scheduler._connection_refusal_waves == 1
+    assert scheduler._local.client is None
+    assert scheduler._blocked_until == pytest.approx(100.0 + TRUNCATION_PAUSE_S)
+    mock_client.close.assert_called_once()
 
-    expected = ((105.0, 115.0), (115.0, 135.0), (135.0, 175.0), (175.0, 235.0))
-    for now, blocked_until in expected:
-        clock["t"] = now
-        scheduler._note_connection_refusal(
-            identity=identity,
-            error=error,
-            request_started_at=now,
-        )
-        assert scheduler._blocked_until == pytest.approx(blocked_until)
 
-    assert scheduler._connection_refusal_waves == 5
+def test_playback_progress_two_line_format(capsys):
+    from archive_magic_fetch.scheduler import PlaybackProgress
+
+    progress = PlaybackProgress(total=2666)
+    progress.request_started("http://www.example.com/factions/")
+    progress.request_finished("Success (0.3s)")
+    out = capsys.readouterr().out
+    assert "  1/2666: Downloading http://www.example.com/factions/ ..." in out
+    assert f"{progress._response_indent}Success (0.3s)" in out
 
 
 def test_session_raises_rate_limit_for_429_memento_response():
