@@ -410,7 +410,11 @@ def test_scheduler_smooth_spacing_concurrency_retry_and_429():
 
 
 def test_rate_limit_uses_error_retry_after_without_exponential_default():
-    from archive_magic_fetch.scheduler import PlaybackScheduler
+    from archive_magic_fetch.scheduler import (
+        BackpressureKind,
+        BackpressureSignal,
+        PlaybackScheduler,
+    )
 
     clock = {"t": 100.0}
     identity = _identity()
@@ -421,14 +425,67 @@ def test_rate_limit_uses_error_retry_after_without_exponential_default():
         clock=lambda: clock["t"],
         sleep=lambda _s: None,
     )
-    scheduler._note_429(12.0, error=None)
+    scheduler._note_backpressure(
+        BackpressureSignal(kind=BackpressureKind.HTTP, retry_after=12.0)
+    )
     assert scheduler._blocked_until == pytest.approx(112.0)
 
     # A second 429 without Retry-After must stay at the fixed default, not 120s.
     clock["t"] = 200.0
-    scheduler._note_429(None, error=None)
+    scheduler._note_backpressure(BackpressureSignal(kind=BackpressureKind.HTTP))
     assert scheduler._blocked_until == pytest.approx(260.0)
-    assert scheduler._consecutive_429 == 2
+    assert scheduler._consecutive_backpressure == 2
+
+
+def test_connection_refused_pauses_all_downloads_for_sixty_seconds():
+    from archive_magic_fetch.models import CONNECTION_REFUSED_RETRY_S
+    from archive_magic_fetch.scheduler import PlaybackScheduler
+
+    clock = {"t": 0.0}
+    sleeps: list[float] = []
+    start_times: list[tuple[str, float]] = []
+
+    def mono():
+        return clock["t"]
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        clock["t"] += seconds
+
+    first = _identity(ts="20040601000000", digest="sha1:" + ("A" * 32))
+    second = _identity(ts="20040602000000", digest="sha1:" + ("B" * 32))
+
+    def download_fn(_client, identity):
+        start_times.append((identity.timestamp, clock["t"]))
+        if identity.timestamp == first.timestamp:
+            attempt = sum(1 for ts, _ in start_times if ts == first.timestamp)
+            if attempt == 1:
+                raise ConnectionRefusedError(61, "Connection refused")
+        return _playback(identity)
+
+    scheduler = PlaybackScheduler(
+        client_factory=lambda: MagicMock(),
+        identities=[first, second],
+        max_connections=1,
+        requests_per_second=float("inf"),
+        max_attempts=5,
+        download_fn=download_fn,
+        clock=mono,
+        sleep=sleep,
+    )
+
+    def consumer():
+        for _item in scheduler.results():
+            scheduler.acknowledge()
+
+    t = threading.Thread(target=consumer)
+    t.start()
+    scheduler.run()
+    t.join(timeout=5)
+
+    second_start = next(t for ts, t in start_times if ts == second.timestamp)
+    assert second_start >= CONNECTION_REFUSED_RETRY_S
+    assert scheduler.metrics.cooldown_wait_s > 0
 
 
 def test_connection_refused_retries_three_times_at_sixty_seconds():
@@ -543,8 +600,9 @@ def test_retry_after_extracted_from_rate_limit_error_and_message():
 
 def test_connection_error_with_429_in_timestamp_is_not_rate_limit():
     from archive_magic_fetch.scheduler import (
-        _is_connection_refused_error,
-        _is_rate_limit_error,
+        BackpressureKind,
+        BackpressureSignal,
+        _classify_backpressure,
     )
     from wayback.exceptions import WaybackRetryError
 
@@ -556,14 +614,24 @@ def test_connection_error_with_429_in_timestamp_is_not_rate_limit():
         "/web/20080429120000id_/http://example.org/page: Connection refused",
     )
     wrapped = WaybackRetryError(0, 0.08, causal)
-    assert not _is_rate_limit_error(wrapped)
-    assert not _is_rate_limit_error(causal)
-    assert _is_connection_refused_error(wrapped)
+    assert _classify_backpressure(wrapped) == BackpressureSignal(
+        kind=BackpressureKind.TCP
+    )
+    assert _classify_backpressure(causal) == BackpressureSignal(
+        kind=BackpressureKind.TCP
+    )
 
     real = RateLimitError(response=MagicMock(headers={}), retry_after=60)
-    assert _is_rate_limit_error(real)
-    assert _is_rate_limit_error(WaybackRetryError(0, 0.1, real))
-    assert _is_rate_limit_error(RuntimeError("429 error while loading memento"))
+    assert _classify_backpressure(real) == BackpressureSignal(
+        kind=BackpressureKind.HTTP,
+        retry_after=60.0,
+    )
+    assert _classify_backpressure(WaybackRetryError(0, 0.1, real)) == (
+        BackpressureSignal(kind=BackpressureKind.HTTP, retry_after=60.0)
+    )
+    assert _classify_backpressure(
+        RuntimeError("429 error while loading memento")
+    ) == BackpressureSignal(kind=BackpressureKind.HTTP)
 
 
 def test_make_client_mounts_pool_sized_adapter():
