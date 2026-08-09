@@ -44,7 +44,7 @@ pywb's archive path.
 Years are selected serially in ascending order. For each selected year Fetch:
 
 1. Creates `captures/<year>/runs/<run-id>/` and durably saves every raw CDX HTTP
-   entity as `page-NNN.cdx[.gz]` before parsing it.
+   entity as `page-NNN.cdx.gz` before parsing it.
 2. Parses, validates, de-duplicates exact CDX rows, and orders them by timestamp.
 3. Inventories only finalized WARCs in `collections/<year>/`.
 4. Skips identities already represented; writes a same-collection revisit when

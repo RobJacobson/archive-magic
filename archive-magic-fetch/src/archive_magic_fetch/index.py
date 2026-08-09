@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
-import tempfile
 from pathlib import Path
 from typing import Optional, Sequence
 
@@ -71,7 +69,12 @@ def merge_cdxj_lines(paths: Sequence[Path]) -> list[str]:
                 lines.append(line)
     lines = sorted(set(lines))
     # Global CDXJ order: urlkey timestamp (fields 0 and 1)
-    lines.sort(key=lambda line: (line.split(" ", 2)[0], line.split(" ", 2)[1] if " " in line else ""))
+    lines.sort(
+        key=lambda line: (
+            line.split(" ", 2)[0],
+            line.split(" ", 2)[1] if " " in line else "",
+        )
+    )
     return lines
 
 
@@ -81,7 +84,12 @@ def publish_collection_index(
     *,
     new_warcs: Sequence[Path] | None = None,
 ) -> Optional[IndexArtifact]:
-    """Index missing WARCs, merge the portable collection CDXJ, and publish."""
+    """Index missing WARCs, merge the portable collection CDXJ, and publish.
+
+    Finalized WARC basenames drive incompleteness detection. Optional
+    ``new_warcs`` only ensures those paths are considered if they already
+    sit beside the collection's listed shards.
+    """
 
     collection_id = layout.validate_collection_id(collection_id)
     collection_warcs = list_collection_warcs(layout, collection_id)
@@ -90,27 +98,23 @@ def publish_collection_index(
 
     index_path = layout.collection_index(collection_id)
     known = cdxj_filenames(index_path)
-    missing = [
-        path
-        for path in collection_warcs
-        if path.name not in known
-    ]
+    warc_by_name = {path.name: path for path in collection_warcs}
+    missing_names = {name for name in warc_by_name if name not in known}
     if new_warcs:
         for path in new_warcs:
-            rel = path.name
-            if rel not in known and path not in missing:
-                missing.append(path)
+            if path.name in warc_by_name and path.name not in known:
+                missing_names.add(path.name)
 
     fragments: list[Path] = []
     try:
-        for warc_path in missing:
-            fragments.append(index_warc_fragment(layout, warc_path))
+        for name in sorted(missing_names):
+            fragments.append(index_warc_fragment(layout, warc_by_name[name]))
 
         inputs: list[Path] = []
         if index_path.is_file():
             inputs.append(index_path)
         inputs.extend(fragments)
-        if not inputs and not index_path.is_file():
+        if not inputs:
             for warc_path in collection_warcs:
                 fragments.append(index_warc_fragment(layout, warc_path))
             inputs = list(fragments)
@@ -151,6 +155,7 @@ def validate_cdxj_against_warcs(
 ) -> None:
     """Ensure every CDXJ locator points at an immutable finalized range."""
 
+    warc_names = {path.name for path in list_collection_warcs(layout, collection_id)}
     for line in lines:
         parts = line.split(" ", 2)
         if len(parts) < 3:
@@ -163,9 +168,7 @@ def validate_cdxj_against_warcs(
             raise ValueError("CDXJ entry missing filename")
         if Path(filename).name != filename:
             raise ValueError(f"CDXJ filename must be a WARC basename: {filename}")
-        if filename not in {
-            path.name for path in list_collection_warcs(layout, collection_id)
-        }:
+        if filename not in warc_names:
             raise ValueError(f"CDXJ references foreign WARC: {filename}")
         warc_path = layout.collection_dir(collection_id) / filename
         if not warc_path.is_file():
@@ -200,31 +203,6 @@ def _response_reference_key(
     )
 
 
-def _collect_response_references(
-    layout: ArchiveLayout,
-    *,
-    collection_id: str,
-) -> set[tuple[str, str, str]]:
-    """Collect response references for one portable collection."""
-
-    refs: set[tuple[str, str, str]] = set()
-    for path in list_collection_warcs(layout, collection_id):
-        with path.open("rb") as stream:
-            for record in ArchiveIterator(stream, check_digests=False):
-                if record.rec_type != "response":
-                    record.raw_stream.read()
-                    continue
-                key = _response_reference_key(
-                    record.rec_headers.get_header("WARC-Target-URI") or "",
-                    record.rec_headers.get_header("WARC-Date") or "",
-                    record.rec_headers.get_header("WARC-Payload-Digest") or "",
-                )
-                if key is not None:
-                    refs.add(key)
-                record.raw_stream.read()
-    return refs
-
-
 def validate_collection_revisit_closure(
     layout: ArchiveLayout,
     collection_id: str,
@@ -232,26 +210,30 @@ def validate_collection_revisit_closure(
 ) -> None:
     """Ensure revisits resolve backward within one portable collection.
 
-    Index lines must point only at that collection's WARCs, and a revisit may
-    reference only a full response stored in the same collection. Forward,
-    cross-collection, and orphan references are rejected.
+    A revisit may reference only a full response stored in the same collection.
+    Forward, cross-collection, and orphan references are rejected. CDXJ locators
+    are assumed already checked by ``validate_cdxj_against_warcs``.
     """
 
-    available = _collect_response_references(layout, collection_id=collection_id)
+    del lines  # Locators validated separately; closure is WARC-level.
+    available: set[tuple[str, str, str]] = set()
+    # Collect responses then validate revisits in a second full-collection pass
+    # so cross-shard Refers-To targets are visible regardless of shard order.
+    warcs = list_collection_warcs(layout, collection_id)
+    for path in warcs:
+        with path.open("rb") as stream:
+            for record in ArchiveIterator(stream, check_digests=False):
+                if record.rec_type == "response":
+                    key = _response_reference_key(
+                        record.rec_headers.get_header("WARC-Target-URI") or "",
+                        record.rec_headers.get_header("WARC-Date") or "",
+                        record.rec_headers.get_header("WARC-Payload-Digest") or "",
+                    )
+                    if key is not None:
+                        available.add(key)
+                record.raw_stream.read()
 
-    for line in lines:
-        parts = line.split(" ", 2)
-        meta = json.loads(parts[2])
-        filename = meta.get("filename", "")
-        if filename not in {
-            path.name for path in list_collection_warcs(layout, collection_id)
-        }:
-            raise ValueError(
-                f"collection index for {collection_id} references foreign WARC: {filename}"
-            )
-
-    # Refers-To must exist earlier (or at the same timestamp) in this collection.
-    for path in list_collection_warcs(layout, collection_id):
+    for path in warcs:
         with path.open("rb") as stream:
             for record in ArchiveIterator(stream, check_digests=False):
                 if record.rec_type != "revisit":
@@ -285,50 +267,6 @@ def validate_collection_revisit_closure(
                         f"for digest {payload}"
                     )
                 record.raw_stream.read()
-
-    # Also accept CDXJ-only revisit lines that were not loaded above (defensive
-    # for synthetic tests) by checking their local payload digest appears
-    # somewhere in the backward chain.
-    response_digests = {item[2] for item in available}
-    for line in lines:
-        parts = line.split(" ", 2)
-        meta = json.loads(parts[2])
-        mime = str(meta.get("mime", ""))
-        if "revisit" not in mime and meta.get("mime") != "warc/revisit":
-            continue
-        digest = meta.get("digest")
-        if not isinstance(digest, str) or not digest:
-            raise ValueError(
-                f"collection revisit in {collection_id} is missing a resolvable "
-                f"response digest"
-            )
-        normalized = normalize_payload_digest(digest)
-        if normalized is None or normalized.lower() not in response_digests:
-            raise ValueError(
-                f"collection revisit in {collection_id} has no earlier response "
-                f"for digest {digest}"
-            )
-
-
-def publish_annual_index(
-    layout: ArchiveLayout,
-    year: int,
-    *,
-    new_warcs: Sequence[Path] | None = None,
-) -> Optional[IndexArtifact]:
-    """Year-strategy adapter for generic collection publication."""
-
-    return publish_collection_index(
-        layout, f"{year:04d}", new_warcs=new_warcs
-    )
-
-
-def validate_annual_revisit_closure(
-    layout: ArchiveLayout, year: int, lines: Sequence[str]
-) -> None:
-    """Year-strategy adapter for generic revisit validation."""
-
-    validate_collection_revisit_closure(layout, f"{year:04d}", lines)
 
 
 def reconcile_missing_indexes(layout: ArchiveLayout) -> list[str]:

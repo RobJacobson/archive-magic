@@ -37,11 +37,11 @@ class ArchiveLayout:
     """Filesystem boundaries for one domain archive and its collections."""
 
     archives_root: Path
-    collection_id: str
+    archive_id: str
 
     @property
     def root(self) -> Path:
-        return self.archives_root / self.collection_id
+        return self.archives_root / self.archive_id
 
     @property
     def collections_root(self) -> Path:
@@ -60,6 +60,11 @@ class ArchiveLayout:
             raise ValueError(f"unsafe collection ID: {collection_id!r}")
         return collection_id
 
+    def validate_run_id(self, run_id: str) -> str:
+        if not _COLLECTION_ID.fullmatch(run_id) or run_id in {".", ".."}:
+            raise ValueError(f"unsafe run ID: {run_id!r}")
+        return run_id
+
     def collection_dir(self, collection_id: str) -> Path:
         return self.collections_root / self.validate_collection_id(collection_id)
 
@@ -67,31 +72,17 @@ class ArchiveLayout:
         return self.captures_root / self.validate_collection_id(collection_id)
 
     def run_dir(self, collection_id: str, run_id: str) -> Path:
-        if not _COLLECTION_ID.fullmatch(run_id):
-            raise ValueError(f"unsafe run ID: {run_id!r}")
-        return self.capture_dir(collection_id) / "runs" / run_id
+        return self.capture_dir(collection_id) / "runs" / self.validate_run_id(run_id)
 
     def run_record(self, collection_id: str, run_id: str) -> Path:
         return self.run_dir(collection_id, run_id) / "run.json"
 
-    def year_dir(self, year: int) -> Path:
-        return self.collection_dir(f"{year:04d}")
-
-    def annual_index_filename(self, year: int) -> str:
-        return self.index_filename(f"{year:04d}")
-
     def index_filename(self, collection_id: str) -> str:
         collection_id = self.validate_collection_id(collection_id)
-        return f"{self.collection_id}-{collection_id}-index.cdxj"
-
-    def annual_index(self, year: int) -> Path:
-        return self.collection_index(f"{year:04d}")
+        return f"{self.archive_id}-{collection_id}-index.cdxj"
 
     def collection_index(self, collection_id: str) -> Path:
         return self.collection_dir(collection_id) / self.index_filename(collection_id)
-
-    def warc_filename(self, year: int, sequence: int) -> str:
-        return self.collection_warc_filename(f"{year:04d}", sequence)
 
     def collection_warc_filename(self, collection_id: str, sequence: int) -> str:
         collection_id = self.validate_collection_id(collection_id)
@@ -99,21 +90,12 @@ class ArchiveLayout:
             raise ValueError(
                 f"WARC sequence must be 001-999, got {sequence}"
             )
-        return f"{self.collection_id}-{collection_id}-{sequence:03d}.warc.gz"
-
-    def warc_relative_key(self, year: int, sequence: int) -> str:
-        return self.warc_filename(year, sequence)
-
-    def warc_path(self, year: int, sequence: int) -> Path:
-        return self.year_dir(year) / self.warc_filename(year, sequence)
+        return f"{self.archive_id}-{collection_id}-{sequence:03d}.warc.gz"
 
     def collection_warc_path(self, collection_id: str, sequence: int) -> Path:
         return self.collection_dir(collection_id) / self.collection_warc_filename(
             collection_id, sequence
         )
-
-    def annual_index_relative_key(self, year: int) -> str:
-        return self.annual_index_filename(year)
 
 
 def normalize_domain(
@@ -305,7 +287,7 @@ def list_collection_warcs(
         return []
     found: list[tuple[int, Path]] = []
     pattern = re.compile(
-        rf"{re.escape(layout.collection_id)}-{re.escape(collection_id)}-"
+        rf"{re.escape(layout.archive_id)}-{re.escape(collection_id)}-"
         r"(?P<seq>\d{3})\.warc\.gz"
     )
     for path in collection_dir.iterdir():
@@ -319,44 +301,6 @@ def list_collection_warcs(
     return [path for _, path in found]
 
 
-def list_year_warcs(layout: ArchiveLayout, year: int) -> list[Path]:
-    """Return finalized WARCs for the current year-based grouping strategy."""
-
-    return list_collection_warcs(layout, f"{year:04d}")
-
-
-def list_annual_indexes(layout: ArchiveLayout) -> list[tuple[int, Path]]:
-    """Return yearly collection indexes, sorted by year."""
-
-    if not layout.collections_root.is_dir():
-        return []
-    found: list[tuple[int, Path]] = []
-    for year_dir in sorted(layout.collections_root.iterdir()):
-        if not year_dir.is_dir() or not year_dir.name.isdigit():
-            continue
-        year = int(year_dir.name)
-        path = layout.annual_index(year)
-        if path.is_file():
-            found.append((year, path))
-    return found
-
-
-def list_all_warcs(layout: ArchiveLayout) -> list[Path]:
-    """Return every finalized WARC in the collection, sorted by key."""
-
-    if not layout.collections_root.is_dir():
-        return []
-    warcs = [
-        path
-        for path in layout.collections_root.rglob("*.warc.gz")
-        if path.is_file() and not path.name.startswith(".tmp-")
-    ]
-    return sorted(
-        warcs,
-        key=lambda p: p.relative_to(layout.root).as_posix(),
-    )
-
-
 def next_collection_warc_sequence(
     layout: ArchiveLayout, collection_id: str
 ) -> int:
@@ -368,7 +312,7 @@ def next_collection_warc_sequence(
         return 1
     last = existing[-1].name
     pattern = re.compile(
-        rf"{re.escape(layout.collection_id)}-{re.escape(collection_id)}-"
+        rf"{re.escape(layout.archive_id)}-{re.escape(collection_id)}-"
         r"(?P<seq>\d{3})\.warc\.gz"
     )
     match = pattern.fullmatch(last)
@@ -376,14 +320,10 @@ def next_collection_warc_sequence(
     nxt = int(match.group("seq")) + 1
     if nxt > 999:
         raise RuntimeError(
-            f"WARC sequence would exceed 999 for {layout.collection_id} "
+            f"WARC sequence would exceed 999 for {layout.archive_id} "
             f"collection {collection_id}; refusing to create shard 1000"
         )
     return nxt
-
-
-def next_warc_sequence(layout: ArchiveLayout, year: int) -> int:
-    return next_collection_warc_sequence(layout, f"{year:04d}")
 
 
 def warc_artifact_from_path(
@@ -399,7 +339,7 @@ def warc_artifact_from_path(
     layout.validate_collection_id(collection_id)
     expected_parent = layout.collection_dir(collection_id)
     pattern = re.compile(
-        rf"{re.escape(layout.collection_id)}-{re.escape(collection_id)}-"
+        rf"{re.escape(layout.archive_id)}-{re.escape(collection_id)}-"
         r"(?P<seq>\d{3})\.warc\.gz"
     )
     match = pattern.fullmatch(path.name)
@@ -460,7 +400,7 @@ def write_run_record(
     payload = {
         "schema_version": RUN_SCHEMA_VERSION,
         "run_id": run_id,
-        "archive_id": layout.collection_id,
+        "archive_id": layout.archive_id,
         "collection_id": collection_id,
         "url_pattern": url_pattern,
         "date_start": date_start,

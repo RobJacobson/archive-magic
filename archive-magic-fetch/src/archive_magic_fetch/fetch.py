@@ -6,7 +6,6 @@ import os
 import sys
 import time
 from dataclasses import dataclass
-from email.utils import mktime_tz, parsedate_tz
 from pathlib import Path
 from typing import Callable, Optional, Sequence
 
@@ -48,6 +47,7 @@ from .models import (
     is_invalid_uri_payload_digest,
     wayback_url,
 )
+from .retry import parse_retry_after
 from .warc import (
     CollectionInventory,
     CollectionWarcWriter,
@@ -201,7 +201,7 @@ def _run_fetch(
 
     years = years_in_range(settings.date_start, settings.date_end)
     print(
-        f"archive {layout.collection_id}: collections {years[0]}-{years[-1]}",
+        f"archive {layout.archive_id}: collections {years[0]}-{years[-1]}",
         flush=True,
     )
     print("playback policy: serial, three attempts maximum", flush=True)
@@ -309,8 +309,9 @@ def _run_fetch(
             )
             year_metrics.index_s += time.monotonic() - idx_started
 
-        # Ensure the portable index exists even if this run wrote no new WARC.
-        if list_collection_warcs(layout, collection_id):
+        # Index may still be missing when this run wrote nothing but prior
+        # finalized WARCs exist (all local reuses / reconciliation lag).
+        if collection_index is None and list_collection_warcs(layout, collection_id):
             idx_started = time.monotonic()
             collection_index = publish_collection_index(layout, collection_id)
             year_metrics.index_s += time.monotonic() - idx_started
@@ -522,25 +523,10 @@ def _retry_after_from_error(error: BaseException) -> float | None:
         headers = getattr(response, "headers", None) or {}
         values.append(headers.get("Retry-After") or headers.get("retry-after"))
         for value in values:
-            parsed = _parse_retry_after(value)
+            parsed = parse_retry_after(value)
             if parsed is not None and parsed > 0:
                 return parsed
     return None
-
-
-def _parse_retry_after(value: object) -> float | None:
-    if isinstance(value, (int, float)):
-        return float(value) if value > 0 else None
-    if not isinstance(value, str):
-        return None
-    try:
-        seconds = float(value)
-    except ValueError:
-        retry_date = parsedate_tz(value)
-        if retry_date is None:
-            return None
-        seconds = float(mktime_tz(retry_date) - time.time())
-    return seconds if seconds > 0 else None
 
 
 def _dedupe_captures(

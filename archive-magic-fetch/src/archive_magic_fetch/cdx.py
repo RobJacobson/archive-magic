@@ -11,7 +11,6 @@ import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from email.utils import mktime_tz, parsedate_tz
 from pathlib import Path
 from typing import Callable, Literal, Optional
 from urllib.parse import urlencode
@@ -39,6 +38,7 @@ from .models import (
     timestamp_year,
 )
 from .collection import normalize_domain
+from .retry import parse_retry_after
 
 
 # Standard CDX field order used by IA and wayback.
@@ -90,7 +90,7 @@ class ArchiveMagicWaybackSession(WaybackSession):
         kwargs["stream"] = True
         response = super().send(request, **kwargs)
         if getattr(response, "status_code", None) == 429:
-            delay = _parse_retry_after(response.headers.get("Retry-After"))
+            delay = parse_retry_after(response.headers.get("Retry-After"))
             read_and_close(response)
             raise RateLimitError(response, delay)
         repair_false_gzip_content_encoding(response)
@@ -318,18 +318,6 @@ def _wayback_version() -> str:
         return importlib.metadata.version("wayback")
     except importlib.metadata.PackageNotFoundError:
         return "unknown"
-
-
-def _parse_retry_after(value: object) -> Optional[float]:
-    if not isinstance(value, str):
-        return None
-    try:
-        return float(max(0, int(value)))
-    except ValueError:
-        retry_date = parsedate_tz(value)
-        if retry_date is None:
-            return None
-        return float(max(0, mktime_tz(retry_date) - int(time.time())))
 
 
 @dataclass(frozen=True)
@@ -564,7 +552,7 @@ def _get_cdx_entity_bytes(
         try:
             response = session.get(url, stream=True, timeout=120)
             if response.status_code == 429:
-                delay = _parse_retry_after(
+                delay = parse_retry_after(
                     response.headers.get("Retry-After")
                 ) or 60.0
                 response.close()
@@ -777,7 +765,7 @@ def init_run_id(layout: ArchiveLayout, run_id: str | None = None) -> str:
 
     ensure_collection_dirs(layout)
     if run_id is not None:
-        layout.validate_collection_id(run_id)
+        layout.validate_run_id(run_id)
         if any(layout.captures_root.glob(f"*/runs/{run_id}")):
             raise FileExistsError(f"run ID already exists: {run_id}")
         return run_id

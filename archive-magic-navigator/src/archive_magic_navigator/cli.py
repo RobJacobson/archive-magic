@@ -73,7 +73,7 @@ def parse_args(
         type=Path,
         default=Path("./archives"),
         metavar="PATH",
-        help="Archive Magic collections root (default: ./archives)",
+        help="domain archives root (default: ./archives)",
     )
     parser.add_argument(
         "--bind",

@@ -235,15 +235,6 @@ def inventory_collection(
     return inv
 
 
-AnnualInventory = CollectionInventory
-
-
-def inventory_year(layout: ArchiveLayout, year: int) -> CollectionInventory:
-    """Year-strategy adapter for generic collection inventory."""
-
-    return inventory_collection(layout, f"{year:04d}")
-
-
 def _is_unusable_playback_body(
     body: bytes, *, status_code: int
 ) -> str | None:
@@ -622,18 +613,6 @@ class CollectionWarcWriter:
         self.temp_path = None
         self.record_count = 0
         self.sequence += 1
-
-
-class YearWarcWriter(CollectionWarcWriter):
-    """Year-strategy adapter for the generic portable collection writer."""
-
-    def __init__(
-        self,
-        layout: ArchiveLayout,
-        year: int,
-        target_bytes: int = WARC_TARGET_BYTES,
-    ) -> None:
-        super().__init__(layout, f"{year:04d}", target_bytes=target_bytes)
 
 
 def validate_warc(path: Path) -> None:
