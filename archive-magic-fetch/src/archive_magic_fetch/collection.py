@@ -189,6 +189,24 @@ def collection_layout(
     return CollectionLayout(root, normalize_collection_id(url_pattern))
 
 
+def require_current_collection_schema(layout: CollectionLayout) -> None:
+    """Reject an existing manifest from an incompatible Fetch collection."""
+
+    if not layout.manifest_path.is_file():
+        return
+    try:
+        schema = json.loads(layout.manifest_path.read_text(encoding="utf-8")).get(
+            "schema_version"
+        )
+    except (OSError, ValueError, AttributeError) as error:
+        raise ValueError("existing collection manifest is unreadable") from error
+    if schema != COLLECTION_SCHEMA_VERSION:
+        raise ValueError(
+            f"existing collection schema {schema!r} is unsupported; "
+            "delete and regenerate the collection"
+        )
+
+
 def ensure_collection_dirs(layout: CollectionLayout) -> None:
     """Create permanent and work directories for a collection."""
 
@@ -483,12 +501,8 @@ def write_manifest(
         "metrics": {
             "cdx_requests": metrics.cdx_requests,
             "cdx_duration_s": round(metrics.cdx_duration_s, 3),
-            "playback_starts": metrics.playback_starts,
-            "playback_completions": metrics.playback_completions,
+            "playback_attempts": metrics.playback_attempts,
             "playback_bytes": metrics.playback_bytes,
-            "peak_connections": metrics.peak_connections,
-            "rate_gate_wait_s": round(metrics.rate_gate_wait_s, 3),
-            "cooldown_wait_s": round(metrics.cooldown_wait_s, 3),
             "warc_write_s": round(metrics.warc_write_s, 3),
             "index_s": round(metrics.index_s, 3),
             "attempts_by_category": dict(
@@ -529,5 +543,3 @@ def write_manifest(
     tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
     publish_file_atomically(tmp, layout.manifest_path)
     return layout.manifest_path
-
-

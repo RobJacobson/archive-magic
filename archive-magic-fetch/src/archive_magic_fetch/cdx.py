@@ -17,7 +17,6 @@ from typing import Callable, Literal, Optional
 from urllib.parse import urlencode
 
 import requests
-from requests.adapters import HTTPAdapter
 from wayback import WaybackClient, WaybackSession
 from wayback._client import read_and_close
 from wayback.exceptions import RateLimitError, WaybackRetryError
@@ -64,13 +63,13 @@ _GZIP_MAGIC = b"\x1f\x8b"
 class ArchiveMagicWaybackSession(WaybackSession):
     """Wayback session tuned for Archive Magic fetch.
 
-    Playback clients keep ``retries=0`` so the scheduler owns backoff. CDX
-    queries opt into library retries for transient connect failures.
+    Library retries stay disabled so Fetch owns its small synchronous retry
+    loops and request volume remains explicit.
 
     Wayback treats any response with ``Memento-Datetime`` as a successful
     memento, which can let HTTP 429 slip through as a playback error with no
-    ``retry_after``. Always surface 429 as ``RateLimitError`` with the
-    session's recommended delay (header or wayback's 60s default).
+    ``retry_after``. Always surface 429 as ``RateLimitError`` and carry an
+    explicit `Retry-After` value when IA supplied one.
 
     Some memento responses also advertise ``Content-Encoding: gzip`` while the
     transfer body is already plaintext (for example HTML starting with
@@ -91,7 +90,7 @@ class ArchiveMagicWaybackSession(WaybackSession):
         kwargs["stream"] = True
         response = super().send(request, **kwargs)
         if getattr(response, "status_code", None) == 429:
-            delay = self.get_retry_delay(0, response)
+            delay = _parse_retry_after(response.headers.get("Retry-After"))
             read_and_close(response)
             raise RateLimitError(response, delay)
         repair_false_gzip_content_encoding(response)
@@ -116,9 +115,7 @@ def repair_false_gzip_content_encoding(response: requests.Response) -> None:
     here. After repair, ``Content-Encoding`` is removed and ``response.content``
     is the logical payload (decompressed when the body was real gzip).
 
-    False-gzip responses are marked with ``_archive_magic_false_gzip``. Under
-    the default permissive digest policy, mismatched bodies are kept for that
-    capture only; ``--strict-digests`` rejects them as unavailable.
+    Mismatched usable bodies are kept for that capture only.
     """
 
     headers = getattr(response, "headers", None)
@@ -141,7 +138,6 @@ def repair_false_gzip_content_encoding(response: requests.Response) -> None:
     if hasattr(raw_stream, "decode_content"):
         raw_stream.decode_content = False
     raw = raw_stream.read()
-    false_gzip = False
     if raw.startswith(_GZIP_MAGIC):
         try:
             body = gzip.decompress(raw)
@@ -150,11 +146,9 @@ def repair_false_gzip_content_encoding(response: requests.Response) -> None:
             body = raw
     else:
         # False Content-Encoding: IA claimed gzip but sent plaintext. Keep the
-        # bytes so digest validation can accept the rare authentic cases; most
-        # of these bodies do not match the CDX digest and are rejected later as
-        # unavailable rather than stored under a false digest-validation label.
+        # bytes so the caller can compare them with the CDX digest and retain
+        # the response without treating it as reusable when they disagree.
         body = raw
-        false_gzip = True
 
     # Body is now the logical entity; drop the misleading transfer coding.
     try:
@@ -163,34 +157,12 @@ def repair_false_gzip_content_encoding(response: requests.Response) -> None:
         pass
     response._content = body
     response._content_consumed = True
-    if false_gzip:
-        setattr(response, "_archive_magic_false_gzip", True)
 
 
-def configure_session_pool(
-    session: ArchiveMagicWaybackSession,
-    *,
-    max_connections: int = 1,
-) -> None:
-    """Cap urllib3 pool size so a session cannot open extra sockets silently."""
+def make_client() -> WaybackClient:
+    """Return the persistent client used for serial playback."""
 
-    if max_connections < 1:
-        raise ValueError("max_connections must be at least 1")
-    adapter = HTTPAdapter(
-        pool_connections=max_connections,
-        pool_maxsize=max_connections,
-        max_retries=0,
-    )
-    session.mount("https://", adapter)
-    session.mount("http://", adapter)
-
-
-def make_client(*, max_connections: int = 1) -> WaybackClient:
-    """Return a Wayback client with an explicit per-session connection pool."""
-
-    session = ArchiveMagicWaybackSession(user_agent=USER_AGENT)
-    configure_session_pool(session, max_connections=max_connections)
-    return WaybackClient(session=session)
+    return WaybackClient(session=ArchiveMagicWaybackSession(user_agent=USER_AGENT))
 
 
 def make_cdx_session() -> ArchiveMagicWaybackSession:

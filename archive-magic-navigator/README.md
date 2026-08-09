@@ -84,10 +84,8 @@ Fetch publishes annual size-bounded WARC shards under `archive/YYYY/` with a
 per-year `{collection_id}-YYYY.cdxj` beside them. The collection-wide replay
 index is `index.cdxj` at the collection root.
 Navigator follows the collection-relative path in each replay entry's `filename`.
-Years build on earlier years: a revisit in a later year may load a full response
-from an earlier annual WARC. Open a complete collection (or leave all required
-prior-year shards in place) before replaying; do not redistribute a single year
-as a standalone package.
+Each annual set is self-contained: revisits may cross WARC shards within a year
+but never depend on another year.
 
 Collection directory names also become browser routes. They must start with an
 ASCII letter or digit, contain only ASCII letters, digits, `.`, `_`, or `-`,

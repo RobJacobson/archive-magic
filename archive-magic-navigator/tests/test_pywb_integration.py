@@ -308,8 +308,6 @@ def test_real_pywb_replays_versions_revisit_and_subresources_read_only(
         thread.join(timeout=2)
 
     assert snapshot_tree(archives) == before
-
-
 @pytest.mark.integration
 def test_real_pywb_uses_wayback_fallback_for_redirect_and_assets(
     tmp_path,
@@ -567,126 +565,6 @@ def test_real_pywb_replays_same_year_revisit_across_annual_warc_shards(
             base + "/annual/20200701000000id_/http://example.org/"
         )
         assert b"Annual shard body" in original
-        assert revisited == original
-
-    assert snapshot_tree(archives) == before
-
-
-@pytest.mark.integration
-def test_real_pywb_replays_backward_cross_year_revisit(tmp_path):
-    """Full response in archive/2004 and revisit in archive/2005 must replay."""
-
-    from io import BytesIO
-
-    from warcio.statusandheaders import StatusAndHeaders
-    from warcio.warcwriter import WARCWriter
-
-    archives = tmp_path / "archives"
-    root = archives / "crossyear"
-    archive = root / "archive"
-    (archive / "2004").mkdir(parents=True)
-    (archive / "2005").mkdir(parents=True)
-
-    url = "http://example.org/"
-    body = b"<!doctype html><html><body>Cross year body</body></html>"
-    headers = StatusAndHeaders(
-        "200 OK",
-        [("Content-Type", "text/html; charset=utf-8")],
-        protocol="HTTP/1.1",
-    )
-    entries = []
-
-    warc2004 = archive / "2004" / "example.org-2004-001.warc.gz"
-    with warc2004.open("wb") as stream:
-        writer = WARCWriter(stream, gzip=True, warc_version="1.1")
-        record = writer.create_warc_record(
-            url,
-            "response",
-            payload=BytesIO(body),
-            http_headers=headers,
-            warc_headers_dict={
-                "WARC-Date": "2004-06-01T00:00:00Z",
-                "CDX-Payload-Digest": "sha1:PLACEHOLDER",
-                "CDX-Status": "200",
-                "CDX-Urlkey": "org,example)/",
-            },
-        )
-        start = stream.tell()
-        writer.write_record(record)
-        length = stream.tell() - start
-        digest = record.rec_headers.get_header("WARC-Payload-Digest")
-        entries.append(
-            (
-                "org,example)/",
-                "20040601000000",
-                {
-                    "url": url,
-                    "mime": "text/html",
-                    "status": "200",
-                    "digest": digest,
-                    "filename": "archive/2004/example.org-2004-001.warc.gz",
-                    "offset": str(start),
-                    "length": str(length),
-                },
-            )
-        )
-
-    warc2005 = archive / "2005" / "example.org-2005-001.warc.gz"
-    with warc2005.open("wb") as stream:
-        writer = WARCWriter(stream, gzip=True, warc_version="1.1")
-        revisit = writer.create_revisit_record(
-            url,
-            digest,
-            url,
-            "2004-06-01T00:00:00Z",
-            http_headers=headers,
-            warc_headers_dict={
-                "WARC-Date": "2005-06-01T00:00:00Z",
-                "CDX-Payload-Digest": digest,
-                "CDX-Status": "200",
-                "CDX-Urlkey": "org,example)/",
-            },
-        )
-        start = stream.tell()
-        writer.write_record(revisit)
-        length = stream.tell() - start
-        entries.append(
-            (
-                "org,example)/",
-                "20050601000000",
-                {
-                    "url": url,
-                    "mime": "warc/revisit",
-                    "status": "200",
-                    "digest": digest,
-                    "filename": "archive/2005/example.org-2005-001.warc.gz",
-                    "offset": str(start),
-                    "length": str(length),
-                },
-            )
-        )
-
-    entries.sort(key=lambda item: (item[0], item[1]))
-    (root / "index.cdxj").write_text(
-        "".join(
-            f"{key} {ts} {json.dumps(meta, separators=(',', ':'), sort_keys=True)}\n"
-            for key, ts, meta in entries
-        ),
-        encoding="utf-8",
-    )
-
-    collection = Collection("crossyear", root.resolve())
-    assert validate_collection(collection).record_count == 2
-    before = snapshot_tree(archives)
-
-    with pywb_server(tmp_path, [collection]) as base:
-        _, original, _ = get(
-            base + "/crossyear/20040601000000id_/http://example.org/"
-        )
-        _, revisited, _ = get(
-            base + "/crossyear/20050601000000id_/http://example.org/"
-        )
-        assert b"Cross year body" in original
         assert revisited == original
 
     assert snapshot_tree(archives) == before

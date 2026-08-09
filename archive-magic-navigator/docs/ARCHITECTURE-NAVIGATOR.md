@@ -243,15 +243,13 @@ Fetch guarantees that:
 - `filename` is relative to the collection root;
 - offsets and lengths address independently compressed WARC members;
 - response and revisit records are indexed;
-- revisits may reference full responses in the same year or an earlier year
-  under other `archive/YYYY/` paths; and
+- revisits may reference full responses only within the same annual
+  `archive/YYYY/` set; and
 - completed WARC files and the CDXJ file are each published with atomic
   replacement.
 
-Playback therefore requires the full collection chain, not a single annual
-slice of WARCs. Annual `archive/YYYY/{collection_id}-YYYY.cdxj` files remain
-helpful for recovery but are not independently portable when revisits cross
-year boundaries.
+An annual `archive/YYYY/{collection_id}-YYYY.cdxj` and all WARC shards in that
+directory therefore form an independently replayable annual set.
 
 ### 4.1 Required preflight
 

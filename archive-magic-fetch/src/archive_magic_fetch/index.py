@@ -224,18 +224,12 @@ def _response_reference_key(
 def _collect_response_references(
     layout: CollectionLayout,
     *,
-    through_year: int,
+    year: int,
 ) -> set[tuple[str, str, str]]:
-    """Collect full-response (uri, date, local digest) tuples through one year."""
+    """Collect full-response (uri, date, local digest) tuples for one year."""
 
     refs: set[tuple[str, str, str]] = set()
-    for path in list_all_warcs(layout):
-        try:
-            year = int(path.parts[path.parts.index("archive") + 1])
-        except (ValueError, IndexError):
-            continue
-        if year > through_year:
-            continue
+    for path in list_year_warcs(layout, year):
         with path.open("rb") as stream:
             for record in ArchiveIterator(stream, check_digests=False):
                 if record.rec_type != "response":
@@ -257,15 +251,15 @@ def validate_annual_revisit_closure(
     year: int,
     lines: Sequence[str],
 ) -> None:
-    """Ensure revisits resolve backward along the collection chain.
+    """Ensure revisits resolve backward within one annual WARC set.
 
     Annual CDXJ lines must still point only at that year's WARC files, but a
-    revisit may reference a full response stored in the current year or any
-    earlier year. Forward references and orphans are rejected.
+    revisit may reference only a full response stored in the current year.
+    Forward references, cross-year references, and orphans are rejected.
     """
 
     year_prefix = f"archive/{year:04d}/"
-    available = _collect_response_references(layout, through_year=year)
+    available = _collect_response_references(layout, year=year)
 
     for line in lines:
         parts = line.split(" ", 2)
@@ -277,7 +271,7 @@ def validate_annual_revisit_closure(
             )
 
     # Validate WARC revisit records themselves: Refers-To must exist earlier
-    # (or equal timestamp) among response records in years <= this year.
+    # (or at the same timestamp) among this year's full response records.
     for path in list_year_warcs(layout, year):
         with path.open("rb") as stream:
             for record in ArchiveIterator(stream, check_digests=False):
