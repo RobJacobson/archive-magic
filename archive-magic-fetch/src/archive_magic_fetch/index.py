@@ -1,4 +1,4 @@
-"""Annual and collection CDXJ construction and validation."""
+"""Portable collection CDXJ construction and validation."""
 
 from __future__ import annotations
 
@@ -12,19 +12,17 @@ from cdxj_indexer.main import CDXJIndexer
 from warcio.archiveiterator import ArchiveIterator
 
 from .collection import (
-    CollectionLayout,
+    ArchiveLayout,
     exclusive_temp_path,
     index_artifact_from_path,
-    list_all_warcs,
-    list_annual_indexes,
-    list_year_warcs,
+    list_collection_warcs,
     publish_file_atomically,
 )
 from .models import IndexArtifact, normalize_original_url, normalize_payload_digest
 
 
 def index_warc_fragment(
-    layout: CollectionLayout,
+    layout: ArchiveLayout,
     warc_path: Path,
 ) -> Path:
     """Build a sorted temporary CDXJ fragment for one finalized WARC."""
@@ -37,7 +35,7 @@ def index_warc_fragment(
         inputs=[str(warc_path)],
         sort=True,
         records="response,revisit",
-        dir_root=str(layout.root),
+        dir_root=str(warc_path.parent),
     ).process_all()
     return tmp
 
@@ -77,28 +75,29 @@ def merge_cdxj_lines(paths: Sequence[Path]) -> list[str]:
     return lines
 
 
-def publish_annual_index(
-    layout: CollectionLayout,
-    year: int,
+def publish_collection_index(
+    layout: ArchiveLayout,
+    collection_id: str,
     *,
     new_warcs: Sequence[Path] | None = None,
 ) -> Optional[IndexArtifact]:
-    """Index missing year WARCs, merge into annual CDXJ, validate, publish."""
+    """Index missing WARCs, merge the portable collection CDXJ, and publish."""
 
-    year_warcs = list_year_warcs(layout, year)
-    if not year_warcs:
+    collection_id = layout.validate_collection_id(collection_id)
+    collection_warcs = list_collection_warcs(layout, collection_id)
+    if not collection_warcs:
         return None
 
-    annual_path = layout.annual_index(year)
-    known = cdxj_filenames(annual_path)
+    index_path = layout.collection_index(collection_id)
+    known = cdxj_filenames(index_path)
     missing = [
         path
-        for path in year_warcs
-        if path.relative_to(layout.root).as_posix() not in known
+        for path in collection_warcs
+        if path.name not in known
     ]
     if new_warcs:
         for path in new_warcs:
-            rel = path.relative_to(layout.root).as_posix()
+            rel = path.name
             if rel not in known and path not in missing:
                 missing.append(path)
 
@@ -108,38 +107,36 @@ def publish_annual_index(
             fragments.append(index_warc_fragment(layout, warc_path))
 
         inputs: list[Path] = []
-        if annual_path.is_file():
-            inputs.append(annual_path)
+        if index_path.is_file():
+            inputs.append(index_path)
         inputs.extend(fragments)
-        if not inputs and not annual_path.is_file():
-            # Index whole year from scratch.
-            for warc_path in year_warcs:
+        if not inputs and not index_path.is_file():
+            for warc_path in collection_warcs:
                 fragments.append(index_warc_fragment(layout, warc_path))
             inputs = list(fragments)
 
         lines = merge_cdxj_lines(inputs)
-        if not lines and year_warcs:
-            # Fallback: reindex all year WARCs.
+        if not lines and collection_warcs:
             for path in fragments:
                 path.unlink(missing_ok=True)
             fragments = [
                 index_warc_fragment(layout, warc_path)
-                for warc_path in year_warcs
+                for warc_path in collection_warcs
             ]
             lines = merge_cdxj_lines(fragments)
 
-        validate_cdxj_against_warcs(layout, lines)
-        validate_annual_revisit_closure(layout, year, lines)
+        validate_cdxj_against_warcs(layout, collection_id, lines)
+        validate_collection_revisit_closure(layout, collection_id, lines)
 
         tmp = exclusive_temp_path(
             layout.work_root,
-            suffix=f".{year}.cdxj.tmp",
+            suffix=f".{collection_id}.cdxj.tmp",
         )
         tmp.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
-        publish_file_atomically(tmp, annual_path)
+        publish_file_atomically(tmp, index_path)
         return index_artifact_from_path(
             layout,
-            annual_path,
+            index_path,
             capture_count=len(lines),
         )
     finally:
@@ -147,31 +144,9 @@ def publish_annual_index(
             path.unlink(missing_ok=True)
 
 
-def publish_collection_index(layout: CollectionLayout) -> Optional[IndexArtifact]:
-    """Merge all annual indexes into a globally sorted collection CDXJ."""
-
-    annuals = [path for _, path in list_annual_indexes(layout)]
-    if not annuals:
-        layout.collection_index.unlink(missing_ok=True)
-        return None
-
-    lines = merge_cdxj_lines(annuals)
-    validate_cdxj_against_warcs(layout, lines)
-    tmp = exclusive_temp_path(
-        layout.work_root,
-        suffix=".index.cdxj.tmp",
-    )
-    tmp.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
-    publish_file_atomically(tmp, layout.collection_index)
-    return index_artifact_from_path(
-        layout,
-        layout.collection_index,
-        capture_count=len(lines),
-    )
-
-
 def validate_cdxj_against_warcs(
-    layout: CollectionLayout,
+    layout: ArchiveLayout,
+    collection_id: str,
     lines: Sequence[str],
 ) -> None:
     """Ensure every CDXJ locator points at an immutable finalized range."""
@@ -186,9 +161,13 @@ def validate_cdxj_against_warcs(
         length = meta.get("length")
         if not isinstance(filename, str):
             raise ValueError("CDXJ entry missing filename")
-        if filename.startswith("/") or ".." in filename.split("/"):
-            raise ValueError(f"CDXJ filename must be collection-relative: {filename}")
-        warc_path = layout.root / filename
+        if Path(filename).name != filename:
+            raise ValueError(f"CDXJ filename must be a WARC basename: {filename}")
+        if filename not in {
+            path.name for path in list_collection_warcs(layout, collection_id)
+        }:
+            raise ValueError(f"CDXJ references foreign WARC: {filename}")
+        warc_path = layout.collection_dir(collection_id) / filename
         if not warc_path.is_file():
             raise ValueError(f"CDXJ references missing WARC: {filename}")
         size = warc_path.stat().st_size
@@ -222,14 +201,14 @@ def _response_reference_key(
 
 
 def _collect_response_references(
-    layout: CollectionLayout,
+    layout: ArchiveLayout,
     *,
-    year: int,
+    collection_id: str,
 ) -> set[tuple[str, str, str]]:
-    """Collect full-response (uri, date, local digest) tuples for one year."""
+    """Collect response references for one portable collection."""
 
     refs: set[tuple[str, str, str]] = set()
-    for path in list_year_warcs(layout, year):
+    for path in list_collection_warcs(layout, collection_id):
         with path.open("rb") as stream:
             for record in ArchiveIterator(stream, check_digests=False):
                 if record.rec_type != "response":
@@ -246,33 +225,33 @@ def _collect_response_references(
     return refs
 
 
-def validate_annual_revisit_closure(
-    layout: CollectionLayout,
-    year: int,
+def validate_collection_revisit_closure(
+    layout: ArchiveLayout,
+    collection_id: str,
     lines: Sequence[str],
 ) -> None:
-    """Ensure revisits resolve backward within one annual WARC set.
+    """Ensure revisits resolve backward within one portable collection.
 
-    Annual CDXJ lines must still point only at that year's WARC files, but a
-    revisit may reference only a full response stored in the current year.
-    Forward references, cross-year references, and orphans are rejected.
+    Index lines must point only at that collection's WARCs, and a revisit may
+    reference only a full response stored in the same collection. Forward,
+    cross-collection, and orphan references are rejected.
     """
 
-    year_prefix = f"archive/{year:04d}/"
-    available = _collect_response_references(layout, year=year)
+    available = _collect_response_references(layout, collection_id=collection_id)
 
     for line in lines:
         parts = line.split(" ", 2)
         meta = json.loads(parts[2])
         filename = meta.get("filename", "")
-        if not str(filename).startswith(year_prefix):
+        if filename not in {
+            path.name for path in list_collection_warcs(layout, collection_id)
+        }:
             raise ValueError(
-                f"annual index for {year} references other year path: {filename}"
+                f"collection index for {collection_id} references foreign WARC: {filename}"
             )
 
-    # Validate WARC revisit records themselves: Refers-To must exist earlier
-    # (or at the same timestamp) among this year's full response records.
-    for path in list_year_warcs(layout, year):
+    # Refers-To must exist earlier (or at the same timestamp) in this collection.
+    for path in list_collection_warcs(layout, collection_id):
         with path.open("rb") as stream:
             for record in ArchiveIterator(stream, check_digests=False):
                 if record.rec_type != "revisit":
@@ -292,17 +271,17 @@ def validate_annual_revisit_closure(
                 key = _response_reference_key(refers_uri, refers_date, payload)
                 if key is None:
                     raise ValueError(
-                        f"annual revisit in {year} is missing a resolvable "
+                        f"collection revisit in {collection_id} is missing a resolvable "
                         f"response reference"
                     )
                 if refers_date > revisit_date:
                     raise ValueError(
-                        f"annual revisit in {year} has forward reference "
+                        f"collection revisit in {collection_id} has forward reference "
                         f"from {revisit_date} to {refers_date}"
                     )
                 if key not in available:
                     raise ValueError(
-                        f"annual revisit in {year} has no earlier response "
+                        f"collection revisit in {collection_id} has no earlier response "
                         f"for digest {payload}"
                     )
                 record.raw_stream.read()
@@ -320,31 +299,52 @@ def validate_annual_revisit_closure(
         digest = meta.get("digest")
         if not isinstance(digest, str) or not digest:
             raise ValueError(
-                f"annual revisit in {year} is missing a resolvable "
+                f"collection revisit in {collection_id} is missing a resolvable "
                 f"response digest"
             )
         normalized = normalize_payload_digest(digest)
         if normalized is None or normalized.lower() not in response_digests:
             raise ValueError(
-                f"annual revisit in {year} has no earlier response "
+                f"collection revisit in {collection_id} has no earlier response "
                 f"for digest {digest}"
             )
 
 
-def reconcile_missing_indexes(layout: CollectionLayout) -> list[int]:
-    """Index any finalized year WARCs missing from their annual CDXJ."""
+def publish_annual_index(
+    layout: ArchiveLayout,
+    year: int,
+    *,
+    new_warcs: Sequence[Path] | None = None,
+) -> Optional[IndexArtifact]:
+    """Year-strategy adapter for generic collection publication."""
 
-    updated: list[int] = []
-    if not layout.archive_root.is_dir():
+    return publish_collection_index(
+        layout, f"{year:04d}", new_warcs=new_warcs
+    )
+
+
+def validate_annual_revisit_closure(
+    layout: ArchiveLayout, year: int, lines: Sequence[str]
+) -> None:
+    """Year-strategy adapter for generic revisit validation."""
+
+    validate_collection_revisit_closure(layout, f"{year:04d}", lines)
+
+
+def reconcile_missing_indexes(layout: ArchiveLayout) -> list[str]:
+    """Index finalized WARCs missing from portable collection indexes."""
+
+    updated: list[str] = []
+    if not layout.collections_root.is_dir():
         return updated
-    for year_dir in sorted(layout.archive_root.iterdir()):
-        if not year_dir.is_dir() or not year_dir.name.isdigit():
+    for collection_dir in sorted(layout.collections_root.iterdir()):
+        if not collection_dir.is_dir():
             continue
-        year = int(year_dir.name)
-        annual = layout.annual_index(year)
-        known = cdxj_filenames(annual)
-        warcs = list_year_warcs(layout, year)
-        if any(w.relative_to(layout.root).as_posix() not in known for w in warcs):
-            publish_annual_index(layout, year)
-            updated.append(year)
+        collection_id = layout.validate_collection_id(collection_dir.name)
+        index = layout.collection_index(collection_id)
+        known = cdxj_filenames(index)
+        warcs = list_collection_warcs(layout, collection_id)
+        if any(w.name not in known for w in warcs):
+            publish_collection_index(layout, collection_id)
+            updated.append(collection_id)
     return updated

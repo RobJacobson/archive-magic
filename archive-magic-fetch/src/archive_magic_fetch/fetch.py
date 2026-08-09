@@ -13,29 +13,23 @@ from typing import Callable, Optional, Sequence
 from .cdx import (
     DEFAULT_DATE_START,
     fetch_year_cdx,
-    init_run_source,
+    init_run_id,
     make_client,
     parse_date_bound,
     validate_date_range,
     years_in_range,
 )
 from .collection import (
-    CollectionLayout,
+    ArchiveLayout,
     cleanup_temps,
     collection_layout,
     ensure_collection_dirs,
-    index_artifact_from_path,
-    list_all_warcs,
-    list_annual_indexes,
-    list_year_warcs,
-    load_failures,
-    require_current_collection_schema,
+    list_collection_warcs,
+    reject_legacy_layout,
     warc_artifact_from_path,
-    write_failures,
-    write_manifest,
+    write_run_record,
 )
 from .index import (
-    publish_annual_index,
     publish_collection_index,
     reconcile_missing_indexes,
 )
@@ -55,13 +49,13 @@ from .models import (
     wayback_url,
 )
 from .warc import (
-    AnnualInventory,
+    CollectionInventory,
+    CollectionWarcWriter,
     StoredResponse,
-    YearWarcWriter,
     classify_playback_error,
     count_warc_records,
     download_exact_for_identity,
-    inventory_year,
+    inventory_collection,
     revisit_from_stored,
     stored_from_playback,
 )
@@ -152,7 +146,7 @@ class FetchResult:
     """Outcome of one fetch run."""
 
     exit_code: int
-    layout: CollectionLayout
+    layout: ArchiveLayout
     metrics: RunMetrics
     failures: list[UnresolvedFailure]
 
@@ -196,34 +190,28 @@ def _run_fetch(
 
     validate_date_range(settings.date_start, settings.date_end)
     layout = collection_layout(settings.url_pattern, settings.archives_root)
-    require_current_collection_schema(layout)
+    reject_legacy_layout(layout)
     ensure_collection_dirs(layout)
     cleanup_temps(layout)
     reconcile_missing_indexes(layout)
 
     metrics = RunMetrics()
-    source_dir = init_run_source(layout)
-    run_id = source_dir.name
-    # Retain unresolved failures from prior runs until they are represented.
-    all_failures: list[UnresolvedFailure] = list(load_failures(layout))
-    all_warcs = _collect_warc_artifacts(layout, ())
-    annual_indexes: list[IndexArtifact] = _existing_annual_indexes(layout)
-
-    represented_identities = _represented_failure_identities(layout, all_failures)
+    run_id = init_run_id(layout)
+    all_failures: list[UnresolvedFailure] = []
 
     years = years_in_range(settings.date_start, settings.date_end)
     print(
-        f"collection {layout.collection_id}: years {years[0]}-{years[-1]}",
+        f"archive {layout.collection_id}: collections {years[0]}-{years[-1]}",
         flush=True,
     )
     print("playback policy: serial, three attempts maximum", flush=True)
 
     run_skips_errors = 0
     for year in years:
+        collection_id = f"{year:04d}"
+        year_metrics = RunMetrics()
+        year_failures: list[UnresolvedFailure] = []
         year_started = time.monotonic()
-        downloads_before = metrics.downloads
-        revisits_before = metrics.revisits
-        reuses_before = metrics.local_reuses
         print(f"year {year}: CDX query", flush=True)
         cdx_started = time.monotonic()
         year_cdx = fetch_year_cdx(
@@ -235,26 +223,25 @@ def _run_fetch(
             run_id=run_id,
             sleep=sleep,
         )
-        metrics.cdx_requests += int(year_cdx.query_meta.get("request_count", 1))
-        metrics.cdx_duration_s += time.monotonic() - cdx_started
-        all_failures.extend(year_cdx.failures)
+        year_metrics.cdx_requests += int(year_cdx.query_meta.get("request_count", 1))
+        year_metrics.cdx_duration_s += time.monotonic() - cdx_started
+        year_failures.extend(year_cdx.failures)
         year_skips_errors = len(year_cdx.failures)
         _report_cdx_ingest_skips(year, year_cdx.failures)
 
         selected = _dedupe_captures(year_cdx.captures)
-        metrics.selected += len(selected)
+        year_metrics.selected += len(selected)
 
-        inventory = inventory_year(layout, year)
-        represented_identities.update(inventory.identities)
-        writer = YearWarcWriter(layout, year)
+        inventory = inventory_collection(layout, collection_id)
+        writer = CollectionWarcWriter(layout, collection_id)
         year_download_fn = download_fn or download_exact_for_identity
         print(f"year {year}: {len(selected)} selected", flush=True)
         total = len(selected)
         for number, capture in enumerate(selected, start=1):
             identity = capture.identity
             if inventory.contains(identity):
-                metrics.local_reuses += 1
-                metrics.represented += 1
+                year_metrics.local_reuses += 1
+                year_metrics.represented += 1
                 _log_capture(
                     number,
                     total,
@@ -278,9 +265,8 @@ def _run_fetch(
                     stored=stored,
                     inventory=inventory,
                     writer=writer,
-                    metrics=metrics,
+                    metrics=year_metrics,
                 )
-                represented_identities.add(identity)
                 _log_capture(number, total, identity, "Revisit", style="revisit")
                 continue
 
@@ -288,92 +274,76 @@ def _run_fetch(
                 client,
                 identity,
                 download_fn=year_download_fn,
-                metrics=metrics,
+                metrics=year_metrics,
                 sleep=sleep,
                 number=number,
                 total=total,
             )
             if failure is not None:
-                all_failures.append(failure)
+                year_failures.append(failure)
                 year_skips_errors += 1
                 continue
             assert result is not None
             write_started = time.monotonic()
             writer.write_playback(result)
-            metrics.warc_write_s += time.monotonic() - write_started
-            metrics.downloads += 1
-            metrics.represented += 1
+            year_metrics.warc_write_s += time.monotonic() - write_started
+            year_metrics.downloads += 1
+            year_metrics.represented += 1
             if not result.digest_matched:
-                metrics.digest_mismatch_accepted += 1
+                year_metrics.digest_mismatch_accepted += 1
             inventory.identities.add(identity)
-            represented_identities.add(identity)
             if result.digest_matched and key is not None:
                 inventory.remember_representative(stored_from_playback(result))
 
         close_started = time.monotonic()
         new_warcs = writer.close()
-        metrics.warc_write_s += time.monotonic() - close_started
+        year_metrics.warc_write_s += time.monotonic() - close_started
+        collection_index: IndexArtifact | None = None
         for artifact in new_warcs:
-            all_warcs.append(artifact)
             print(f"  published {artifact.relative_key}", flush=True)
             idx_started = time.monotonic()
-            annual = publish_annual_index(
+            collection_index = publish_collection_index(
                 layout,
-                year,
+                collection_id,
                 new_warcs=[artifact.path],
             )
-            metrics.index_s += time.monotonic() - idx_started
-            if annual is not None:
-                annual_indexes = _replace_annual_index(annual_indexes, annual)
+            year_metrics.index_s += time.monotonic() - idx_started
 
-        # Ensure annual index exists even if no new warcs this year.
-        if list_year_warcs(layout, year):
-            annual = publish_annual_index(layout, year)
-            if annual is not None:
-                annual_indexes = _replace_annual_index(annual_indexes, annual)
+        # Ensure the portable index exists even if this run wrote no new WARC.
+        if list_collection_warcs(layout, collection_id):
+            idx_started = time.monotonic()
+            collection_index = publish_collection_index(layout, collection_id)
+            year_metrics.index_s += time.monotonic() - idx_started
 
-        coll = publish_collection_index(layout)
-        _publish_state(
-            layout,
-            settings=settings,
-            run_source=f"sources/{run_id}",
-            warcs=all_warcs,
-            annual_indexes=_merge_annual_indexes(layout, annual_indexes),
-            collection_index=coll,
-            metrics=metrics,
-            failures=all_failures,
-            represented_identities=represented_identities,
-            final=False,
+        year_metrics.unresolved = len(year_failures)
+        year_warcs = _collect_warc_artifacts(
+            layout, collection_id, new_warcs
         )
+        write_run_record(
+            layout,
+            collection_id=collection_id,
+            run_id=run_id,
+            url_pattern=settings.url_pattern,
+            date_start=str(year_cdx.query_meta["from"]),
+            date_end=str(year_cdx.query_meta["to"]),
+            query=year_cdx.query_meta,
+            warcs=year_warcs,
+            index=collection_index,
+            metrics=year_metrics,
+            failures=year_failures,
+        )
+        _accumulate_metrics(metrics, year_metrics)
+        all_failures.extend(year_failures)
         run_skips_errors += year_skips_errors
         print(
-            f"year {year} done: downloads={metrics.downloads - downloads_before} "
-            f"revisits={metrics.revisits - revisits_before} "
-            f"already-represented={metrics.local_reuses - reuses_before} "
+            f"year {year} done: downloads={year_metrics.downloads} "
+            f"revisits={year_metrics.revisits} "
+            f"already-represented={year_metrics.local_reuses} "
             f"skips/errors={year_skips_errors}",
             flush=True,
         )
         print(f"elapsed {_format_elapsed(time.monotonic() - year_started)}", flush=True)
 
-    coll = publish_collection_index(layout)
-    final_warcs = all_warcs
-    final_annual = _merge_annual_indexes(layout, annual_indexes)
-    unresolved = _publish_state(
-        layout,
-        settings=settings,
-        run_source=f"sources/{run_id}",
-        warcs=final_warcs,
-        annual_indexes=final_annual,
-        collection_index=coll or (
-            index_artifact_from_path(layout, layout.collection_index)
-            if layout.collection_index.is_file()
-            else None
-        ),
-        metrics=metrics,
-        failures=all_failures,
-        represented_identities=represented_identities,
-        final=True,
-    )
     print(
         f"done: downloads={metrics.downloads} revisits={metrics.revisits} "
         f"already-represented={metrics.local_reuses} "
@@ -384,7 +354,7 @@ def _run_fetch(
         exit_code=0,
         layout=layout,
         metrics=metrics,
-        failures=unresolved,
+        failures=all_failures,
     )
 
 
@@ -441,8 +411,8 @@ def _write_revisit(
     *,
     identity: CaptureIdentity,
     stored: StoredResponse,
-    inventory: AnnualInventory,
-    writer: YearWarcWriter,
+    inventory: CollectionInventory,
+    writer: CollectionWarcWriter,
     metrics: RunMetrics,
 ) -> None:
     started = time.monotonic()
@@ -573,28 +543,6 @@ def _parse_retry_after(value: object) -> float | None:
     return seconds if seconds > 0 else None
 
 
-def _represented_failure_identities(
-    layout: CollectionLayout,
-    failures: Sequence[UnresolvedFailure],
-) -> set[CaptureIdentity]:
-    """Resolve stale failures by inventorying only the years they mention."""
-
-    identities: set[CaptureIdentity] = set()
-    inventories: dict[int, AnnualInventory] = {}
-    for failure in failures:
-        prefix = failure.identity.timestamp[:4]
-        if not prefix.isdigit():
-            continue
-        year = int(prefix)
-        inventory = inventories.get(year)
-        if inventory is None:
-            inventory = inventory_year(layout, year)
-            inventories[year] = inventory
-        if inventory.contains(failure.identity):
-            identities.add(failure.identity)
-    return identities
-
-
 def _dedupe_captures(
     captures: Sequence[ParsedCapture],
 ) -> list[ParsedCapture]:
@@ -609,12 +557,13 @@ def _dedupe_captures(
 
 
 def _collect_warc_artifacts(
-    layout: CollectionLayout,
+    layout: ArchiveLayout,
+    collection_id: str,
     new_warcs: Sequence[WarcArtifact],
 ) -> list[WarcArtifact]:
     known = {item.relative_key: item for item in new_warcs}
     artifacts: list[WarcArtifact] = []
-    for path in list_all_warcs(layout):
+    for path in list_collection_warcs(layout, collection_id):
         rel = path.relative_to(layout.root).as_posix()
         if rel in known:
             artifacts.append(known[rel])
@@ -629,74 +578,29 @@ def _collect_warc_artifacts(
     return artifacts
 
 
-def _existing_annual_indexes(layout: CollectionLayout) -> list[IndexArtifact]:
-    return [
-        index_artifact_from_path(layout, path)
-        for _, path in list_annual_indexes(layout)
-    ]
+def _accumulate_metrics(total: RunMetrics, current: RunMetrics) -> None:
+    """Add one collection's metrics to the invocation totals."""
 
-
-def _replace_annual_index(
-    annual_indexes: list[IndexArtifact],
-    annual: IndexArtifact,
-) -> list[IndexArtifact]:
-    return [
-        item
-        for item in annual_indexes
-        if item.relative_key != annual.relative_key
-    ] + [annual]
-
-
-def _merge_annual_indexes(
-    layout: CollectionLayout,
-    annual_indexes: Sequence[IndexArtifact],
-) -> list[IndexArtifact]:
-    """Prefer in-run artifacts, then include every on-disk annual index."""
-
-    by_key = {item.relative_key: item for item in annual_indexes}
-    for item in _existing_annual_indexes(layout):
-        by_key.setdefault(item.relative_key, item)
-    return sorted(by_key.values(), key=lambda item: item.relative_key)
-
-
-def _publish_state(
-    layout: CollectionLayout,
-    *,
-    settings: FetchSettings,
-    run_source: str,
-    warcs: Sequence[WarcArtifact],
-    annual_indexes: Sequence[IndexArtifact],
-    collection_index: Optional[IndexArtifact],
-    metrics: RunMetrics,
-    failures: Sequence[UnresolvedFailure],
-    represented_identities: set[CaptureIdentity],
-    final: bool,
-) -> list[UnresolvedFailure]:
-    # Collapse failures by identity; later details replace stale ones.
-    # Drop any identity represented by the annual inventories processed in memory.
-    by_id: dict[CaptureIdentity, UnresolvedFailure] = {}
-    for failure in failures:
-        by_id[failure.identity] = failure
-
-    unresolved_list = [
-        failure
-        for failure in by_id.values()
-        if failure.identity not in represented_identities
-    ]
-
-    metrics.unresolved = len(unresolved_list)
-    write_failures(layout, unresolved_list)
-    write_manifest(
-        layout,
-        url_pattern=settings.url_pattern,
-        status="complete" if final else "partial",
-        run_source_relative=run_source,
-        warcs=warcs,
-        annual_indexes=annual_indexes,
-        collection_index=collection_index,
-        metrics=metrics,
-    )
-    return unresolved_list
+    for name in (
+        "cdx_requests",
+        "cdx_duration_s",
+        "playback_attempts",
+        "playback_bytes",
+        "local_reuses",
+        "downloads",
+        "revisits",
+        "digest_mismatch_accepted",
+        "selected",
+        "represented",
+        "unresolved",
+        "warc_write_s",
+        "index_s",
+    ):
+        setattr(total, name, getattr(total, name) + getattr(current, name))
+    for category, count in current.attempts_by_category.items():
+        total.attempts_by_category[category] = (
+            total.attempts_by_category.get(category, 0) + count
+        )
 
 
 def build_settings(

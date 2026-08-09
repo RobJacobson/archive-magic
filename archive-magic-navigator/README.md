@@ -21,21 +21,21 @@ its implementation modules.
 
 ## Run
 
-Serve one collection:
+Serve one domain archive:
 
 ```bash
 uv run --package archive-magic-navigator \
   archive-magic-navigator wecanstopthehate.org
 ```
 
-Serve every immediate collection directory:
+Serve every immediate domain archive directory:
 
 ```bash
 uv run --package archive-magic-navigator \
   archive-magic-navigator --all
 ```
 
-Use `--archives PATH` for another collections root, `--port PORT` for another
+Use `--archives PATH` for another archives root, `--port PORT` for another
 port, and `--open` to open the landing page after the server is ready. Wayback
 fallback is on by default; use `--wayback-fallback off` for strictly local
 replay.
@@ -52,42 +52,40 @@ timestamp. Remote lookup and loading use a ten-second timeout. Navigator does
 not cache or persist fallback responses.
 
 Archive Magic Fetch preserves selected historical redirect responses but does
-not automatically capture their targets. Its per-run `redirects.json` report
-lists covered, skipped, and unresolved targets so the operator can choose
-subsequent Fetch queries. Locally captured targets and assets take precedence
-here exactly like primary records; runtime Wayback fallback can supply missing
-resources without changing the local collection.
+not automatically capture their targets. Locally captured targets and assets
+take precedence exactly like primary records; runtime Wayback fallback can
+supply missing resources without changing the local archive.
 
-## Collection contract
+## Archive and collection contract
 
-Each collection must contain:
+Each domain archive contains one or more flat portable collections:
 
 ```text
-<collection>/
-├── index.cdxj
-└── archive/
-    ├── 2004/
-    │   ├── example.org-2004-001.warc.gz
-    │   └── example.org-2004.cdxj
-    └── example.com/
-        └── **/*.warc.gz
+<domain>/
+├── collections/
+│   ├── 2004/
+│   │   ├── example.org-2004-001.warc.gz
+│   │   └── example.org-2004-index.cdxj
+│   └── 2005/
+│       ├── example.org-2005-001.warc.gz
+│       └── example.org-2005-index.cdxj
+└── captures/                    # ignored by Navigator
+    └── 2004/runs/...
 ```
 
-CDXJ `filename` values must be safe collection-relative
-`archive/...` paths (annual shards or legacy domain folders).
-Navigator reads indexed compressed byte ranges directly and never copies,
-repairs, reindexes, or records collection data. It never writes Wayback
-fallback responses into the collection. There is no fallback to the current
-live web.
+Each CDXJ `filename` must be the basename of a WARC in the same portable
+collection. Navigator validates every collection, supplies its indexes to pywb
+as one index group, and supplies the corresponding collection directories as
+archive paths. It reads indexed compressed byte ranges directly and never
+copies, repairs, reindexes, or records archive data.
 
-Fetch publishes annual size-bounded WARC shards under `archive/YYYY/` with a
-per-year `{collection_id}-YYYY.cdxj` beside them. The collection-wide replay
-index is `index.cdxj` at the collection root.
-Navigator follows the collection-relative path in each replay entry's `filename`.
-Each annual set is self-contained: revisits may cross WARC shards within a year
-but never depend on another year.
+Only `<domain>/collections/**` is required for playback or bucket publication.
+`<domain>/captures/**` contains Fetch provenance and is ignored. Fetch currently
+groups by year, but collection IDs and Navigator discovery are not year-specific.
+Revisits may cross WARC shards inside a collection but never depend on another
+collection. There is no domain-wide merged index.
 
-Collection directory names also become browser routes. They must start with an
+Domain archive names become browser routes. They must start with an
 ASCII letter or digit, contain only ASCII letters, digits, `.`, `_`, or `-`,
 and must not use Navigator-reserved names such as `static`.
 
@@ -104,5 +102,5 @@ uv --directory archive-magic-fetch run pytest
 uv --directory archive-magic-navigator run pytest
 ```
 
-The ignored local `archives/wecanstopthehate.org` collection is useful for a
+The ignored local `archives/wecanstopthehate.org` archive is useful for a
 manual smoke test but is not required by deterministic CI.

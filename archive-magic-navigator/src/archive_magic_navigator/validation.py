@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Never, TextIO
 
-from .collections import Collection
+from .collections import Archive, ReplayCollection
 from .errors import ValidationError
 
 
@@ -28,7 +28,8 @@ class ValidationSummary:
 
 @dataclass(frozen=True)
 class _LineContext:
-    collection: Collection
+    archive_id: str
+    collection: ReplayCollection
     index_path: Path
     number: int
 
@@ -39,7 +40,8 @@ class _LineContext:
         cause: Exception | None = None,
     ) -> Never:
         error = ValidationError(
-            f"collection {self.collection.collection_id!r}, "
+            f"archive {self.archive_id!r}, collection "
+            f"{self.collection.collection_id!r}, "
             f"index {self.index_path}, line {self.number}: {message}"
         )
         if cause is None:
@@ -47,10 +49,26 @@ class _LineContext:
         raise error from cause
 
 
-def validate_collection(collection: Collection) -> ValidationSummary:
+def validate_archive(archive: Archive) -> ValidationSummary:
+    """Validate every portable collection exposed by one domain archive."""
+
+    records = 0
+    warcs = 0
+    for collection in archive.collections:
+        summary = validate_collection(collection, archive_id=archive.archive_id)
+        records += summary.record_count
+        warcs += summary.warc_count
+    return ValidationSummary(records, warcs)
+
+
+def validate_collection(
+    collection: ReplayCollection,
+    *,
+    archive_id: str,
+) -> ValidationSummary:
     """Validate one CDXJ and every distinct referenced WARC path."""
 
-    index_path, stream = _open_replay_index(collection)
+    index_path, stream = _open_replay_index(collection, archive_id=archive_id)
     previous: tuple[str, str] | None = None
     warc_sizes: dict[str, int] = {}
     record_count = 0
@@ -61,7 +79,7 @@ def validate_collection(collection: Collection) -> ValidationSummary:
                 if not raw_line.strip():
                     continue
                 record_count += 1
-                context = _LineContext(collection, index_path, line_number)
+                context = _LineContext(archive_id, collection, index_path, line_number)
                 url_key, timestamp, payload = _parse_cdxj_line(context, raw_line)
                 current = (url_key, timestamp)
                 if previous is not None and current < previous:
@@ -70,18 +88,21 @@ def validate_collection(collection: Collection) -> ValidationSummary:
                 _validate_record(context, payload, warc_sizes)
     except UnicodeError as error:
         raise ValidationError(
-            f"collection {collection.collection_id!r} replay index is not "
+            f"archive {archive_id!r}, collection {collection.collection_id!r} "
+            f"replay index is not "
             f"valid UTF-8: {index_path}: {error}"
         ) from error
     except OSError as error:
         raise ValidationError(
-            f"collection {collection.collection_id!r} cannot read replay "
+            f"archive {archive_id!r}, collection {collection.collection_id!r} "
+            f"cannot read replay "
             f"index: {index_path}: {error}"
         ) from error
 
     if record_count == 0:
         raise ValidationError(
-            f"collection {collection.collection_id!r} replay index is empty: "
+            f"archive {archive_id!r}, collection {collection.collection_id!r} "
+            f"replay index is empty: "
             f"{index_path}"
         )
     return ValidationSummary(
@@ -90,14 +111,31 @@ def validate_collection(collection: Collection) -> ValidationSummary:
     )
 
 
-def _open_replay_index(collection: Collection) -> tuple[Path, TextIO]:
+def _open_replay_index(
+    collection: ReplayCollection,
+    *,
+    archive_id: str,
+) -> tuple[Path, TextIO]:
     index_path = collection.replay_index
+    other_indexes = sorted(
+        path.name
+        for path in collection.root.iterdir()
+        if path.is_file()
+        and path.suffix in {".cdx", ".cdxj"}
+        and path != index_path
+    )
+    if other_indexes:
+        raise ValidationError(
+            f"archive {archive_id!r}, collection {collection.collection_id!r} "
+            f"contains unexpected indexes: {', '.join(other_indexes)}"
+        )
     try:
         resolved = index_path.resolve(strict=True)
         resolved.relative_to(collection.root)
     except (OSError, RuntimeError, ValueError) as error:
         raise ValidationError(
-            f"collection {collection.collection_id!r} replay index escapes "
+            f"archive {archive_id!r}, collection {collection.collection_id!r} "
+            f"replay index escapes "
             f"or cannot be resolved: {index_path}"
         ) from error
 
@@ -109,13 +147,15 @@ def _open_replay_index(collection: Collection) -> tuple[Path, TextIO]:
         if stream is not None:
             stream.close()
         raise ValidationError(
-            f"collection {collection.collection_id!r} cannot open replay "
+            f"archive {archive_id!r}, collection {collection.collection_id!r} "
+            f"cannot open replay "
             f"index: {index_path}: {error}"
         ) from error
     if not stat.S_ISREG(mode):
         stream.close()
         raise ValidationError(
-            f"collection {collection.collection_id!r} replay index is not a "
+            f"archive {archive_id!r}, collection {collection.collection_id!r} "
+            f"replay index is not a "
             f"regular file: {index_path}"
         )
     return index_path, stream
@@ -199,20 +239,23 @@ def _validate_warc_path(
     context: _LineContext,
     filename: str,
 ) -> int:
-    parts = filename.split("/")
     if (
         not filename
         or "\x00" in filename
         or "\\" in filename
-        or any(PureWindowsPath(part).drive for part in parts)
-        or any(part in {"", ".", ".."} for part in parts)
-        or parts[0] != "archive"
-        or len(parts) < 3
+        or PurePosixPath(filename).name != filename
+        or PureWindowsPath(filename).drive
     ):
         context.fail(f"unsafe WARC filename {filename!r}")
 
-    pure_path = PurePosixPath(filename)
-    candidate = context.collection.root.joinpath(*pure_path.parts)
+    expected = re.compile(
+        rf"{re.escape(context.archive_id)}-"
+        rf"{re.escape(context.collection.collection_id)}-[0-9]{{3}}\.warc\.gz"
+    )
+    if not expected.fullmatch(filename):
+        context.fail(f"foreign or invalid WARC filename {filename!r}")
+
+    candidate = context.collection.root / filename
     try:
         resolved = candidate.resolve(strict=True)
         resolved.relative_to(context.collection.root)

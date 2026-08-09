@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "archive-magic-fetch"
 version = "0.1.0"
-description = "Build annual WARC 1.1 and CDXJ collections from Internet Archive history"
+description = "Build portable WARC 1.1 and CDXJ collections from Internet Archive history"
 requires-python = ">=3.12"
 license = { text = "MIT" }
 dependencies = [

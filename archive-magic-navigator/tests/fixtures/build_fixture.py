@@ -12,14 +12,11 @@ from warcio.warcwriter import WARCWriter
 
 
 ROOT = Path(__file__).parent / "collection"
-WARC = ROOT / "archive" / "example.test" / "index.warc.gz"
-LOCAL_REDIRECT_WARC = (
-    ROOT / "archive" / "local-redirect.test" / "index.warc.gz"
-)
-LOCAL_TARGET_WARC = (
-    ROOT / "archive" / "local-target.test" / "index.warc.gz"
-)
-INDEX = ROOT / "index.cdxj"
+COLLECTION = ROOT / "collections" / "2020"
+WARC = COLLECTION / "fixture-2020-001.warc.gz"
+LOCAL_REDIRECT_WARC = COLLECTION / "fixture-2020-002.warc.gz"
+LOCAL_TARGET_WARC = COLLECTION / "fixture-2020-003.warc.gz"
+INDEX = COLLECTION / "fixture-2020-index.cdxj"
 HASHES = ROOT / "SHA256SUMS"
 MAIN_URL = "http://example.test/"
 CSS_URL = "http://example.test/assets/site.css"
@@ -217,7 +214,7 @@ def main() -> None:
                 start,
                 stream.tell() - start,
                 status="301",
-                filename="archive/local-redirect.test/index.warc.gz",
+                filename=LOCAL_REDIRECT_WARC.name,
             )
         )
 
@@ -244,7 +241,7 @@ def main() -> None:
                 local_target,
                 start,
                 stream.tell() - start,
-                filename="archive/local-target.test/index.warc.gz",
+                filename=LOCAL_TARGET_WARC.name,
             )
         )
 
@@ -274,7 +271,7 @@ def entry(
     length: int,
     *,
     status: str = "200",
-    filename: str = "archive/example.test/index.warc.gz",
+    filename: str = WARC.name,
 ):
     return (
         url_key,

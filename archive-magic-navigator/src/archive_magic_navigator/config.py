@@ -11,7 +11,7 @@ from typing import Any
 
 import yaml
 
-from .collections import Collection
+from .collections import Archive
 
 
 WAYBACK_MEMENTO_SOURCE = "memento+https://web.archive.org/web/"
@@ -19,13 +19,18 @@ WAYBACK_TIMEOUT_SECONDS = 10
 
 
 def _collection_config(
-    collection: Collection,
+    archive: Archive,
     *,
     wayback_fallback: bool,
 ) -> dict[str, Any]:
     local = {
-        "index": str(collection.replay_index),
-        "archive_paths": [str(collection.root) + os.sep],
+        "index_group": {
+            collection.collection_id: str(collection.replay_index)
+            for collection in archive.collections
+        },
+        "archive_paths": [
+            str(collection.root) + os.sep for collection in archive.collections
+        ],
     }
     if not wayback_fallback:
         return local
@@ -52,7 +57,7 @@ def package_asset_paths() -> tuple[Path, Path]:
 
 
 def build_config(
-    collections: Sequence[Collection],
+    archives: Sequence[Archive],
     *,
     wayback_fallback: bool = True,
 ) -> dict[str, Any]:
@@ -61,11 +66,11 @@ def build_config(
     return {
         "enable_auto_colls": False,
         "collections": {
-            collection.collection_id: _collection_config(
-                collection,
+            archive.archive_id: _collection_config(
+                archive,
                 wayback_fallback=wayback_fallback,
             )
-            for collection in collections
+            for archive in archives
         },
         "framed_replay": True,
         "client_side_replay": False,

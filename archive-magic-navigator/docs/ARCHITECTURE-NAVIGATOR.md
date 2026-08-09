@@ -4,7 +4,7 @@
 
 **Scope:** `archive-magic-navigator` only
 
-**Updated:** August 2, 2026
+**Updated:** August 9, 2026
 
 **Compatibility spike:** [PYWB-SPIKE.md](PYWB-SPIKE.md)
 
@@ -26,8 +26,8 @@ Navigator's current scope is deliberately small:
 - serve existing Archive Magic collections from the local filesystem;
 - use the Internet Archive's Memento endpoint as the default fallback for
   resources missing from a local collection;
-- support one selected collection or all immediate collections, failing startup
-  if any selected collection is invalid;
+- support one selected domain archive or all immediate domain archives, failing
+  startup if any selected archive or portable collection is invalid;
 - use pywb's framed replay, timeline, calendar, URL search, and rewriting;
 - provide a minimal branded home/collection experience as an example of pywb
   customization;
@@ -62,8 +62,8 @@ Their integration boundary is the documented collection layout.
 | Preferred pywb executable | `wayback` from Navigator's Python environment |
 | Navigator license | MIT, subject to final packaging review |
 | Data source | Local WARC/CDXJ first; Internet Archive Memento fallback by default |
-| Collection ownership | Fetch owns; Navigator reads |
-| Collection writes | Forbidden |
+| Archive ownership | Fetch owns; Navigator reads |
+| Archive writes | Forbidden |
 | Live-web fallback | Forbidden |
 | Wayback fallback | Enabled by default; `--wayback-fallback off` disables it |
 | Fallback persistence/cache | None |
@@ -123,10 +123,9 @@ The applications have separate ownership:
 
 | Area | Owner | Navigator behavior |
 | --- | --- | --- |
-| `sources/` | Fetch | Ignore |
-| `archive/**/*.warc.gz` | Fetch | Read by indexed byte range |
-| `index.cdxj` | Fetch | Query as the authoritative replay index |
-| `website/` | Fetch | Ignore |
+| `<domain>/collections/*/*.warc.gz` | Fetch | Read by indexed byte range |
+| `<domain>/collections/*/*-index.cdxj` | Fetch | Aggregate as pywb index sources |
+| `<domain>/captures/` | Fetch | Ignore |
 | Navigator runtime config | Navigator | Generate outside the collection tree |
 | Navigator templates/static assets | Navigator | Ship inside the Navigator package |
 | Browser preferences/history | Future Navigator | Store outside the collection tree |
@@ -139,13 +138,13 @@ Fetch is responsible for:
 - WARC record construction and validation;
 - response/revisit identity;
 - compressed member boundaries;
-- deterministic collection-relative WARC filenames;
+- globally unique WARC basenames inside each domain archive;
 - sorted CDXJ generation from the final WARC bytes; and
 - publication of the WARC/CDXJ data.
 
 Navigator is responsible for:
 
-- collection selection and read-only validation;
+- domain archive selection and portable-collection validation;
 - translating the Archive Magic layout into pywb configuration;
 - configuring the optional Internet Archive Memento fallback;
 - pywb process lifecycle and local server options;
@@ -153,10 +152,9 @@ Navigator is responsible for:
 - minimal UI branding; and
 - browser-facing routes.
 
-Fetch preserves redirect responses without broadening capture scope. Its
-`redirects.json` report lets an operator select target sites for later Fetch
-runs. A locally captured target is authoritative and prevents remote lookup;
-fallback covers targets and assets that are absent from the collection.
+Fetch preserves redirect responses without broadening capture scope. A locally
+captured target is authoritative and prevents remote lookup; fallback covers
+targets and assets that are absent from the archive.
 Navigator does not depend on how a local record was selected.
 
 Navigator does not depend on `archive-magic-fetch`. A user may copy a valid
@@ -172,121 +170,68 @@ Navigator must not:
 - write metadata, indexes, templates, static files, logs, or caches beneath
   `archives/`;
 - enable pywb recording, live, proxy, auto-fetch, or auto-indexing modes;
-- treat `sources/` or `website/` as replay inputs;
+- treat `captures/` as replay input;
 - infer capture timestamps or target URLs from WARC filenames; or
 - add a shared Fetch/Navigator Python library.
 
 The repository root remains a uv workspace and development convenience. It
 does not turn Fetch and Navigator into one application.
 
-## 4. Collection data contract
+## 4. Domain archive data contract
 
-Navigator consumes the Fetch collection layout:
-
-```text
-archives/
-└── example.com/
-    ├── sources/
-    ├── index.cdxj
-    └── archive/
-        └── 2004/
-            ├── example.com-2004-001.warc.gz
-            ├── example.com-2004-002.warc.gz
-            └── example.com-2004.cdxj
-```
-
-A locally replayable collection has, at minimum:
+Navigator consumes flat portable collections beneath each domain archive:
 
 ```text
-<collection-root>/index.cdxj
-<collection-root>/<each CDXJ filename>
+archives/example.com/
+├── collections/
+│   ├── 2004/
+│   │   ├── example.com-2004-001.warc.gz
+│   │   └── example.com-2004-index.cdxj
+│   └── 2005/
+│       ├── example.com-2005-001.warc.gz
+│       └── example.com-2005-index.cdxj
+└── captures/                       # ignored by Navigator
 ```
 
-Each non-empty CDXJ line has three whitespace-separated fields:
+The domain directory is the browser route. Every immediate child of
+`collections/` is an independently portable collection. Fetch currently uses
+calendar years as IDs, but Navigator accepts any safe collection ID.
 
-```text
-<SURT-url-key> <14-digit-timestamp> <JSON-object>
-```
-
-Fetch's CDXJ entries use collection-relative filenames:
+Each non-empty CDXJ line is a SURT URL key, a 14-digit timestamp, and a JSON
+object. Its `filename` is the basename of a WARC in the same directory:
 
 ```json
-{
-  "filename": "archive/example.com/posts/index.warc.gz",
-  "offset": "9673",
-  "length": "9362"
-}
+{"filename":"example.com-2004-001.warc.gz","offset":"9673","length":"9362"}
 ```
 
-| Field | Meaning | Validation |
-| --- | --- | --- |
-| `filename` | Collection-relative WARC path | Normalized relative POSIX path beginning `archive/<domain-folder>/` |
-| `offset` | Compressed-member byte offset | Integer string or integer, value `>= 0` |
-| `length` | Compressed-member byte length | Integer string or integer, value `> 0` |
-
-Consequently, pywb's resource prefix must be the collection root, not the
-`archive/` directory:
-
-```text
-resource prefix + filename
-= /absolute/path/archives/example.com/
-  + archive/example.com/posts/index.warc.gz
-```
-
-The CDXJ, not the readable WARC filename, defines capture identity and the
-compressed byte range to load. Navigator does not infer a target URL or timestamp
-from a WARC path.
-
-Fetch guarantees that:
-
-- the index is sorted by URL key and timestamp;
-- `filename` is relative to the collection root;
-- offsets and lengths address independently compressed WARC members;
-- response and revisit records are indexed;
-- revisits may reference full responses only within the same annual
-  `archive/YYYY/` set; and
-- completed WARC files and the CDXJ file are each published with atomic
-  replacement.
-
-An annual `archive/YYYY/{collection_id}-YYYY.cdxj` and all WARC shards in that
-directory therefore form an independently replayable annual set.
+Navigator configures all collection indexes as one pywb `index_group` and all
+collection directories as ordered `archive_paths`. The domain therefore has one
+timeline without requiring a merged root index. Globally unique
+`<domain>-<collection>-NNN.warc.gz` names prevent resolution from a wrong path.
 
 ### 4.1 Required preflight
 
-Before starting pywb, Navigator validates the selected input without changing it:
+Before starting pywb, Navigator validates without changing the archive:
 
-1. The archives root and selected collection are directories.
-2. The collection resolves beneath the configured archives root.
-3. `index.cdxj` resolves beneath the collection root and is a regular,
-   readable UTF-8 file.
-4. Each non-empty CDXJ line splits into a URL key, 14-digit timestamp, and JSON
-   object.
-5. CDXJ keys and timestamps are nondecreasing.
-6. Each replay record has a relative `filename` and nonnegative integer
-   `offset` and positive integer `length` (numeric strings or JSON integers;
-   not booleans, floats, or signed forms).
-7. A filename is a normalized relative POSIX path, begins with
-   `archive/<domain-folder>/`, contains no `.` or `..` traversal, and resolves
-   beneath the collection root.
-8. Each distinct referenced WARC is a readable regular file, and
-   `offset + length` does not exceed the current file size.
-9. Symlinks or resolved targets that escape the collection are rejected.
-10. An entirely empty index is rejected.
+1. The archives root, selected domain, its `collections/` directory, and every
+   portable collection resolve as contained directories.
+2. At least one portable collection exists.
+3. Each collection contains exactly its expected
+   `<domain>-<collection>-index.cdxj` and no additional CDX/CDXJ files.
+4. Each index is a readable, nonempty, sorted UTF-8 CDXJ file.
+5. Every record has `filename`, `offset`, and `length`; ranges accept unsigned
+   integers or digit strings, reject booleans/floats/signed forms, and remain
+   within the WARC size.
+6. Every `filename` is a basename matching the same domain and collection ID,
+   resolves to a readable regular file in that collection, and cannot escape by
+   traversal or symlink.
 
-Validation streams the index line by line. Diagnostics include the collection
-ID, index path, and one-based line number without dumping the full JSON
-record. Distinct WARC filenames are validated once and cached for the rest of
-the index.
+Validation streams indexes and caches distinct WARC sizes. Navigator does not
+fully parse every WARC at startup; Fetch owns WARC validation, while real-pywb
+integration tests verify indexed compressed-member replay.
 
-Navigator does not fully parse every WARC at startup. Fetch already performs WARC
-validation, and eagerly decompressing all records would make server startup
-unnecessarily expensive. Integration tests verify that pywb can load the
-indexed byte ranges.
-
-### 4.2 Future collection manifest
-
-Navigator does not require a new manifest. Folder names and the existing CDXJ
-are sufficient for the local filesystem mode.
+No catalog or manifest is required. Local discovery uses the directory tree;
+remote bucket discovery remains future work.
 
 A future storage/concurrency revision should add a small versioned manifest
 that identifies:
@@ -307,7 +252,7 @@ collections.
 The commands are:
 
 ```text
-archive-magic-navigator COLLECTION
+archive-magic-navigator ARCHIVE
   [--archives PATH]
   [--bind ADDRESS]
   [--port PORT]
@@ -329,16 +274,16 @@ import package uses Python's underscore form, `archive_magic_navigator`.
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `COLLECTION` | none | One collection directory name beneath `--archives` |
-| `--all` | off | Validate and serve every immediate collection beneath `--archives`; fail if any is invalid |
-| `--archives` | `./archives` | Shared Archive Magic collection root |
+| `ARCHIVE` | none | One domain archive directory name beneath `--archives` |
+| `--all` | off | Validate and serve every immediate domain archive beneath `--archives`; fail if any is invalid |
+| `--archives` | `./archives` | Shared Archive Magic archives root |
 | `--bind` | `127.0.0.1` | Local address on which pywb listens |
 | `--port` | `8080` | Local TCP port |
 | `--wayback-fallback` | `on` | Load resources missing locally from the Internet Archive; `off` provides strictly local replay |
 | `--open` | off | Open the landing page in the default browser |
 | `--debug` | off | Send pywb diagnostic output directly to the console |
 
-Exactly one of `COLLECTION` and `--all` is required. A collection positional
+Exactly one of `ARCHIVE` and `--all` is required. An archive positional
 argument is an ID, not an arbitrary path. This keeps route names and filesystem
 resolution separate. Users with a nonstandard location pass its parent with
 `--archives`.
@@ -435,11 +380,11 @@ Navigator never enables:
 - proxy mode; or
 - `wb-manager`.
 
-### 7.1 Explicit collections
+### 7.1 Explicit domain archives
 
-Navigator generates an explicit route for every collection that passed
-preflight and disables pywb's automatic collection routes. With the default
-Wayback fallback, a single collection looks like:
+Navigator generates an explicit route for every validated domain archive and
+disables pywb's automatic collection routes. All portable collection indexes
+inside a domain become one local `index_group`:
 
 ```yaml
 enable_auto_colls: false
@@ -450,72 +395,36 @@ collections:
   example.com:
     sequence:
       - name: local
-        index: /absolute/path/archives/example.com/index.cdxj
+        index_group:
+          '2004': /absolute/path/archives/example.com/collections/2004/example.com-2004-index.cdxj
+          '2005': /absolute/path/archives/example.com/collections/2005/example.com-2005-index.cdxj
         archive_paths:
-          - /absolute/path/archives/example.com/
+          - /absolute/path/archives/example.com/collections/2004/
+          - /absolute/path/archives/example.com/collections/2005/
       - name: wayback
         index_group:
           ia: memento+https://web.archive.org/web/
         timeout: 10
 ```
 
-Pywb tries the sequence in order, so any valid local response—including a
-redirect or archived error response—is authoritative. A missing index or
-unloadable local resource falls through to the Internet Archive. Wrapping the
-Memento source in an index group applies the ten-second timeout to remote
-lookup and loading. `--wayback-fallback off` emits the original local-only
-`index` and `archive_paths` shape.
+Pywb queries the local index sources together, then resolves each globally
+unique WARC basename through the ordered archive paths. Its sequence preserves
+local-first behavior: a valid local response is authoritative, while a missing
+resource may fall through to the Internet Archive. `--wayback-fallback off`
+emits only the local `index_group` and `archive_paths`.
 
-The compatibility spike documented in [PYWB-SPIKE.md](PYWB-SPIKE.md) confirmed
-the local handler against Fetch's collection-root `archive/...` filenames. A
-real-pywb integration test covers the sequential fallback with a deterministic
-local Memento service.
+Real-pywb integration tests cover aggregation across flat collections,
+same-collection cross-shard revisits, and deterministic Memento fallback.
 
-### 7.2 All collections
+### 7.2 All domain archives
 
-`--all` uses the same local-first sequence with one entry per validated
-collection. Each route has its own local handler followed by the shared
-Wayback Memento source:
-
-```yaml
-enable_auto_colls: false
-framed_replay: true
-client_side_replay: false
-collections:
-  example.com:
-    sequence:
-      - name: local
-        index: /absolute/path/archives/example.com/index.cdxj
-        archive_paths:
-          - /absolute/path/archives/example.com/
-      - name: wayback
-        index_group:
-          ia: memento+https://web.archive.org/web/
-        timeout: 10
-  example.net:
-    sequence:
-      - name: local
-        index: /absolute/path/archives/example.net/index.cdxj
-        archive_paths:
-          - /absolute/path/archives/example.net/
-      - name: wayback
-        index_group:
-          ia: memento+https://web.archive.org/web/
-        timeout: 10
-```
-
-This keeps configuration generation identical in single and all-collection
-modes and prevents pywb from exposing a directory that Navigator did not
-validate. Replacements at configured CDXJ/WARC paths remain visible to later
-pywb reads. Adding or removing an entire collection requires restarting
-Navigator, which is acceptable while concurrent publication is unsupported.
+`--all` uses the same local-first shape for every validated domain archive.
+Each archive becomes one pywb route and independently aggregates its portable
+collections. Navigator never exposes a path that did not pass preflight.
 
 Every immediate child directory under the archives root is treated as an
-intended collection. If any such directory is invalid, startup fails with
-diagnostics instead of allowing pywb's homepage to list a broken collection.
-Non-directory entries are ignored. A later filtered dynamic-collection view
-would be a separate design if mixed collection and non-collection directories
-become common.
+intended domain archive. Non-directory entries are ignored. Adding or removing
+a domain archive or portable collection requires restarting Navigator.
 
 ## 8. Browser UI and replay behavior
 
@@ -606,9 +515,9 @@ concurrency warning.
 
 ### 10.2 Why current atomic files are insufficient
 
-Fetch atomically replaces each completed WARC and later atomically replaces
-`index.cdxj`. Those individual publications are safe, but the collection
-is not one transaction.
+Fetch atomically publishes completed WARCs and later atomically replaces that
+portable collection's CDXJ. Those individual publications are safe, but a
+multi-file collection update is not one transaction.
 
 During a concurrent update, these unsafe combinations are possible:
 
@@ -865,7 +774,7 @@ Archived pages can contain hostile or obsolete HTML and JavaScript. Navigator:
 - validates CDXJ WARC paths before serving;
 - rejects collection traversal and escaping symlinks;
 - treats collection data as untrusted input;
-- does not serve arbitrary loose files from `website/` or `sources/`; and
+- ignores acquisition provenance beneath `captures/`; and
 - does not claim internet-facing production hardening.
 
 Framed replay reduces the ability of archived content to tamper with the
@@ -913,7 +822,7 @@ archive-magic-navigator/
 | File | Responsibility |
 | --- | --- |
 | `cli.py` | Arguments, diagnostics, exit status, high-level lifecycle |
-| `collections.py` | Resolve/select/discover collection roots |
+| `collections.py` | Resolve/select/discover domain archives and portable collections |
 | `validation.py` | Read-only CDXJ and WARC-path preflight |
 | `config.py` | Deterministic pywb YAML/runtime configuration |
 | `errors.py` | Expected user-facing validation and startup failures |

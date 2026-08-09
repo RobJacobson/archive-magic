@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gzip
 import json
 from pathlib import Path
 from typing import Optional
@@ -13,6 +14,7 @@ from wayback.exceptions import MementoPlaybackError, RateLimitError
 
 from archive_magic_fetch.cdx import (
     fetch_year_cdx,
+    init_run_id,
     parse_date_bound,
     year_bounds,
 )
@@ -21,9 +23,7 @@ from archive_magic_fetch.collection import (
     ensure_collection_dirs,
     list_annual_indexes,
     list_year_warcs,
-    load_failures,
     next_warc_sequence,
-    write_failures,
 )
 from archive_magic_fetch.fetch import (
     FetchSettings,
@@ -35,8 +35,8 @@ from archive_magic_fetch.fetch import (
     run_fetch,
 )
 from archive_magic_fetch.index import (
-    publish_annual_index,
     publish_collection_index,
+    publish_annual_index,
     validate_annual_revisit_closure,
     validate_cdxj_against_warcs,
 )
@@ -54,6 +54,7 @@ from archive_magic_fetch.models import (
     normalize_original_url,
 )
 from archive_magic_fetch.warc import (
+    CollectionWarcWriter,
     YearWarcWriter,
     classify_playback_error,
     get_warc_identity,
@@ -223,14 +224,14 @@ def test_raw_cdx_saved_before_normalization_and_malformed_in_failures(tmp_path):
     )
     assert result.raw_path.is_file()
     raw = result.raw_path.read_bytes()
-    assert raw == body
-    assert b"200406" in raw
+    assert gzip.decompress(raw) == body
+    assert b"200406" in gzip.decompress(raw)
     assert len(result.captures) == 1
     assert len(result.failures) == 1
     assert result.failures[0].category == FailureCategory.MALFORMED_CDX
-    query = json.loads((result.source_dir / "query.json").read_text())
-    assert query["years"]["2004"]["response_encoding"] == "identity"
-    assert query["years"]["2004"]["response_encoding"] != "nd-json-pages"
+    assert result.query_meta["response_encoding"] == "identity"
+    assert result.raw_path.name == "page-001.cdx.gz"
+    assert not (result.source_dir / "query.json").exists()
 
 
 def test_malformed_rows_keep_distinct_failure_identities():
@@ -1309,7 +1310,7 @@ def test_orphan_revisit_annual_index_is_rejected(tmp_path):
         'com,example)/ 20040602000000 {"url":"http://example.org/",'
         '"digest":"sha1:FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF",'
         '"mime":"warc/revisit","status":"200",'
-        f'"filename":"{warcs[0].relative_key}","offset":0,"length":10}}'
+        f'"filename":"{warcs[0].path.name}","offset":0,"length":10}}'
     ]
     with pytest.raises(ValueError, match="no earlier response"):
         validate_annual_revisit_closure(layout, 2004, fake_lines)
@@ -1318,12 +1319,15 @@ def test_orphan_revisit_annual_index_is_rejected(tmp_path):
 def test_orphan_redirect_revisit_annual_index_is_rejected(tmp_path):
     layout = collection_layout("http://example.org/", tmp_path)
     ensure_collection_dirs(layout)
+    writer = YearWarcWriter(layout, 2004)
+    writer.write_playback(_playback(_identity(digest="sha1:" + "E" * 32)))
+    writer.close()
     # Redirect-status revisits must still resolve; no redirect exemption.
     fake_lines = [
         'com,example)/ 20040602000000 {"url":"http://example.org/",'
         '"digest":"sha1:FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF",'
         '"mime":"warc/revisit","status":"302",'
-        '"filename":"archive/2004/example.org-2004-001.warc.gz",'
+        '"filename":"example.org-2004-001.warc.gz",'
         '"offset":0,"length":10}'
     ]
     with pytest.raises(ValueError, match="no earlier response"):
@@ -1454,10 +1458,10 @@ def test_annual_index_beside_warcs_covers_multi_shard_year(tmp_path):
 
     annual = publish_annual_index(layout, 2004)
     assert annual is not None
-    assert annual.relative_key == "archive/2004/example.org-2004.cdxj"
-    assert layout.annual_index(2004) == layout.year_dir(2004) / "example.org-2004.cdxj"
+    assert annual.relative_key == "collections/2004/example.org-2004-index.cdxj"
+    assert layout.annual_index(2004) == layout.year_dir(2004) / "example.org-2004-index.cdxj"
     assert layout.annual_index(2004).is_file()
-    assert not (layout.root / "indexes").exists()
+    assert not (layout.root / "archive").exists()
 
     names = set()
     for line in layout.annual_index(2004).read_text().splitlines():
@@ -1466,8 +1470,8 @@ def test_annual_index_beside_warcs_covers_multi_shard_year(tmp_path):
         meta = json.loads(line.split(" ", 2)[2])
         names.add(meta["filename"])
     assert names == {
-        "archive/2004/example.org-2004-001.warc.gz",
-        "archive/2004/example.org-2004-002.warc.gz",
+        "example.org-2004-001.warc.gz",
+        "example.org-2004-002.warc.gz",
     }
 
 
@@ -1478,22 +1482,22 @@ def test_list_annual_indexes_ignores_warcs_and_foreign_names(tmp_path):
     year_dir.mkdir(parents=True)
     layout.warc_path(2004, 1).write_bytes(b"warc")
     # Correct annual index name.
-    (year_dir / "example.org-2004.cdxj").write_text(
+    (year_dir / "example.org-2004-index.cdxj").write_text(
         "a 20040101000000 {}\n", encoding="utf-8"
     )
     # Foreign names must be ignored.
     (year_dir / "other.org-2004.cdxj").write_text("x\n", encoding="utf-8")
     (year_dir / "2004.cdxj").write_text("y\n", encoding="utf-8")
-    (year_dir / "example.org-2004-index.cdxj").write_text("z\n", encoding="utf-8")
+    (year_dir / "example.org-2004-extra.cdxj").write_text("z\n", encoding="utf-8")
     # Another year with matching index.
     y2005 = layout.year_dir(2005)
     y2005.mkdir(parents=True)
-    (y2005 / "example.org-2005.cdxj").write_text("b\n", encoding="utf-8")
+    (y2005 / "example.org-2005-index.cdxj").write_text("b\n", encoding="utf-8")
 
     found = list_annual_indexes(layout)
     assert [(year, path.name) for year, path in found] == [
-        (2004, "example.org-2004.cdxj"),
-        (2005, "example.org-2005.cdxj"),
+        (2004, "example.org-2004-index.cdxj"),
+        (2005, "example.org-2005-index.cdxj"),
     ]
 
 
@@ -1512,38 +1516,13 @@ def test_crash_recovery_indexes_finalized_warc_without_redownload(tmp_path):
     assert not layout.annual_index(2004).exists()
     publish_annual_index(layout, 2004)
     assert layout.annual_index(2004).is_file()
-    assert layout.annual_index(2004).name == "example.org-2004.cdxj"
+    assert layout.annual_index(2004).name == "example.org-2004-index.cdxj"
     inv = inventory_year(layout, 2004)
     assert inv.contains(capt)
 
 
 # ---------------------------------------------------------------------------
-# 9. Annual + collection CDXJ merge
-# ---------------------------------------------------------------------------
-
-
-def test_annual_and_collection_index_merge_sorted_and_idempotent(tmp_path):
-    layout = collection_layout("http://example.org/", tmp_path)
-    ensure_collection_dirs(layout)
-    for year, day in ((2004, "01"), (2005, "02")):
-        capt = _identity(ts=f"{year}06{day}000000")
-        writer = YearWarcWriter(layout, year)
-        writer.write_playback(_playback(capt, body=f"y{year}".encode()))
-        writer.close()
-        publish_annual_index(layout, year)
-    first = publish_collection_index(layout)
-    second = publish_collection_index(layout)
-    assert first is not None and second is not None
-    text1 = layout.collection_index.read_text()
-    assert text1 == layout.collection_index.read_text()
-    lines = [line for line in text1.splitlines() if line]
-    keys = [(line.split()[0], line.split()[1]) for line in lines]
-    assert keys == sorted(keys)
-    validate_cdxj_against_warcs(layout, lines)
-
-
-# ---------------------------------------------------------------------------
-# 11. Completed run + failure persistence across scoped rerun
+# 9. Completed run records and failure history
 # ---------------------------------------------------------------------------
 
 
@@ -1601,10 +1580,13 @@ def test_completed_run_reports_expected_failures(tmp_path, capsys):
         fetch_mod.fetch_year_cdx = original
 
     assert result.exit_code == 0
-    manifest = json.loads(layout.manifest_path.read_text())
-    assert manifest["schema_version"] == 3
-    assert manifest["status"] == "complete"
-    assert set(manifest["metrics"]) == {
+    run_dirs = list((layout.capture_dir("2004") / "runs").iterdir())
+    assert len(run_dirs) == 1
+    record = json.loads((run_dirs[0] / "run.json").read_text())
+    assert record["schema_version"] == 1
+    assert record["archive_id"] == "example.org"
+    assert record["collection_id"] == "2004"
+    assert set(record["metrics"]) == {
         "cdx_requests",
         "cdx_duration_s",
         "playback_attempts",
@@ -1613,9 +1595,14 @@ def test_completed_run_reports_expected_failures(tmp_path, capsys):
         "index_s",
         "attempts_by_category",
     }
-    assert layout.failures_path.is_file()
+    assert len(record["failures"]) == 1
+    assert record["failures"][0]["identity"]["timestamp"] == bad.timestamp
+    assert record["query"]["raw_file"] == "page-001.cdx.gz"
     assert list_year_warcs(layout, 2004)
-    assert all(w["record_count"] > 0 for w in manifest["warcs"])
+    assert all(w["record_count"] > 0 for w in record["warcs"])
+    assert record["index"]["filename"] == (
+        "collections/2004/example.org-2004-index.cdxj"
+    )
     output = capsys.readouterr().out
     assert (
         "year 2004 done: downloads=1 revisits=0 "
@@ -1633,21 +1620,16 @@ def test_elapsed_format_uses_unbounded_hours():
     assert _format_elapsed(25 * 60 * 60 + 2) == "25:00:02"
 
 
-def test_scoped_rerun_keeps_prior_failures_and_annual_indexes(tmp_path):
+def test_scoped_rerun_keeps_prior_collection_and_records_only_current_failures(tmp_path):
     layout = collection_layout("http://example.org/", tmp_path)
     ensure_collection_dirs(layout)
-    prior = UnresolvedFailure(
-        identity=_identity(ts="20040601000000"),
-        category=FailureCategory.UNAVAILABLE,
-        message="still unresolved from earlier run",
-    )
-    write_failures(layout, [prior])
-    # Seed a 2004 annual index so a 2005-only rerun must still publish it.
+    # Seed a portable 2004 collection; a 2005-only run must leave it unchanged.
     capt = _identity(ts="20040615000000")
     writer = YearWarcWriter(layout, 2004)
     writer.write_playback(_playback(capt))
     writer.close()
     publish_annual_index(layout, 2004)
+    original_index = layout.annual_index(2004).read_bytes()
 
     body_2005 = _cdx_json(
         [
@@ -1684,16 +1666,12 @@ def test_scoped_rerun_keeps_prior_failures_and_annual_indexes(tmp_path):
         fetch_mod.fetch_year_cdx = original
 
     assert result.exit_code == 0
-    remaining = {item.identity for item in load_failures(layout)}
-    assert prior.identity in remaining
-    manifest = json.loads(layout.manifest_path.read_text())
-    annual_names = {item["filename"] for item in manifest["annual_indexes"]}
-    assert "archive/2004/example.org-2004.cdxj" in annual_names
-    assert "archive/2005/example.org-2005.cdxj" in annual_names
-    warc_2004 = [
-        item for item in manifest["warcs"] if item["filename"].startswith("archive/2004/")
-    ]
-    assert warc_2004 and warc_2004[0]["record_count"] > 0
+    assert layout.annual_index(2004).read_bytes() == original_index
+    assert layout.annual_index(2005).is_file()
+    run_dirs = list((layout.capture_dir("2005") / "runs").iterdir())
+    record = json.loads((run_dirs[0] / "run.json").read_text())
+    assert record["collection_id"] == "2005"
+    assert record["failures"] == []
 
 
 def test_cli_rejects_reversed_range():
@@ -1711,10 +1689,10 @@ def test_cli_rejects_reversed_range():
     assert code == 2
 
 
-def test_existing_older_collection_schema_requires_regeneration(tmp_path):
+def test_existing_legacy_layout_requires_regeneration(tmp_path):
     layout = collection_layout("http://example.org/", tmp_path)
     layout.root.mkdir(parents=True)
-    layout.manifest_path.write_text('{"schema_version": 2}\n', encoding="utf-8")
+    (layout.root / "index.cdxj").write_text("legacy\n", encoding="utf-8")
 
     with pytest.raises(ValueError, match="delete and regenerate"):
         run_fetch(
@@ -1728,7 +1706,7 @@ def test_existing_older_collection_schema_requires_regeneration(tmp_path):
         )
 
 
-def test_resolved_prior_failure_exits_zero(tmp_path):
+def test_rerun_retries_missing_capture_without_failure_ledger(tmp_path):
     layout = collection_layout("http://example.org/", tmp_path)
     ensure_collection_dirs(layout)
     body_bytes = b"resolved-body"
@@ -1738,17 +1716,6 @@ def test_resolved_prior_failure_exits_zero(tmp_path):
         digest=f"sha1:{digest}",
         urlkey="com,example)/",
     )
-    write_failures(
-        layout,
-        [
-            UnresolvedFailure(
-                identity=identity,
-                category=FailureCategory.UNAVAILABLE,
-                message="historical unresolved",
-            )
-        ],
-    )
-
     def download_fn(_client, capt_identity):
         return _playback(capt_identity, body=body_bytes)
 
@@ -1784,26 +1751,14 @@ def test_resolved_prior_failure_exits_zero(tmp_path):
 
     assert result.exit_code == 0
     assert result.failures == []
-    manifest = json.loads(layout.manifest_path.read_text())
-    assert manifest["status"] == "complete"
-    assert not layout.failures_path.is_file()
+    run_dir = next((layout.capture_dir("2004") / "runs").iterdir())
+    assert json.loads((run_dir / "run.json").read_text())["failures"] == []
 
 
-def test_newer_failure_details_replace_stale(tmp_path):
+def test_failure_details_are_stored_in_current_run(tmp_path):
     layout = collection_layout("http://example.org/", tmp_path)
     ensure_collection_dirs(layout)
     identity = _identity(ts="20040615000000", urlkey="com,example)/")
-    write_failures(
-        layout,
-        [
-            UnresolvedFailure(
-                identity=identity,
-                category=FailureCategory.UNAVAILABLE,
-                message="stale historical message",
-            )
-        ],
-    )
-
     def download_fn(_client, capt_identity):
         raise MementoPlaybackError("memento playback failed: 404 Not Found")
 
@@ -1838,27 +1793,93 @@ def test_newer_failure_details_replace_stale(tmp_path):
         fetch_mod.fetch_year_cdx = original
 
     assert result.exit_code == 0
-    remaining = load_failures(layout)
-    assert len(remaining) == 1
-    assert remaining[0].identity == identity
-    assert remaining[0].message != "stale historical message"
-    assert "stale historical message" not in remaining[0].message
+    assert len(result.failures) == 1
+    run_dir = next((layout.capture_dir("2004") / "runs").iterdir())
+    failures = json.loads((run_dir / "run.json").read_text())["failures"]
+    assert failures[0]["identity"]["timestamp"] == identity.timestamp
+    assert "404 Not Found" in failures[0]["message"]
 
 
-def test_run_source_ids_are_unique(tmp_path):
-    from archive_magic_fetch.cdx import init_run_source
-
+def test_run_ids_are_unique(tmp_path):
     layout = collection_layout("http://example.org/", tmp_path)
     ensure_collection_dirs(layout)
-    first = init_run_source(layout)
-    second = init_run_source(layout)
+    first = init_run_id(layout)
+    (layout.run_dir("2004", first)).mkdir(parents=True)
+    second = init_run_id(layout)
     assert first != second
-    assert first.name != second.name
-    # Pre-create a colliding candidate directory and ensure allocation bumps.
-    collide = layout.sources_root / first.name
-    assert collide.is_dir()
-    third = init_run_source(layout)
-    assert third.name not in {first.name, second.name}
+    assert isinstance(first, str)
+
+
+@pytest.mark.parametrize("collection_id", ("", "../2004", "nested/2004", "bad id"))
+def test_generic_collection_ids_must_be_filesystem_safe(tmp_path, collection_id):
+    layout = collection_layout("http://example.org/", tmp_path)
+    with pytest.raises(ValueError, match="unsafe collection ID"):
+        layout.collection_dir(collection_id)
+
+
+def test_generic_collection_writer_and_index_are_portable(tmp_path):
+    layout = collection_layout("http://example.org/", tmp_path)
+    ensure_collection_dirs(layout)
+    writer = CollectionWarcWriter(layout, "campaign-launch")
+    writer.write_playback(_playback(_identity()))
+    warcs = writer.close()
+
+    index = publish_collection_index(layout, "campaign-launch")
+
+    assert warcs[0].path.name == "example.org-campaign-launch-001.warc.gz"
+    assert index is not None
+    assert index.path.name == "example.org-campaign-launch-index.cdxj"
+    payload = json.loads(index.path.read_text().split(" ", 2)[2])
+    assert payload["filename"] == warcs[0].path.name
+
+
+def test_multi_year_empty_run_shares_id_without_playback_collections(
+    tmp_path, monkeypatch
+):
+    from archive_magic_fetch.cdx import YearCdxResult
+    import archive_magic_fetch.fetch as fetch_mod
+
+    seen_ids = []
+
+    def empty_year(layout, *, year, run_id, **_kwargs):
+        seen_ids.append(run_id)
+        run_dir = layout.run_dir(str(year), run_id)
+        run_dir.mkdir(parents=True)
+        raw = run_dir / "page-001.cdx.gz"
+        raw.write_bytes(b"[]")
+        return YearCdxResult(
+            year=year,
+            source_dir=run_dir,
+            raw_path=raw,
+            captures=(),
+            failures=(),
+            query_meta={
+                "year": year,
+                "from": f"{year}0101000000",
+                "to": f"{year}1231235959",
+                "request_count": 1,
+                "raw_file": raw.name,
+                "pages": [{"page": 1, "raw_file": raw.name}],
+            },
+        )
+
+    monkeypatch.setattr(fetch_mod, "fetch_year_cdx", empty_year)
+    result = run_fetch(
+        FetchSettings(
+            url_pattern="http://example.org/",
+            date_start="20040101000000",
+            date_end="20051231235959",
+            archives_root=tmp_path,
+        ),
+        client_factory=lambda: MagicMock(),
+    )
+
+    assert result.exit_code == 0
+    assert len(seen_ids) == 2 and len(set(seen_ids)) == 1
+    layout = result.layout
+    for year in ("2004", "2005"):
+        assert layout.run_record(year, seen_ids[0]).is_file()
+        assert not layout.collection_dir(year).exists()
 
 
 def test_multipage_cdx_metadata_coherent_and_parsed_from_disk(tmp_path):

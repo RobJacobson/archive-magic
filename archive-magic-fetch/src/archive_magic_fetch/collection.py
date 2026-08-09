@@ -1,4 +1,4 @@
-"""Collection layout, atomic publication, manifest, and failure ledger."""
+"""Domain archive layout, atomic publication, and immutable run records."""
 
 from __future__ import annotations
 
@@ -14,34 +14,27 @@ from typing import Optional, Sequence
 from urllib.parse import urlsplit
 
 from .models import (
-    COLLECTION_SCHEMA_VERSION,
     DEFAULT_OUTPUT_ROOT,
-    FAILURES_SCHEMA_VERSION,
+    RUN_SCHEMA_VERSION,
     WARC_TARGET_BYTES,
     WARC_VERSION,
-    FailureCategory,
     IndexArtifact,
     RunMetrics,
     UnresolvedFailure,
     WarcArtifact,
-    identity_from_dict,
     identity_to_dict,
 )
 
 
 _WWW_ALIAS_PREFIX = re.compile(r"^www\d*\.")
 _TEMP_NAME = re.compile(r"^\.tmp-|^.*\.(tmp|partial)$")
-_WARC_NAME = re.compile(
-    r"^(?P<id>.+)-(?P<year>\d{4})-(?P<seq>\d{3})\.warc\.gz$"
-)
-_ANNUAL_INDEX_NAME = re.compile(
-    r"^(?P<id>.+)-(?P<year>\d{4})\.cdxj$"
-)
+_COLLECTION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+_LEGACY_NAMES = ("archive", "sources", "index.cdxj", "collection.json", "failures.json")
 
 
 @dataclass(frozen=True)
-class CollectionLayout:
-    """Filesystem boundaries for one website collection."""
+class ArchiveLayout:
+    """Filesystem boundaries for one domain archive and its collections."""
 
     archives_root: Path
     collection_id: str
@@ -51,56 +44,76 @@ class CollectionLayout:
         return self.archives_root / self.collection_id
 
     @property
-    def archive_root(self) -> Path:
-        return self.root / "archive"
+    def collections_root(self) -> Path:
+        return self.root / "collections"
 
     @property
-    def collection_index(self) -> Path:
-        return self.root / "index.cdxj"
-
-    @property
-    def sources_root(self) -> Path:
-        return self.root / "sources"
+    def captures_root(self) -> Path:
+        return self.root / "captures"
 
     @property
     def work_root(self) -> Path:
-        return self.root / ".work"
+        return self.captures_root / ".work"
 
-    @property
-    def manifest_path(self) -> Path:
-        return self.root / "collection.json"
+    def validate_collection_id(self, collection_id: str) -> str:
+        if not _COLLECTION_ID.fullmatch(collection_id) or collection_id in {".", ".."}:
+            raise ValueError(f"unsafe collection ID: {collection_id!r}")
+        return collection_id
 
-    @property
-    def failures_path(self) -> Path:
-        return self.root / "failures.json"
+    def collection_dir(self, collection_id: str) -> Path:
+        return self.collections_root / self.validate_collection_id(collection_id)
+
+    def capture_dir(self, collection_id: str) -> Path:
+        return self.captures_root / self.validate_collection_id(collection_id)
+
+    def run_dir(self, collection_id: str, run_id: str) -> Path:
+        if not _COLLECTION_ID.fullmatch(run_id):
+            raise ValueError(f"unsafe run ID: {run_id!r}")
+        return self.capture_dir(collection_id) / "runs" / run_id
+
+    def run_record(self, collection_id: str, run_id: str) -> Path:
+        return self.run_dir(collection_id, run_id) / "run.json"
 
     def year_dir(self, year: int) -> Path:
-        return self.archive_root / f"{year:04d}"
+        return self.collection_dir(f"{year:04d}")
 
     def annual_index_filename(self, year: int) -> str:
-        return f"{self.collection_id}-{year:04d}.cdxj"
+        return self.index_filename(f"{year:04d}")
+
+    def index_filename(self, collection_id: str) -> str:
+        collection_id = self.validate_collection_id(collection_id)
+        return f"{self.collection_id}-{collection_id}-index.cdxj"
 
     def annual_index(self, year: int) -> Path:
-        return self.year_dir(year) / self.annual_index_filename(year)
+        return self.collection_index(f"{year:04d}")
+
+    def collection_index(self, collection_id: str) -> Path:
+        return self.collection_dir(collection_id) / self.index_filename(collection_id)
 
     def warc_filename(self, year: int, sequence: int) -> str:
+        return self.collection_warc_filename(f"{year:04d}", sequence)
+
+    def collection_warc_filename(self, collection_id: str, sequence: int) -> str:
+        collection_id = self.validate_collection_id(collection_id)
         if sequence < 1 or sequence > 999:
             raise ValueError(
                 f"WARC sequence must be 001-999, got {sequence}"
             )
-        return f"{self.collection_id}-{year:04d}-{sequence:03d}.warc.gz"
+        return f"{self.collection_id}-{collection_id}-{sequence:03d}.warc.gz"
 
     def warc_relative_key(self, year: int, sequence: int) -> str:
-        return f"archive/{year:04d}/{self.warc_filename(year, sequence)}"
+        return self.warc_filename(year, sequence)
 
     def warc_path(self, year: int, sequence: int) -> Path:
         return self.year_dir(year) / self.warc_filename(year, sequence)
 
-    def annual_index_relative_key(self, year: int) -> str:
-        return f"archive/{year:04d}/{self.annual_index_filename(year)}"
+    def collection_warc_path(self, collection_id: str, sequence: int) -> Path:
+        return self.collection_dir(collection_id) / self.collection_warc_filename(
+            collection_id, sequence
+        )
 
-    def collection_index_relative_key(self) -> str:
-        return "index.cdxj"
+    def annual_index_relative_key(self, year: int) -> str:
+        return self.annual_index_filename(year)
 
 
 def normalize_domain(
@@ -178,7 +191,7 @@ def default_archives_root() -> Path:
 def collection_layout(
     url_pattern: str,
     archives_root: Path | str | None = None,
-) -> CollectionLayout:
+) -> ArchiveLayout:
     """Build collection layout for one URL pattern."""
 
     root = (
@@ -186,37 +199,30 @@ def collection_layout(
         if archives_root is not None
         else default_archives_root()
     )
-    return CollectionLayout(root, normalize_collection_id(url_pattern))
+    return ArchiveLayout(root, normalize_collection_id(url_pattern))
 
 
-def require_current_collection_schema(layout: CollectionLayout) -> None:
-    """Reject an existing manifest from an incompatible Fetch collection."""
+def reject_legacy_layout(layout: ArchiveLayout) -> None:
+    """Reject pre-flat Archive Magic output rather than mixing schemas."""
 
-    if not layout.manifest_path.is_file():
-        return
-    try:
-        schema = json.loads(layout.manifest_path.read_text(encoding="utf-8")).get(
-            "schema_version"
-        )
-    except (OSError, ValueError, AttributeError) as error:
-        raise ValueError("existing collection manifest is unreadable") from error
-    if schema != COLLECTION_SCHEMA_VERSION:
+    found = [name for name in _LEGACY_NAMES if (layout.root / name).exists()]
+    if found:
         raise ValueError(
-            f"existing collection schema {schema!r} is unsupported; "
-            "delete and regenerate the collection"
+            "unsupported legacy archive layout; delete and regenerate the archive "
+            f"(found: {', '.join(found)})"
         )
 
 
-def ensure_collection_dirs(layout: CollectionLayout) -> None:
-    """Create permanent and work directories for a collection."""
+def ensure_collection_dirs(layout: ArchiveLayout) -> None:
+    """Create permanent domain archive and capture-state directories."""
 
     layout.root.mkdir(parents=True, exist_ok=True)
-    layout.archive_root.mkdir(parents=True, exist_ok=True)
-    layout.sources_root.mkdir(parents=True, exist_ok=True)
+    layout.collections_root.mkdir(parents=True, exist_ok=True)
+    layout.captures_root.mkdir(parents=True, exist_ok=True)
     layout.work_root.mkdir(parents=True, exist_ok=True)
 
 
-def cleanup_temps(layout: CollectionLayout) -> None:
+def cleanup_temps(layout: ArchiveLayout) -> None:
     """Remove abandoned temporary files under the collection root."""
 
     if not layout.root.is_dir():
@@ -288,61 +294,61 @@ def exclusive_temp_path(directory: Path, *, suffix: str) -> Path:
     return path
 
 
-def list_year_warcs(layout: CollectionLayout, year: int) -> list[Path]:
-    """Return finalized WARC paths for one year, sorted by sequence."""
+def list_collection_warcs(
+    layout: ArchiveLayout, collection_id: str
+) -> list[Path]:
+    """Return finalized WARC paths for one portable collection."""
 
-    year_dir = layout.year_dir(year)
-    if not year_dir.is_dir():
+    collection_id = layout.validate_collection_id(collection_id)
+    collection_dir = layout.collection_dir(collection_id)
+    if not collection_dir.is_dir():
         return []
     found: list[tuple[int, Path]] = []
-    for path in year_dir.iterdir():
+    pattern = re.compile(
+        rf"{re.escape(layout.collection_id)}-{re.escape(collection_id)}-"
+        r"(?P<seq>\d{3})\.warc\.gz"
+    )
+    for path in collection_dir.iterdir():
         if not path.is_file():
             continue
-        match = _WARC_NAME.fullmatch(path.name)
+        match = pattern.fullmatch(path.name)
         if match is None:
-            continue
-        if match.group("id") != layout.collection_id:
-            continue
-        if int(match.group("year")) != year:
             continue
         found.append((int(match.group("seq")), path))
     found.sort(key=lambda item: item[0])
     return [path for _, path in found]
 
 
-def list_annual_indexes(layout: CollectionLayout) -> list[tuple[int, Path]]:
-    """Return (year, path) for every annual CDXJ under archive/, sorted by year."""
+def list_year_warcs(layout: ArchiveLayout, year: int) -> list[Path]:
+    """Return finalized WARCs for the current year-based grouping strategy."""
 
-    if not layout.archive_root.is_dir():
+    return list_collection_warcs(layout, f"{year:04d}")
+
+
+def list_annual_indexes(layout: ArchiveLayout) -> list[tuple[int, Path]]:
+    """Return yearly collection indexes, sorted by year."""
+
+    if not layout.collections_root.is_dir():
         return []
     found: list[tuple[int, Path]] = []
-    for year_dir in sorted(layout.archive_root.iterdir()):
+    for year_dir in sorted(layout.collections_root.iterdir()):
         if not year_dir.is_dir() or not year_dir.name.isdigit():
             continue
         year = int(year_dir.name)
-        for path in year_dir.iterdir():
-            if not path.is_file() or path.name.startswith(".tmp-"):
-                continue
-            match = _ANNUAL_INDEX_NAME.fullmatch(path.name)
-            if match is None:
-                continue
-            if match.group("id") != layout.collection_id:
-                continue
-            if int(match.group("year")) != year:
-                continue
+        path = layout.annual_index(year)
+        if path.is_file():
             found.append((year, path))
-            break
     return found
 
 
-def list_all_warcs(layout: CollectionLayout) -> list[Path]:
+def list_all_warcs(layout: ArchiveLayout) -> list[Path]:
     """Return every finalized WARC in the collection, sorted by key."""
 
-    if not layout.archive_root.is_dir():
+    if not layout.collections_root.is_dir():
         return []
     warcs = [
         path
-        for path in layout.archive_root.rglob("*.warc.gz")
+        for path in layout.collections_root.rglob("*.warc.gz")
         if path.is_file() and not path.name.startswith(".tmp-")
     ]
     return sorted(
@@ -351,26 +357,37 @@ def list_all_warcs(layout: CollectionLayout) -> list[Path]:
     )
 
 
-def next_warc_sequence(layout: CollectionLayout, year: int) -> int:
-    """Return the next WARC sequence number (1-based) for a year."""
+def next_collection_warc_sequence(
+    layout: ArchiveLayout, collection_id: str
+) -> int:
+    """Return the next WARC sequence number for a portable collection."""
 
-    existing = list_year_warcs(layout, year)
+    collection_id = layout.validate_collection_id(collection_id)
+    existing = list_collection_warcs(layout, collection_id)
     if not existing:
         return 1
     last = existing[-1].name
-    match = _WARC_NAME.fullmatch(last)
+    pattern = re.compile(
+        rf"{re.escape(layout.collection_id)}-{re.escape(collection_id)}-"
+        r"(?P<seq>\d{3})\.warc\.gz"
+    )
+    match = pattern.fullmatch(last)
     assert match is not None
     nxt = int(match.group("seq")) + 1
     if nxt > 999:
         raise RuntimeError(
             f"WARC sequence would exceed 999 for {layout.collection_id} "
-            f"year {year}; refusing to create shard 1000"
+            f"collection {collection_id}; refusing to create shard 1000"
         )
     return nxt
 
 
+def next_warc_sequence(layout: ArchiveLayout, year: int) -> int:
+    return next_collection_warc_sequence(layout, f"{year:04d}")
+
+
 def warc_artifact_from_path(
-    layout: CollectionLayout,
+    layout: ArchiveLayout,
     path: Path,
     *,
     record_count: int,
@@ -378,12 +395,19 @@ def warc_artifact_from_path(
     """Build a WarcArtifact descriptor for a finalized WARC."""
 
     relative = path.relative_to(layout.root).as_posix()
-    match = _WARC_NAME.fullmatch(path.name)
-    if match is None:
+    collection_id = path.parent.name
+    layout.validate_collection_id(collection_id)
+    expected_parent = layout.collection_dir(collection_id)
+    pattern = re.compile(
+        rf"{re.escape(layout.collection_id)}-{re.escape(collection_id)}-"
+        r"(?P<seq>\d{3})\.warc\.gz"
+    )
+    match = pattern.fullmatch(path.name)
+    if match is None or path.parent.resolve() != expected_parent.resolve():
         raise ValueError(f"unexpected WARC filename: {path.name}")
     return WarcArtifact(
         relative_key=relative,
-        year=int(match.group("year")),
+        collection_id=collection_id,
         sequence=int(match.group("seq")),
         path=path,
         size_bytes=path.stat().st_size,
@@ -393,7 +417,7 @@ def warc_artifact_from_path(
 
 
 def index_artifact_from_path(
-    layout: CollectionLayout,
+    layout: ArchiveLayout,
     path: Path,
     *,
     capture_count: int | None = None,
@@ -413,82 +437,37 @@ def index_artifact_from_path(
     )
 
 
-def write_failures(
-    layout: CollectionLayout,
+def write_run_record(
+    layout: ArchiveLayout,
+    *,
+    collection_id: str,
+    run_id: str,
+    url_pattern: str,
+    date_start: str,
+    date_end: str,
+    query: dict[str, object],
+    warcs: Sequence[WarcArtifact],
+    index: Optional[IndexArtifact],
+    metrics: RunMetrics,
     failures: Sequence[UnresolvedFailure],
-) -> Optional[Path]:
-    """Publish or remove the failures ledger."""
+) -> Path:
+    """Atomically publish the immutable completion record for one run slice."""
 
-    if not failures:
-        layout.failures_path.unlink(missing_ok=True)
-        return None
-
-    ordered = sorted(
+    ordered_failures = sorted(
         failures,
-        key=lambda item: (
-            item.identity.sort_key(),
-            item.category.value,
-            item.message,
-        ),
+        key=lambda item: (item.identity.sort_key(), item.category.value, item.message),
     )
     payload = {
-        "schema_version": FAILURES_SCHEMA_VERSION,
-        "failures": [
-            {
-                "identity": identity_to_dict(item.identity),
-                "category": item.category.value,
-                "message": item.message,
-            }
-            for item in ordered
-        ],
-    }
-    tmp = exclusive_temp_path(layout.root, suffix=".failures.json.tmp")
-    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
-    publish_file_atomically(tmp, layout.failures_path)
-    return layout.failures_path
-
-
-def load_failures(layout: CollectionLayout) -> list[UnresolvedFailure]:
-    """Load the current failure ledger if present."""
-
-    if not layout.failures_path.is_file():
-        return []
-    data = json.loads(layout.failures_path.read_text(encoding="utf-8"))
-    result: list[UnresolvedFailure] = []
-    for row in data.get("failures", []):
-        result.append(
-            UnresolvedFailure(
-                identity=identity_from_dict(row["identity"]),
-                category=FailureCategory(row["category"]),
-                message=str(row["message"]),
-            )
-        )
-    return result
-
-
-def write_manifest(
-    layout: CollectionLayout,
-    *,
-    url_pattern: str,
-    status: str,
-    run_source_relative: Optional[str],
-    warcs: Sequence[WarcArtifact],
-    annual_indexes: Sequence[IndexArtifact],
-    collection_index: Optional[IndexArtifact],
-    metrics: RunMetrics,
-) -> Path:
-    """Atomically publish collection.json."""
-
-    if status not in {"complete", "partial"}:
-        raise ValueError(f"invalid collection status: {status}")
-    payload = {
-        "schema_version": COLLECTION_SCHEMA_VERSION,
-        "collection_id": layout.collection_id,
+        "schema_version": RUN_SCHEMA_VERSION,
+        "run_id": run_id,
+        "archive_id": layout.collection_id,
+        "collection_id": collection_id,
         "url_pattern": url_pattern,
+        "date_start": date_start,
+        "date_end": date_end,
         "warc_version": WARC_VERSION,
         "warc_target_bytes": WARC_TARGET_BYTES,
-        "status": status,
-        "run_source": run_source_relative,
+        "query": query,
         "counts": {
             "selected": metrics.selected,
             "represented": metrics.represented,
@@ -512,34 +491,36 @@ def write_manifest(
         "warcs": [
             {
                 "filename": item.relative_key,
-                "year": item.year,
+                "collection_id": item.collection_id,
                 "size_bytes": item.size_bytes,
                 "sha256": item.sha256,
                 "record_count": item.record_count,
             }
             for item in sorted(warcs, key=lambda w: w.relative_key)
         ],
-        "annual_indexes": [
+        "index": (
             {
-                "filename": item.relative_key,
-                "size_bytes": item.size_bytes,
-                "sha256": item.sha256,
-                "capture_count": item.capture_count,
+                "filename": index.relative_key,
+                "size_bytes": index.size_bytes,
+                "sha256": index.sha256,
+                "capture_count": index.capture_count,
             }
-            for item in sorted(annual_indexes, key=lambda i: i.relative_key)
-        ],
-        "collection_index": (
-            {
-                "filename": collection_index.relative_key,
-                "size_bytes": collection_index.size_bytes,
-                "sha256": collection_index.sha256,
-                "capture_count": collection_index.capture_count,
-            }
-            if collection_index is not None
+            if index is not None
             else None
         ),
+        "failures": [
+            {
+                "identity": identity_to_dict(item.identity),
+                "category": item.category.value,
+                "message": item.message,
+            }
+            for item in ordered_failures
+        ],
     }
-    tmp = exclusive_temp_path(layout.root, suffix=".collection.json.tmp")
+    destination = layout.run_record(collection_id, run_id)
+    if destination.exists():
+        raise FileExistsError(f"run record already exists: {destination}")
+    tmp = exclusive_temp_path(destination.parent, suffix=".run.json.tmp")
     tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
-    publish_file_atomically(tmp, layout.manifest_path)
-    return layout.manifest_path
+    publish_file_atomically(tmp, destination)
+    return destination
