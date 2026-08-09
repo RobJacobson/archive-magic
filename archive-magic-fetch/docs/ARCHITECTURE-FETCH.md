@@ -114,9 +114,10 @@ bytes, WARC/index timing, and attempts by failure category.
 
 Interactive console output numbers every selected capture as `current/total`.
 Capture labels use OSC 8 hyperlinks so terminals can display the compact
-`timestamp/original-url` form while opening the full Wayback URL. Successful
-downloads, revisits, warnings, and errors use distinct ANSI styles. Redirected
-output remains plain text, and the `NO_COLOR` convention disables color.
+`timestamp/original-url` form, omitting a leading `www.`, while opening the full
+Wayback URL. Successful downloads, revisits, warnings, and errors use distinct
+ANSI styles. Redirected output remains plain text, and the `NO_COLOR` convention
+disables color.
 
 ## Deliberate exclusions
 

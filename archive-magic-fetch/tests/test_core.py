@@ -388,7 +388,7 @@ def test_console_link_uses_compact_label_and_full_destination():
     plain = _capture_link(identity, enabled=False)
     linked = _capture_link(identity, enabled=True)
 
-    assert plain == "20080516181742/http://www.example.org/a"
+    assert plain == "20080516181742/http://example.org/a"
     assert plain in linked
     assert "https://web.archive.org/web/20080516181742/http://www.example.org/a" in linked
     assert linked.startswith("\033]8;;")

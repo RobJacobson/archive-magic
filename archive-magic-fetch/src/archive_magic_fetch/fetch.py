@@ -96,7 +96,13 @@ def _terminal_safe(value: str) -> str:
 def _capture_link(identity: CaptureIdentity, *, enabled: bool | None = None) -> str:
     """Render a compact OSC 8 link, or its plain-text label when unsupported."""
 
-    label = _terminal_safe(f"{identity.timestamp}/{identity.original_url}")
+    display_url = identity.original_url
+    lowered = display_url.lower()
+    for prefix in ("http://www.", "https://www."):
+        if lowered.startswith(prefix):
+            display_url = display_url[: prefix.index("www.")] + display_url[len(prefix) :]
+            break
+    label = _terminal_safe(f"{identity.timestamp}/{display_url}")
     if enabled is None:
         enabled = _terminal_output_enabled()
     if not enabled:
