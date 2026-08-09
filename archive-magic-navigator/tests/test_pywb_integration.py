@@ -308,8 +308,6 @@ def test_real_pywb_replays_versions_revisit_and_subresources_read_only(
         thread.join(timeout=2)
 
     assert snapshot_tree(archives) == before
-
-
 @pytest.mark.integration
 def test_real_pywb_uses_wayback_fallback_for_redirect_and_assets(
     tmp_path,
@@ -476,8 +474,6 @@ def test_real_pywb_replays_same_year_revisit_across_annual_warc_shards(
     root = archives / "annual"
     year_dir = root / "archive" / "2020"
     year_dir.mkdir(parents=True)
-    indexes = root / "indexes"
-    indexes.mkdir(parents=True)
 
     url = "http://example.org/"
     body = b"<!doctype html><html><body>Annual shard body</body></html>"
@@ -549,7 +545,7 @@ def test_real_pywb_replays_same_year_revisit_across_annual_warc_shards(
         )
 
     entries.sort(key=lambda item: (item[0], item[1]))
-    (indexes / "index.cdxj").write_text(
+    (root / "index.cdxj").write_text(
         "".join(
             f"{key} {ts} {json.dumps(meta, separators=(',', ':'), sort_keys=True)}\n"
             for key, ts, meta in entries
@@ -572,3 +568,4 @@ def test_real_pywb_replays_same_year_revisit_across_annual_warc_shards(
         assert revisited == original
 
     assert snapshot_tree(archives) == before
+

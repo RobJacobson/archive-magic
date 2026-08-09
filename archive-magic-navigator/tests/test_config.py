@@ -28,7 +28,7 @@ def test_single_collection_config_is_safe_and_deterministic(tmp_path):
     sequence = loaded["collections"]["example.org"]["sequence"]
     assert sequence[0]["name"] == "local"
     assert sequence[0]["index"].endswith(
-        "/example.org/indexes/index.cdxj"
+        "/example.org/index.cdxj"
     )
     assert sequence[0]["archive_paths"] == [
         str(collection.root) + "/"

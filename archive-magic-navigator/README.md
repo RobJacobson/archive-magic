@@ -64,13 +64,13 @@ Each collection must contain:
 
 ```text
 <collection>/
-├── archive/
-│   ├── 2004/
-│   │   └── example.org-2004-001.warc.gz
-│   └── example.com/
-│       └── **/*.warc.gz
-└── indexes/
-    └── index.cdxj
+├── index.cdxj
+└── archive/
+    ├── 2004/
+    │   ├── example.org-2004-001.warc.gz
+    │   └── example.org-2004.cdxj
+    └── example.com/
+        └── **/*.warc.gz
 ```
 
 CDXJ `filename` values must be safe collection-relative
@@ -80,8 +80,12 @@ repairs, reindexes, or records collection data. It never writes Wayback
 fallback responses into the collection. There is no fallback to the current
 live web.
 
-Fetch publishes annual size-bounded WARC shards under `archive/YYYY/`.
+Fetch publishes annual size-bounded WARC shards under `archive/YYYY/` with a
+per-year `{collection_id}-YYYY.cdxj` beside them. The collection-wide replay
+index is `index.cdxj` at the collection root.
 Navigator follows the collection-relative path in each replay entry's `filename`.
+Each annual set is self-contained: revisits may cross WARC shards within a year
+but never depend on another year.
 
 Collection directory names also become browser routes. They must start with an
 ASCII letter or digit, contain only ASCII letters, digits, `.`, `_`, or `-`,

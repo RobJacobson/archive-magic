@@ -34,6 +34,9 @@ _TEMP_NAME = re.compile(r"^\.tmp-|^.*\.(tmp|partial)$")
 _WARC_NAME = re.compile(
     r"^(?P<id>.+)-(?P<year>\d{4})-(?P<seq>\d{3})\.warc\.gz$"
 )
+_ANNUAL_INDEX_NAME = re.compile(
+    r"^(?P<id>.+)-(?P<year>\d{4})\.cdxj$"
+)
 
 
 @dataclass(frozen=True)
@@ -52,16 +55,8 @@ class CollectionLayout:
         return self.root / "archive"
 
     @property
-    def indexes_root(self) -> Path:
-        return self.root / "indexes"
-
-    @property
-    def years_index_root(self) -> Path:
-        return self.indexes_root / "years"
-
-    @property
     def collection_index(self) -> Path:
-        return self.indexes_root / "index.cdxj"
+        return self.root / "index.cdxj"
 
     @property
     def sources_root(self) -> Path:
@@ -82,8 +77,11 @@ class CollectionLayout:
     def year_dir(self, year: int) -> Path:
         return self.archive_root / f"{year:04d}"
 
+    def annual_index_filename(self, year: int) -> str:
+        return f"{self.collection_id}-{year:04d}.cdxj"
+
     def annual_index(self, year: int) -> Path:
-        return self.years_index_root / f"{year:04d}.cdxj"
+        return self.year_dir(year) / self.annual_index_filename(year)
 
     def warc_filename(self, year: int, sequence: int) -> str:
         if sequence < 1 or sequence > 999:
@@ -99,10 +97,10 @@ class CollectionLayout:
         return self.year_dir(year) / self.warc_filename(year, sequence)
 
     def annual_index_relative_key(self, year: int) -> str:
-        return f"indexes/years/{year:04d}.cdxj"
+        return f"archive/{year:04d}/{self.annual_index_filename(year)}"
 
     def collection_index_relative_key(self) -> str:
-        return "indexes/index.cdxj"
+        return "index.cdxj"
 
 
 def normalize_domain(
@@ -191,12 +189,29 @@ def collection_layout(
     return CollectionLayout(root, normalize_collection_id(url_pattern))
 
 
+def require_current_collection_schema(layout: CollectionLayout) -> None:
+    """Reject an existing manifest from an incompatible Fetch collection."""
+
+    if not layout.manifest_path.is_file():
+        return
+    try:
+        schema = json.loads(layout.manifest_path.read_text(encoding="utf-8")).get(
+            "schema_version"
+        )
+    except (OSError, ValueError, AttributeError) as error:
+        raise ValueError("existing collection manifest is unreadable") from error
+    if schema != COLLECTION_SCHEMA_VERSION:
+        raise ValueError(
+            f"existing collection schema {schema!r} is unsupported; "
+            "delete and regenerate the collection"
+        )
+
+
 def ensure_collection_dirs(layout: CollectionLayout) -> None:
     """Create permanent and work directories for a collection."""
 
     layout.root.mkdir(parents=True, exist_ok=True)
     layout.archive_root.mkdir(parents=True, exist_ok=True)
-    layout.years_index_root.mkdir(parents=True, exist_ok=True)
     layout.sources_root.mkdir(parents=True, exist_ok=True)
     layout.work_root.mkdir(parents=True, exist_ok=True)
 
@@ -293,6 +308,31 @@ def list_year_warcs(layout: CollectionLayout, year: int) -> list[Path]:
         found.append((int(match.group("seq")), path))
     found.sort(key=lambda item: item[0])
     return [path for _, path in found]
+
+
+def list_annual_indexes(layout: CollectionLayout) -> list[tuple[int, Path]]:
+    """Return (year, path) for every annual CDXJ under archive/, sorted by year."""
+
+    if not layout.archive_root.is_dir():
+        return []
+    found: list[tuple[int, Path]] = []
+    for year_dir in sorted(layout.archive_root.iterdir()):
+        if not year_dir.is_dir() or not year_dir.name.isdigit():
+            continue
+        year = int(year_dir.name)
+        for path in year_dir.iterdir():
+            if not path.is_file() or path.name.startswith(".tmp-"):
+                continue
+            match = _ANNUAL_INDEX_NAME.fullmatch(path.name)
+            if match is None:
+                continue
+            if match.group("id") != layout.collection_id:
+                continue
+            if int(match.group("year")) != year:
+                continue
+            found.append((year, path))
+            break
+    return found
 
 
 def list_all_warcs(layout: CollectionLayout) -> list[Path]:
@@ -461,12 +501,8 @@ def write_manifest(
         "metrics": {
             "cdx_requests": metrics.cdx_requests,
             "cdx_duration_s": round(metrics.cdx_duration_s, 3),
-            "playback_starts": metrics.playback_starts,
-            "playback_completions": metrics.playback_completions,
+            "playback_attempts": metrics.playback_attempts,
             "playback_bytes": metrics.playback_bytes,
-            "peak_connections": metrics.peak_connections,
-            "rate_gate_wait_s": round(metrics.rate_gate_wait_s, 3),
-            "cooldown_wait_s": round(metrics.cooldown_wait_s, 3),
             "warc_write_s": round(metrics.warc_write_s, 3),
             "index_s": round(metrics.index_s, 3),
             "attempts_by_category": dict(
@@ -507,5 +543,3 @@ def write_manifest(
     tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
     publish_file_atomically(tmp, layout.manifest_path)
     return layout.manifest_path
-
-

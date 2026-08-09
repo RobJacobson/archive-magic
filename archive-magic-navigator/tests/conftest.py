@@ -31,7 +31,7 @@ def collection_factory(tmp_path):
                     },
                 )
             ]
-        index = collection / "indexes" / "index.cdxj"
+        index = collection / "index.cdxj"
         index.parent.mkdir(parents=True, exist_ok=True)
         index.write_text(
             "".join(

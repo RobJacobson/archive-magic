@@ -25,7 +25,7 @@ from wayback.exceptions import (
 from .collection import (
     CollectionLayout,
     exclusive_temp_path,
-    list_all_warcs,
+    list_year_warcs,
     next_warc_sequence,
     publish_file_atomically,
     warc_artifact_from_path,
@@ -71,43 +71,78 @@ _REPRESENTATION_HEADERS = {
 
 @dataclass(frozen=True)
 class StoredResponse:
-    """Location of one full response within a year."""
+    """Compact revisit reference for one full response.
+
+    Never retain payload bytes or HTTP headers; pywb resolves them from the
+    referenced full response.
+    """
 
     identity: CaptureIdentity
-    relative_key: str
     warc_date: str
     warc_payload_digest: str
     target_uri: str
     status_code: int
-    headers: tuple[tuple[str, str], ...]
-    body: bytes | None = None
 
 
 @dataclass
-class YearResponseIndex:
-    """In-year full responses available for revisit targets."""
+class AnnualInventory:
+    """Exact captures and reusable responses from one annual WARC set.
 
-    by_identity: dict[CaptureIdentity, StoredResponse] = field(
-        default_factory=dict
-    )
+    ``by_url_digest`` maps ``(urlkey, IA/CDX payload digest)`` to the oldest
+    matched full response with that key. Entries store compact locator metadata
+    only (never payloads), rebuilt from finalized annual WARCs on resume.
+    """
+
+    identities: set[CaptureIdentity] = field(default_factory=set)
     by_url_digest: dict[tuple[str, str], StoredResponse] = field(
         default_factory=dict
     )
 
-
-@dataclass
-class CollectionInventory:
-    """Exact captures already present in the collection."""
-
-    identities: set[CaptureIdentity] = field(default_factory=set)
-    # year -> urlkey/digest -> stored response metadata for revisits
-    year_responses: dict[int, YearResponseIndex] = field(default_factory=dict)
-
     def contains(self, identity: CaptureIdentity) -> bool:
         return identity in self.identities
 
-    def year_index(self, year: int) -> YearResponseIndex:
-        return self.year_responses.setdefault(year, YearResponseIndex())
+    def lookup_representative(
+        self,
+        urlkey: str,
+        ia_digest: str,
+        *,
+        not_after_timestamp: str,
+    ) -> StoredResponse | None:
+        """Return a prior successful response usable for a capture timestamp.
+
+        Reject representatives after the capture timestamp so revisits never
+        point forward within the year.
+        """
+
+        if ia_digest == MISSING_CDX_PAYLOAD_DIGEST:
+            return None
+        stored = self.by_url_digest.get((urlkey, ia_digest))
+        if stored is None:
+            return None
+        if stored.identity.timestamp > not_after_timestamp:
+            return None
+        return stored
+
+    def remember_representative(self, stored: StoredResponse) -> None:
+        """Record a successful full response for later revisit short-circuits.
+
+        Keeps the oldest representative for each ``(urlkey, IA digest)``.
+        Callers must pass only successfully written, digest-matched responses.
+        Redirects and missing IA digests are ignored.
+        """
+
+        ia_digest = stored.identity.payload_digest
+        if ia_digest == MISSING_CDX_PAYLOAD_DIGEST:
+            return
+        if is_redirect_status_token(stored.identity.status_token):
+            return
+        key = (stored.identity.urlkey, ia_digest)
+        existing = self.by_url_digest.get(key)
+        if (
+            existing is None
+            or stored.identity.timestamp < existing.identity.timestamp
+        ):
+            self.by_url_digest[key] = stored
 
 
 def payload_digest(payload: bytes) -> str:
@@ -148,13 +183,16 @@ def get_warc_identity(record) -> CaptureIdentity:
     )
 
 
-def inventory_collection(layout: CollectionLayout) -> CollectionInventory:
-    """Validate and inventory every existing collection WARC."""
+def inventory_year(layout: CollectionLayout, year: int) -> AnnualInventory:
+    """Validate and inventory finalized WARCs for one year.
 
-    inv = CollectionInventory()
-    for path in list_all_warcs(layout):
-        relative = path.relative_to(layout.root).as_posix()
-        year = _year_from_warc_path(path)
+    Finalized annual WARCs are the recovery source of truth. Rebuild exact
+    identity membership and the compact representative map without loading
+    payload bodies.
+    """
+
+    inv = AnnualInventory()
+    for path in list_year_warcs(layout, year):
         with path.open("rb") as stream:
             for record in ArchiveIterator(stream, check_digests="raise"):
                 if record.rec_type not in {"response", "revisit"}:
@@ -166,42 +204,33 @@ def inventory_collection(layout: CollectionLayout) -> CollectionInventory:
                     record.rec_headers.get_header("WARC-Payload-Digest")
                 )
                 if record.rec_type == "response" and warc_payload is not None:
-                    status = int(record.http_headers.get_statuscode())
-                    headers = tuple(record.http_headers.headers)
-                    # Do not retain full bodies in inventory for memory.
+                    status_code = 200
+                    try:
+                        status_code = int(record.http_headers.get_statuscode())
+                    except (TypeError, ValueError, AttributeError):
+                        if identity.status_token.isdigit():
+                            status_code = int(identity.status_token)
+                    # Compact inventory: no body, no HTTP headers.
                     stored = StoredResponse(
                         identity=identity,
-                        relative_key=relative,
                         warc_date=record.rec_headers.get_header("WARC-Date"),
                         warc_payload_digest=warc_payload,
                         target_uri=identity.original_url,
-                        status_code=status,
-                        headers=headers,
-                        body=None,
+                        status_code=status_code,
                     )
-                    yindex = inv.year_index(year)
-                    yindex.by_identity[identity] = stored
-                    # Only digest-matched responses may be revisit targets.
+                    cdx_payload = normalize_payload_digest(identity.payload_digest)
+                    explicitly_mismatched = (
+                        record.rec_headers.get_header(CDX_DIGEST_MATCH_HEADER)
+                        == "false"
+                    )
                     if (
-                        identity.payload_digest != MISSING_CDX_PAYLOAD_DIGEST
-                        and _cdx_digest_matches_payload(
-                            identity.payload_digest, warc_payload
-                        )
+                        not explicitly_mismatched
+                        and cdx_payload == warc_payload
                     ):
-                        yindex.by_url_digest[
-                            (identity.urlkey, identity.payload_digest)
-                        ] = stored
+                        inv.remember_representative(stored)
                 # consume body stream
                 record.raw_stream.read()
     return inv
-
-
-def _cdx_digest_matches_payload(cdx_digest: str, warc_payload_digest: str) -> bool:
-    """Return whether a CDX digest token names the same payload as WARC."""
-
-    expected = normalize_payload_digest(cdx_digest)
-    actual = normalize_payload_digest(warc_payload_digest)
-    return expected is not None and actual is not None and expected == actual
 
 
 def _is_unusable_playback_body(
@@ -252,10 +281,6 @@ def download_exact(
         )
         url = memento.url
         # Require an explicit True; MagicMock auto-attrs must not count as set.
-        false_gzip_repaired = (
-            getattr(getattr(memento, "_raw", None), "_archive_magic_false_gzip", False)
-            is True
-        )
 
     returned_ts = timestamp_to_warc_date(memento_timestamp)
     returned_cdx = warc_date_to_cdx(returned_ts)
@@ -292,7 +317,6 @@ def download_exact(
         warc_date=returned_ts,
         source_uri=memento_url,
         warc_payload_digest=payload_digest(body),
-        false_gzip_repaired=false_gzip_repaired,
         digest_matched=True,
     )
 
@@ -300,16 +324,13 @@ def download_exact(
 def download_exact_for_identity(
     client,
     identity: CaptureIdentity,
-    *,
-    strict_digests: bool = False,
 ) -> PlaybackResult:
     """Exact-playback one capture identity and attach full identity fields.
 
-    By default, a body that does not match the CDX digest is still kept
-    (imperfect IA captures are better than gaps). Pass ``strict_digests=True``
-    to reject mismatches. Unusable stubs such as ``Invalid URI`` are always
-    rejected. Empty bodies are rejected except for HTTP redirects (3xx), which
-    historically often have an empty entity and a ``Location`` header.
+    A body that does not match the CDX digest is kept for this capture but must
+    not seed later revisit reuse. Unusable stubs such as ``Invalid URI`` are
+    always rejected. Empty bodies are rejected except for HTTP redirects (3xx),
+    which historically often have an empty entity and a ``Location`` header.
     """
 
     expected_status = (
@@ -327,19 +348,6 @@ def download_exact_for_identity(
     digest_matched = (
         expected_digest is None or actual_digest == expected_digest
     )
-    if not digest_matched:
-        assert expected_digest is not None
-        if strict_digests:
-            if result.false_gzip_repaired:
-                raise FalseGzipPlaybackError(
-                    f"IA Content-Encoding:gzip response was not gzip and does "
-                    f"not match CDX digest: CDX {expected_digest}, "
-                    f"downloaded {actual_digest}"
-                )
-            raise DigestValidationError(
-                f"payload digest mismatch: CDX {expected_digest}, "
-                f"downloaded {actual_digest}"
-            )
     return PlaybackResult(
         identity=identity,
         body=result.body,
@@ -348,7 +356,6 @@ def download_exact_for_identity(
         warc_date=result.warc_date,
         source_uri=result.source_uri,
         warc_payload_digest=actual_digest,
-        false_gzip_repaired=result.false_gzip_repaired,
         digest_matched=digest_matched,
     )
 
@@ -357,19 +364,11 @@ class ExactMismatchError(MementoPlaybackError):
     """Returned memento is not the requested capture."""
 
 
-class DigestValidationError(Exception):
-    """Downloaded payload does not match the CDX payload digest."""
-
-
-class FalseGzipPlaybackError(MementoPlaybackError):
-    """IA claimed gzip, served non-gzip bytes that do not match the CDX digest."""
-
-
 class UnusablePlaybackError(MementoPlaybackError):
     """IA returned a non-content stub (empty body or Invalid URI)."""
 
 
-_RETRYABLE_HTTP_STATUSES = frozenset({413, 421, 429, 500, 502, 503, 504, 599})
+_RETRYABLE_HTTP_STATUSES = frozenset({429, *range(500, 600)})
 _STATUS_IN_MESSAGE = re.compile(r"\b([45]\d\d)\b")
 
 
@@ -380,12 +379,6 @@ def classify_playback_error(error: BaseException) -> tuple[FailureCategory, bool
         return FailureCategory.EXACT_MISMATCH, False
     if isinstance(error, UnusablePlaybackError):
         return FailureCategory.UNAVAILABLE, False
-    if isinstance(error, FalseGzipPlaybackError):
-        # Subclass of MementoPlaybackError; keep the explicit branch so the
-        # unavailable classification stays obvious next to digest failures.
-        return FailureCategory.UNAVAILABLE, False
-    if isinstance(error, DigestValidationError):
-        return FailureCategory.DIGEST_VALIDATION, False
     if isinstance(error, (BlockedByRobotsError, BlockedSiteError)):
         return FailureCategory.BLOCKED, False
     name = type(error).__name__
@@ -453,15 +446,6 @@ def _status_line(status_code: int) -> str:
     return f"{status_code} {reason}".rstrip()
 
 
-def _year_from_warc_path(path: Path) -> int:
-    # archive/YYYY/…
-    parts = path.parts
-    for index, part in enumerate(parts):
-        if part == "archive" and index + 1 < len(parts):
-            return int(parts[index + 1])
-    raise ValueError(f"cannot determine year for {path}")
-
-
 def build_response_record(result: PlaybackResult):
     """Create a WARC 1.1 response record for a playback result."""
 
@@ -492,11 +476,16 @@ def build_response_record(result: PlaybackResult):
 
 
 def build_revisit_record(result: RevisitResult):
-    """Create a WARC 1.1 revisit record."""
+    """Create a WARC 1.1 revisit record.
+
+    Revisits store current capture identity via CDX extension headers and point
+    at an earlier full response via ``WARC-Refers-To-*``. HTTP headers may be
+    empty; pywb loads missing HTTP headers from the referenced response.
+    """
 
     http_headers = StatusAndHeaders(
         _status_line(result.http_status_code),
-        list(result.http_headers),
+        [],
         protocol="HTTP/1.1",
     )
     builder = RecordBuilder(warc_version=WARC_VERSION)
@@ -509,6 +498,7 @@ def build_revisit_record(result: RevisitResult):
             CDX_STATUS_HEADER: result.identity.status_token,
             CDX_URLKEY_HEADER: result.identity.urlkey,
             "WARC-Date": result.warc_date,
+            # Local digest of the referenced payload (may differ from CDX).
             "WARC-Payload-Digest": result.warc_payload_digest,
             "WARC-Profile": (
                 "http://netpreserve.org/warc/1.1/revisit/identical-payload-digest"
@@ -643,38 +633,35 @@ def count_warc_records(path: Path) -> int:
 def revisit_from_stored(
     identity: CaptureIdentity,
     stored: StoredResponse,
-    *,
-    http_status_code: int | None = None,
-    http_headers: tuple[tuple[str, str], ...] | None = None,
 ) -> RevisitResult:
-    """Build a revisit referencing an in-year full response."""
+    """Build a revisit referencing an earlier successful full response.
 
+    Prefer the current capture's CDX status for the HTTP status line when it is
+    numeric. Pywb fills omitted HTTP headers from the referred response.
+    """
+
+    http_status_code = (
+        int(identity.status_token)
+        if identity.status_token.isdigit()
+        else stored.status_code
+    )
     return RevisitResult(
         identity=identity,
         warc_date=cdx_timestamp_to_warc_date(identity.timestamp),
         refers_to_target_uri=stored.target_uri,
         refers_to_date=stored.warc_date,
         warc_payload_digest=stored.warc_payload_digest,
-        http_status_code=http_status_code or stored.status_code,
-        http_headers=http_headers or stored.headers,
+        http_status_code=http_status_code,
     )
 
 
-def stored_from_playback(
-    layout: CollectionLayout,
-    year: int,
-    result: PlaybackResult,
-    relative_key: str,
-) -> StoredResponse:
-    """Create inventory metadata for a just-written full response."""
+def stored_from_playback(result: PlaybackResult) -> StoredResponse:
+    """Create compact inventory metadata for a just-written full response."""
 
     return StoredResponse(
         identity=result.identity,
-        relative_key=relative_key,
         warc_date=result.warc_date,
         warc_payload_digest=result.warc_payload_digest,
         target_uri=result.identity.original_url,
         status_code=result.status_code,
-        headers=result.headers,
-        body=None,
     )

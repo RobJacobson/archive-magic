@@ -18,23 +18,10 @@ from surt import surt
 
 DEFAULT_OUTPUT_ROOT = Path("../archives")
 WARC_TARGET_BYTES = 1_000_000_000
-PLAYBACK_REQUESTS_PER_SECOND = 4.0
-# Connection budget is separate from the request start rate.
-MAX_CONNECTIONS = 1
-MAX_PLAYBACK_ATTEMPTS = 9  # first try + 8 retries
-MAX_RETRY_DELAY_S = 3600
-DEFAULT_429_COOLDOWN_S = 60.0
-MAX_429_COOLDOWN_S = 900.0
-# Temporarily disabled (was 5.0): truncated payloads are permanent failures;
-# pause is not applied so the next capture starts immediately. Revisit if TCP
-# backpressure returns after truncated IncompleteRead series.
-TRUNCATION_PAUSE_S = 0.0
-CONNECTION_REFUSED_RETRY_S = 60.0
-CONNECTION_REFUSED_MAX_RETRIES = 3
-RESULT_QUEUE_SIZE = 64
+MAX_PLAYBACK_ATTEMPTS = 3
 CDX_PAGE_LIMIT = 10_000
 DEFAULT_DATE_START = "19950101000000"
-COLLECTION_SCHEMA_VERSION = 1
+COLLECTION_SCHEMA_VERSION = 3
 FAILURES_SCHEMA_VERSION = 1
 WARC_VERSION = "1.1"
 SOFTWARE_ID = "archive-magic-fetch/0.1.0"
@@ -64,7 +51,6 @@ class FailureCategory(str, Enum):
     UNAVAILABLE = "unavailable"
     RETRY_EXHAUSTED = "retry_exhausted"
     TRUNCATED = "truncated"
-    DIGEST_VALIDATION = "digest_validation"
     PUBLICATION = "publication"
 
 
@@ -113,10 +99,11 @@ class ParsedCapture:
 class PlaybackResult:
     """Exact-playback payload ready for WARC writing.
 
-    ``warc_payload_digest`` is always the digest of ``body``. The capture
-    identity may still carry a different CDX digest when IA served imperfect
-    bytes; ``digest_matched`` records whether those agreed. Mismatched payloads
-    are kept by default but must not become same-year revisit representatives.
+    ``warc_payload_digest`` is always the digest of ``body`` (local SHA-1).
+    The capture identity may still carry a different IA/CDX digest when IA
+    served imperfect bytes; ``digest_matched`` records whether those agreed.
+    Mismatched payloads are retained for this capture only and never seed
+    revisit reuse.
     """
 
     identity: CaptureIdentity
@@ -126,15 +113,16 @@ class PlaybackResult:
     warc_date: str
     source_uri: str
     warc_payload_digest: str
-    # Set when ArchiveMagicWaybackSession accepted a non-gzip body that IA
-    # advertised as Content-Encoding: gzip.
-    false_gzip_repaired: bool = False
     digest_matched: bool = True
 
 
 @dataclass(frozen=True)
 class RevisitResult:
-    """A same-year revisit of an already-stored full response."""
+    """A revisit of an earlier successful full response.
+
+    The referred response lives in the same annual WARC set.
+    ``warc_payload_digest`` is the representative's local payload digest.
+    """
 
     identity: CaptureIdentity
     warc_date: str
@@ -142,7 +130,6 @@ class RevisitResult:
     refers_to_date: str
     warc_payload_digest: str
     http_status_code: int
-    http_headers: tuple[tuple[str, str], ...]
 
 
 @dataclass(frozen=True)
@@ -184,12 +171,8 @@ class RunMetrics:
 
     cdx_requests: int = 0
     cdx_duration_s: float = 0.0
-    playback_starts: int = 0
-    playback_completions: int = 0
+    playback_attempts: int = 0
     playback_bytes: int = 0
-    peak_connections: int = 0
-    rate_gate_wait_s: float = 0.0
-    cooldown_wait_s: float = 0.0
     local_reuses: int = 0
     downloads: int = 0
     revisits: int = 0
