@@ -29,6 +29,7 @@ from archive_magic_fetch.fetch import (
     FetchSettings,
     _capture_link,
     _download_with_retries,
+    _format_elapsed,
     _style_result,
     build_settings,
     run_fetch,
@@ -1024,7 +1025,7 @@ def test_failed_older_capture_does_not_use_later_success(tmp_path):
         cdx_mod.fetch_year_cdx = original
         fetch_mod.fetch_year_cdx = original
 
-    assert result.exit_code == 1
+    assert result.exit_code == 0
     assert result.metrics.downloads == 1
     assert result.metrics.revisits == 0
     assert any(
@@ -1542,11 +1543,11 @@ def test_annual_and_collection_index_merge_sorted_and_idempotent(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# 11. Partial run + failure persistence across scoped rerun
+# 11. Completed run + failure persistence across scoped rerun
 # ---------------------------------------------------------------------------
 
 
-def test_partial_run_truthful_manifest_and_nonzero_exit(tmp_path):
+def test_completed_run_reports_expected_failures(tmp_path, capsys):
     layout = collection_layout("http://example.org/", tmp_path)
     ensure_collection_dirs(layout)
     good_body = b"good"
@@ -1599,10 +1600,10 @@ def test_partial_run_truthful_manifest_and_nonzero_exit(tmp_path):
         cdx_mod.fetch_year_cdx = original
         fetch_mod.fetch_year_cdx = original
 
-    assert result.exit_code != 0
+    assert result.exit_code == 0
     manifest = json.loads(layout.manifest_path.read_text())
     assert manifest["schema_version"] == 3
-    assert manifest["status"] == "partial"
+    assert manifest["status"] == "complete"
     assert set(manifest["metrics"]) == {
         "cdx_requests",
         "cdx_duration_s",
@@ -1615,6 +1616,21 @@ def test_partial_run_truthful_manifest_and_nonzero_exit(tmp_path):
     assert layout.failures_path.is_file()
     assert list_year_warcs(layout, 2004)
     assert all(w["record_count"] > 0 for w in manifest["warcs"])
+    output = capsys.readouterr().out
+    assert (
+        "year 2004 done: downloads=1 revisits=0 "
+        "already-represented=0 skips/errors=1"
+    ) in output
+    assert "elapsed " in output
+    assert (
+        "done: downloads=1 revisits=0 already-represented=0 skips/errors=1"
+        in output
+    )
+
+
+def test_elapsed_format_uses_unbounded_hours():
+    assert _format_elapsed(3661.9) == "01:01:01"
+    assert _format_elapsed(25 * 60 * 60 + 2) == "25:00:02"
 
 
 def test_scoped_rerun_keeps_prior_failures_and_annual_indexes(tmp_path):
@@ -1667,7 +1683,7 @@ def test_scoped_rerun_keeps_prior_failures_and_annual_indexes(tmp_path):
         cdx_mod.fetch_year_cdx = original
         fetch_mod.fetch_year_cdx = original
 
-    assert result.exit_code != 0
+    assert result.exit_code == 0
     remaining = {item.identity for item in load_failures(layout)}
     assert prior.identity in remaining
     manifest = json.loads(layout.manifest_path.read_text())
@@ -1821,7 +1837,7 @@ def test_newer_failure_details_replace_stale(tmp_path):
         cdx_mod.fetch_year_cdx = original
         fetch_mod.fetch_year_cdx = original
 
-    assert result.exit_code != 0
+    assert result.exit_code == 0
     remaining = load_failures(layout)
     assert len(remaining) == 1
     assert remaining[0].identity == identity

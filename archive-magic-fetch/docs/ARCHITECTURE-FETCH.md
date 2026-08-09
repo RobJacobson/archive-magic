@@ -10,10 +10,13 @@ the authoritative description of Fetch.
 archive-magic-fetch URL_PATTERN [--start DATE] [--end DATE]
 ```
 
-The default range is 1995 through the current UTC time. Exit status is zero only
-when every selected capture is represented and publication succeeds. A partial
-run keeps finalized WARCs and indexes usable, records unresolved captures in
-`failures.json`, and returns nonzero.
+The default range is 1995 through the current UTC time. Reaching final
+publication returns zero even when expected capture-level failures remain; they
+are counted in the console summary and retained in `failures.json`. An
+unexpected exception prevents normal completion and the CLI returns nonzero.
+Manifest status is `partial` only for an intermediate multi-year checkpoint and
+`complete` after final publication; it does not mean that every IA capture was
+available.
 
 ```text
 <archives-root>/example.org/
@@ -117,7 +120,9 @@ Capture labels use OSC 8 hyperlinks so terminals can display the compact
 `timestamp/original-url` form, omitting a leading `www.`, while opening the full
 Wayback URL. Successful downloads, revisits, warnings, and errors use distinct
 ANSI styles. Redirected output remains plain text, and the `NO_COLOR` convention
-disables color.
+disables color. Each year ends with counts for downloads, revisits, identities
+already represented, and skips/errors, followed by elapsed `HH:MM:SS` measured
+from the start of that year. The final line reports the same run-wide counts.
 
 ## Deliberate exclusions
 

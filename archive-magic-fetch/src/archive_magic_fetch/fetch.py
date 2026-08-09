@@ -218,7 +218,12 @@ def _run_fetch(
     )
     print("playback policy: serial, three attempts maximum", flush=True)
 
+    run_skips_errors = 0
     for year in years:
+        year_started = time.monotonic()
+        downloads_before = metrics.downloads
+        revisits_before = metrics.revisits
+        reuses_before = metrics.local_reuses
         print(f"year {year}: CDX query", flush=True)
         cdx_started = time.monotonic()
         year_cdx = fetch_year_cdx(
@@ -233,6 +238,7 @@ def _run_fetch(
         metrics.cdx_requests += int(year_cdx.query_meta.get("request_count", 1))
         metrics.cdx_duration_s += time.monotonic() - cdx_started
         all_failures.extend(year_cdx.failures)
+        year_skips_errors = len(year_cdx.failures)
         _report_cdx_ingest_skips(year, year_cdx.failures)
 
         selected = _dedupe_captures(year_cdx.captures)
@@ -289,6 +295,7 @@ def _run_fetch(
             )
             if failure is not None:
                 all_failures.append(failure)
+                year_skips_errors += 1
                 continue
             assert result is not None
             write_started = time.monotonic()
@@ -338,6 +345,15 @@ def _run_fetch(
             represented_identities=represented_identities,
             final=False,
         )
+        run_skips_errors += year_skips_errors
+        print(
+            f"year {year} done: downloads={metrics.downloads - downloads_before} "
+            f"revisits={metrics.revisits - revisits_before} "
+            f"already-represented={metrics.local_reuses - reuses_before} "
+            f"skips/errors={year_skips_errors}",
+            flush=True,
+        )
+        print(f"elapsed {_format_elapsed(time.monotonic() - year_started)}", flush=True)
 
     coll = publish_collection_index(layout)
     final_warcs = all_warcs
@@ -358,19 +374,25 @@ def _run_fetch(
         represented_identities=represented_identities,
         final=True,
     )
-    status = "complete" if metrics.unresolved == 0 else "partial"
     print(
-        f"done: status={status} represented={metrics.represented} "
-        f"unresolved={metrics.unresolved}",
+        f"done: downloads={metrics.downloads} revisits={metrics.revisits} "
+        f"already-represented={metrics.local_reuses} "
+        f"skips/errors={run_skips_errors}",
         flush=True,
     )
-    exit_code = 0 if status == "complete" else 1
     return FetchResult(
-        exit_code=exit_code,
+        exit_code=0,
         layout=layout,
         metrics=metrics,
         failures=unresolved,
     )
+
+
+def _format_elapsed(seconds: float) -> str:
+    total = max(0, int(seconds))
+    hours, remainder = divmod(total, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
 
 def _report_cdx_ingest_skips(
@@ -667,7 +689,7 @@ def _publish_state(
     write_manifest(
         layout,
         url_pattern=settings.url_pattern,
-        status="complete" if final and metrics.unresolved == 0 else "partial",
+        status="complete" if final else "partial",
         run_source_relative=run_source,
         warcs=warcs,
         annual_indexes=annual_indexes,
