@@ -163,11 +163,17 @@ def main(argv: Sequence[str] | None = None) -> int:
 
             def ready(url: str) -> None:
                 print("Archive Magic Navigator", flush=True)
+                collection_count = sum(
+                    len(item.collections) for item in archives
+                )
+                archive_word = "archive" if len(archives) == 1 else "archives"
+                collection_word = (
+                    "collection" if collection_count == 1 else "collections"
+                )
                 print(
-                    f"Serving {len(archives)} domain "
-                    f"{'archive' if len(archives) == 1 else 'archives'} "
-                    f"with {sum(len(item.collections) for item in archives)} "
-                    f"portable collections from {archives_root}",
+                    f"Serving {len(archives)} domain {archive_word} "
+                    f"with {collection_count} portable {collection_word} "
+                    f"from {archives_root}",
                     flush=True,
                 )
                 print(

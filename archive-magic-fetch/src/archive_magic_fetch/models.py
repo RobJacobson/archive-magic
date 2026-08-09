@@ -50,7 +50,6 @@ class FailureCategory(str, Enum):
     UNAVAILABLE = "unavailable"
     RETRY_EXHAUSTED = "retry_exhausted"
     TRUNCATED = "truncated"
-    PUBLICATION = "publication"
 
 
 # SHA-1 (CDX base32) of the literal IA playback stub body ``Invalid URI``.
@@ -382,18 +381,6 @@ def identity_to_dict(identity: CaptureIdentity) -> dict[str, str]:
         "status_token": identity.status_token,
         "payload_digest": identity.payload_digest,
     }
-
-
-def identity_from_dict(data: dict[str, object]) -> CaptureIdentity:
-    """Deserialize one capture identity from a JSON object."""
-
-    return CaptureIdentity(
-        urlkey=str(data["urlkey"]),
-        original_url=normalize_original_url(str(data["original_url"])),
-        timestamp=str(data["timestamp"]),
-        status_token=str(data["status_token"]),
-        payload_digest=str(data["payload_digest"]),
-    )
 
 
 def current_utc_cdx_timestamp() -> str:

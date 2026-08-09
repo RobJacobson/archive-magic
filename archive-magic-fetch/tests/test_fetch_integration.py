@@ -9,7 +9,7 @@ import pytest
 from warcio.archiveiterator import ArchiveIterator
 
 from archive_magic_fetch.collection import (
-    collection_layout,
+    archive_layout,
     ensure_collection_dirs,
     list_collection_warcs,
 )
@@ -25,7 +25,7 @@ from archive_magic_fetch.warc import (
 from helpers import cdx_json, make_capt, patch_cdx, patch_cdx_by_year, playback
 
 def test_statusless_capture_three_runs_no_extra_network(tmp_path):
-    layout = collection_layout("http://example.org/", tmp_path)
+    layout = archive_layout("http://example.org/", tmp_path)
     ensure_collection_dirs(layout)
     digest = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
     identity = make_identity(
@@ -94,7 +94,7 @@ def test_statusless_capture_three_runs_no_extra_network(tmp_path):
 
 
 def test_same_year_representative_revisits_and_redirects_individual(tmp_path):
-    layout = collection_layout("http://example.org/", tmp_path)
+    layout = archive_layout("http://example.org/", tmp_path)
     ensure_collection_dirs(layout)
     shared_body = b"shared"
     dig = payload_digest(shared_body).split(":")[1]
@@ -171,7 +171,7 @@ def test_same_year_representative_revisits_and_redirects_individual(tmp_path):
 
 
 def test_matching_payloads_download_once_per_year(tmp_path):
-    layout = collection_layout("http://example.org/", tmp_path)
+    layout = archive_layout("http://example.org/", tmp_path)
     ensure_collection_dirs(layout)
     body = b"logo"
     dig = payload_digest(body).split(":")[1]
@@ -256,7 +256,7 @@ def test_matching_payloads_download_once_per_year(tmp_path):
 
 
 def test_different_ia_digest_downloads_twice(tmp_path):
-    layout = collection_layout("http://example.org/", tmp_path)
+    layout = archive_layout("http://example.org/", tmp_path)
     ensure_collection_dirs(layout)
     body = b"same-bytes"
     dig_a = payload_digest(body).split(":")[1]
@@ -312,7 +312,7 @@ def test_different_ia_digest_downloads_twice(tmp_path):
 
 
 def test_failed_older_capture_does_not_use_later_success(tmp_path):
-    layout = collection_layout("http://example.org/", tmp_path)
+    layout = archive_layout("http://example.org/", tmp_path)
     ensure_collection_dirs(layout)
     body = b"payload"
     dig = payload_digest(body).split(":")[1]
@@ -383,7 +383,7 @@ def test_failed_older_capture_does_not_use_later_success(tmp_path):
 
 
 def test_representative_failure_promotes_next_same_key_candidate(tmp_path):
-    layout = collection_layout("http://example.org/", tmp_path)
+    layout = archive_layout("http://example.org/", tmp_path)
     ensure_collection_dirs(layout)
     body = b"shared"
     dig = payload_digest(body).split(":")[1]
@@ -464,7 +464,7 @@ def test_representative_failure_promotes_next_same_key_candidate(tmp_path):
 
 
 def test_completed_run_reports_expected_failures(tmp_path, capsys):
-    layout = collection_layout("http://example.org/", tmp_path)
+    layout = archive_layout("http://example.org/", tmp_path)
     ensure_collection_dirs(layout)
     good_body = b"good"
     good_digest = payload_digest(good_body).split(":")[1]
@@ -553,7 +553,7 @@ def test_completed_run_reports_expected_failures(tmp_path, capsys):
 
 
 def test_scoped_rerun_keeps_prior_collection_and_records_only_current_failures(tmp_path):
-    layout = collection_layout("http://example.org/", tmp_path)
+    layout = archive_layout("http://example.org/", tmp_path)
     ensure_collection_dirs(layout)
     # Seed a portable 2004 collection; a 2005-only run must leave it unchanged.
     capt = make_capt(ts="20040615000000")
@@ -606,36 +606,83 @@ def test_scoped_rerun_keeps_prior_collection_and_records_only_current_failures(t
     assert record["failures"] == []
 
 
-def test_cli_rejects_reversed_range():
-    from archive_magic_fetch.cli import main
-
-    code = main(
+def test_failed_capture_retries_successfully_on_rerun(tmp_path):
+    layout = archive_layout("http://example.org/", tmp_path)
+    ensure_collection_dirs(layout)
+    body_bytes = b"eventually-ok"
+    dig = payload_digest(body_bytes).split(":")[1]
+    capt = make_capt(
+        ts="20040615000000",
+        digest=f"sha1:{dig}",
+        urlkey="com,example)/",
+    )
+    cdx_body = cdx_json(
         [
-            "http://example.org/",
-            "--start",
-            "20050101",
-            "--end",
-            "20040101",
+            [
+                "com,example)/",
+                capt.timestamp,
+                capt.original_url,
+                "text/html",
+                "200",
+                dig,
+                "5",
+            ]
         ]
     )
-    assert code == 2
 
+    attempts = {"n": 0}
 
-def test_existing_legacy_layout_requires_regeneration(tmp_path):
-    layout = collection_layout("http://example.org/", tmp_path)
-    layout.root.mkdir(parents=True)
-    (layout.root / "index.cdxj").write_text("legacy\n", encoding="utf-8")
+    def download_fn(_client, identity):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise RuntimeError("memento unavailable")
+        return playback(identity, body=body_bytes)
 
-    with pytest.raises(ValueError, match="delete and regenerate"):
-        run_fetch(
-            FetchSettings(
-                url_pattern="http://example.org/",
-                date_start="20040601000000",
-                date_end="20040601000000",
-                archives_root=tmp_path,
-            ),
+    settings = FetchSettings(
+        url_pattern="http://example.org/",
+        date_start="20040615000000",
+        date_end="20040615000000",
+        archives_root=tmp_path,
+    )
+    original, cdx_mod, fetch_mod = patch_cdx(cdx_body)
+    try:
+        first = run_fetch(
+            settings,
             client_factory=lambda: MagicMock(),
+            download_fn=download_fn,
+            sleep=lambda _s: None,
         )
+        assert first.exit_code == 0
+        assert attempts["n"] == 1
+        assert not list_collection_warcs(layout, "2004")
+        first_run_dirs = list((layout.capture_dir("2004") / "runs").iterdir())
+        assert len(first_run_dirs) == 1
+        first_record = json.loads((first_run_dirs[0] / "run.json").read_text())
+        assert len(first_record["failures"]) == 1
+        assert first_record["failures"][0]["identity"]["timestamp"] == capt.timestamp
+
+        second = run_fetch(
+            settings,
+            client_factory=lambda: MagicMock(),
+            download_fn=download_fn,
+            sleep=lambda _s: None,
+        )
+    finally:
+        cdx_mod.fetch_year_cdx = original
+        fetch_mod.fetch_year_cdx = original
+
+    assert second.exit_code == 0
+    assert attempts["n"] == 2
+    assert layout.collection_index("2004").is_file()
+    inv = inventory_collection(layout, "2004")
+    assert inv.contains(capt)
+
+    run_dirs = sorted((layout.capture_dir("2004") / "runs").iterdir())
+    assert len(run_dirs) == 2
+    second_record = json.loads((run_dirs[1] / "run.json").read_text())
+    assert second_record["failures"] == []
+    assert second_record["counts"]["downloaded"] == 1
+    assert not (layout.root / "failures.json").exists()
 
 
 def test_multi_year_empty_run_shares_id_without_playback_collections(
@@ -690,7 +737,7 @@ def test_multi_year_empty_run_shares_id_without_playback_collections(
 
 
 def test_run_record_is_published_after_index(tmp_path):
-    layout = collection_layout("http://example.org/", tmp_path)
+    layout = archive_layout("http://example.org/", tmp_path)
     ensure_collection_dirs(layout)
     dig = payload_digest(b"ordered").split(":")[1]
     body = cdx_json(
@@ -739,9 +786,7 @@ def test_run_record_is_published_after_index(tmp_path):
     ("archive", "sources", "index.cdxj", "collection.json", "failures.json"),
 )
 def test_legacy_layout_rejects_all_artifacts(tmp_path, legacy_name):
-    from archive_magic_fetch.collection import reject_legacy_layout
-
-    layout = collection_layout("http://example.org/", tmp_path)
+    layout = archive_layout("http://example.org/", tmp_path)
     layout.root.mkdir(parents=True)
     target = layout.root / legacy_name
     if legacy_name in {"archive", "sources"}:
@@ -749,4 +794,12 @@ def test_legacy_layout_rejects_all_artifacts(tmp_path, legacy_name):
     else:
         target.write_text("legacy\n", encoding="utf-8")
     with pytest.raises(ValueError, match="delete and regenerate"):
-        reject_legacy_layout(layout)
+        run_fetch(
+            FetchSettings(
+                url_pattern="http://example.org/",
+                date_start="20040601000000",
+                date_end="20040601000000",
+                archives_root=tmp_path,
+            ),
+            client_factory=lambda: MagicMock(),
+        )

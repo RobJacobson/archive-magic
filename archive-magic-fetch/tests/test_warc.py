@@ -9,7 +9,7 @@ from wayback.exceptions import MementoPlaybackError
 from warcio.archiveiterator import ArchiveIterator
 
 from archive_magic_fetch.collection import (
-    collection_layout,
+    archive_layout,
     ensure_collection_dirs,
     list_collection_warcs,
     next_collection_warc_sequence,
@@ -34,7 +34,7 @@ from helpers import cdx_json, make_capt, memento_client, patch_cdx, playback
 def test_empty_redirect_playback_is_stored_with_location(tmp_path):
     """Historical 3xx captures often have an empty body; still archive them."""
 
-    from archive_magic_fetch.collection import collection_layout, ensure_collection_dirs
+    from archive_magic_fetch.collection import archive_layout, ensure_collection_dirs
     from archive_magic_fetch.warc import (
         CollectionWarcWriter,
         download_exact_for_identity,
@@ -60,7 +60,7 @@ def test_empty_redirect_playback_is_stored_with_location(tmp_path):
     assert result.warc_payload_digest == empty_digest
     assert any(name.lower() == "location" and value == location for name, value in result.headers)
 
-    layout = collection_layout("http://example.org/", tmp_path)
+    layout = archive_layout("http://example.org/", tmp_path)
     ensure_collection_dirs(layout)
     writer = CollectionWarcWriter(layout, "2008")
     writer.write_playback(result)
@@ -106,7 +106,7 @@ def test_invalid_uri_playback_is_always_rejected():
 
 
 def test_custom_cdx_urlkey_survives_warc_inventory(tmp_path):
-    layout = collection_layout("http://example.org/", tmp_path)
+    layout = archive_layout("http://example.org/", tmp_path)
     ensure_collection_dirs(layout)
     identity = make_capt(urlkey="custom,key)/special")
     writer = CollectionWarcWriter(layout, "2004")
@@ -131,7 +131,7 @@ def test_digest_mismatch_is_kept_but_never_seeds_revisit(tmp_path):
 
     from archive_magic_fetch.models import CDX_DIGEST_MATCH_HEADER
 
-    layout = collection_layout("http://example.org/", tmp_path)
+    layout = archive_layout("http://example.org/", tmp_path)
     ensure_collection_dirs(layout)
     claimed = "sha1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
     body = b"imperfect-but-kept"
@@ -248,7 +248,7 @@ def test_wrapped_incomplete_read_is_permanent_truncated_failure():
 
 
 def test_warc_rollover_naming_and_rejects_1000(tmp_path):
-    layout = collection_layout("http://example.org/", tmp_path)
+    layout = archive_layout("http://example.org/", tmp_path)
     ensure_collection_dirs(layout)
     writer = CollectionWarcWriter(layout, "2004", target_bytes=1)
     for i in range(2):

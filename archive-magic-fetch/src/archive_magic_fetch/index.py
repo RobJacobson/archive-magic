@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Optional
 
 from cdxj_indexer.main import CDXJIndexer
 from warcio.archiveiterator import ArchiveIterator
@@ -81,14 +81,11 @@ def merge_cdxj_lines(paths: Sequence[Path]) -> list[str]:
 def publish_collection_index(
     layout: ArchiveLayout,
     collection_id: str,
-    *,
-    new_warcs: Sequence[Path] | None = None,
 ) -> Optional[IndexArtifact]:
     """Index missing WARCs, merge the portable collection CDXJ, and publish.
 
-    Finalized WARC basenames drive incompleteness detection. Optional
-    ``new_warcs`` only ensures those paths are considered if they already
-    sit beside the collection's listed shards.
+    Finalized WARC basenames drive incompleteness detection: only shards not
+    already referenced by the on-disk index are fragment-indexed and merged.
     """
 
     collection_id = layout.validate_collection_id(collection_id)
@@ -100,10 +97,6 @@ def publish_collection_index(
     known = cdxj_filenames(index_path)
     warc_by_name = {path.name: path for path in collection_warcs}
     missing_names = {name for name in warc_by_name if name not in known}
-    if new_warcs:
-        for path in new_warcs:
-            if path.name in warc_by_name and path.name not in known:
-                missing_names.add(path.name)
 
     fragments: list[Path] = []
     try:
@@ -114,23 +107,10 @@ def publish_collection_index(
         if index_path.is_file():
             inputs.append(index_path)
         inputs.extend(fragments)
-        if not inputs:
-            for warc_path in collection_warcs:
-                fragments.append(index_warc_fragment(layout, warc_path))
-            inputs = list(fragments)
-
         lines = merge_cdxj_lines(inputs)
-        if not lines and collection_warcs:
-            for path in fragments:
-                path.unlink(missing_ok=True)
-            fragments = [
-                index_warc_fragment(layout, warc_path)
-                for warc_path in collection_warcs
-            ]
-            lines = merge_cdxj_lines(fragments)
 
         validate_cdxj_against_warcs(layout, collection_id, lines)
-        validate_collection_revisit_closure(layout, collection_id, lines)
+        validate_collection_revisit_closure(layout, collection_id)
 
         tmp = exclusive_temp_path(
             layout.work_root,
@@ -206,7 +186,6 @@ def _response_reference_key(
 def validate_collection_revisit_closure(
     layout: ArchiveLayout,
     collection_id: str,
-    lines: Sequence[str],
 ) -> None:
     """Ensure revisits resolve backward within one portable collection.
 
@@ -215,7 +194,6 @@ def validate_collection_revisit_closure(
     are assumed already checked by ``validate_cdxj_against_warcs``.
     """
 
-    del lines  # Locators validated separately; closure is WARC-level.
     available: set[tuple[str, str, str]] = set()
     # Collect responses then validate revisits in a second full-collection pass
     # so cross-shard Refers-To targets are visible regardless of shard order.

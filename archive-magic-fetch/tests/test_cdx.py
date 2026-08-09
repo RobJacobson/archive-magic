@@ -9,7 +9,7 @@ import json
 import pytest
 
 from archive_magic_fetch.cdx import fetch_year_cdx, init_run_id, parse_date_bound, year_bounds
-from archive_magic_fetch.collection import collection_layout, ensure_collection_dirs
+from archive_magic_fetch.collection import archive_layout, ensure_collection_dirs
 from archive_magic_fetch.fetch import _report_cdx_ingest_skips, build_settings
 from archive_magic_fetch.models import (
     CaptureIdentity,
@@ -20,7 +20,7 @@ from archive_magic_fetch.models import (
 from helpers import FakeSession, cdx_json, make_capt
 
 def test_raw_cdx_saved_before_normalization_and_malformed_in_failures(tmp_path):
-    layout = collection_layout("http://example.org/", tmp_path)
+    layout = archive_layout("http://example.org/", tmp_path)
     ensure_collection_dirs(layout)
 
     good = [
@@ -85,7 +85,7 @@ def test_malformed_rows_keep_distinct_failure_identities():
 
 
 def test_non_list_cdx_entries_become_malformed_failures(tmp_path):
-    layout = collection_layout("http://example.org/", tmp_path)
+    layout = archive_layout("http://example.org/", tmp_path)
     ensure_collection_dirs(layout)
     good = [
         "com,example)/",
@@ -148,7 +148,7 @@ def test_year_end_bound_covers_full_utc_year():
 
 
 def test_init_run_id_allocates_unique_id_after_collision(tmp_path):
-    layout = collection_layout("http://example.org/", tmp_path)
+    layout = archive_layout("http://example.org/", tmp_path)
     ensure_collection_dirs(layout)
     first = init_run_id(layout)
     (layout.run_dir("2004", first)).mkdir(parents=True)
@@ -160,7 +160,7 @@ def test_init_run_id_allocates_unique_id_after_collision(tmp_path):
 def test_multipage_cdx_metadata_coherent_and_parsed_from_disk(tmp_path):
     import hashlib
 
-    layout = collection_layout("http://example.org/", tmp_path)
+    layout = archive_layout("http://example.org/", tmp_path)
     ensure_collection_dirs(layout)
     page1_row = [
         "com,example)/",

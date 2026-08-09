@@ -483,31 +483,6 @@ def fetch_year_cdx(
     )
 
 
-def parse_raw_cdx_bytes(
-    entity: bytes,
-    *,
-    content_encoding: str = "identity",
-) -> tuple[list[ParsedCapture], list[UnresolvedFailure]]:
-    """Parse raw CDX entity bytes, optionally gzip-compressed."""
-
-    body = _decode_cdx_entity(entity, content_encoding)
-    captures: list[ParsedCapture] = []
-    failures: list[UnresolvedFailure] = []
-    seen: set[CaptureIdentity] = set()
-    rows, _ = _split_cdx_json_pages(body)
-    for raw_line, fields in rows:
-        parsed = _parse_row(fields, raw_line=raw_line)
-        if isinstance(parsed, UnresolvedFailure):
-            failures.append(parsed)
-            continue
-        if parsed.identity in seen:
-            continue
-        seen.add(parsed.identity)
-        captures.append(parsed)
-    captures.sort(key=lambda item: item.identity.sort_key())
-    return captures, failures
-
-
 def _write_raw_cdx_page(
     source_dir: Path,
     *,

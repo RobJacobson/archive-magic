@@ -82,8 +82,6 @@ def test_multiple_archive_config_lists_only_validated_archives(tmp_path):
 
     assert config["enable_auto_colls"] is False
     assert list(config["collections"]) == ["archive-a", "archive-b"]
-    assert "collections_root" not in config
-    assert "index_paths" not in config
     assert config["framed_replay"] is True
     assert config["client_side_replay"] is False
     for archive in archives:

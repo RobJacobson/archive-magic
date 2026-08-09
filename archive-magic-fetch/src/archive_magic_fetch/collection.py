@@ -141,8 +141,8 @@ def normalize_domain(
     return host, port
 
 
-def normalize_collection_id(url_pattern: str) -> str:
-    """Derive one safe collection directory name from a URL pattern."""
+def normalize_archive_id(url_pattern: str) -> str:
+    """Derive one safe domain-archive directory name from a URL pattern."""
 
     if not isinstance(url_pattern, str) or not url_pattern.strip():
         raise ValueError("URL pattern must be a non-empty string")
@@ -158,7 +158,7 @@ def normalize_collection_id(url_pattern: str) -> str:
     name = host if port is None else f"{host}%3A{port}"
     if not name or name in {".", ".."} or "/" in name or "\\" in name:
         raise ValueError(
-            f"URL pattern produced an unsafe collection name: {name}"
+            f"URL pattern produced an unsafe archive name: {name}"
         )
     return name
 
@@ -170,18 +170,18 @@ def default_archives_root() -> Path:
     return (project_root / DEFAULT_OUTPUT_ROOT).resolve()
 
 
-def collection_layout(
+def archive_layout(
     url_pattern: str,
     archives_root: Path | str | None = None,
 ) -> ArchiveLayout:
-    """Build collection layout for one URL pattern."""
+    """Build domain-archive layout for one URL pattern."""
 
     root = (
         Path(archives_root).expanduser().resolve()
         if archives_root is not None
         else default_archives_root()
     )
-    return ArchiveLayout(root, normalize_collection_id(url_pattern))
+    return ArchiveLayout(root, normalize_archive_id(url_pattern))
 
 
 def reject_legacy_layout(layout: ArchiveLayout) -> None:
@@ -276,6 +276,17 @@ def exclusive_temp_path(directory: Path, *, suffix: str) -> Path:
     return path
 
 
+def _collection_warc_name_pattern(
+    layout: ArchiveLayout, collection_id: str
+) -> re.Pattern[str]:
+    """Return the basename pattern for one portable collection's WARC shards."""
+
+    return re.compile(
+        rf"{re.escape(layout.archive_id)}-{re.escape(collection_id)}-"
+        r"(?P<seq>\d{3})\.warc\.gz"
+    )
+
+
 def list_collection_warcs(
     layout: ArchiveLayout, collection_id: str
 ) -> list[Path]:
@@ -286,10 +297,7 @@ def list_collection_warcs(
     if not collection_dir.is_dir():
         return []
     found: list[tuple[int, Path]] = []
-    pattern = re.compile(
-        rf"{re.escape(layout.archive_id)}-{re.escape(collection_id)}-"
-        r"(?P<seq>\d{3})\.warc\.gz"
-    )
+    pattern = _collection_warc_name_pattern(layout, collection_id)
     for path in collection_dir.iterdir():
         if not path.is_file():
             continue
@@ -311,11 +319,7 @@ def next_collection_warc_sequence(
     if not existing:
         return 1
     last = existing[-1].name
-    pattern = re.compile(
-        rf"{re.escape(layout.archive_id)}-{re.escape(collection_id)}-"
-        r"(?P<seq>\d{3})\.warc\.gz"
-    )
-    match = pattern.fullmatch(last)
+    match = _collection_warc_name_pattern(layout, collection_id).fullmatch(last)
     assert match is not None
     nxt = int(match.group("seq")) + 1
     if nxt > 999:
@@ -338,11 +342,9 @@ def warc_artifact_from_path(
     collection_id = path.parent.name
     layout.validate_collection_id(collection_id)
     expected_parent = layout.collection_dir(collection_id)
-    pattern = re.compile(
-        rf"{re.escape(layout.archive_id)}-{re.escape(collection_id)}-"
-        r"(?P<seq>\d{3})\.warc\.gz"
+    match = _collection_warc_name_pattern(layout, collection_id).fullmatch(
+        path.name
     )
-    match = pattern.fullmatch(path.name)
     if match is None or path.parent.resolve() != expected_parent.resolve():
         raise ValueError(f"unexpected WARC filename: {path.name}")
     return WarcArtifact(

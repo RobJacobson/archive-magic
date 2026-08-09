@@ -298,7 +298,7 @@ The command prints the landing-page URL after startup:
 
 ```text
 Archive Magic Navigator
-Serving 1 collection from /path/to/archives
+Serving 1 domain archive with 1 portable collection from /path/to/archives
 Wayback fallback: on
 Open http://127.0.0.1:8080/
 Press Ctrl-C to stop.
@@ -865,12 +865,12 @@ the final 20 lines in relevant startup errors.
 
 Unit tests cover:
 
-- CLI exclusivity of `COLLECTION` and `--all`;
+- CLI exclusivity of `ARCHIVE` and `--all`;
 - loopback defaults and explicit non-loopback warnings;
-- deterministic collection discovery and route names;
+- deterministic domain-archive discovery and portable-collection route names;
 - collection containment and symlink rejection;
 - CDXJ parsing, ordering, numeric ranges, and filename safety;
-- config generation for one and all collections;
+- config generation for one and all domain archives;
 - default-on and explicitly disabled Wayback fallback configuration;
 - no recording/live/autoindex settings;
 - child startup failure, port conflict, interrupt, and exit propagation;

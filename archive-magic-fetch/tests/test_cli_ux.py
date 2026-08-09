@@ -135,3 +135,18 @@ def test_elapsed_format_uses_unbounded_hours():
     assert _format_elapsed(25 * 60 * 60 + 2) == "25:00:02"
 
 
+def test_cli_rejects_reversed_range():
+    from archive_magic_fetch.cli import main
+
+    code = main(
+        [
+            "http://example.org/",
+            "--start",
+            "20050101",
+            "--end",
+            "20040101",
+        ]
+    )
+    assert code == 2
+
+

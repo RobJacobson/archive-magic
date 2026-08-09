@@ -88,7 +88,7 @@ def test_main_validates_before_start_and_opens_after_ready(
         ("open", "http://127.0.0.1:8080/"),
     ]
     output = capsys.readouterr().out
-    assert "Serving 1 domain archive with 1 portable collections" in output
+    assert "Serving 1 domain archive with 1 portable collection" in output
     assert "Wayback fallback: on" in output
 
 

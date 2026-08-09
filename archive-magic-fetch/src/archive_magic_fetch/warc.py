@@ -567,7 +567,7 @@ class CollectionWarcWriter:
             self.collection_id, self.sequence
         )
         self.temp_path = exclusive_temp_path(
-            collection_dir,
+            self.layout.work_root,
             suffix=f".{final_name}.partial",
         )
         self.stream = self.temp_path.open("xb")

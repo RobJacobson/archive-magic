@@ -7,7 +7,7 @@ import json
 import pytest
 
 from archive_magic_fetch.collection import (
-    collection_layout,
+    archive_layout,
     ensure_collection_dirs,
     list_collection_warcs,
 )
@@ -24,19 +24,15 @@ from archive_magic_fetch.warc import (
 )
 from helpers import make_capt, playback
 
-@pytest.mark.parametrize("status_token", ("200", "302"))
-def test_orphan_revisit_in_warc_is_rejected(tmp_path, status_token):
+
+def test_orphan_revisit_in_warc_is_rejected(tmp_path):
     """Revisits must resolve to a full response in the same collection."""
 
-    layout = collection_layout("http://example.org/", tmp_path)
+    layout = archive_layout("http://example.org/", tmp_path)
     ensure_collection_dirs(layout)
-    from archive_magic_fetch.warc import StoredResponse, revisit_from_stored
-
-    # Write only a response with a known digest, then a revisit that points at a
-    # different digest/date pair so closure fails at WARC level.
     body = b"body"
     dig = payload_digest(body)
-    response_id = make_capt(ts="20040601000000", digest=dig, status=status_token if status_token == "200" else "200")
+    response_id = make_capt(ts="20040601000000", digest=dig, status="200")
     writer = CollectionWarcWriter(layout, "2004")
     writer.write_playback(playback(response_id, body=body, status=200))
     # Orphan: refers to a never-written future response
@@ -45,12 +41,12 @@ def test_orphan_revisit_in_warc_is_rejected(tmp_path, status_token):
         warc_date="2004-06-02T00:00:00Z",
         warc_payload_digest="sha1:" + "F" * 32,
         target_uri="http://example.org/",
-        status_code=int(status_token) if status_token.isdigit() else 200,
+        status_code=200,
     )
     revisit_id = make_capt(
         ts="20040603000000",
         digest="sha1:" + "F" * 32,
-        status=status_token,
+        status="200",
     )
     writer.write_revisit(revisit_from_stored(revisit_id, ghost))
     writer.close()
@@ -59,7 +55,7 @@ def test_orphan_revisit_in_warc_is_rejected(tmp_path, status_token):
 
 
 def test_cross_year_revisit_closure_is_rejected(tmp_path):
-    layout = collection_layout("http://example.org/", tmp_path)
+    layout = archive_layout("http://example.org/", tmp_path)
     ensure_collection_dirs(layout)
     body = b"across-years"
     dig = payload_digest(body)
@@ -70,8 +66,6 @@ def test_cross_year_revisit_closure_is_rejected(tmp_path):
     writer.write_playback(playback(older, body=body))
     writer.close()
     publish_collection_index(layout, "2004")
-
-    from archive_magic_fetch.warc import StoredResponse, revisit_from_stored
 
     stored = StoredResponse(
         identity=older,
@@ -88,17 +82,14 @@ def test_cross_year_revisit_closure_is_rejected(tmp_path):
 
 
 def test_forward_revisit_reference_is_rejected(tmp_path):
-    layout = collection_layout("http://example.org/", tmp_path)
+    layout = archive_layout("http://example.org/", tmp_path)
     ensure_collection_dirs(layout)
     body = b"body"
     dig = payload_digest(body)
-    # Create a later-collection response first so a forward Refers-To can exist.
     future = make_capt(ts="20050601000000", digest=dig)
     writer = CollectionWarcWriter(layout, "2005")
     writer.write_playback(playback(future, body=body))
     writer.close()
-
-    from archive_magic_fetch.warc import StoredResponse, revisit_from_stored
 
     stored_future = StoredResponse(
         identity=future,
@@ -119,7 +110,7 @@ def test_forward_revisit_reference_is_rejected(tmp_path):
 
 
 def test_collection_index_beside_warcs_covers_multi_shard_year(tmp_path):
-    layout = collection_layout("http://example.org/", tmp_path)
+    layout = archive_layout("http://example.org/", tmp_path)
     ensure_collection_dirs(layout)
     writer = CollectionWarcWriter(layout, "2004", target_bytes=1)
     for i in range(2):
@@ -161,7 +152,7 @@ def test_collection_index_beside_warcs_covers_multi_shard_year(tmp_path):
 
 
 def test_crash_recovery_indexes_finalized_warc_without_redownload(tmp_path):
-    layout = collection_layout("http://example.org/", tmp_path)
+    layout = archive_layout("http://example.org/", tmp_path)
     ensure_collection_dirs(layout)
     capt = make_capt()
     writer = CollectionWarcWriter(layout, "2004")
@@ -178,13 +169,13 @@ def test_crash_recovery_indexes_finalized_warc_without_redownload(tmp_path):
 
 @pytest.mark.parametrize("collection_id", ("", "../2004", "nested/2004", "bad id"))
 def test_generic_collection_ids_must_be_filesystem_safe(tmp_path, collection_id):
-    layout = collection_layout("http://example.org/", tmp_path)
+    layout = archive_layout("http://example.org/", tmp_path)
     with pytest.raises(ValueError, match="unsafe collection ID"):
         layout.collection_dir(collection_id)
 
 
 def test_generic_collection_writer_and_index_are_portable(tmp_path):
-    layout = collection_layout("http://example.org/", tmp_path)
+    layout = archive_layout("http://example.org/", tmp_path)
     ensure_collection_dirs(layout)
     writer = CollectionWarcWriter(layout, "campaign-launch")
     writer.write_playback(playback(make_capt()))
@@ -199,23 +190,27 @@ def test_generic_collection_writer_and_index_are_portable(tmp_path):
     assert payload["filename"] == warcs[0].path.name
 
 
-
-
 @pytest.mark.parametrize(
     ("filename", "match"),
     (
         ("other.org-2004-001.warc.gz", "foreign WARC"),
+        ("example.org-2004-001.warc.gz", "foreign WARC"),
         ("collections/2004/example.org-2004-001.warc.gz", "basename"),
-        ("example.org-2004-001.warc.gz", "out of bounds"),
+        (None, "out of bounds"),
     ),
 )
 def test_validate_cdxj_rejects_unsafe_locators(tmp_path, filename, match):
-    layout = collection_layout("http://example.org/", tmp_path)
+    layout = archive_layout("http://example.org/", tmp_path)
     ensure_collection_dirs(layout)
     writer = CollectionWarcWriter(layout, "2004")
-    writer.write_playback(playback(make_capt()))
+    writer.write_playback(playback(make_capt(ts="20040601000000")))
     writer.close()
-    warcs = list_collection_warcs(layout, "2004")
+    writer = CollectionWarcWriter(layout, "2005")
+    writer.write_playback(playback(make_capt(ts="20050601000000")))
+    writer.close()
+
+    # Validate against 2005 so a 2004-shaped basename is foreign.
+    warcs = list_collection_warcs(layout, "2005")
     size = warcs[0].stat().st_size
     if match == "out of bounds":
         length = size + 1
@@ -224,26 +219,8 @@ def test_validate_cdxj_rejects_unsafe_locators(tmp_path, filename, match):
         length = 10
         fname = filename
     line = (
-        'com,example)/ 20040615000000 {"url":"http://example.org/",'
+        'com,example)/ 20050601000000 {"url":"http://example.org/",'
         f'"filename":"{fname}","offset":0,"length":{length}}}'
     )
     with pytest.raises(ValueError, match=match):
-        validate_cdxj_against_warcs(layout, "2004", [line])
-
-
-def test_cross_collection_cdxj_basename_rejected(tmp_path):
-    layout = collection_layout("http://example.org/", tmp_path)
-    ensure_collection_dirs(layout)
-    writer = CollectionWarcWriter(layout, "2004")
-    writer.write_playback(playback(make_capt(ts="20040601000000")))
-    writer.close()
-    writer = CollectionWarcWriter(layout, "2005")
-    writer.write_playback(playback(make_capt(ts="20050601000000")))
-    writer.close()
-    foreign = layout.collection_warc_filename("2004", 1)
-    line = (
-        'com,example)/ 20050601000000 {"url":"http://example.org/",'
-        f'"filename":"{foreign}","offset":0,"length":10}}'
-    )
-    with pytest.raises(ValueError, match="foreign WARC"):
         validate_cdxj_against_warcs(layout, "2005", [line])

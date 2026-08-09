@@ -77,6 +77,23 @@ def test_archive_discovery_ignores_capture_metadata(collection_factory):
     assert [item.collection_id for item in selected.collections] == ["2020"]
 
 
+def test_select_archive_lists_multiple_portable_collections_sorted(
+    collection_factory,
+):
+    root, archive, _, _ = collection_factory(collection_id="2020")
+    collection_factory(collection_id="2008")
+    run = archive / "captures" / "2008" / "runs" / "run-noise"
+    run.mkdir(parents=True)
+    (run / "run.json").write_text("{}\n", encoding="utf-8")
+
+    selected = select_archive(resolve_archives_root(root), "example.org")
+
+    assert [item.collection_id for item in selected.collections] == [
+        "2008",
+        "2020",
+    ]
+
+
 def test_discovery_rejects_escaping_directory_symlink(
     collection_factory,
     tmp_path,

@@ -20,9 +20,10 @@ from .cdx import (
 )
 from .collection import (
     ArchiveLayout,
+    archive_layout,
     cleanup_temps,
-    collection_layout,
     ensure_collection_dirs,
+    index_artifact_from_path,
     list_collection_warcs,
     reject_legacy_layout,
     warc_artifact_from_path,
@@ -189,7 +190,7 @@ def _run_fetch(
     """Execute the serial year-by-year work with an open playback client."""
 
     validate_date_range(settings.date_start, settings.date_end)
-    layout = collection_layout(settings.url_pattern, settings.archives_root)
+    layout = archive_layout(settings.url_pattern, settings.archives_root)
     reject_legacy_layout(layout)
     ensure_collection_dirs(layout)
     cleanup_temps(layout)
@@ -298,23 +299,19 @@ def _run_fetch(
         close_started = time.monotonic()
         new_warcs = writer.close()
         year_metrics.warc_write_s += time.monotonic() - close_started
-        collection_index: IndexArtifact | None = None
         for artifact in new_warcs:
             print(f"  published {artifact.relative_key}", flush=True)
-            idx_started = time.monotonic()
-            collection_index = publish_collection_index(
-                layout,
-                collection_id,
-                new_warcs=[artifact.path],
-            )
-            year_metrics.index_s += time.monotonic() - idx_started
 
-        # Index may still be missing when this run wrote nothing but prior
-        # finalized WARCs exist (all local reuses / reconciliation lag).
-        if collection_index is None and list_collection_warcs(layout, collection_id):
-            idx_started = time.monotonic()
-            collection_index = publish_collection_index(layout, collection_id)
-            year_metrics.index_s += time.monotonic() - idx_started
+        collection_index: IndexArtifact | None = None
+        collection_warcs = list_collection_warcs(layout, collection_id)
+        if collection_warcs:
+            index_path = layout.collection_index(collection_id)
+            if new_warcs or not index_path.is_file():
+                idx_started = time.monotonic()
+                collection_index = publish_collection_index(layout, collection_id)
+                year_metrics.index_s += time.monotonic() - idx_started
+            else:
+                collection_index = index_artifact_from_path(layout, index_path)
 
         year_metrics.unresolved = len(year_failures)
         year_warcs = _collect_warc_artifacts(
