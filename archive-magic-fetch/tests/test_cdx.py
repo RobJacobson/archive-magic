@@ -212,3 +212,81 @@ def test_multipage_cdx_metadata_coherent_and_parsed_from_disk(tmp_path):
         assert hashlib.sha256(path.read_bytes()).hexdigest() == page["sha256"]
 
 
+def test_cdx_retries_protocol_incomplete_read(tmp_path, capsys):
+    from http.client import IncompleteRead
+    from unittest.mock import MagicMock
+
+    from urllib3.exceptions import ProtocolError
+
+    from helpers import FakeRaw
+
+    layout = archive_layout("http://example.org/", tmp_path)
+    ensure_collection_dirs(layout)
+    row = [
+        "com,example)/",
+        "20040615000000",
+        "http://example.org/",
+        "text/html",
+        "200",
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567",
+        "123",
+    ]
+    body = cdx_json([row])
+    sleeps: list[float] = []
+
+    class TruncateThenOkSession:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.closed = 0
+
+        def get(self, url, stream=True, timeout=120):
+            self.calls += 1
+            response = MagicMock()
+            response.status_code = 200
+            response.headers = {"Content-Encoding": "identity"}
+            response.raise_for_status = MagicMock()
+
+            def close() -> None:
+                self.closed += 1
+
+            response.close = close
+            if self.calls == 1:
+                def boom(decode_content: bool = False):
+                    raise ProtocolError(
+                        "Connection broken: "
+                        "IncompleteRead(7070 bytes read)",
+                        IncompleteRead(b" partial"),
+                    )
+
+                response.raw = MagicMock()
+                response.raw.read = boom
+                response.content = None
+            else:
+                response.raw = FakeRaw(body)
+                response.content = body
+            return response
+
+        def close(self):
+            return None
+
+    session = TruncateThenOkSession()
+    result = fetch_year_cdx(
+        layout,
+        url_pattern="http://example.org/",
+        year=2004,
+        date_start="20040101000000",
+        date_end="20041231235959",
+        run_id="test-incomplete-read",
+        session=session,
+        sleep=sleeps.append,
+    )
+    assert session.calls == 2
+    assert session.closed >= 1
+    assert sleeps == [5.0]
+    assert len(result.captures) == 1
+    assert result.query_meta["request_count"] == 1
+    out = capsys.readouterr().out
+    assert "CDX connection error: retrying in 5s" in out
+    assert "ProtocolError" in out
+
+
