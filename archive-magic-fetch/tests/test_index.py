@@ -10,6 +10,7 @@ from archive_magic_fetch.collection import (
     archive_layout,
     ensure_collection_dirs,
     list_collection_warcs,
+    reset_collection_data,
 )
 from archive_magic_fetch.index import (
     publish_collection_index,
@@ -224,3 +225,21 @@ def test_validate_cdxj_rejects_unsafe_locators(tmp_path, filename, match):
     )
     with pytest.raises(ValueError, match=match):
         validate_cdxj_against_warcs(layout, "2005", [line])
+
+
+def test_reset_collection_data_deletes_warc_and_cdxj(tmp_path):
+    layout = archive_layout("http://example.org/", tmp_path)
+    ensure_collection_dirs(layout)
+    writer = CollectionWarcWriter(layout, "2004")
+    writer.write_playback(playback(make_capt(ts="20040601000000")))
+    writer.close()
+    publish_collection_index(layout, "2004")
+
+    index_path = layout.collection_index("2004")
+    assert list_collection_warcs(layout, "2004")
+    assert index_path.is_file()
+
+    reset_collection_data(layout, "2004")
+
+    assert list_collection_warcs(layout, "2004") == []
+    assert not index_path.is_file()

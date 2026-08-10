@@ -93,6 +93,80 @@ def test_statusless_capture_three_runs_no_extra_network(tmp_path):
                 record.raw_stream.read()
 
 
+def test_reset_data_redownloads_instead_of_reusing(tmp_path):
+    layout = archive_layout("http://example.org/", tmp_path)
+    ensure_collection_dirs(layout)
+    identity = make_capt(urlkey="com,example)/")
+    calls = {"n": 0}
+
+    def download_fn(_client, capt_identity):
+        calls["n"] += 1
+        return playback(capt_identity)
+
+    rows = [
+        [
+            "com,example)/",
+            "20040615000000",
+            "http://example.org/",
+            "text/html",
+            "200",
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "5",
+        ]
+    ]
+    body = cdx_json(rows)
+    original, cdx_mod, fetch_mod = patch_cdx(body)
+    settings = FetchSettings(
+        url_pattern="http://example.org/",
+        date_start="20040615000000",
+        date_end="20040615000000",
+        archives_root=tmp_path,
+    )
+    try:
+        assert (
+            run_fetch(
+                settings,
+                client_factory=lambda: MagicMock(),
+                download_fn=download_fn,
+                sleep=lambda _s: None,
+            ).exit_code
+            == 0
+        )
+        assert calls["n"] == 1
+        assert inventory_collection(layout, "2004").contains(identity)
+
+        assert (
+            run_fetch(
+                settings,
+                client_factory=lambda: MagicMock(),
+                download_fn=download_fn,
+                sleep=lambda _s: None,
+            ).exit_code
+            == 0
+        )
+        assert calls["n"] == 1
+
+        assert (
+            run_fetch(
+                FetchSettings(
+                    url_pattern=settings.url_pattern,
+                    date_start=settings.date_start,
+                    date_end=settings.date_end,
+                    archives_root=settings.archives_root,
+                    reset_data=True,
+                ),
+                client_factory=lambda: MagicMock(),
+                download_fn=download_fn,
+                sleep=lambda _s: None,
+            ).exit_code
+            == 0
+        )
+        assert calls["n"] == 2
+    finally:
+        cdx_mod.fetch_year_cdx = original
+        fetch_mod.fetch_year_cdx = original
+
+
 def test_same_year_representative_revisits_and_redirects_individual(tmp_path):
     layout = archive_layout("http://example.org/", tmp_path)
     ensure_collection_dirs(layout)

@@ -150,3 +150,13 @@ def test_cli_rejects_reversed_range():
     assert code == 2
 
 
+def test_cli_reset_data_flag():
+    from archive_magic_fetch.cli import parse_args
+
+    args = parse_args(["http://example.org/", "--reset-data"])
+    assert args.reset_data is True
+
+    args = parse_args(["http://example.org/"])
+    assert args.reset_data is False
+
+

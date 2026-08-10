@@ -26,6 +26,7 @@ from .collection import (
     index_artifact_from_path,
     list_collection_warcs,
     reject_legacy_layout,
+    reset_collection_data,
     warc_artifact_from_path,
     write_run_record,
 )
@@ -140,6 +141,7 @@ class FetchSettings:
     date_start: str
     date_end: str
     archives_root: Optional[Path] = None
+    reset_data: bool = False
 
 
 @dataclass
@@ -210,6 +212,9 @@ def _run_fetch(
     run_skips_errors = 0
     for year in years:
         collection_id = f"{year:04d}"
+        if settings.reset_data:
+            reset_collection_data(layout, collection_id)
+            print(f"year {year}: reset existing collection data", flush=True)
         year_metrics = RunMetrics()
         year_failures: list[UnresolvedFailure] = []
         year_started = time.monotonic()
@@ -591,6 +596,8 @@ def build_settings(
     date_start: Optional[str] = None,
     date_end: Optional[str] = None,
     archives_root: Optional[Path] = None,
+    *,
+    reset_data: bool = False,
 ) -> FetchSettings:
     """Validate CLI-facing inputs into settings."""
 
@@ -606,4 +613,5 @@ def build_settings(
         date_start=start,
         date_end=end,
         archives_root=archives_root,
+        reset_data=reset_data,
     )

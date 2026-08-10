@@ -287,6 +287,17 @@ def _collection_warc_name_pattern(
     )
 
 
+def reset_collection_data(layout: ArchiveLayout, collection_id: str) -> None:
+    """Remove finalized WARC and CDXJ artifacts for one portable collection."""
+
+    collection_id = layout.validate_collection_id(collection_id)
+    for path in list_collection_warcs(layout, collection_id):
+        path.unlink()
+    index_path = layout.collection_index(collection_id)
+    if index_path.is_file():
+        index_path.unlink()
+
+
 def list_collection_warcs(
     layout: ArchiveLayout, collection_id: str
 ) -> list[Path]:
