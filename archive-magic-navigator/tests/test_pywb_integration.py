@@ -17,14 +17,41 @@ from urllib.request import urlopen
 import pytest
 
 from archive_magic_navigator import config as navigator_config
-from archive_magic_navigator.collections import Collection
+from archive_magic_navigator.collections import Archive, ReplayCollection, select_archive
 from archive_magic_navigator.config import build_config, write_config
 from archive_magic_navigator.errors import StartupError
 from archive_magic_navigator.process import find_wayback, run_wayback
-from archive_magic_navigator.validation import validate_collection
+from archive_magic_navigator.validation import validate_archive
 
 
 FIXTURE = Path(__file__).parent / "fixtures" / "collection"
+
+
+def archive_for_root(archive_id: str, root: Path) -> Archive:
+    collection_root = root / "collections" / "2020"
+    replay_index = collection_root / f"{archive_id}-2020-index.cdxj"
+    return Archive(
+        archive_id,
+        root.resolve(),
+        (ReplayCollection("2020", collection_root.resolve(), replay_index.resolve()),),
+    )
+
+
+def copy_fixture(archives: Path, archive_id: str) -> Archive:
+    root = archives / archive_id
+    shutil.copytree(FIXTURE, root)
+    collection_root = root / "collections" / "2020"
+    if archive_id != "fixture":
+        old_index = collection_root / "fixture-2020-index.cdxj"
+        text = old_index.read_text(encoding="utf-8").replace(
+            "fixture-2020-", f"{archive_id}-2020-"
+        )
+        for path in sorted(collection_root.glob("fixture-2020-*.warc.gz")):
+            path.rename(collection_root / path.name.replace("fixture", archive_id, 1))
+        new_index = collection_root / f"{archive_id}-2020-index.cdxj"
+        new_index.write_text(text, encoding="utf-8")
+        old_index.unlink()
+    return archive_for_root(archive_id, root)
 
 
 def snapshot_tree(root: Path):
@@ -202,18 +229,17 @@ def test_real_pywb_replays_versions_revisit_and_subresources_read_only(
     tmp_path,
 ):
     archives = tmp_path / "archives"
-    collection_root = archives / "fixture"
-    shutil.copytree(FIXTURE, collection_root)
-    collection = Collection("fixture", collection_root.resolve())
-    assert validate_collection(collection).record_count == 7
+    collection = copy_fixture(archives, "fixture")
+    assert validate_archive(collection).record_count == 7
+    replay_index = collection.collections[0].replay_index
     replay_filenames = {
         json.loads(line.split(" ", 2)[2])["filename"]
-        for line in collection.replay_index.read_text().splitlines()
+        for line in replay_index.read_text().splitlines()
     }
     assert replay_filenames == {
-        "archive/example.test/index.warc.gz",
-        "archive/local-redirect.test/index.warc.gz",
-        "archive/local-target.test/index.warc.gz",
+        "fixture-2020-001.warc.gz",
+        "fixture-2020-002.warc.gz",
+        "fixture-2020-003.warc.gz",
     }
     before = snapshot_tree(archives)
 
@@ -314,10 +340,8 @@ def test_real_pywb_uses_wayback_fallback_for_redirect_and_assets(
     monkeypatch,
 ):
     archives = tmp_path / "archives"
-    collection_root = archives / "fixture"
-    shutil.copytree(FIXTURE, collection_root)
-    collection = Collection("fixture", collection_root.resolve())
-    assert validate_collection(collection).record_count == 7
+    collection = copy_fixture(archives, "fixture")
+    assert validate_archive(collection).record_count == 7
     before = snapshot_tree(archives)
 
     with memento_server() as (source, handler):
@@ -379,10 +403,8 @@ def test_real_pywb_lists_multiple_explicit_collections(tmp_path):
     archives = tmp_path / "archives"
     collections = []
     for collection_id in ("collection-a", "collection-b"):
-        root = archives / collection_id
-        shutil.copytree(FIXTURE, root)
-        collection = Collection(collection_id, root.resolve())
-        validate_collection(collection)
+        collection = copy_fixture(archives, collection_id)
+        validate_archive(collection)
         collections.append(collection)
     before = snapshot_tree(archives)
 
@@ -408,7 +430,7 @@ def test_readiness_does_not_accept_an_unrelated_service(tmp_path):
     runtime = tmp_path / "runtime"
     runtime.mkdir()
     fixture = FIXTURE.resolve()
-    write_config(runtime, build_config([Collection("fixture", fixture)]))
+    write_config(runtime, build_config([archive_for_root("fixture", fixture)]))
     ready = []
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), SentinelHandler)
@@ -437,7 +459,7 @@ def test_run_wayback_accepts_its_private_readiness_marker(tmp_path):
     runtime = tmp_path / "runtime"
     runtime.mkdir()
     fixture = FIXTURE.resolve()
-    write_config(runtime, build_config([Collection("fixture", fixture)]))
+    write_config(runtime, build_config([archive_for_root("fixture", fixture)]))
     ready = []
 
     def stop_after_ready(url):
@@ -460,7 +482,7 @@ def test_run_wayback_accepts_its_private_readiness_marker(tmp_path):
 
 
 @pytest.mark.integration
-def test_real_pywb_replays_same_year_revisit_across_annual_warc_shards(
+def test_real_pywb_aggregates_flat_collections_and_replays_same_collection_revisit(
     tmp_path,
 ):
     """Full response in 001 and revisit in 002 of the same year must replay."""
@@ -472,7 +494,7 @@ def test_real_pywb_replays_same_year_revisit_across_annual_warc_shards(
 
     archives = tmp_path / "archives"
     root = archives / "annual"
-    year_dir = root / "archive" / "2020"
+    year_dir = root / "collections" / "2020"
     year_dir.mkdir(parents=True)
 
     url = "http://example.org/"
@@ -484,7 +506,7 @@ def test_real_pywb_replays_same_year_revisit_across_annual_warc_shards(
     )
     entries = []
 
-    warc001 = year_dir / "example.org-2020-001.warc.gz"
+    warc001 = year_dir / "annual-2020-001.warc.gz"
     with warc001.open("wb") as stream:
         writer = WARCWriter(stream, gzip=True, warc_version="1.1")
         record = writer.create_warc_record(
@@ -507,14 +529,14 @@ def test_real_pywb_replays_same_year_revisit_across_annual_warc_shards(
                     "mime": "text/html",
                     "status": "200",
                     "digest": digest,
-                    "filename": "archive/2020/example.org-2020-001.warc.gz",
+                    "filename": warc001.name,
                     "offset": str(start),
                     "length": str(length),
                 },
             )
         )
 
-    warc002 = year_dir / "example.org-2020-002.warc.gz"
+    warc002 = year_dir / "annual-2020-002.warc.gz"
     with warc002.open("wb") as stream:
         writer = WARCWriter(stream, gzip=True, warc_version="1.1")
         revisit = writer.create_revisit_record(
@@ -537,7 +559,7 @@ def test_real_pywb_replays_same_year_revisit_across_annual_warc_shards(
                     "mime": "warc/revisit",
                     "status": "200",
                     "digest": digest,
-                    "filename": "archive/2020/example.org-2020-002.warc.gz",
+                    "filename": warc002.name,
                     "offset": str(start),
                     "length": str(length),
                 },
@@ -545,7 +567,8 @@ def test_real_pywb_replays_same_year_revisit_across_annual_warc_shards(
         )
 
     entries.sort(key=lambda item: (item[0], item[1]))
-    (root / "index.cdxj").write_text(
+    index = year_dir / "annual-2020-index.cdxj"
+    index.write_text(
         "".join(
             f"{key} {ts} {json.dumps(meta, separators=(',', ':'), sort_keys=True)}\n"
             for key, ts, meta in entries
@@ -553,8 +576,44 @@ def test_real_pywb_replays_same_year_revisit_across_annual_warc_shards(
         encoding="utf-8",
     )
 
-    collection = Collection("annual", root.resolve())
-    assert validate_collection(collection).record_count == 2
+    second_dir = root / "collections" / "2021"
+    second_dir.mkdir()
+    second_url = "http://second.example/"
+    second_warc = second_dir / "annual-2021-001.warc.gz"
+    with second_warc.open("wb") as stream:
+        writer = WARCWriter(stream, gzip=True, warc_version="1.1")
+        second = writer.create_warc_record(
+            second_url,
+            "response",
+            payload=BytesIO(b"Second portable collection"),
+            http_headers=headers,
+            warc_headers_dict={"WARC-Date": "2021-01-01T00:00:00Z"},
+        )
+        start = stream.tell()
+        writer.write_record(second)
+        length = stream.tell() - start
+    (second_dir / "annual-2021-index.cdxj").write_text(
+        "example,second)/ 20210101000000 "
+        + json.dumps(
+            {
+                "url": second_url,
+                "mime": "text/html",
+                "status": "200",
+                "digest": second.rec_headers.get_header("WARC-Payload-Digest"),
+                "filename": second_warc.name,
+                "offset": str(start),
+                "length": str(length),
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    collection = select_archive(archives.resolve(), "annual")
+    assert validate_archive(collection).record_count == 3
+    assert [item.collection_id for item in collection.collections] == ["2020", "2021"]
     before = snapshot_tree(archives)
 
     with pywb_server(tmp_path, [collection]) as base:
@@ -566,6 +625,9 @@ def test_real_pywb_replays_same_year_revisit_across_annual_warc_shards(
         )
         assert b"Annual shard body" in original
         assert revisited == original
+        _, second_body, _ = get(
+            base + "/annual/20210101000000id_/http://second.example/"
+        )
+        assert b"Second portable collection" in second_body
 
     assert snapshot_tree(archives) == before
-

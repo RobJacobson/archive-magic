@@ -1,0 +1,7 @@
+test,example)/ 20200101000000 {"digest":"sha1:BVEBWQOHFMEK2IWJ7PM532L6AMTG2PTK","filename":"fixture-2020-001.warc.gz","length":"418","mime":"text/html","offset":"0","status":"200","url":"http://example.test/"}
+test,example)/ 20210101000000 {"digest":"sha1:OBBH7RGFXOVGGHKOLIWQ25ELWV4N4FQ4","filename":"fixture-2020-001.warc.gz","length":"382","mime":"text/html","offset":"1074","status":"200","url":"http://example.test/"}
+test,example)/ 20220101000000 {"digest":"sha1:OBBH7RGFXOVGGHKOLIWQ25ELWV4N4FQ4","filename":"fixture-2020-001.warc.gz","length":"363","mime":"warc/revisit","offset":"1456","status":"200","url":"http://example.test/"}
+test,example)/assets/site.css 20200101000001 {"digest":"sha1:42EOHDO7TPYQMBU4G44S76CP72HOFHBW","filename":"fixture-2020-001.warc.gz","length":"329","mime":"text/css","offset":"745","status":"200","url":"http://example.test/assets/site.css"}
+test,local-redirect)/ 20200101000003 {"digest":"sha1:3I42H3S6NNFQ2MSVX7XZKYAYSCX5QBYJ","filename":"fixture-2020-002.warc.gz","length":"327","mime":"text/html","offset":"0","status":"301","url":"http://local-redirect.test/"}
+test,local-target)/ 20200101000000 {"digest":"sha1:QX4VYEJOLXJGKGFVRXDD3O2PDKCJ4TAW","filename":"fixture-2020-003.warc.gz","length":"328","mime":"text/html","offset":"0","status":"200","url":"http://local-target.test/"}
+test,redirect)/ 20200101000002 {"digest":"sha1:3I42H3S6NNFQ2MSVX7XZKYAYSCX5QBYJ","filename":"fixture-2020-001.warc.gz","length":"327","mime":"text/html","offset":"418","status":"301","url":"http://redirect.test/"}

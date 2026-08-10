@@ -21,8 +21,7 @@ WARC_TARGET_BYTES = 1_000_000_000
 MAX_PLAYBACK_ATTEMPTS = 3
 CDX_PAGE_LIMIT = 10_000
 DEFAULT_DATE_START = "19950101000000"
-COLLECTION_SCHEMA_VERSION = 3
-FAILURES_SCHEMA_VERSION = 1
+RUN_SCHEMA_VERSION = 1
 WARC_VERSION = "1.1"
 SOFTWARE_ID = "archive-magic-fetch/0.1.0"
 USER_AGENT = (
@@ -43,7 +42,7 @@ _CDX_TIMESTAMP = re.compile(r"^\d{14}$")
 
 
 class FailureCategory(str, Enum):
-    """Stable failure categories in failures.json."""
+    """Stable failure categories in immutable run records."""
 
     MALFORMED_CDX = "malformed_cdx"
     BLOCKED = "blocked"
@@ -51,7 +50,6 @@ class FailureCategory(str, Enum):
     UNAVAILABLE = "unavailable"
     RETRY_EXHAUSTED = "retry_exhausted"
     TRUNCATED = "truncated"
-    PUBLICATION = "publication"
 
 
 # SHA-1 (CDX base32) of the literal IA playback stub body ``Invalid URI``.
@@ -120,7 +118,7 @@ class PlaybackResult:
 class RevisitResult:
     """A revisit of an earlier successful full response.
 
-    The referred response lives in the same annual WARC set.
+    The referred response lives in the same portable collection.
     ``warc_payload_digest`` is the representative's local payload digest.
     """
 
@@ -134,7 +132,7 @@ class RevisitResult:
 
 @dataclass(frozen=True)
 class UnresolvedFailure:
-    """One unresolved capture failure for the failure ledger."""
+    """One capture failure recorded for the current run."""
 
     identity: CaptureIdentity
     category: FailureCategory
@@ -146,7 +144,7 @@ class WarcArtifact:
     """One finalized WARC shard."""
 
     relative_key: str
-    year: int
+    collection_id: str
     sequence: int
     path: Path
     size_bytes: int
@@ -385,18 +383,6 @@ def identity_to_dict(identity: CaptureIdentity) -> dict[str, str]:
     }
 
 
-def identity_from_dict(data: dict[str, object]) -> CaptureIdentity:
-    """Deserialize one capture identity from a JSON object."""
-
-    return CaptureIdentity(
-        urlkey=str(data["urlkey"]),
-        original_url=normalize_original_url(str(data["original_url"])),
-        timestamp=str(data["timestamp"]),
-        status_token=str(data["status_token"]),
-        payload_digest=str(data["payload_digest"]),
-    )
-
-
 def current_utc_cdx_timestamp() -> str:
     """Return the current UTC time as a full CDX timestamp."""
 
@@ -404,7 +390,7 @@ def current_utc_cdx_timestamp() -> str:
 
 
 def current_run_id() -> str:
-    """Return one UTC run identifier suitable for sources/ directory names.
+    """Return one UTC run identifier suitable for captures/ run directories.
 
     Uses microsecond precision so rapid consecutive runs do not collide.
     """

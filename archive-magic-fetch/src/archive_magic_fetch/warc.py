@@ -23,10 +23,10 @@ from wayback.exceptions import (
 )
 
 from .collection import (
-    CollectionLayout,
+    ArchiveLayout,
     exclusive_temp_path,
-    list_year_warcs,
-    next_warc_sequence,
+    list_collection_warcs,
+    next_collection_warc_sequence,
     publish_file_atomically,
     warc_artifact_from_path,
 )
@@ -85,12 +85,12 @@ class StoredResponse:
 
 
 @dataclass
-class AnnualInventory:
-    """Exact captures and reusable responses from one annual WARC set.
+class CollectionInventory:
+    """Exact captures and reusable responses from one portable collection.
 
     ``by_url_digest`` maps ``(urlkey, IA/CDX payload digest)`` to the oldest
     matched full response with that key. Entries store compact locator metadata
-    only (never payloads), rebuilt from finalized annual WARCs on resume.
+    only (never payloads), rebuilt from finalized collection WARCs on resume.
     """
 
     identities: set[CaptureIdentity] = field(default_factory=set)
@@ -183,16 +183,18 @@ def get_warc_identity(record) -> CaptureIdentity:
     )
 
 
-def inventory_year(layout: CollectionLayout, year: int) -> AnnualInventory:
-    """Validate and inventory finalized WARCs for one year.
+def inventory_collection(
+    layout: ArchiveLayout, collection_id: str
+) -> CollectionInventory:
+    """Validate and inventory finalized WARCs for one collection.
 
-    Finalized annual WARCs are the recovery source of truth. Rebuild exact
+    Finalized collection WARCs are the recovery source of truth. Rebuild exact
     identity membership and the compact representative map without loading
     payload bodies.
     """
 
-    inv = AnnualInventory()
-    for path in list_year_warcs(layout, year):
+    inv = CollectionInventory()
+    for path in list_collection_warcs(layout, collection_id):
         with path.open("rb") as stream:
             for record in ArchiveIterator(stream, check_digests="raise"):
                 if record.rec_type not in {"response", "revisit"}:
@@ -510,11 +512,11 @@ def build_revisit_record(result: RevisitResult):
 
 
 @dataclass
-class YearWarcWriter:
-    """Single-owner WARC writer for one calendar year."""
+class CollectionWarcWriter:
+    """Single-owner WARC writer for one portable collection."""
 
-    layout: CollectionLayout
-    year: int
+    layout: ArchiveLayout
+    collection_id: str
     target_bytes: int = WARC_TARGET_BYTES
     sequence: int = 0
     stream: BinaryIO | None = None
@@ -525,7 +527,9 @@ class YearWarcWriter:
 
     def __post_init__(self) -> None:
         if self.sequence == 0:
-            self.sequence = next_warc_sequence(self.layout, self.year)
+            self.sequence = next_collection_warc_sequence(
+                self.layout, self.collection_id
+            )
 
     def write_playback(self, result: PlaybackResult) -> None:
         self._ensure_open()
@@ -555,13 +559,15 @@ class YearWarcWriter:
             return
         if self.sequence > 999:
             raise RuntimeError(
-                f"WARC sequence would exceed 999 for year {self.year}"
+                f"WARC sequence would exceed 999 for collection {self.collection_id}"
             )
-        year_dir = self.layout.year_dir(self.year)
-        year_dir.mkdir(parents=True, exist_ok=True)
-        final_name = self.layout.warc_filename(self.year, self.sequence)
+        collection_dir = self.layout.collection_dir(self.collection_id)
+        collection_dir.mkdir(parents=True, exist_ok=True)
+        final_name = self.layout.collection_warc_filename(
+            self.collection_id, self.sequence
+        )
         self.temp_path = exclusive_temp_path(
-            year_dir,
+            self.layout.work_root,
             suffix=f".{final_name}.partial",
         )
         self.stream = self.temp_path.open("xb")
@@ -593,7 +599,9 @@ class YearWarcWriter:
         self.stream = None
         self.writer = None
         validate_warc(self.temp_path)
-        final_path = self.layout.warc_path(self.year, self.sequence)
+        final_path = self.layout.collection_warc_path(
+            self.collection_id, self.sequence
+        )
         publish_file_atomically(self.temp_path, final_path)
         # record_count includes warcinfo; store total records written
         artifact = warc_artifact_from_path(

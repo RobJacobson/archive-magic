@@ -23,6 +23,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         default=None,
         help=argparse.SUPPRESS,
     )
+    parser.add_argument(
+        "--reset-data",
+        action="store_true",
+        help=(
+            "overwrite existing collection data instead of merging with it "
+            "(deletes WARC and CDXJ files for each selected collection)"
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -36,6 +44,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             date_start=args.start,
             date_end=args.end,
             archives_root=args.archives_root,
+            reset_data=args.reset_data,
         )
     except ValueError as error:
         print(f"error: {error}", file=sys.stderr)

@@ -11,7 +11,6 @@ import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from email.utils import mktime_tz, parsedate_tz
 from pathlib import Path
 from typing import Callable, Literal, Optional
 from urllib.parse import urlencode
@@ -21,7 +20,7 @@ from wayback import WaybackClient, WaybackSession
 from wayback._client import read_and_close
 from wayback.exceptions import RateLimitError, WaybackRetryError
 
-from .collection import CollectionLayout, ensure_collection_dirs, exclusive_temp_path, publish_file_atomically
+from .collection import ArchiveLayout, ensure_collection_dirs, exclusive_temp_path, publish_file_atomically
 from .models import (
     CDX_PAGE_LIMIT,
     DEFAULT_DATE_START as DEFAULT_DATE_START,
@@ -39,6 +38,7 @@ from .models import (
     timestamp_year,
 )
 from .collection import normalize_domain
+from .retry import parse_retry_after
 
 
 # Standard CDX field order used by IA and wayback.
@@ -90,7 +90,7 @@ class ArchiveMagicWaybackSession(WaybackSession):
         kwargs["stream"] = True
         response = super().send(request, **kwargs)
         if getattr(response, "status_code", None) == 429:
-            delay = _parse_retry_after(response.headers.get("Retry-After"))
+            delay = parse_retry_after(response.headers.get("Retry-After"))
             read_and_close(response)
             raise RateLimitError(response, delay)
         repair_false_gzip_content_encoding(response)
@@ -320,18 +320,6 @@ def _wayback_version() -> str:
         return "unknown"
 
 
-def _parse_retry_after(value: object) -> Optional[float]:
-    if not isinstance(value, str):
-        return None
-    try:
-        return float(max(0, int(value)))
-    except ValueError:
-        retry_date = parsedate_tz(value)
-        if retry_date is None:
-            return None
-        return float(max(0, mktime_tz(retry_date) - int(time.time())))
-
-
 @dataclass(frozen=True)
 class YearCdxResult:
     """Raw and parsed annual CDX acquisition result."""
@@ -345,7 +333,7 @@ class YearCdxResult:
 
 
 def fetch_year_cdx(
-    layout: CollectionLayout,
+    layout: ArchiveLayout,
     *,
     url_pattern: str,
     year: int,
@@ -363,7 +351,8 @@ def fetch_year_cdx(
     year_start, year_end = bounds
 
     ensure_collection_dirs(layout)
-    source_dir = layout.sources_root / run_id
+    collection_id = f"{year:04d}"
+    source_dir = layout.run_dir(collection_id, run_id)
     source_dir.mkdir(parents=True, exist_ok=True)
 
     search_url, match_type = normalize_cdx_search(url_pattern)
@@ -413,13 +402,17 @@ def fetch_year_cdx(
             )
             if raw_path is None:
                 raw_path = page_path
+            stored_entity = page_path.read_bytes()
             page_metas.append(
                 {
                     "page": page,
                     "raw_file": page_path.name,
+                    "storage_encoding": "gzip",
                     "response_encoding": content_encoding,
-                    "byte_length": len(entity),
-                    "sha256": hashlib.sha256(entity).hexdigest(),
+                    "byte_length": len(stored_entity),
+                    "sha256": hashlib.sha256(stored_entity).hexdigest(),
+                    "response_byte_length": len(entity),
+                    "response_sha256": hashlib.sha256(entity).hexdigest(),
                     "query_url": query_url,
                 }
             )
@@ -436,20 +429,6 @@ def fetch_year_cdx(
     if raw_path is None:
         raise RuntimeError(f"CDX query for {year} returned no response pages")
 
-    # Single-page years use the stable annual name; multi-page years keep
-    # durable per-page files and point raw_path at page 001.
-    if len(page_metas) == 1:
-        stable_name = (
-            f"{year:04d}.cdx.gz"
-            if str(page_metas[0]["response_encoding"]).startswith("gzip")
-            else f"{year:04d}.cdx"
-        )
-        stable_path = source_dir / stable_name
-        if raw_path != stable_path:
-            publish_file_atomically(raw_path, stable_path)
-            raw_path = stable_path
-            page_metas[0]["raw_file"] = stable_name
-
     # Parse from durable published pages so source and processed input match.
     captures: list[ParsedCapture] = []
     failures: list[UnresolvedFailure] = []
@@ -457,9 +436,7 @@ def fetch_year_cdx(
     for page_meta in page_metas:
         page_path = source_dir / str(page_meta["raw_file"])
         entity = page_path.read_bytes()
-        parse_body = _decode_cdx_entity(
-            entity, str(page_meta["response_encoding"])
-        )
+        parse_body = _decode_cdx_entity(entity, "gzip")
         page_rows, _ = _split_cdx_json_pages(parse_body)
         for raw_line, fields in page_rows:
             parsed = _parse_row(fields, raw_line=raw_line)
@@ -496,8 +473,6 @@ def fetch_year_cdx(
         "raw_file": str(primary["raw_file"]),
         "pages": page_metas,
     }
-    _merge_query_json(source_dir, year, query_meta)
-
     return YearCdxResult(
         year=year,
         source_dir=source_dir,
@@ -506,31 +481,6 @@ def fetch_year_cdx(
         failures=tuple(failures),
         query_meta=query_meta,
     )
-
-
-def parse_raw_cdx_bytes(
-    entity: bytes,
-    *,
-    content_encoding: str = "identity",
-) -> tuple[list[ParsedCapture], list[UnresolvedFailure]]:
-    """Parse raw CDX entity bytes, optionally gzip-compressed."""
-
-    body = _decode_cdx_entity(entity, content_encoding)
-    captures: list[ParsedCapture] = []
-    failures: list[UnresolvedFailure] = []
-    seen: set[CaptureIdentity] = set()
-    rows, _ = _split_cdx_json_pages(body)
-    for raw_line, fields in rows:
-        parsed = _parse_row(fields, raw_line=raw_line)
-        if isinstance(parsed, UnresolvedFailure):
-            failures.append(parsed)
-            continue
-        if parsed.identity in seen:
-            continue
-        seen.add(parsed.identity)
-        captures.append(parsed)
-    captures.sort(key=lambda item: item.identity.sort_key())
-    return captures, failures
 
 
 def _write_raw_cdx_page(
@@ -543,10 +493,12 @@ def _write_raw_cdx_page(
 ) -> Path:
     """Persist one CDX HTTP entity before any parsing."""
 
-    suffix = ".cdx.gz" if content_encoding.startswith("gzip") else ".cdx"
-    page_path = source_dir / f"{year:04d}.page{page:03d}{suffix}"
+    page_path = source_dir / f"page-{page:03d}.cdx.gz"
+    stored_entity = (
+        entity if content_encoding.lower().startswith("gzip") else gzip.compress(entity)
+    )
     tmp = exclusive_temp_path(source_dir, suffix=f".{page_path.name}.tmp")
-    tmp.write_bytes(entity)
+    tmp.write_bytes(stored_entity)
     publish_file_atomically(tmp, page_path)
     return page_path
 
@@ -575,7 +527,7 @@ def _get_cdx_entity_bytes(
         try:
             response = session.get(url, stream=True, timeout=120)
             if response.status_code == 429:
-                delay = _parse_retry_after(
+                delay = parse_retry_after(
                     response.headers.get("Retry-After")
                 ) or 60.0
                 response.close()
@@ -756,7 +708,7 @@ def _parse_row(
 
 def _malformed(raw_line: str, message: str) -> UnresolvedFailure:
     # Distinct synthetic identity per malformed source row so publication
-    # cannot collapse unrelated bad rows into one failure ledger entry.
+    # cannot collapse unrelated bad rows in the current run record.
     row_digest = hashlib.sha1(raw_line.encode("utf-8", errors="replace")).hexdigest()
     identity = CaptureIdentity(
         urlkey=f"malformed:{row_digest}",
@@ -773,7 +725,7 @@ def _malformed(raw_line: str, message: str) -> UnresolvedFailure:
             timestamp=parts[1],
             status_token=parts[4] if len(parts) > 4 else "-",
             # Always keep the row hash so distinct malformed rows that share
-            # timestamp/url fields cannot collide in failures.json.
+            # timestamp/url fields remain distinct in run.json.
             payload_digest=f"malformed:{row_digest}",
         )
     return UnresolvedFailure(
@@ -783,47 +735,19 @@ def _malformed(raw_line: str, message: str) -> UnresolvedFailure:
     )
 
 
-def _merge_query_json(
-    source_dir: Path,
-    year: int,
-    year_meta: dict[str, object],
-) -> None:
-    path = source_dir / "query.json"
-    if path.is_file():
-        data = json.loads(path.read_text(encoding="utf-8"))
-    else:
-        data = {
-            "schema_version": 1,
-            "run_id": source_dir.name,
-            "years": {},
-        }
-    years = data.setdefault("years", {})
-    years[str(year)] = year_meta
-    tmp = exclusive_temp_path(source_dir, suffix=".query.json.tmp")
-    tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
-    publish_file_atomically(tmp, path)
-
-
-def init_run_source(layout: CollectionLayout, run_id: str | None = None) -> Path:
-    """Create the run source directory and return it.
-
-    When ``run_id`` is omitted, allocate a unique directory. Explicit run IDs
-    (tests, resume tooling) may reuse an existing directory.
-    """
+def init_run_id(layout: ArchiveLayout, run_id: str | None = None) -> str:
+    """Allocate one invocation ID shared by every selected collection."""
 
     ensure_collection_dirs(layout)
     if run_id is not None:
-        source_dir = layout.sources_root / run_id
-        source_dir.mkdir(parents=True, exist_ok=True)
-        return source_dir
+        layout.validate_run_id(run_id)
+        if any(layout.captures_root.glob(f"*/runs/{run_id}")):
+            raise FileExistsError(f"run ID already exists: {run_id}")
+        return run_id
 
-    # Auto-allocate: microsecond IDs usually suffice; bump on collision.
+    # Microsecond IDs normally suffice; check all existing collection runs.
     for attempt in range(1000):
         candidate = current_run_id() if attempt == 0 else f"{current_run_id()}-{attempt:02d}"
-        source_dir = layout.sources_root / candidate
-        try:
-            source_dir.mkdir(parents=True, exist_ok=False)
-            return source_dir
-        except FileExistsError:
-            continue
+        if not any(layout.captures_root.glob(f"*/runs/{candidate}")):
+            return candidate
     raise RuntimeError("unable to allocate a unique run source directory")

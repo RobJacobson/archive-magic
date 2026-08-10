@@ -9,14 +9,17 @@ import pytest
 @pytest.fixture
 def collection_factory(tmp_path):
     def create(
-        collection_id="example.org",
+        archive_id="example.org",
         *,
+        collection_id="2020",
         entries=None,
         warc_size=128,
     ):
         root = tmp_path / "archives"
-        collection = root / collection_id
-        warc = collection / "archive" / "example.org" / "index.warc.gz"
+        archive = root / archive_id
+        collection = archive / "collections" / collection_id
+        warc_name = f"{archive_id}-{collection_id}-001.warc.gz"
+        warc = collection / warc_name
         warc.parent.mkdir(parents=True, exist_ok=True)
         warc.write_bytes(b"x" * warc_size)
         if entries is None:
@@ -25,13 +28,13 @@ def collection_factory(tmp_path):
                     "org,example)/",
                     "20200101000000",
                     {
-                        "filename": "archive/example.org/index.warc.gz",
+                        "filename": warc_name,
                         "offset": "0",
                         "length": "16",
                     },
                 )
             ]
-        index = collection / "index.cdxj"
+        index = collection / f"{archive_id}-{collection_id}-index.cdxj"
         index.parent.mkdir(parents=True, exist_ok=True)
         index.write_text(
             "".join(
@@ -40,6 +43,6 @@ def collection_factory(tmp_path):
             ),
             encoding="utf-8",
         )
-        return root, collection, index, warc
+        return root, archive, index, warc
 
     return create

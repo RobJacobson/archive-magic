@@ -9,7 +9,7 @@ def test_parse_args_defaults_and_modes():
     request = cli.parse_args(["example.org"])
 
     assert request == cli.NavigatorRequest(
-        collection_id="example.org",
+        archive_id="example.org",
         archives=Path("./archives"),
         bind="127.0.0.1",
         port=8080,
@@ -17,7 +17,7 @@ def test_parse_args_defaults_and_modes():
         open_browser=False,
         debug=False,
     )
-    assert cli.parse_args(["--all"]).collection_id is None
+    assert cli.parse_args(["--all"]).archive_id is None
     assert cli.parse_args(
         ["example.org", "--wayback-fallback", "on"]
     ).wayback_fallback is True
@@ -88,7 +88,7 @@ def test_main_validates_before_start_and_opens_after_ready(
         ("open", "http://127.0.0.1:8080/"),
     ]
     output = capsys.readouterr().out
-    assert "Serving 1 collection" in output
+    assert "Serving 1 domain archive with 1 portable collection" in output
     assert "Wayback fallback: on" in output
 
 
@@ -166,7 +166,7 @@ def test_main_maps_validation_failure_without_traceback(tmp_path, capsys):
     assert "Traceback" not in output.err
 
 
-def test_all_mode_aggregates_invalid_collection_diagnostics(
+def test_all_mode_aggregates_invalid_archive_diagnostics(
     collection_factory,
     capsys,
 ):
@@ -178,6 +178,6 @@ def test_all_mode_aggregates_invalid_collection_diagnostics(
     assert cli.main(["--all", "--archives", str(root)]) == 1
 
     error = capsys.readouterr().err
-    assert "invalid collections:" in error
-    assert "collection 'collection-a'" in error
-    assert "collection 'collection-b'" in error
+    assert "invalid archives:" in error
+    assert "archive 'collection-a'" in error
+    assert "archive 'collection-b'" in error

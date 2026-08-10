@@ -4,13 +4,22 @@ import json
 
 import pytest
 
-from archive_magic_navigator.collections import Collection
+from archive_magic_navigator.collections import ReplayCollection
 from archive_magic_navigator.errors import ValidationError
 from archive_magic_navigator import validation
 
 
 def selected(collection):
-    return Collection("example.org", collection.resolve())
+    root = collection.resolve() / "collections" / "2020"
+    return ReplayCollection(
+        "2020", root, root / "example.org-2020-index.cdxj"
+    )
+
+
+def validate(collection):
+    return validation.validate_collection(
+        selected(collection), archive_id="example.org"
+    )
 
 
 def test_valid_index_accepts_integer_and_digit_string_ranges(
@@ -21,7 +30,7 @@ def test_valid_index_accepts_integer_and_digit_string_ranges(
             "org,example)/",
             "20200101000000",
             {
-                "filename": "archive/example.org/index.warc.gz",
+                "filename": "example.org-2020-001.warc.gz",
                 "offset": 0,
                 "length": 8,
             },
@@ -30,7 +39,7 @@ def test_valid_index_accepts_integer_and_digit_string_ranges(
             "org,example)/",
             "20210101000000",
             {
-                "filename": "archive/example.org/index.warc.gz",
+                "filename": "example.org-2020-001.warc.gz",
                 "offset": "8",
                 "length": "8",
             },
@@ -38,7 +47,9 @@ def test_valid_index_accepts_integer_and_digit_string_ranges(
     ]
     _, collection, _, _ = collection_factory(entries=entries)
 
-    summary = validation.validate_collection(selected(collection))
+    summary = validation.validate_collection(
+        selected(collection), archive_id="example.org"
+    )
 
     assert summary.record_count == 2
     assert summary.warc_count == 1
@@ -50,7 +61,7 @@ def test_valid_index_accepts_integer_and_digit_string_ranges(
         ({"offset": "0", "length": "1"}, "missing required field 'filename'"),
         (
             {
-                "filename": "archive/example.org/index.warc.gz",
+                "filename": "example.org-2020-001.warc.gz",
                 "offset": True,
                 "length": "1",
             },
@@ -58,7 +69,7 @@ def test_valid_index_accepts_integer_and_digit_string_ranges(
         ),
         (
             {
-                "filename": "archive/example.org/index.warc.gz",
+                "filename": "example.org-2020-001.warc.gz",
                 "offset": 1.5,
                 "length": "1",
             },
@@ -66,7 +77,7 @@ def test_valid_index_accepts_integer_and_digit_string_ranges(
         ),
         (
             {
-                "filename": "archive/example.org/index.warc.gz",
+                "filename": "example.org-2020-001.warc.gz",
                 "offset": "-1",
                 "length": "1",
             },
@@ -74,7 +85,7 @@ def test_valid_index_accepts_integer_and_digit_string_ranges(
         ),
         (
             {
-                "filename": "archive/example.org/index.warc.gz",
+                "filename": "example.org-2020-001.warc.gz",
                 "offset": "0",
                 "length": "0",
             },
@@ -82,7 +93,7 @@ def test_valid_index_accepts_integer_and_digit_string_ranges(
         ),
         (
             {
-                "filename": "archive/example.org/index.warc.gz",
+                "filename": "example.org-2020-001.warc.gz",
                 "offset": "120",
                 "length": "16",
             },
@@ -100,7 +111,7 @@ def test_invalid_record_ranges_include_line_context(
     )
 
     with pytest.raises(ValidationError, match=message) as raised:
-        validation.validate_collection(selected(collection))
+        validate(collection)
 
     assert str(index) in str(raised.value)
     assert "line 1" in str(raised.value)
@@ -110,13 +121,13 @@ def test_invalid_record_ranges_include_line_context(
 @pytest.mark.parametrize(
     "filename",
     (
-        "/archive/example.org/index.warc.gz",
-        "../archive/example.org/index.warc.gz",
+        "/example.org-2020-001.warc.gz",
+        "../example.org-2020-001.warc.gz",
         "archive/fixture.warc.gz",
         "archive/../fixture.warc.gz",
         "archive//fixture.warc.gz",
         r"archive\fixture.warc.gz",
-        "C:/archive/example.org/index.warc.gz",
+        "C:/example.org-2020-001.warc.gz",
         "archive/C:/fixture.warc.gz",
         "https://example.test/fixture.warc.gz",
         "website/fixture.warc.gz",
@@ -130,7 +141,7 @@ def test_unsafe_warc_paths_are_rejected(collection_factory, filename):
     )
 
     with pytest.raises(ValidationError, match="unsafe WARC filename"):
-        validation.validate_collection(selected(collection))
+        validate(collection)
 
 
 def test_escaping_warc_symlink_is_rejected(collection_factory, tmp_path):
@@ -141,7 +152,7 @@ def test_escaping_warc_symlink_is_rejected(collection_factory, tmp_path):
     warc.symlink_to(outside)
 
     with pytest.raises(ValidationError, match="escapes or cannot be resolved"):
-        validation.validate_collection(selected(collection))
+        validate(collection)
 
 
 def test_escaping_index_symlink_is_rejected(collection_factory, tmp_path):
@@ -151,21 +162,43 @@ def test_escaping_index_symlink_is_rejected(collection_factory, tmp_path):
     index.symlink_to(outside)
 
     with pytest.raises(ValidationError, match="index escapes"):
-        validation.validate_collection(selected(collection))
+        validate(collection)
+
+
+def test_unexpected_second_index_is_rejected(collection_factory):
+    _, collection, index, _ = collection_factory()
+    (index.parent / "foreign.cdxj").write_text("x\n", encoding="utf-8")
+
+    with pytest.raises(ValidationError, match="unexpected indexes"):
+        validate(collection)
+
+
+def test_foreign_collection_warc_basename_is_rejected(collection_factory):
+    payload = {
+        "filename": "example.org-2021-001.warc.gz",
+        "offset": "0",
+        "length": "1",
+    }
+    _, collection, _, _ = collection_factory(
+        entries=[("org,example)/", "20200101000000", payload)]
+    )
+
+    with pytest.raises(ValidationError, match="foreign or invalid"):
+        validate(collection)
 
 
 def test_index_must_be_nonempty_valid_utf8_and_sorted(collection_factory):
     _, collection, index, _ = collection_factory()
     index.write_text("", encoding="utf-8")
     with pytest.raises(ValidationError, match="index is empty"):
-        validation.validate_collection(selected(collection))
+        validate(collection)
 
     index.write_bytes(b"\xff")
     with pytest.raises(ValidationError, match="valid UTF-8"):
-        validation.validate_collection(selected(collection))
+        validate(collection)
 
     payload = {
-        "filename": "archive/example.org/index.warc.gz",
+        "filename": "example.org-2020-001.warc.gz",
         "offset": "0",
         "length": "1",
     }
@@ -175,7 +208,7 @@ def test_index_must_be_nonempty_valid_utf8_and_sorted(collection_factory):
         encoding="utf-8",
     )
     with pytest.raises(ValidationError, match="not sorted"):
-        validation.validate_collection(selected(collection))
+        validate(collection)
 
 
 def test_malformed_lines_timestamp_and_json_fail(collection_factory):
@@ -188,7 +221,9 @@ def test_malformed_lines_timestamp_and_json_fail(collection_factory):
     ):
         index.write_text(content, encoding="utf-8")
         with pytest.raises(ValidationError, match=message):
-            validation.validate_collection(selected(collection))
+            validation.validate_collection(
+                selected(collection), archive_id="example.org"
+            )
 
 
 def test_each_distinct_warc_is_validated_once(
@@ -200,7 +235,7 @@ def test_each_distinct_warc_is_validated_once(
             "org,example)/",
             f"20200{number}01000000",
             {
-                "filename": "archive/example.org/index.warc.gz",
+                "filename": "example.org-2020-001.warc.gz",
                 "offset": str(number),
                 "length": "1",
             },
@@ -217,6 +252,6 @@ def test_each_distinct_warc_is_validated_once(
 
     monkeypatch.setattr(validation, "_validate_warc_path", counted)
 
-    validation.validate_collection(selected(collection))
+    validate(collection)
 
-    assert calls == ["archive/example.org/index.warc.gz"]
+    assert calls == ["example.org-2020-001.warc.gz"]

@@ -11,22 +11,22 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .collections import (
-    Collection,
-    discover_collections,
+    Archive,
+    discover_archives,
     resolve_archives_root,
-    select_collection,
+    select_archive,
 )
 from .config import build_config, write_config
 from .errors import NavigatorError, ValidationError
 from .process import is_loopback_bind, run_wayback
-from .validation import validate_collection
+from .validation import validate_archive
 
 
 @dataclass(frozen=True)
 class NavigatorRequest:
     """Normalized public CLI request."""
 
-    collection_id: str | None
+    archive_id: str | None
     archives: Path
     bind: str
     port: int
@@ -58,22 +58,22 @@ def parse_args(
 
     parser = argparse.ArgumentParser(prog="archive-magic-navigator")
     parser.add_argument(
-        "collection",
+        "archive",
         nargs="?",
-        metavar="COLLECTION",
-        help="immediate collection directory name beneath --archives",
+        metavar="ARCHIVE",
+        help="immediate domain archive name beneath --archives",
     )
     parser.add_argument(
         "--all",
         action="store_true",
-        help="serve every immediate collection beneath --archives",
+        help="serve every immediate domain archive beneath --archives",
     )
     parser.add_argument(
         "--archives",
         type=Path,
         default=Path("./archives"),
         metavar="PATH",
-        help="Archive Magic collections root (default: ./archives)",
+        help="domain archives root (default: ./archives)",
     )
     parser.add_argument(
         "--bind",
@@ -110,10 +110,10 @@ def parse_args(
         help="show Navigator and pywb diagnostic output",
     )
     args = parser.parse_args(argv)
-    if (args.collection is None) == (not args.all):
-        parser.error("exactly one of COLLECTION and --all is required")
+    if (args.archive is None) == (not args.all):
+        parser.error("exactly one of ARCHIVE and --all is required")
     return NavigatorRequest(
-        collection_id=args.collection,
+        archive_id=args.archive,
         archives=args.archives,
         bind=args.bind,
         port=args.port,
@@ -129,10 +129,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     request = parse_args(argv)
     try:
         archives_root = resolve_archives_root(request.archives)
-        collections = _select_collections(request, archives_root)
-        _validate_collections(
-            collections,
-            aggregate=request.collection_id is None,
+        archives = _select_archives(request, archives_root)
+        _validate_archives(
+            archives,
+            aggregate=request.archive_id is None,
         )
 
         if not is_loopback_bind(request.bind):
@@ -156,16 +156,23 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "temporary runtime directory must be outside archives root"
                 )
             config = build_config(
-                collections,
+                archives,
                 wayback_fallback=request.wayback_fallback,
             )
             write_config(runtime_directory, config)
 
             def ready(url: str) -> None:
                 print("Archive Magic Navigator", flush=True)
+                collection_count = sum(
+                    len(item.collections) for item in archives
+                )
+                archive_word = "archive" if len(archives) == 1 else "archives"
+                collection_word = (
+                    "collection" if collection_count == 1 else "collections"
+                )
                 print(
-                    f"Serving {len(collections)} "
-                    f"{'collection' if len(collections) == 1 else 'collections'} "
+                    f"Serving {len(archives)} domain {archive_word} "
+                    f"with {collection_count} portable {collection_word} "
                     f"from {archives_root}",
                     flush=True,
                 )
@@ -191,28 +198,28 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
 
 
-def _select_collections(
+def _select_archives(
     request: NavigatorRequest,
     archives_root: Path,
-) -> tuple[Collection, ...]:
-    if request.collection_id is None:
-        return discover_collections(archives_root)
-    return (select_collection(archives_root, request.collection_id),)
+) -> tuple[Archive, ...]:
+    if request.archive_id is None:
+        return discover_archives(archives_root)
+    return (select_archive(archives_root, request.archive_id),)
 
 
-def _validate_collections(
-    collections: tuple[Collection, ...],
+def _validate_archives(
+    archives: tuple[Archive, ...],
     *,
     aggregate: bool,
 ) -> None:
     failures: list[str] = []
-    for collection in collections:
+    for archive in archives:
         try:
-            validate_collection(collection)
+            validate_archive(archive)
         except ValidationError as error:
             if not aggregate:
                 raise
             failures.append(str(error))
     if failures:
         details = "\n".join(f"  - {failure}" for failure in failures)
-        raise ValidationError(f"invalid collections:\n{details}")
+        raise ValidationError(f"invalid archives:\n{details}")
