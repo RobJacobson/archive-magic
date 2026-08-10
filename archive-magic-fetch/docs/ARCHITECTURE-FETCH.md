@@ -121,6 +121,7 @@ rewriting paths.
 | HTTP entity headers | **Modified** — drop representation headers (`Content-Encoding`, `Transfer-Encoding`, `ETag`, payload digests, etc.) and rewrite `Content-Length` so headers describe the stored body; keep `Content-Range` for HTTP 206 |
 | Status reason / protocol line | **Derived** — synthesized (`200 OK`, `HTTP/1.1`); not taken from the archived reason phrase |
 | Failed / unplayable CDX rows | **Omitted** — recorded in `run.json`; nothing written to WARC/CDXJ |
+| Digest match | **Exact or soft** — exact body SHA-1, or early-IA quirk where CDX hashed `body + "\n"` while `id_` returns `body`; soft matches still store exact playback bytes and can seed revisits |
 | Digest mismatch | **Kept** — body stored; `WARC-Payload-Digest` is of actual bytes; IA digest preserved; `CDX-Digest-Match: false`; cannot seed revisits |
 | Same-urlkey revisits | **Derived** — collection-local identical-payload revisits; not IA's revisit graph |
 | Year collections | **Derived** — calendar-year partition; revisits do not cross years |

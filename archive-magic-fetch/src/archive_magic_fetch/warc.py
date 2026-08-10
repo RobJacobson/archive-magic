@@ -152,6 +152,22 @@ def payload_digest(payload: bytes) -> str:
     return f"sha1:{encoded}"
 
 
+def cdx_digest_matches_body(expected_digest: object, body: bytes) -> bool:
+    """True when CDX digest matches the body, or body plus a trailing ``\\n``.
+
+    Some early IA ARC indexes hashed ``payload + \"\\n\"`` while ``id_``
+    playback returns the payload without that newline. Treat that as a match
+    so the capture can seed revisits; still store the exact playback bytes.
+    """
+
+    expected = normalize_payload_digest(expected_digest)
+    if expected is None:
+        return True
+    if payload_digest(body) == expected:
+        return True
+    return payload_digest(body + b"\n") == expected
+
+
 def get_warc_identity(record) -> CaptureIdentity:
     """Rebuild capture identity from WARC extension headers."""
 
@@ -225,10 +241,10 @@ def inventory_collection(
                         record.rec_headers.get_header(CDX_DIGEST_MATCH_HEADER)
                         == "false"
                     )
-                    if (
-                        not explicitly_mismatched
-                        and cdx_payload == warc_payload
-                    ):
+                    # Exact matches have equal digests. Soft matches (IA CDX
+                    # hashed body+"\n") differ but omit CDX-Digest-Match:false
+                    # and must still seed revisits after resume.
+                    if not explicitly_mismatched and cdx_payload is not None:
                         inv.remember_representative(stored)
                 # consume body stream
                 record.raw_stream.read()
@@ -329,9 +345,10 @@ def download_exact_for_identity(
 ) -> PlaybackResult:
     """Exact-playback one capture identity and attach full identity fields.
 
-    A body that does not match the CDX digest is kept for this capture but must
-    not seed later revisit reuse. Unusable stubs such as ``Invalid URI`` are
-    always rejected. Empty bodies are rejected except for HTTP redirects (3xx),
+    A body that does not match the CDX digest (including the early-IA
+    trailing-newline soft match) is kept for this capture but must not seed
+    later revisit reuse. Unusable stubs such as ``Invalid URI`` are always
+    rejected. Empty bodies are rejected except for HTTP redirects (3xx),
     which historically often have an empty entity and a ``Location`` header.
     """
 
@@ -346,9 +363,8 @@ def download_exact_for_identity(
         expected_url=identity.original_url,
     )
     actual_digest = result.warc_payload_digest
-    expected_digest = normalize_payload_digest(identity.payload_digest)
-    digest_matched = (
-        expected_digest is None or actual_digest == expected_digest
+    digest_matched = cdx_digest_matches_body(
+        identity.payload_digest, result.body
     )
     return PlaybackResult(
         identity=identity,

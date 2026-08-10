@@ -99,9 +99,9 @@ class PlaybackResult:
 
     ``warc_payload_digest`` is always the digest of ``body`` (local SHA-1).
     The capture identity may still carry a different IA/CDX digest when IA
-    served imperfect bytes; ``digest_matched`` records whether those agreed.
-    Mismatched payloads are retained for this capture only and never seed
-    revisit reuse.
+    served imperfect bytes; ``digest_matched`` records whether those agreed
+    (exact body, or early-IA ``body + \"\\n\"`` soft match). Mismatched
+    payloads are retained for this capture only and never seed revisit reuse.
     """
 
     identity: CaptureIdentity
