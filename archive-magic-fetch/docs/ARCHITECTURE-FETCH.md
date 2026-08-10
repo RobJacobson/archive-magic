@@ -101,6 +101,32 @@ Redirects and captures without valid CDX digests download individually. Fetch
 requests exact timestamps and URLs, uses original/raw playback, never follows
 historical redirects, and never substitutes a nearest capture.
 
+## Fidelity: pass-through vs derived
+
+Fetch reconstructs portable WARC/CDXJ collections from IA CDX plus exact
+``id_`` playback. It does not download IA's internal WARCs, so output will not
+match those files byte-for-byte. The contract is: for each well-formed CDX row
+that exact playback can satisfy, store that capture's URL, time, status, and
+payload in a pywb-playable form—without collapsing URL aliases (scheme/www) or
+rewriting paths.
+
+| Field / concern | Treatment |
+|-----------------|-----------|
+| CDX row selection | **Pass-through** — every well-formed row is scheduled; no http/https or www alias filtering |
+| Original URL (`WARC-Target-URI`) | **Pass-through** — CDX original URL; only default ports (`:80` / `:443`) are stripped |
+| Capture timestamp | **Pass-through** — CDX timestamp → `WARC-Date` |
+| HTTP status | **Pass-through** — exact playback must match CDX status; retained as `CDX-Status` |
+| CDX urlkey / digest | **Pass-through** — stored on the WARC as `CDX-Urlkey` / `CDX-Payload-Digest` |
+| Payload body | **Pass-through** of exact `id_` entity bytes (after false-gzip repair when IA mis-labels encoding) |
+| HTTP entity headers | **Modified** — drop representation headers (`Content-Encoding`, `Transfer-Encoding`, `ETag`, payload digests, etc.) and rewrite `Content-Length` so headers describe the stored body; keep `Content-Range` for HTTP 206 |
+| Status reason / protocol line | **Derived** — synthesized (`200 OK`, `HTTP/1.1`); not taken from the archived reason phrase |
+| Failed / unplayable CDX rows | **Omitted** — recorded in `run.json`; nothing written to WARC/CDXJ |
+| Digest mismatch | **Kept** — body stored; `WARC-Payload-Digest` is of actual bytes; IA digest preserved; `CDX-Digest-Match: false`; cannot seed revisits |
+| Same-urlkey revisits | **Derived** — collection-local identical-payload revisits; not IA's revisit graph |
+| Year collections | **Derived** — calendar-year partition; revisits do not cross years |
+| Collection CDXJ | **Derived** — indexed from finalized WARCs (`url`, `status`, `mime`, digests, offsets); not a copy of IA CDX |
+| Record types / order | **Derived** — `warcinfo` + `response`/`revisit` only; shard order is write order, not crawl order |
+
 ## Deferred capabilities
 
 Arbitrary grouping strategies, a public collection-ID CLI, remote publication,
