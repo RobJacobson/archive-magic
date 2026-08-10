@@ -75,6 +75,43 @@ def test_empty_redirect_playback_is_stored_with_location(tmp_path):
     assert rec.content_stream().read() == b""
 
 
+def test_download_exact_accepts_ia_double_encoded_original_url():
+    """IA Link rel=original may %25-escape already-encoded query bytes."""
+
+    from archive_magic_fetch.warc import download_exact_for_identity
+
+    cdx_url = (
+        "http://lideres.nclr.org/groups/index.php?view=browse"
+        "&PHPSESSID=abc&page=5&sort=name%20DESC&state=46"
+    )
+    link_url = (
+        "http://lideres.nclr.org/groups/index.php?view=browse"
+        "&PHPSESSID=abc&page=5&sort=name%2520DESC&state=46"
+    )
+    identity = make_capt(url=cdx_url, ts="20041116040449")
+    body = b"<html>ok</html>"
+    result = download_exact_for_identity(
+        memento_client(identity, body, returned_url=link_url),
+        identity,
+    )
+    assert result.identity.original_url == cdx_url
+    assert result.body == body
+
+
+def test_download_exact_rejects_different_original_url():
+    from archive_magic_fetch.warc import ExactMismatchError, download_exact_for_identity
+
+    identity = make_capt(url="http://example.org/a")
+    with pytest.raises(ExactMismatchError, match="URL mismatch"):
+        download_exact_for_identity(
+            memento_client(
+                identity,
+                b"x",
+                returned_url="http://example.org/b",
+            ),
+            identity,
+        )
+
 def test_cdx_digest_matches_body_accepts_trailing_newline_soft_match():
     from archive_magic_fetch.warc import (
         cdx_digest_matches_body,

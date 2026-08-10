@@ -113,7 +113,7 @@ rewriting paths.
 | Field / concern | Treatment |
 |-----------------|-----------|
 | CDX row selection | **Pass-through** — every well-formed row is scheduled; no http/https or www alias filtering |
-| Original URL (`WARC-Target-URI`) | **Pass-through** — CDX original URL; only default ports (`:80` / `:443`) are stripped |
+| Original URL (`WARC-Target-URI`) | **Pass-through** — CDX original URL; only default ports (`:80` / `:443`) are stripped. Exact-playback URL checks treat percent-encoding variants as equal (IA may double-encode in `Link: rel="original"`) |
 | Capture timestamp | **Pass-through** — CDX timestamp → `WARC-Date` |
 | HTTP status | **Pass-through** — exact playback must match CDX status; retained as `CDX-Status` |
 | CDX urlkey / digest | **Pass-through** — stored on the WARC as `CDX-Urlkey` / `CDX-Payload-Digest` |

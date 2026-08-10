@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Optional
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import unquote, urlsplit, urlunsplit
 
 from surt import surt
 
@@ -289,6 +289,45 @@ def normalize_original_url(url: str) -> str:
         netloc = netloc[: -len(suffix)]
     return urlunsplit(
         (parts.scheme, netloc, parts.path, parts.query, parts.fragment)
+    )
+
+
+def _fully_unquote(value: str) -> str:
+    """Decode percent-escapes until stable (undoes IA double-encoding)."""
+
+    previous = None
+    current = value
+    while previous != current:
+        previous = current
+        current = unquote(current)
+    return current
+
+
+def same_original_url(left: str, right: str) -> bool:
+    """True when two capture URLs identify the same original after encoding normalize.
+
+    Compares default-port-stripped URLs, then treats percent-encoding variants as
+    equal (``%20`` vs ``%2520`` from IA ``Link: rel="original"``). Does not
+    collapse scheme/www aliases or rewrite path spelling for storage—callers still
+    keep the CDX original URL as ``WARC-Target-URI``.
+    """
+
+    a = normalize_original_url(left)
+    b = normalize_original_url(right)
+    if a == b:
+        return True
+    a_parts = urlsplit(a)
+    b_parts = urlsplit(b)
+    if (a_parts.scheme, a_parts.netloc) != (b_parts.scheme, b_parts.netloc):
+        return False
+    return (
+        _fully_unquote(a_parts.path),
+        _fully_unquote(a_parts.query),
+        _fully_unquote(a_parts.fragment),
+    ) == (
+        _fully_unquote(b_parts.path),
+        _fully_unquote(b_parts.query),
+        _fully_unquote(b_parts.fragment),
     )
 
 
