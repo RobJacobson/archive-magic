@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import re
 from dataclasses import dataclass, field
 from http import HTTPStatus
@@ -82,6 +83,222 @@ class StoredResponse:
     warc_payload_digest: str
     target_uri: str
     status_code: int
+
+
+@dataclass(frozen=True)
+class PayloadLocator:
+    """Indexed location of one reusable full response payload."""
+
+    collection_id: str
+    warc_path: Path
+    offset: int
+    length: int
+    timestamp: str
+    status_code: int
+
+
+@dataclass
+class PriorPayloadCache:
+    """Best-effort IA-digest lookup over finalized collection responses."""
+
+    by_ia_digest: dict[str, PayloadLocator] = field(default_factory=dict)
+
+    @classmethod
+    def from_layout(cls, layout: ArchiveLayout) -> "PriorPayloadCache":
+        cache = cls()
+        if not layout.collections_root.is_dir():
+            return cache
+        for collection_dir in sorted(layout.collections_root.iterdir()):
+            if collection_dir.is_dir():
+                cache.add_collection(layout, collection_dir.name)
+        return cache
+
+    def add_collection(self, layout: ArchiveLayout, collection_id: str) -> None:
+        """Add eligible full responses from one collection's portable index."""
+
+        collection_id = layout.validate_collection_id(collection_id)
+        index_path = layout.collection_index(collection_id)
+        if not index_path.is_file():
+            return
+        with index_path.open(encoding="utf-8") as stream:
+            for line in stream:
+                locator_and_digest = _payload_locator_from_cdxj_line(
+                    layout, collection_id, line
+                )
+                if locator_and_digest is None:
+                    continue
+                ia_digest, locator = locator_and_digest
+                existing = self.by_ia_digest.get(ia_digest)
+                if existing is None or (
+                    _payload_locator_order(locator)
+                    < _payload_locator_order(existing)
+                ):
+                    self.by_ia_digest[ia_digest] = locator
+
+    def materialize(
+        self,
+        identity: CaptureIdentity,
+        *,
+        current_collection_id: str,
+    ) -> PlaybackResult | None:
+        """Return a current response copied from an earlier cached payload."""
+
+        ia_digest = normalize_payload_digest(identity.payload_digest)
+        if ia_digest is None or is_redirect_status_token(identity.status_token):
+            return None
+        locator = self.by_ia_digest.get(ia_digest)
+        if locator is None or locator.collection_id == current_collection_id:
+            return None
+        if locator.timestamp > identity.timestamp:
+            return None
+        try:
+            record, body = _read_indexed_response(locator, check_digests="raise")
+            source_identity = get_warc_identity(record)
+            if source_identity.payload_digest != ia_digest:
+                return None
+            if record.rec_headers.get_header(CDX_DIGEST_MATCH_HEADER) == "false":
+                return None
+            if not cdx_digest_matches_body(ia_digest, body):
+                return None
+            source_status = int(record.http_headers.get_statuscode())
+            if is_redirect_status_token(str(source_status)):
+                return None
+            actual_digest = payload_digest(body)
+            stored_digest = normalize_payload_digest(
+                record.rec_headers.get_header("WARC-Payload-Digest")
+            )
+            if stored_digest != actual_digest:
+                return None
+            status_code = (
+                int(identity.status_token)
+                if identity.status_token.isdigit()
+                else source_status
+            )
+            return PlaybackResult(
+                identity=identity,
+                body=body,
+                status_code=status_code,
+                headers=tuple(record.http_headers.headers),
+                warc_date=cdx_timestamp_to_warc_date(identity.timestamp),
+                source_uri=f"urn:archive-magic:payload-cache:{ia_digest}",
+                warc_payload_digest=actual_digest,
+                digest_matched=True,
+            )
+        except Exception:  # noqa: BLE001 - cache corruption is always a miss
+            return None
+
+
+def _payload_locator_order(locator: PayloadLocator) -> tuple[str, str, str, int]:
+    return (
+        locator.timestamp,
+        locator.collection_id,
+        locator.warc_path.name,
+        locator.offset,
+    )
+
+
+def _read_indexed_response(
+    locator: PayloadLocator,
+    *,
+    check_digests: bool | str,
+):
+    size = locator.warc_path.stat().st_size
+    if locator.offset < 0 or locator.length <= 0:
+        raise ValueError("invalid cached WARC byte range")
+    if locator.offset + locator.length > size:
+        raise ValueError("cached WARC byte range is out of bounds")
+    with locator.warc_path.open("rb") as stream:
+        stream.seek(locator.offset)
+        encoded = stream.read(locator.length)
+    if len(encoded) != locator.length:
+        raise EOFError("cached WARC byte range is truncated")
+    iterator = ArchiveIterator(BytesIO(encoded), check_digests=check_digests)
+    record = next(iterator)
+    if record.rec_type != "response" or record.http_headers is None:
+        raise ValueError("cached WARC record is not a full response")
+    body = record.content_stream().read()
+    try:
+        next(iterator)
+    except StopIteration:
+        pass
+    else:
+        raise ValueError("cached WARC byte range contains multiple records")
+    return record, body
+
+
+def _read_indexed_response_header(locator: PayloadLocator):
+    """Read only enough of an indexed legacy record to inspect its headers."""
+
+    size = locator.warc_path.stat().st_size
+    if locator.offset < 0 or locator.length <= 0:
+        raise ValueError("invalid cached WARC byte range")
+    if locator.offset + locator.length > size:
+        raise ValueError("cached WARC byte range is out of bounds")
+    with locator.warc_path.open("rb") as stream:
+        stream.seek(locator.offset)
+        encoded = stream.read(locator.length)
+    if len(encoded) != locator.length:
+        raise EOFError("cached WARC byte range is truncated")
+    record = next(ArchiveIterator(BytesIO(encoded), check_digests=False))
+    if record.rec_type != "response" or record.http_headers is None:
+        raise ValueError("cached WARC record is not a full response")
+    return record
+
+
+def _payload_locator_from_cdxj_line(
+    layout: ArchiveLayout,
+    collection_id: str,
+    line: str,
+) -> tuple[str, PayloadLocator] | None:
+    try:
+        parts = line.split(" ", 2)
+        if len(parts) != 3:
+            return None
+        timestamp = parts[1]
+        if len(timestamp) != 14 or not timestamp.isdigit():
+            return None
+        meta = json.loads(parts[2])
+        if meta.get("mime") == "warc/revisit":
+            return None
+        filename = meta.get("filename")
+        if not isinstance(filename, str) or Path(filename).name != filename:
+            return None
+        offset = int(meta.get("offset"))
+        length = int(meta.get("length"))
+        status_token = str(meta.get("status", ""))
+        if is_redirect_status_token(status_token):
+            return None
+        warc_path = layout.collection_dir(collection_id) / filename
+        locator = PayloadLocator(
+            collection_id=collection_id,
+            warc_path=warc_path,
+            offset=offset,
+            length=length,
+            timestamp=timestamp,
+            status_code=int(status_token) if status_token.isdigit() else 200,
+        )
+        ia_digest = normalize_payload_digest(meta.get("cdxDigest"))
+        match = meta.get("cdxDigestMatch")
+        if ia_digest is not None and match is True:
+            return ia_digest, locator
+        if "cdxDigest" in meta or "cdxDigestMatch" in meta:
+            return None
+
+        # Compatibility for indexes created before IA digest fields were added.
+        record = _read_indexed_response_header(locator)
+        ia_digest = normalize_payload_digest(
+            record.rec_headers.get_header(CDX_PAYLOAD_DIGEST_HEADER)
+        )
+        if ia_digest is None:
+            return None
+        if record.rec_headers.get_header(CDX_DIGEST_MATCH_HEADER) == "false":
+            return None
+        source_status = str(record.http_headers.get_statuscode())
+        if is_redirect_status_token(source_status):
+            return None
+        return ia_digest, locator
+    except Exception:  # noqa: BLE001 - legacy cache hydration is best effort
+        return None
 
 
 @dataclass

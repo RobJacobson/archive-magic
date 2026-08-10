@@ -48,8 +48,10 @@ Years are selected serially in ascending order. For each selected year Fetch:
 2. Parses, validates, de-duplicates exact CDX rows, and orders them by timestamp.
 3. Inventories only finalized WARCs in `collections/<year>/`.
 4. Skips identities already represented; writes a same-collection revisit when
-   an earlier matched response has the same URL key and valid CDX digest;
-   otherwise attempts exact playback and records any failure for this run.
+   an earlier matched response has the same URL key and valid CDX digest; copies
+   an eligible payload with the same IA digest from an earlier collection into
+   a new full response; otherwise attempts exact playback and records any
+   failure for this run.
 5. Finalizes size-bounded WARC shards, builds and validates the collection CDXJ,
    and atomically publishes it.
 6. Atomically publishes `run.json` last. Its presence marks normal completion
@@ -76,9 +78,11 @@ A shard is written to an exclusive temporary path beneath `captures/.work/`,
 closed, validated, and atomically moved into its portable collection.
 
 Capture identity preserves URL key, original URL, raw timestamp, raw CDX status,
-and raw CDX digest. Payload reuse is collection-local and same-URL only, keyed by
-`(urlkey, valid CDX digest)`. Revisits may cross WARC shards inside a collection
-but never cross collection boundaries or point forward in time.
+and raw CDX digest. Revisit reuse is collection-local and same-URL only, keyed by
+`(urlkey, valid CDX digest)`. Payload reuse across collections is keyed only by
+the valid IA digest and writes a new full response into the current collection.
+Revisits may cross WARC shards inside a collection but never cross collection
+boundaries or point forward in time.
 
 Collection index validation requires every locator to be a basename naming one
 of that collection's immutable WARCs, every byte range to be in bounds, and
@@ -101,6 +105,36 @@ Redirects and captures without valid CDX digests download individually. Fetch
 requests exact timestamps and URLs, uses original/raw playback, never follows
 historical redirects, and never substitutes a nearest capture.
 
+## Digest domains and payload reuse
+
+Fetch deliberately uses two digest domains. The IA/CDX payload digest is source
+metadata used at acquisition edges: it remains part of capture identity and is
+the key for comparing captures against the cross-year payload cache. The WARC
+payload digest is recomputed from the exact bytes Fetch stores and is used for
+internal integrity, revisit references, and the standard CDXJ `digest` field.
+Generated CDXJ response entries retain both domains as `cdxDigest` and `digest`,
+plus `cdxDigestMatch` to identify responses eligible to seed payload reuse.
+
+Some early IA ARC indexes hashed `payload + "\n"` while playback returns
+`payload`. Fetch accepts this recognized discrepancy as a soft match, stores
+the playback bytes, and retains IA's original digest as the cache key. It does
+not create aliases between IA digests: identical bytes advertised under the
+correct and newline-adjusted hashes miss each other and may be downloaded more
+than once. This is a safe false negative. Other explicit digest mismatches are
+kept for capture fidelity but never seed revisits or payload reuse.
+
+The payload cache is an in-memory, rebuildable acquisition accelerator derived
+from finalized CDXJ locators and WARC response headers. Its keys intentionally
+omit URL. A hit range-reads and validates the earlier full response, then writes
+a new full response with the current capture identity and status, the earlier
+normalized HTTP headers and body, and a freshly computed WARC payload digest.
+This makes each yearly collection independently replayable. Redirects are not
+eligible because their meaningful `Location` header is outside the payload
+digest and empty redirect bodies commonly share one digest. Missing, corrupt,
+future, or invalid candidates are ordinary cache misses and fall back to exact
+playback. Older CDXJs without the added IA fields are supported by reading the
+indexed WARC header; no persistent catalog or index migration is required.
+
 ## Fidelity: pass-through vs derived
 
 Fetch reconstructs portable WARC/CDXJ collections from IA CDX plus exact
@@ -121,16 +155,17 @@ rewriting paths.
 | HTTP entity headers | **Modified** — drop representation headers (`Content-Encoding`, `Transfer-Encoding`, `ETag`, payload digests, etc.) and rewrite `Content-Length` so headers describe the stored body; keep `Content-Range` for HTTP 206 |
 | Status reason / protocol line | **Derived** — synthesized (`200 OK`, `HTTP/1.1`); not taken from the archived reason phrase |
 | Failed / unplayable CDX rows | **Omitted** — recorded in `run.json`; nothing written to WARC/CDXJ |
-| Digest match | **Exact or soft** — exact body SHA-1, or early-IA quirk where CDX hashed `body + "\n"` while `id_` returns `body`; soft matches still store exact playback bytes and can seed revisits |
-| Digest mismatch | **Kept** — body stored; `WARC-Payload-Digest` is of actual bytes; IA digest preserved; `CDX-Digest-Match: false`; cannot seed revisits |
+| Digest match | **Exact or soft** — exact body SHA-1, or early-IA quirk where CDX hashed `body + "\n"` while `id_` returns `body`; soft matches still store exact playback bytes and can seed revisits and payload reuse |
+| Digest mismatch | **Kept** — body stored; `WARC-Payload-Digest` is of actual bytes; IA digest preserved; `CDX-Digest-Match: false`; cannot seed revisits or payload reuse |
 | Same-urlkey revisits | **Derived** — collection-local identical-payload revisits; not IA's revisit graph |
-| Year collections | **Derived** — calendar-year partition; revisits do not cross years |
-| Collection CDXJ | **Derived** — indexed from finalized WARCs (`url`, `status`, `mime`, digests, offsets); not a copy of IA CDX |
+| Cross-year payload reuse | **Derived** — digest-only IA lookup; cached body and normalized headers become a new full response in the current year |
+| Year collections | **Derived** — calendar-year partition; revisits do not cross years and every year retains a full copy of reused payload data |
+| Collection CDXJ | **Derived** — indexed from finalized WARCs (`url`, `status`, `mime`, local/IA digests, offsets); not a copy of IA CDX |
 | Record types / order | **Derived** — `warcinfo` + `response`/`revisit` only; shard order is write order, not crawl order |
 
 ## Deferred capabilities
 
 Arbitrary grouping strategies, a public collection-ID CLI, remote publication,
-catalogs, cross-collection deduplication, and overlapping-collection precedence
-are intentionally deferred. The layout and publication APIs use generic IDs so
-those features do not require another storage-format redesign.
+persistent catalogs, cross-collection revisits, and overlapping-collection
+precedence are intentionally deferred. The layout and publication APIs use
+generic IDs so those features do not require another storage-format redesign.

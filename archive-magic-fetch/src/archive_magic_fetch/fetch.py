@@ -53,6 +53,7 @@ from .retry import parse_retry_after
 from .warc import (
     CollectionInventory,
     CollectionWarcWriter,
+    PriorPayloadCache,
     StoredResponse,
     classify_playback_error,
     count_warc_records,
@@ -201,6 +202,7 @@ def _run_fetch(
     metrics = RunMetrics()
     run_id = init_run_id(layout)
     all_failures: list[UnresolvedFailure] = []
+    payload_cache = PriorPayloadCache.from_layout(layout)
 
     years = years_in_range(settings.date_start, settings.date_end)
     print(
@@ -276,6 +278,28 @@ def _run_fetch(
                 _log_capture(number, total, identity, "Revisit", style="revisit")
                 continue
 
+            cached = payload_cache.materialize(
+                identity,
+                current_collection_id=collection_id,
+            )
+            if cached is not None:
+                write_started = time.monotonic()
+                writer.write_playback(cached)
+                year_metrics.warc_write_s += time.monotonic() - write_started
+                year_metrics.payload_reuses += 1
+                year_metrics.represented += 1
+                inventory.identities.add(identity)
+                if key is not None:
+                    inventory.remember_representative(stored_from_playback(cached))
+                _log_capture(
+                    number,
+                    total,
+                    identity,
+                    "Payload reused",
+                    style="revisit",
+                )
+                continue
+
             result, failure = _download_with_retries(
                 client,
                 identity,
@@ -317,6 +341,7 @@ def _run_fetch(
                 year_metrics.index_s += time.monotonic() - idx_started
             else:
                 collection_index = index_artifact_from_path(layout, index_path)
+            payload_cache.add_collection(layout, collection_id)
 
         year_metrics.unresolved = len(year_failures)
         year_warcs = _collect_warc_artifacts(
@@ -340,6 +365,7 @@ def _run_fetch(
         run_skips_errors += year_skips_errors
         print(
             f"year {year} done: downloads={year_metrics.downloads} "
+            f"payload-reuses={year_metrics.payload_reuses} "
             f"revisits={year_metrics.revisits} "
             f"already-represented={year_metrics.local_reuses} "
             f"skips/errors={year_skips_errors}",
@@ -349,6 +375,7 @@ def _run_fetch(
 
     print(
         f"done: downloads={metrics.downloads} revisits={metrics.revisits} "
+        f"payload-reuses={metrics.payload_reuses} "
         f"already-represented={metrics.local_reuses} "
         f"skips/errors={run_skips_errors}",
         flush=True,
@@ -575,6 +602,7 @@ def _accumulate_metrics(total: RunMetrics, current: RunMetrics) -> None:
         "playback_attempts",
         "playback_bytes",
         "local_reuses",
+        "payload_reuses",
         "downloads",
         "revisits",
         "digest_mismatch_accepted",

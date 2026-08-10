@@ -21,7 +21,7 @@ WARC_TARGET_BYTES = 1_000_000_000
 MAX_PLAYBACK_ATTEMPTS = 3
 CDX_PAGE_LIMIT = 10_000
 DEFAULT_DATE_START = "19950101000000"
-RUN_SCHEMA_VERSION = 1
+RUN_SCHEMA_VERSION = 2
 WARC_VERSION = "1.1"
 SOFTWARE_ID = "archive-magic-fetch/0.1.0"
 USER_AGENT = (
@@ -172,6 +172,7 @@ class RunMetrics:
     playback_attempts: int = 0
     playback_bytes: int = 0
     local_reuses: int = 0
+    payload_reuses: int = 0
     downloads: int = 0
     revisits: int = 0
     digest_mismatch_accepted: int = 0

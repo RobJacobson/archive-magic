@@ -189,6 +189,27 @@ def test_generic_collection_writer_and_index_are_portable(tmp_path):
     assert index.path.name == "example.org-campaign-launch-index.cdxj"
     payload = json.loads(index.path.read_text().split(" ", 2)[2])
     assert payload["filename"] == warcs[0].path.name
+    assert payload["cdxDigest"] == make_capt().payload_digest
+    assert payload["cdxDigestMatch"] is True
+    assert payload["digest"] == payload_digest(b"hello")
+
+
+def test_collection_index_keeps_ia_and_local_soft_match_digests_separate(tmp_path):
+    layout = archive_layout("http://example.org/", tmp_path)
+    ensure_collection_dirs(layout)
+    body = b"soft-match"
+    ia_digest = payload_digest(body + b"\n")
+    capt = make_capt(digest=ia_digest)
+    writer = CollectionWarcWriter(layout, "2004")
+    writer.write_playback(playback(capt, body=body))
+    writer.close()
+
+    index = publish_collection_index(layout, "2004")
+
+    meta = json.loads(index.path.read_text().split(" ", 2)[2])
+    assert meta["cdxDigest"] == ia_digest
+    assert meta["cdxDigestMatch"] is True
+    assert meta["digest"] == payload_digest(body)
 
 
 @pytest.mark.parametrize(

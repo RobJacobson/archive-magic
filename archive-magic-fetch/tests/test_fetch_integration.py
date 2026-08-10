@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from unittest.mock import MagicMock
 
 import pytest
@@ -301,8 +302,9 @@ def test_matching_payloads_download_once_per_year(tmp_path):
         fetch_mod.fetch_year_cdx = original
 
     assert result.exit_code == 0
-    assert downloads == ["20040601000000", "20050601000000"]
-    assert result.metrics.downloads == 2
+    assert downloads == ["20040601000000"]
+    assert result.metrics.downloads == 1
+    assert result.metrics.payload_reuses == 1
     assert result.metrics.revisits == 0
 
     types_2004 = []
@@ -327,6 +329,341 @@ def test_matching_payloads_download_once_per_year(tmp_path):
     )
     assert stored is not None
     assert stored.identity.timestamp == "20050601000000"
+
+
+def test_cross_year_payload_reuse_ignores_url_and_preserves_source_headers(
+    tmp_path,
+):
+    layout = archive_layout("http://example.org/", tmp_path)
+    ensure_collection_dirs(layout)
+    body = b"shared-across-urls"
+    digest = payload_digest(body).split(":")[1]
+    downloads: list[str] = []
+
+    def download_fn(_client, identity):
+        downloads.append(identity.timestamp)
+        result = playback(identity, body=body)
+        return replace(
+            result,
+            headers=(
+                ("Content-Type", "application/octet-stream"),
+                ("X-Archived-Source", "2004"),
+                ("Content-Length", str(len(body))),
+            ),
+        )
+
+    rows = {
+        2004: cdx_json(
+            [["com,example)/a", "20040601000000", "http://example.org/a",
+              "application/octet-stream", "200", digest, str(len(body))]]
+        ),
+        2005: cdx_json(
+            [["com,example)/b", "20050601000000", "http://example.org/b",
+              "application/octet-stream", "201", digest, str(len(body))]]
+        ),
+    }
+    original, cdx_mod, fetch_mod = patch_cdx_by_year(rows)
+    try:
+        result = run_fetch(
+            FetchSettings(
+                url_pattern="http://example.org/*",
+                date_start="20040601000000",
+                date_end="20050601000000",
+                archives_root=tmp_path,
+            ),
+            client_factory=lambda: MagicMock(),
+            download_fn=download_fn,
+            sleep=lambda _s: None,
+        )
+    finally:
+        cdx_mod.fetch_year_cdx = original
+        fetch_mod.fetch_year_cdx = original
+
+    assert downloads == ["20040601000000"]
+    assert result.metrics.payload_reuses == 1
+    layout.collection_dir("2004").rename(tmp_path / "detached-2004")
+    with list_collection_warcs(layout, "2005")[0].open("rb") as stream:
+        response = next(
+            record for record in ArchiveIterator(stream)
+            if record.rec_type == "response"
+        )
+        assert response.rec_headers.get_header("WARC-Target-URI") == (
+            "http://example.org/b"
+        )
+        assert response.http_headers.get_statuscode() == "201"
+        assert response.http_headers.get_header("X-Archived-Source") == "2004"
+        assert response.content_stream().read() == body
+
+
+def test_cross_year_payload_cache_uses_ia_digest_for_soft_match(tmp_path):
+    layout = archive_layout("http://example.org/", tmp_path)
+    ensure_collection_dirs(layout)
+    body = b"early-arc"
+    ia_digest = payload_digest(body + b"\n").split(":")[1]
+    downloads: list[str] = []
+
+    def download_fn(_client, identity):
+        downloads.append(identity.timestamp)
+        return playback(identity, body=body)
+
+    rows = {
+        year: cdx_json(
+            [["com,example)/", f"{year}0601000000", "http://example.org/",
+              "text/html", "200", ia_digest, str(len(body))]]
+        )
+        for year in (2004, 2005)
+    }
+    original, cdx_mod, fetch_mod = patch_cdx_by_year(rows)
+    try:
+        result = run_fetch(
+            FetchSettings(
+                url_pattern="http://example.org/",
+                date_start="20040601000000",
+                date_end="20050601000000",
+                archives_root=tmp_path,
+            ),
+            client_factory=lambda: MagicMock(),
+            download_fn=download_fn,
+            sleep=lambda _s: None,
+        )
+    finally:
+        cdx_mod.fetch_year_cdx = original
+        fetch_mod.fetch_year_cdx = original
+
+    assert downloads == ["20040601000000"]
+    assert result.metrics.payload_reuses == 1
+    meta = json.loads(layout.collection_index("2005").read_text().split(" ", 2)[2])
+    assert meta["cdxDigest"] == f"sha1:{ia_digest}"
+    assert meta["digest"] == payload_digest(body)
+
+
+def test_cross_year_identical_bytes_with_different_ia_digests_download_twice(
+    tmp_path,
+):
+    body = b"same-bytes-different-ia-hashes"
+    digests = {
+        2004: payload_digest(body).split(":")[1],
+        2005: payload_digest(body + b"\n").split(":")[1],
+    }
+    rows = {
+        year: cdx_json(
+            [["com,example)/", f"{year}0601000000", "http://example.org/",
+              "text/html", "200", digest, str(len(body))]]
+        )
+        for year, digest in digests.items()
+    }
+    downloads: list[str] = []
+    original, cdx_mod, fetch_mod = patch_cdx_by_year(rows)
+    try:
+        result = run_fetch(
+            FetchSettings(
+                url_pattern="http://example.org/",
+                date_start="20040601000000",
+                date_end="20050601000000",
+                archives_root=tmp_path,
+            ),
+            client_factory=lambda: MagicMock(),
+            download_fn=lambda _client, identity: (
+                downloads.append(identity.timestamp) or playback(identity, body=body)
+            ),
+            sleep=lambda _s: None,
+        )
+    finally:
+        cdx_mod.fetch_year_cdx = original
+        fetch_mod.fetch_year_cdx = original
+
+    assert downloads == ["20040601000000", "20050601000000"]
+    assert result.metrics.payload_reuses == 0
+
+
+def test_digest_mismatch_response_never_seeds_cross_year_cache(tmp_path):
+    layout = archive_layout("http://example.org/", tmp_path)
+    ensure_collection_dirs(layout)
+    claimed = "F" * 32
+    downloads: list[str] = []
+
+    def download_fn(_client, identity):
+        downloads.append(identity.timestamp)
+        result = playback(identity, body=f"body-{identity.timestamp}".encode())
+        return replace(result, digest_matched=False)
+
+    rows = {
+        year: cdx_json(
+            [["com,example)/", f"{year}0601000000", "http://example.org/",
+              "text/html", "200", claimed, "4"]]
+        )
+        for year in (2004, 2005)
+    }
+    original, cdx_mod, fetch_mod = patch_cdx_by_year(rows)
+    try:
+        result = run_fetch(
+            FetchSettings(
+                url_pattern="http://example.org/",
+                date_start="20040601000000",
+                date_end="20050601000000",
+                archives_root=tmp_path,
+            ),
+            client_factory=lambda: MagicMock(),
+            download_fn=download_fn,
+            sleep=lambda _s: None,
+        )
+    finally:
+        cdx_mod.fetch_year_cdx = original
+        fetch_mod.fetch_year_cdx = original
+
+    assert downloads == ["20040601000000", "20050601000000"]
+    assert result.metrics.payload_reuses == 0
+
+
+def test_legacy_cdxj_without_ia_fields_seeds_payload_cache(tmp_path):
+    layout = archive_layout("http://example.org/", tmp_path)
+    ensure_collection_dirs(layout)
+    body = b"legacy-index"
+    digest = payload_digest(body).split(":")[1]
+    older = make_capt(ts="20040601000000", digest=f"sha1:{digest}")
+    writer = CollectionWarcWriter(layout, "2004")
+    writer.write_playback(playback(older, body=body))
+    writer.close()
+    publish_collection_index(layout, "2004")
+    index_path = layout.collection_index("2004")
+    parts = index_path.read_text().strip().split(" ", 2)
+    meta = json.loads(parts[2])
+    meta.pop("cdxDigest")
+    meta.pop("cdxDigestMatch")
+    index_path.write_text(f"{parts[0]} {parts[1]} {json.dumps(meta)}\n")
+
+    rows = cdx_json(
+        [["com,example)/new", "20050601000000", "http://example.org/new",
+          "text/html", "200", digest, str(len(body))]]
+    )
+    downloads: list[str] = []
+    original, cdx_mod, fetch_mod = patch_cdx(rows)
+    try:
+        result = run_fetch(
+            FetchSettings(
+                url_pattern="http://example.org/*",
+                date_start="20050601000000",
+                date_end="20050601000000",
+                archives_root=tmp_path,
+            ),
+            client_factory=lambda: MagicMock(),
+            download_fn=lambda _client, identity: (
+                downloads.append(identity.timestamp) or playback(identity, body=body)
+            ),
+            sleep=lambda _s: None,
+        )
+    finally:
+        cdx_mod.fetch_year_cdx = original
+        fetch_mod.fetch_year_cdx = original
+
+    assert downloads == []
+    assert result.metrics.payload_reuses == 1
+
+
+def test_future_or_corrupt_payload_cache_entry_falls_back_to_download(tmp_path):
+    layout = archive_layout("http://example.org/", tmp_path)
+    ensure_collection_dirs(layout)
+    body = b"ordered-cache"
+    digest = payload_digest(body).split(":")[1]
+    future = make_capt(ts="20050601000000", digest=f"sha1:{digest}")
+    writer = CollectionWarcWriter(layout, "2005")
+    writer.write_playback(playback(future, body=body))
+    writer.close()
+    publish_collection_index(layout, "2005")
+
+    row = [["com,example)/", "20040601000000", "http://example.org/",
+            "text/html", "200", digest, str(len(body))]]
+    downloads: list[str] = []
+
+    def download_fn(_client, identity):
+        downloads.append(identity.timestamp)
+        return playback(identity, body=body)
+
+    original, cdx_mod, fetch_mod = patch_cdx(cdx_json(row))
+    try:
+        first = run_fetch(
+            FetchSettings(
+                url_pattern="http://example.org/",
+                date_start="20040601000000",
+                date_end="20040601000000",
+                archives_root=tmp_path,
+            ),
+            client_factory=lambda: MagicMock(),
+            download_fn=download_fn,
+            sleep=lambda _s: None,
+        )
+    finally:
+        cdx_mod.fetch_year_cdx = original
+        fetch_mod.fetch_year_cdx = original
+
+    assert first.metrics.payload_reuses == 0
+    assert downloads == ["20040601000000"]
+
+    # Corrupt the earlier locator and request a later year with the same digest.
+    index_path = layout.collection_index("2004")
+    parts = index_path.read_text().strip().split(" ", 2)
+    meta = json.loads(parts[2])
+    meta["length"] = "999999999"
+    index_path.write_text(f"{parts[0]} {parts[1]} {json.dumps(meta)}\n")
+    later_row = [["com,example)/", "20060601000000", "http://example.org/",
+                  "text/html", "200", digest, str(len(body))]]
+    original, cdx_mod, fetch_mod = patch_cdx(cdx_json(later_row))
+    try:
+        second = run_fetch(
+            FetchSettings(
+                url_pattern="http://example.org/",
+                date_start="20060601000000",
+                date_end="20060601000000",
+                archives_root=tmp_path,
+            ),
+            client_factory=lambda: MagicMock(),
+            download_fn=download_fn,
+            sleep=lambda _s: None,
+        )
+    finally:
+        cdx_mod.fetch_year_cdx = original
+        fetch_mod.fetch_year_cdx = original
+
+    assert second.metrics.payload_reuses == 0
+    assert downloads[-1] == "20060601000000"
+
+
+def test_reset_data_allows_prior_year_payload_reuse(tmp_path):
+    layout = archive_layout("http://example.org/", tmp_path)
+    ensure_collection_dirs(layout)
+    body = b"reset-cache"
+    digest = payload_digest(body).split(":")[1]
+    older = make_capt(ts="20040601000000", digest=f"sha1:{digest}")
+    writer = CollectionWarcWriter(layout, "2004")
+    writer.write_playback(playback(older, body=body))
+    writer.close()
+    publish_collection_index(layout, "2004")
+
+    row = [["com,example)/", "20050601000000", "http://example.org/",
+            "text/html", "200", digest, str(len(body))]]
+    downloads: list[str] = []
+    original, cdx_mod, fetch_mod = patch_cdx(cdx_json(row))
+    try:
+        result = run_fetch(
+            FetchSettings(
+                url_pattern="http://example.org/",
+                date_start="20050601000000",
+                date_end="20050601000000",
+                archives_root=tmp_path,
+                reset_data=True,
+            ),
+            client_factory=lambda: MagicMock(),
+            download_fn=lambda _client, identity: (
+                downloads.append(identity.timestamp) or playback(identity, body=body)
+            ),
+            sleep=lambda _s: None,
+        )
+    finally:
+        cdx_mod.fetch_year_cdx = original
+        fetch_mod.fetch_year_cdx = original
+
+    assert downloads == []
+    assert result.metrics.payload_reuses == 1
 
 
 def test_different_ia_digest_downloads_twice(tmp_path):
@@ -594,9 +931,10 @@ def test_completed_run_reports_expected_failures(tmp_path, capsys):
     run_dirs = list((layout.capture_dir("2004") / "runs").iterdir())
     assert len(run_dirs) == 1
     record = json.loads((run_dirs[0] / "run.json").read_text())
-    assert record["schema_version"] == 1
+    assert record["schema_version"] == 2
     assert record["archive_id"] == "example.org"
     assert record["collection_id"] == "2004"
+    assert record["counts"]["payload_reused"] == 0
     assert set(record["metrics"]) == {
         "cdx_requests",
         "cdx_duration_s",
@@ -616,12 +954,13 @@ def test_completed_run_reports_expected_failures(tmp_path, capsys):
     )
     output = capsys.readouterr().out
     assert (
-        "year 2004 done: downloads=1 revisits=0 "
+        "year 2004 done: downloads=1 payload-reuses=0 revisits=0 "
         "already-represented=0 skips/errors=1"
     ) in output
     assert "elapsed " in output
     assert (
-        "done: downloads=1 revisits=0 already-represented=0 skips/errors=1"
+        "done: downloads=1 revisits=0 payload-reuses=0 "
+        "already-represented=0 skips/errors=1"
         in output
     )
 
