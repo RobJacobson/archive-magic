@@ -101,9 +101,10 @@ delays of 5 and 10 seconds unless `Retry-After` specifies a positive delay.
 Exact mismatches, blocked captures, unusable bodies, truncated stored payloads,
 and other permanent failures continue immediately.
 
-Redirects and captures without valid CDX digests download individually. Fetch
-requests exact timestamps and URLs, uses original/raw playback, never follows
-historical redirects, and never substitutes a nearest capture.
+Redirects, non-200 responses, captures without a numeric CDX status, and
+captures without valid CDX digests download individually. Fetch requests exact
+timestamps and URLs, uses original/raw playback, never follows historical
+redirects, and never substitutes a nearest capture.
 
 ## Digest domains and payload reuse
 
@@ -124,16 +125,20 @@ than once. This is a safe false negative. Other explicit digest mismatches are
 kept for capture fidelity but never seed revisits or payload reuse.
 
 The payload cache is an in-memory, rebuildable acquisition accelerator derived
-from finalized CDXJ locators and WARC response headers. Its keys intentionally
-omit URL. A hit range-reads and validates the earlier full response, then writes
-a new full response with the current capture identity and status, the earlier
-normalized HTTP headers and body, and a freshly computed WARC payload digest.
-This makes each yearly collection independently replayable. Redirects are not
-eligible because their meaningful `Location` header is outside the payload
-digest and empty redirect bodies commonly share one digest. Missing, corrupt,
-future, or invalid candidates are ordinary cache misses and fall back to exact
-playback. Older CDXJs without the added IA fields are supported by reading the
-indexed WARC header; no persistent catalog or index migration is required.
+from finalized CDXJ locators. Its keys intentionally omit URL. Reuse is limited
+to HTTP 200 captures because a payload digest says nothing about status-specific
+metadata such as `Location` or `Content-Range`. A hit range-reads and validates
+the earlier full response, verifies that its WARC timestamp matches the CDXJ
+timestamp and is not later than the current capture, then writes a new full
+response with the current capture identity, status, and CDX MIME. Only
+`Content-Type` and a recomputed `Content-Length` are synthesized; headers from
+the representative capture are not copied across captures. This makes each
+yearly collection independently replayable without attributing another
+capture's cookies, security policy, or other HTTP metadata to the current one.
+Missing, corrupt, future, or invalid candidates are ordinary cache misses and
+fall back to exact playback. CDXJs without the explicit `cdxDigest` and
+`cdxDigestMatch` fields do not seed the cache; there is no compatibility or
+migration path.
 
 ## Fidelity: pass-through vs derived
 
@@ -158,7 +163,7 @@ rewriting paths.
 | Digest match | **Exact or soft** — exact body SHA-1, or early-IA quirk where CDX hashed `body + "\n"` while `id_` returns `body`; soft matches still store exact playback bytes and can seed revisits and payload reuse |
 | Digest mismatch | **Kept** — body stored; `WARC-Payload-Digest` is of actual bytes; IA digest preserved; `CDX-Digest-Match: false`; cannot seed revisits or payload reuse |
 | Same-urlkey revisits | **Derived** — collection-local identical-payload revisits; not IA's revisit graph |
-| Cross-year payload reuse | **Derived** — digest-only IA lookup; cached body and normalized headers become a new full response in the current year |
+| Cross-year payload reuse | **Derived** — digest-only IA lookup for HTTP 200 captures; the cached body, current CDX MIME, and recomputed length become a new full response in the current year |
 | Year collections | **Derived** — calendar-year partition; revisits do not cross years and every year retains a full copy of reused payload data |
 | Collection CDXJ | **Derived** — indexed from finalized WARCs (`url`, `status`, `mime`, local/IA digests, offsets); not a copy of IA CDX |
 | Record types / order | **Derived** — `warcinfo` + `response`/`revisit` only; shard order is write order, not crawl order |

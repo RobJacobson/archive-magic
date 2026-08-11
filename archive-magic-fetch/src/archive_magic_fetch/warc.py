@@ -94,7 +94,6 @@ class PayloadLocator:
     offset: int
     length: int
     timestamp: str
-    status_code: int
 
 
 @dataclass
@@ -139,12 +138,13 @@ class PriorPayloadCache:
         self,
         identity: CaptureIdentity,
         *,
+        mime: str,
         current_collection_id: str,
     ) -> PlaybackResult | None:
         """Return a current response copied from an earlier cached payload."""
 
         ia_digest = normalize_payload_digest(identity.payload_digest)
-        if ia_digest is None or is_redirect_status_token(identity.status_token):
+        if ia_digest is None or identity.status_token != "200":
             return None
         locator = self.by_ia_digest.get(ia_digest)
         if locator is None or locator.collection_id == current_collection_id:
@@ -156,12 +156,16 @@ class PriorPayloadCache:
             source_identity = get_warc_identity(record)
             if source_identity.payload_digest != ia_digest:
                 return None
+            if source_identity.timestamp != locator.timestamp:
+                return None
+            if source_identity.timestamp > identity.timestamp:
+                return None
             if record.rec_headers.get_header(CDX_DIGEST_MATCH_HEADER) == "false":
                 return None
             if not cdx_digest_matches_body(ia_digest, body):
                 return None
             source_status = int(record.http_headers.get_statuscode())
-            if is_redirect_status_token(str(source_status)):
+            if source_status != 200:
                 return None
             actual_digest = payload_digest(body)
             stored_digest = normalize_payload_digest(
@@ -169,16 +173,19 @@ class PriorPayloadCache:
             )
             if stored_digest != actual_digest:
                 return None
-            status_code = (
-                int(identity.status_token)
-                if identity.status_token.isdigit()
-                else source_status
+            content_type = (
+                mime
+                if "/" in mime and "\r" not in mime and "\n" not in mime
+                else "application/octet-stream"
             )
             return PlaybackResult(
                 identity=identity,
                 body=body,
-                status_code=status_code,
-                headers=tuple(record.http_headers.headers),
+                status_code=200,
+                headers=(
+                    ("Content-Type", content_type),
+                    ("Content-Length", str(len(body))),
+                ),
                 warc_date=cdx_timestamp_to_warc_date(identity.timestamp),
                 source_uri=f"urn:archive-magic:payload-cache:{ia_digest}",
                 warc_payload_digest=actual_digest,
@@ -226,25 +233,6 @@ def _read_indexed_response(
     return record, body
 
 
-def _read_indexed_response_header(locator: PayloadLocator):
-    """Read only enough of an indexed legacy record to inspect its headers."""
-
-    size = locator.warc_path.stat().st_size
-    if locator.offset < 0 or locator.length <= 0:
-        raise ValueError("invalid cached WARC byte range")
-    if locator.offset + locator.length > size:
-        raise ValueError("cached WARC byte range is out of bounds")
-    with locator.warc_path.open("rb") as stream:
-        stream.seek(locator.offset)
-        encoded = stream.read(locator.length)
-    if len(encoded) != locator.length:
-        raise EOFError("cached WARC byte range is truncated")
-    record = next(ArchiveIterator(BytesIO(encoded), check_digests=False))
-    if record.rec_type != "response" or record.http_headers is None:
-        raise ValueError("cached WARC record is not a full response")
-    return record
-
-
 def _payload_locator_from_cdxj_line(
     layout: ArchiveLayout,
     collection_id: str,
@@ -266,7 +254,7 @@ def _payload_locator_from_cdxj_line(
         offset = int(meta.get("offset"))
         length = int(meta.get("length"))
         status_token = str(meta.get("status", ""))
-        if is_redirect_status_token(status_token):
+        if status_token != "200":
             return None
         warc_path = layout.collection_dir(collection_id) / filename
         locator = PayloadLocator(
@@ -275,29 +263,12 @@ def _payload_locator_from_cdxj_line(
             offset=offset,
             length=length,
             timestamp=timestamp,
-            status_code=int(status_token) if status_token.isdigit() else 200,
         )
         ia_digest = normalize_payload_digest(meta.get("cdxDigest"))
-        match = meta.get("cdxDigestMatch")
-        if ia_digest is not None and match is True:
+        if ia_digest is not None and meta.get("cdxDigestMatch") is True:
             return ia_digest, locator
-        if "cdxDigest" in meta or "cdxDigestMatch" in meta:
-            return None
-
-        # Compatibility for indexes created before IA digest fields were added.
-        record = _read_indexed_response_header(locator)
-        ia_digest = normalize_payload_digest(
-            record.rec_headers.get_header(CDX_PAYLOAD_DIGEST_HEADER)
-        )
-        if ia_digest is None:
-            return None
-        if record.rec_headers.get_header(CDX_DIGEST_MATCH_HEADER) == "false":
-            return None
-        source_status = str(record.http_headers.get_statuscode())
-        if is_redirect_status_token(source_status):
-            return None
-        return ia_digest, locator
-    except Exception:  # noqa: BLE001 - legacy cache hydration is best effort
+        return None
+    except Exception:  # noqa: BLE001 - cache hydration is best effort
         return None
 
 

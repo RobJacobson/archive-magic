@@ -280,6 +280,7 @@ def _run_fetch(
 
             cached = payload_cache.materialize(
                 identity,
+                mime=capture.mime,
                 current_collection_id=collection_id,
             )
             if cached is not None:

@@ -331,7 +331,7 @@ def test_matching_payloads_download_once_per_year(tmp_path):
     assert stored.identity.timestamp == "20050601000000"
 
 
-def test_cross_year_payload_reuse_ignores_url_and_preserves_source_headers(
+def test_cross_year_payload_reuse_uses_current_cdx_metadata(
     tmp_path,
 ):
     layout = archive_layout("http://example.org/", tmp_path)
@@ -359,7 +359,7 @@ def test_cross_year_payload_reuse_ignores_url_and_preserves_source_headers(
         ),
         2005: cdx_json(
             [["com,example)/b", "20050601000000", "http://example.org/b",
-              "application/octet-stream", "201", digest, str(len(body))]]
+              "text/plain", "200", digest, str(len(body))]]
         ),
     }
     original, cdx_mod, fetch_mod = patch_cdx_by_year(rows)
@@ -390,8 +390,9 @@ def test_cross_year_payload_reuse_ignores_url_and_preserves_source_headers(
         assert response.rec_headers.get_header("WARC-Target-URI") == (
             "http://example.org/b"
         )
-        assert response.http_headers.get_statuscode() == "201"
-        assert response.http_headers.get_header("X-Archived-Source") == "2004"
+        assert response.http_headers.get_statuscode() == "200"
+        assert response.http_headers.get_header("Content-Type") == "text/plain"
+        assert response.http_headers.get_header("X-Archived-Source") is None
         assert response.content_stream().read() == body
 
 
@@ -515,33 +516,57 @@ def test_digest_mismatch_response_never_seeds_cross_year_cache(tmp_path):
     assert result.metrics.payload_reuses == 0
 
 
-def test_legacy_cdxj_without_ia_fields_seeds_payload_cache(tmp_path):
+@pytest.mark.parametrize(
+    ("source_status", "status", "digest_token", "strip_cache_fields"),
+    (
+        (200, "-", "valid", False),
+        (200, "201", "valid", False),
+        (200, "206", "valid", False),
+        (200, "302", "valid", False),
+        (200, "200", "-", False),
+        (201, "200", "valid", False),
+        (206, "200", "valid", False),
+        (302, "200", "valid", False),
+        (200, "200", "valid", True),
+    ),
+)
+def test_ineligible_current_capture_downloads_individually(
+    tmp_path,
+    source_status,
+    status,
+    digest_token,
+    strip_cache_fields,
+):
     layout = archive_layout("http://example.org/", tmp_path)
     ensure_collection_dirs(layout)
-    body = b"legacy-index"
+    body = b"status-sensitive"
     digest = payload_digest(body).split(":")[1]
-    older = make_capt(ts="20040601000000", digest=f"sha1:{digest}")
+    older = make_capt(
+        ts="20040601000000",
+        status=str(source_status),
+        digest=f"sha1:{digest}",
+    )
     writer = CollectionWarcWriter(layout, "2004")
-    writer.write_playback(playback(older, body=body))
+    writer.write_playback(playback(older, body=body, status=source_status))
     writer.close()
     publish_collection_index(layout, "2004")
-    index_path = layout.collection_index("2004")
-    parts = index_path.read_text().strip().split(" ", 2)
-    meta = json.loads(parts[2])
-    meta.pop("cdxDigest")
-    meta.pop("cdxDigestMatch")
-    index_path.write_text(f"{parts[0]} {parts[1]} {json.dumps(meta)}\n")
+    if strip_cache_fields:
+        index_path = layout.collection_index("2004")
+        parts = index_path.read_text().strip().split(" ", 2)
+        meta = json.loads(parts[2])
+        meta.pop("cdxDigest")
+        meta.pop("cdxDigestMatch")
+        index_path.write_text(f"{parts[0]} {parts[1]} {json.dumps(meta)}\n")
 
-    rows = cdx_json(
-        [["com,example)/new", "20050601000000", "http://example.org/new",
-          "text/html", "200", digest, str(len(body))]]
-    )
+    current_digest = digest if digest_token == "valid" else digest_token
+    row = [["com,example)/", "20050601000000", "http://example.org/",
+            "text/html", status, current_digest, str(len(body))]]
     downloads: list[str] = []
-    original, cdx_mod, fetch_mod = patch_cdx(rows)
+    original, cdx_mod, fetch_mod = patch_cdx(cdx_json(row))
     try:
         result = run_fetch(
             FetchSettings(
-                url_pattern="http://example.org/*",
+                url_pattern="http://example.org/",
                 date_start="20050601000000",
                 date_end="20050601000000",
                 archives_root=tmp_path,
@@ -556,11 +581,15 @@ def test_legacy_cdxj_without_ia_fields_seeds_payload_cache(tmp_path):
         cdx_mod.fetch_year_cdx = original
         fetch_mod.fetch_year_cdx = original
 
-    assert downloads == []
-    assert result.metrics.payload_reuses == 1
+    assert downloads == ["20050601000000"]
+    assert result.metrics.payload_reuses == 0
 
 
-def test_future_or_corrupt_payload_cache_entry_falls_back_to_download(tmp_path):
+@pytest.mark.parametrize("corruption", ("timestamp", "range"))
+def test_future_or_corrupt_payload_cache_entry_falls_back_to_download(
+    tmp_path,
+    corruption,
+):
     layout = archive_layout("http://example.org/", tmp_path)
     ensure_collection_dirs(layout)
     body = b"ordered-cache"
@@ -603,7 +632,10 @@ def test_future_or_corrupt_payload_cache_entry_falls_back_to_download(tmp_path):
     index_path = layout.collection_index("2004")
     parts = index_path.read_text().strip().split(" ", 2)
     meta = json.loads(parts[2])
-    meta["length"] = "999999999"
+    if corruption == "timestamp":
+        parts[1] = "20030601000000"
+    else:
+        meta["length"] = "999999999"
     index_path.write_text(f"{parts[0]} {parts[1]} {json.dumps(meta)}\n")
     later_row = [["com,example)/", "20060601000000", "http://example.org/",
                   "text/html", "200", digest, str(len(body))]]
