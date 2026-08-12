@@ -11,11 +11,13 @@ import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from http.client import IncompleteRead
 from pathlib import Path
 from typing import Callable, Literal, Optional
 from urllib.parse import urlencode
 
 import requests
+from urllib3.exceptions import ProtocolError
 from wayback import WaybackClient, WaybackSession
 from wayback._client import read_and_close
 from wayback.exceptions import RateLimitError, WaybackRetryError
@@ -519,11 +521,19 @@ def _get_cdx_entity_bytes(
     sleep: Callable[[float], None],
     max_attempts: int = 8,
 ) -> tuple[bytes, str]:
-    """GET exact CDX HTTP entity bytes without content-encoding decode."""
+    """GET exact CDX HTTP entity bytes without content-encoding decode.
+
+    Mid-transfer truncations from ``response.raw.read()`` surface as urllib3
+    ``ProtocolError`` / ``IncompleteRead`` (not ``requests.ConnectionError``),
+    so those are retried here with the same exponential backoff as connect
+    failures. Playback treats IncompleteRead as a permanent truncated payload;
+    CDX treats it as a failed transfer of an otherwise available index page.
+    """
 
     attempt = 0
     while True:
         attempt += 1
+        response = None
         try:
             response = session.get(url, stream=True, timeout=120)
             if response.status_code == 429:
@@ -531,6 +541,7 @@ def _get_cdx_entity_bytes(
                     response.headers.get("Retry-After")
                 ) or 60.0
                 response.close()
+                response = None
                 if attempt >= max_attempts:
                     raise RuntimeError(
                         f"CDX rate limited after {attempt} attempts "
@@ -544,12 +555,14 @@ def _get_cdx_entity_bytes(
                 sleep(delay)
                 continue
             if response.status_code >= 500:
+                status = response.status_code
                 if attempt >= max_attempts:
                     response.raise_for_status()
                 response.close()
+                response = None
                 delay = min(5 * (2 ** (attempt - 1)), 300)
                 print(
-                    f"  CDX server error {response.status_code}: "
+                    f"  CDX server error {status}: "
                     f"retrying in {delay:g}s "
                     f"(attempt {attempt}/{max_attempts})",
                     flush=True,
@@ -565,13 +578,19 @@ def _get_cdx_entity_bytes(
             ).lower()
             body = _read_raw_entity_bytes(response)
             response.close()
+            response = None
             return body, content_encoding
         except (
             requests.ConnectionError,
             requests.Timeout,
+            requests.exceptions.ChunkedEncodingError,
+            ProtocolError,
+            IncompleteRead,
             WaybackRetryError,
             OSError,
         ) as error:
+            if response is not None:
+                response.close()
             if attempt >= max_attempts:
                 raise
             delay = min(5 * (2 ** (attempt - 1)), 300)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import re
 from dataclasses import dataclass, field
 from http import HTTPStatus
@@ -50,8 +51,8 @@ from .models import (
     cdx_timestamp_to_warc_date,
     is_redirect_status_token,
     make_identity,
-    normalize_original_url,
     normalize_payload_digest,
+    same_original_url,
     timestamp_to_warc_date,
     warc_date_to_cdx,
 )
@@ -82,6 +83,193 @@ class StoredResponse:
     warc_payload_digest: str
     target_uri: str
     status_code: int
+
+
+@dataclass(frozen=True)
+class PayloadLocator:
+    """Indexed location of one reusable full response payload."""
+
+    collection_id: str
+    warc_path: Path
+    offset: int
+    length: int
+    timestamp: str
+
+
+@dataclass
+class PriorPayloadCache:
+    """Best-effort IA-digest lookup over finalized collection responses."""
+
+    by_ia_digest: dict[str, PayloadLocator] = field(default_factory=dict)
+
+    @classmethod
+    def from_layout(cls, layout: ArchiveLayout) -> "PriorPayloadCache":
+        cache = cls()
+        if not layout.collections_root.is_dir():
+            return cache
+        for collection_dir in sorted(layout.collections_root.iterdir()):
+            if collection_dir.is_dir():
+                cache.add_collection(layout, collection_dir.name)
+        return cache
+
+    def add_collection(self, layout: ArchiveLayout, collection_id: str) -> None:
+        """Add eligible full responses from one collection's portable index."""
+
+        collection_id = layout.validate_collection_id(collection_id)
+        index_path = layout.collection_index(collection_id)
+        if not index_path.is_file():
+            return
+        with index_path.open(encoding="utf-8") as stream:
+            for line in stream:
+                locator_and_digest = _payload_locator_from_cdxj_line(
+                    layout, collection_id, line
+                )
+                if locator_and_digest is None:
+                    continue
+                ia_digest, locator = locator_and_digest
+                existing = self.by_ia_digest.get(ia_digest)
+                if existing is None or (
+                    _payload_locator_order(locator)
+                    < _payload_locator_order(existing)
+                ):
+                    self.by_ia_digest[ia_digest] = locator
+
+    def materialize(
+        self,
+        identity: CaptureIdentity,
+        *,
+        mime: str,
+        current_collection_id: str,
+    ) -> PlaybackResult | None:
+        """Return a current response copied from an earlier cached payload."""
+
+        ia_digest = normalize_payload_digest(identity.payload_digest)
+        if ia_digest is None or identity.status_token != "200":
+            return None
+        locator = self.by_ia_digest.get(ia_digest)
+        if locator is None or locator.collection_id == current_collection_id:
+            return None
+        if locator.timestamp > identity.timestamp:
+            return None
+        try:
+            record, body = _read_indexed_response(locator, check_digests="raise")
+            source_identity = get_warc_identity(record)
+            if source_identity.payload_digest != ia_digest:
+                return None
+            if source_identity.timestamp != locator.timestamp:
+                return None
+            if source_identity.timestamp > identity.timestamp:
+                return None
+            if record.rec_headers.get_header(CDX_DIGEST_MATCH_HEADER) == "false":
+                return None
+            if not cdx_digest_matches_body(ia_digest, body):
+                return None
+            source_status = int(record.http_headers.get_statuscode())
+            if source_status != 200:
+                return None
+            actual_digest = payload_digest(body)
+            stored_digest = normalize_payload_digest(
+                record.rec_headers.get_header("WARC-Payload-Digest")
+            )
+            if stored_digest != actual_digest:
+                return None
+            content_type = (
+                mime
+                if "/" in mime and "\r" not in mime and "\n" not in mime
+                else "application/octet-stream"
+            )
+            return PlaybackResult(
+                identity=identity,
+                body=body,
+                status_code=200,
+                headers=(
+                    ("Content-Type", content_type),
+                    ("Content-Length", str(len(body))),
+                ),
+                warc_date=cdx_timestamp_to_warc_date(identity.timestamp),
+                source_uri=f"urn:archive-magic:payload-cache:{ia_digest}",
+                warc_payload_digest=actual_digest,
+                digest_matched=True,
+            )
+        except Exception:  # noqa: BLE001 - cache corruption is always a miss
+            return None
+
+
+def _payload_locator_order(locator: PayloadLocator) -> tuple[str, str, str, int]:
+    return (
+        locator.timestamp,
+        locator.collection_id,
+        locator.warc_path.name,
+        locator.offset,
+    )
+
+
+def _read_indexed_response(
+    locator: PayloadLocator,
+    *,
+    check_digests: bool | str,
+):
+    size = locator.warc_path.stat().st_size
+    if locator.offset < 0 or locator.length <= 0:
+        raise ValueError("invalid cached WARC byte range")
+    if locator.offset + locator.length > size:
+        raise ValueError("cached WARC byte range is out of bounds")
+    with locator.warc_path.open("rb") as stream:
+        stream.seek(locator.offset)
+        encoded = stream.read(locator.length)
+    if len(encoded) != locator.length:
+        raise EOFError("cached WARC byte range is truncated")
+    iterator = ArchiveIterator(BytesIO(encoded), check_digests=check_digests)
+    record = next(iterator)
+    if record.rec_type != "response" or record.http_headers is None:
+        raise ValueError("cached WARC record is not a full response")
+    body = record.content_stream().read()
+    try:
+        next(iterator)
+    except StopIteration:
+        pass
+    else:
+        raise ValueError("cached WARC byte range contains multiple records")
+    return record, body
+
+
+def _payload_locator_from_cdxj_line(
+    layout: ArchiveLayout,
+    collection_id: str,
+    line: str,
+) -> tuple[str, PayloadLocator] | None:
+    try:
+        parts = line.split(" ", 2)
+        if len(parts) != 3:
+            return None
+        timestamp = parts[1]
+        if len(timestamp) != 14 or not timestamp.isdigit():
+            return None
+        meta = json.loads(parts[2])
+        if meta.get("mime") == "warc/revisit":
+            return None
+        filename = meta.get("filename")
+        if not isinstance(filename, str) or Path(filename).name != filename:
+            return None
+        offset = int(meta.get("offset"))
+        length = int(meta.get("length"))
+        status_token = str(meta.get("status", ""))
+        if status_token != "200":
+            return None
+        warc_path = layout.collection_dir(collection_id) / filename
+        locator = PayloadLocator(
+            collection_id=collection_id,
+            warc_path=warc_path,
+            offset=offset,
+            length=length,
+            timestamp=timestamp,
+        )
+        ia_digest = normalize_payload_digest(meta.get("cdxDigest"))
+        if ia_digest is not None and meta.get("cdxDigestMatch") is True:
+            return ia_digest, locator
+        return None
+    except Exception:  # noqa: BLE001 - cache hydration is best effort
+        return None
 
 
 @dataclass
@@ -150,6 +338,22 @@ def payload_digest(payload: bytes) -> str:
 
     encoded = base64.b32encode(hashlib.sha1(payload).digest()).decode("ascii")
     return f"sha1:{encoded}"
+
+
+def cdx_digest_matches_body(expected_digest: object, body: bytes) -> bool:
+    """True when CDX digest matches the body, or body plus a trailing ``\\n``.
+
+    Some early IA ARC indexes hashed ``payload + \"\\n\"`` while ``id_``
+    playback returns the payload without that newline. Treat that as a match
+    so the capture can seed revisits; still store the exact playback bytes.
+    """
+
+    expected = normalize_payload_digest(expected_digest)
+    if expected is None:
+        return True
+    if payload_digest(body) == expected:
+        return True
+    return payload_digest(body + b"\n") == expected
 
 
 def get_warc_identity(record) -> CaptureIdentity:
@@ -225,10 +429,10 @@ def inventory_collection(
                         record.rec_headers.get_header(CDX_DIGEST_MATCH_HEADER)
                         == "false"
                     )
-                    if (
-                        not explicitly_mismatched
-                        and cdx_payload == warc_payload
-                    ):
+                    # Exact matches have equal digests. Soft matches (IA CDX
+                    # hashed body+"\n") differ but omit CDX-Digest-Match:false
+                    # and must still seed revisits after resume.
+                    if not explicitly_mismatched and cdx_payload is not None:
                         inv.remember_representative(stored)
                 # consume body stream
                 record.raw_stream.read()
@@ -290,7 +494,7 @@ def download_exact(
         raise ExactMismatchError(
             f"timestamp mismatch: requested {timestamp}, got {returned_cdx}"
         )
-    if normalize_original_url(url) != normalize_original_url(expected_url):
+    if not same_original_url(url, expected_url):
         raise ExactMismatchError(
             f"URL mismatch: requested {expected_url}, got {url}"
         )
@@ -329,9 +533,10 @@ def download_exact_for_identity(
 ) -> PlaybackResult:
     """Exact-playback one capture identity and attach full identity fields.
 
-    A body that does not match the CDX digest is kept for this capture but must
-    not seed later revisit reuse. Unusable stubs such as ``Invalid URI`` are
-    always rejected. Empty bodies are rejected except for HTTP redirects (3xx),
+    A body that does not match the CDX digest (including the early-IA
+    trailing-newline soft match) is kept for this capture but must not seed
+    later revisit reuse. Unusable stubs such as ``Invalid URI`` are always
+    rejected. Empty bodies are rejected except for HTTP redirects (3xx),
     which historically often have an empty entity and a ``Location`` header.
     """
 
@@ -346,9 +551,8 @@ def download_exact_for_identity(
         expected_url=identity.original_url,
     )
     actual_digest = result.warc_payload_digest
-    expected_digest = normalize_payload_digest(identity.payload_digest)
-    digest_matched = (
-        expected_digest is None or actual_digest == expected_digest
+    digest_matched = cdx_digest_matches_body(
+        identity.payload_digest, result.body
     )
     return PlaybackResult(
         identity=identity,

@@ -121,7 +121,13 @@ def patch_cdx_by_year(bodies_by_year: dict[int, bytes]):
     return original, cdx_mod, fetch_mod
 
 
-def memento_client(identity, body: bytes, *, headers: dict | None = None):
+def memento_client(
+    identity,
+    body: bytes,
+    *,
+    headers: dict | None = None,
+    returned_url: str | None = None,
+):
     from datetime import datetime, timezone
 
     class Client:
@@ -149,7 +155,11 @@ def memento_client(identity, body: bytes, *, headers: dict | None = None):
                 tzinfo=timezone.utc,
             )
             memento.headers = {"Content-Type": "text/html", **(headers or {})}
-            memento.url = identity.original_url
+            memento.url = (
+                returned_url
+                if returned_url is not None
+                else identity.original_url
+            )
             return memento
 
     return Client()

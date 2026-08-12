@@ -16,7 +16,53 @@ from .collection import (
     list_collection_warcs,
     publish_file_atomically,
 )
-from .models import IndexArtifact, normalize_original_url, normalize_payload_digest
+from .models import (
+    CDX_DIGEST_MATCH_HEADER,
+    CDX_PAYLOAD_DIGEST_HEADER,
+    IndexArtifact,
+    normalize_original_url,
+    normalize_payload_digest,
+)
+
+
+_CDX_DIGEST_FIELD = "archive-magic:cdx-digest"
+_CDX_DIGEST_MATCH_FIELD = "archive-magic:cdx-digest-match"
+
+
+class ArchiveMagicCDXJIndexer(CDXJIndexer):
+    """CDXJ indexer that retains IA digest provenance for payload reuse."""
+
+    field_names = {
+        **CDXJIndexer.field_names,
+        _CDX_DIGEST_FIELD: "cdxDigest",
+        _CDX_DIGEST_MATCH_FIELD: "cdxDigestMatch",
+    }
+    inv_field_names = {value: key for key, value in field_names.items()}
+    DEFAULT_FIELDS = [
+        *CDXJIndexer.DEFAULT_FIELDS,
+        _CDX_DIGEST_FIELD,
+        _CDX_DIGEST_MATCH_FIELD,
+    ]
+
+    def get_field(self, record, name, it, filename):
+        if name == _CDX_DIGEST_FIELD:
+            if record.rec_type != "response":
+                return None
+            return normalize_payload_digest(
+                record.rec_headers.get_header(CDX_PAYLOAD_DIGEST_HEADER)
+            )
+        if name == _CDX_DIGEST_MATCH_FIELD:
+            if record.rec_type != "response":
+                return None
+            digest = normalize_payload_digest(
+                record.rec_headers.get_header(CDX_PAYLOAD_DIGEST_HEADER)
+            )
+            if digest is None:
+                return None
+            return (
+                record.rec_headers.get_header(CDX_DIGEST_MATCH_HEADER) != "false"
+            )
+        return super().get_field(record, name, it, filename)
 
 
 def index_warc_fragment(
@@ -28,7 +74,7 @@ def index_warc_fragment(
     work = layout.work_root
     work.mkdir(parents=True, exist_ok=True)
     tmp = exclusive_temp_path(work, suffix=".fragment.cdxj")
-    CDXJIndexer(
+    ArchiveMagicCDXJIndexer(
         output=str(tmp),
         inputs=[str(warc_path)],
         sort=True,

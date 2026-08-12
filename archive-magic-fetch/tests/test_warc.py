@@ -75,6 +75,162 @@ def test_empty_redirect_playback_is_stored_with_location(tmp_path):
     assert rec.content_stream().read() == b""
 
 
+def test_download_exact_accepts_ia_double_encoded_original_url():
+    """IA Link rel=original may %25-escape already-encoded query bytes."""
+
+    from archive_magic_fetch.warc import download_exact_for_identity
+
+    cdx_url = (
+        "http://lideres.nclr.org/groups/index.php?view=browse"
+        "&PHPSESSID=abc&page=5&sort=name%20DESC&state=46"
+    )
+    link_url = (
+        "http://lideres.nclr.org/groups/index.php?view=browse"
+        "&PHPSESSID=abc&page=5&sort=name%2520DESC&state=46"
+    )
+    identity = make_capt(url=cdx_url, ts="20041116040449")
+    body = b"<html>ok</html>"
+    result = download_exact_for_identity(
+        memento_client(identity, body, returned_url=link_url),
+        identity,
+    )
+    assert result.identity.original_url == cdx_url
+    assert result.body == body
+
+
+def test_download_exact_rejects_different_original_url():
+    from archive_magic_fetch.warc import ExactMismatchError, download_exact_for_identity
+
+    identity = make_capt(url="http://example.org/a")
+    with pytest.raises(ExactMismatchError, match="URL mismatch"):
+        download_exact_for_identity(
+            memento_client(
+                identity,
+                b"x",
+                returned_url="http://example.org/b",
+            ),
+            identity,
+        )
+
+def test_cdx_digest_matches_body_accepts_trailing_newline_soft_match():
+    from archive_magic_fetch.warc import (
+        cdx_digest_matches_body,
+        download_exact_for_identity,
+        payload_digest,
+    )
+
+    body = b"GIF89a-soft-match"
+    exact = payload_digest(body)
+    soft = payload_digest(body + b"\n")
+    other = payload_digest(b"different")
+
+    assert cdx_digest_matches_body(exact, body) is True
+    assert cdx_digest_matches_body(soft, body) is True
+    assert cdx_digest_matches_body(other, body) is False
+    assert cdx_digest_matches_body(None, body) is True
+
+    identity = make_capt(digest=soft)
+    result = download_exact_for_identity(
+        memento_client(identity, body), identity
+    )
+    assert result.digest_matched is True
+    assert result.body == body
+    assert result.warc_payload_digest == exact
+    assert result.warc_payload_digest != soft
+
+
+def test_trailing_newline_soft_match_seeds_revisit_and_survives_inventory(
+    tmp_path,
+):
+    """IA CDX hashed body+LF; playback body without LF still revisits."""
+
+    body = b"<html>soft</html>"
+    dig = payload_digest(body + b"\n").split(":")[1]
+    downloads: list[str] = []
+
+    def download_fn(_client, identity):
+        from archive_magic_fetch.warc import download_exact_for_identity
+
+        downloads.append(identity.timestamp)
+        return download_exact_for_identity(
+            memento_client(identity, body), identity
+        )
+
+    cdx_body = cdx_json(
+        [
+            [
+                "com,example)/",
+                "20040601000000",
+                "http://example.org/",
+                "text/html",
+                "200",
+                dig,
+                "4",
+            ],
+            [
+                "com,example)/",
+                "20040602000000",
+                "http://example.org/",
+                "text/html",
+                "200",
+                dig,
+                "4",
+            ],
+        ]
+    )
+    layout = archive_layout("http://example.org/", tmp_path)
+    ensure_collection_dirs(layout)
+    original, cdx_mod, fetch_mod = patch_cdx(cdx_body)
+    try:
+        result = run_fetch(
+            FetchSettings(
+                url_pattern="http://example.org/",
+                date_start="20040601000000",
+                date_end="20040602000000",
+                archives_root=tmp_path,
+            ),
+            client_factory=lambda: MagicMock(),
+            download_fn=download_fn,
+            sleep=lambda _s: None,
+        )
+    finally:
+        cdx_mod.fetch_year_cdx = original
+        fetch_mod.fetch_year_cdx = original
+
+    assert result.exit_code == 0
+    assert downloads == ["20040601000000"]
+    assert result.metrics.downloads == 1
+    assert result.metrics.revisits == 1
+    assert result.metrics.digest_mismatch_accepted == 0
+
+    warc = list_collection_warcs(layout, "2004")[0]
+    with warc.open("rb") as stream:
+        responses = []
+        revisits = []
+        for record in ArchiveIterator(stream):
+            if record.rec_type == "response":
+                responses.append(record)
+                assert record.rec_headers.get_header(CDX_DIGEST_MATCH_HEADER) is None
+                assert record.rec_headers.get_header("WARC-Payload-Digest") == (
+                    payload_digest(body)
+                )
+                assert record.content_stream().read() == body
+            elif record.rec_type == "revisit":
+                revisits.append(record)
+                record.raw_stream.read()
+            else:
+                record.raw_stream.read()
+    assert len(responses) == 1
+    assert len(revisits) == 1
+
+    inv = inventory_collection(layout, "2004")
+    assert inv.lookup_representative(
+        "com,example)/",
+        f"sha1:{dig}",
+        not_after_timestamp="20040602000000",
+    ) is not None
+
+
 def test_empty_non_redirect_playback_is_rejected():
     from archive_magic_fetch.warc import (
         UnusablePlaybackError,
