@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Sequence
 
 from cdxj_indexer.main import CDXJIndexer
 from warcio.archiveiterator import ArchiveIterator
@@ -16,13 +16,9 @@ from .collection import (
     list_collection_warcs,
     publish_file_atomically,
 )
-from .models import (
-    CDX_DIGEST_MATCH_HEADER,
-    CDX_PAYLOAD_DIGEST_HEADER,
-    IndexArtifact,
-    normalize_original_url,
-    normalize_payload_digest,
-)
+from .identity import normalize_original_url, normalize_payload_digest
+from .models import IndexArtifact
+from .policy import CDX_DIGEST_MATCH_HEADER, CDX_PAYLOAD_DIGEST_HEADER
 
 
 _CDX_DIGEST_FIELD = "archive-magic:cdx-digest"
@@ -65,25 +61,6 @@ class ArchiveMagicCDXJIndexer(CDXJIndexer):
         return super().get_field(record, name, it, filename)
 
 
-def index_warc_fragment(
-    layout: ArchiveLayout,
-    warc_path: Path,
-) -> Path:
-    """Build a sorted temporary CDXJ fragment for one finalized WARC."""
-
-    work = layout.work_root
-    work.mkdir(parents=True, exist_ok=True)
-    tmp = exclusive_temp_path(work, suffix=".fragment.cdxj")
-    ArchiveMagicCDXJIndexer(
-        output=str(tmp),
-        inputs=[str(warc_path)],
-        sort=True,
-        records="response,revisit",
-        dir_root=str(warc_path.parent),
-    ).process_all()
-    return tmp
-
-
 def cdxj_filenames(path: Path) -> set[str]:
     """Return every filename field referenced by a CDXJ file."""
 
@@ -103,75 +80,42 @@ def cdxj_filenames(path: Path) -> set[str]:
     return names
 
 
-def merge_cdxj_lines(paths: Sequence[Path]) -> list[str]:
-    """Merge sorted CDXJ files, dropping exact duplicate lines."""
-
-    lines: list[str] = []
-    for path in paths:
-        if not path.is_file():
-            continue
-        for line in path.read_text(encoding="utf-8").splitlines():
-            if line:
-                lines.append(line)
-    lines = sorted(set(lines))
-    # Global CDXJ order: urlkey timestamp (fields 0 and 1)
-    lines.sort(
-        key=lambda line: (
-            line.split(" ", 2)[0],
-            line.split(" ", 2)[1] if " " in line else "",
-        )
-    )
-    return lines
-
-
 def publish_collection_index(
     layout: ArchiveLayout,
     collection_id: str,
 ) -> Optional[IndexArtifact]:
-    """Index missing WARCs, merge the portable collection CDXJ, and publish.
-
-    Finalized WARC basenames drive incompleteness detection: only shards not
-    already referenced by the on-disk index are fragment-indexed and merged.
-    """
+    """Rebuild the portable collection CDXJ from every finalized WARC."""
 
     collection_id = layout.validate_collection_id(collection_id)
     collection_warcs = list_collection_warcs(layout, collection_id)
     if not collection_warcs:
         return None
 
+    collection_dir = layout.collection_dir(collection_id)
     index_path = layout.collection_index(collection_id)
-    known = cdxj_filenames(index_path)
-    warc_by_name = {path.name: path for path in collection_warcs}
-    missing_names = {name for name in warc_by_name if name not in known}
-
-    fragments: list[Path] = []
+    tmp = exclusive_temp_path(collection_dir, suffix=".cdxj.tmp")
     try:
-        for name in sorted(missing_names):
-            fragments.append(index_warc_fragment(layout, warc_by_name[name]))
-
-        inputs: list[Path] = []
-        if index_path.is_file():
-            inputs.append(index_path)
-        inputs.extend(fragments)
-        lines = merge_cdxj_lines(inputs)
-
+        ArchiveMagicCDXJIndexer(
+            output=str(tmp),
+            inputs=[str(path) for path in collection_warcs],
+            sort=True,
+            records="response,revisit",
+            dir_root=str(collection_dir),
+        ).process_all()
+        lines = [
+            line for line in tmp.read_text(encoding="utf-8").splitlines() if line
+        ]
         validate_cdxj_against_warcs(layout, collection_id, lines)
         validate_collection_revisit_closure(layout, collection_id)
-
-        tmp = exclusive_temp_path(
-            layout.work_root,
-            suffix=f".{collection_id}.cdxj.tmp",
-        )
-        tmp.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
         publish_file_atomically(tmp, index_path)
         return index_artifact_from_path(
             layout,
             index_path,
             capture_count=len(lines),
         )
-    finally:
-        for path in fragments:
-            path.unlink(missing_ok=True)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def validate_cdxj_against_warcs(
@@ -241,8 +185,9 @@ def validate_collection_revisit_closure(
     """
 
     available: set[tuple[str, str, str]] = set()
-    # Collect responses then validate revisits in a second full-collection pass
-    # so cross-shard Refers-To targets are visible regardless of shard order.
+    revisits: list[
+        tuple[str, str, tuple[str, str, str] | None, str]
+    ] = []
     warcs = list_collection_warcs(layout, collection_id)
     for path in warcs:
         with path.open("rb") as stream:
@@ -255,46 +200,50 @@ def validate_collection_revisit_closure(
                     )
                     if key is not None:
                         available.add(key)
+                elif record.rec_type == "revisit":
+                    revisit_date = record.rec_headers.get_header("WARC-Date") or ""
+                    refers_uri = (
+                        record.rec_headers.get_header("WARC-Refers-To-Target-URI")
+                        or ""
+                    )
+                    refers_date = (
+                        record.rec_headers.get_header("WARC-Refers-To-Date") or ""
+                    )
+                    payload = (
+                        record.rec_headers.get_header("WARC-Payload-Digest") or ""
+                    )
+                    revisits.append(
+                        (
+                            revisit_date,
+                            refers_date,
+                            _response_reference_key(
+                                refers_uri, refers_date, payload
+                            ),
+                            payload,
+                        )
+                    )
                 record.raw_stream.read()
 
-    for path in warcs:
-        with path.open("rb") as stream:
-            for record in ArchiveIterator(stream, check_digests=False):
-                if record.rec_type != "revisit":
-                    record.raw_stream.read()
-                    continue
-                revisit_date = record.rec_headers.get_header("WARC-Date") or ""
-                refers_uri = (
-                    record.rec_headers.get_header("WARC-Refers-To-Target-URI")
-                    or ""
-                )
-                refers_date = (
-                    record.rec_headers.get_header("WARC-Refers-To-Date") or ""
-                )
-                payload = (
-                    record.rec_headers.get_header("WARC-Payload-Digest") or ""
-                )
-                key = _response_reference_key(refers_uri, refers_date, payload)
-                if key is None:
-                    raise ValueError(
-                        f"collection revisit in {collection_id} is missing a resolvable "
-                        f"response reference"
-                    )
-                if refers_date > revisit_date:
-                    raise ValueError(
-                        f"collection revisit in {collection_id} has forward reference "
-                        f"from {revisit_date} to {refers_date}"
-                    )
-                if key not in available:
-                    raise ValueError(
-                        f"collection revisit in {collection_id} has no earlier response "
-                        f"for digest {payload}"
-                    )
-                record.raw_stream.read()
+    for revisit_date, refers_date, key, payload in revisits:
+        if key is None:
+            raise ValueError(
+                f"collection revisit in {collection_id} is missing a resolvable "
+                "response reference"
+            )
+        if refers_date > revisit_date:
+            raise ValueError(
+                f"collection revisit in {collection_id} has forward reference "
+                f"from {revisit_date} to {refers_date}"
+            )
+        if key not in available:
+            raise ValueError(
+                f"collection revisit in {collection_id} has no earlier response "
+                f"for digest {payload}"
+            )
 
 
 def reconcile_missing_indexes(layout: ArchiveLayout) -> list[str]:
-    """Index finalized WARCs missing from portable collection indexes."""
+    """Rebuild portable indexes that are missing or older than their WARCs."""
 
     updated: list[str] = []
     if not layout.collections_root.is_dir():
@@ -303,10 +252,24 @@ def reconcile_missing_indexes(layout: ArchiveLayout) -> list[str]:
         if not collection_dir.is_dir():
             continue
         collection_id = layout.validate_collection_id(collection_dir.name)
-        index = layout.collection_index(collection_id)
-        known = cdxj_filenames(index)
-        warcs = list_collection_warcs(layout, collection_id)
-        if any(w.name not in known for w in warcs):
+        if _collection_index_is_stale(layout, collection_id):
             publish_collection_index(layout, collection_id)
             updated.append(collection_id)
     return updated
+
+
+def _collection_index_is_stale(
+    layout: ArchiveLayout, collection_id: str
+) -> bool:
+    warcs = list_collection_warcs(layout, collection_id)
+    if not warcs:
+        return False
+    index = layout.collection_index(collection_id)
+    if not index.is_file():
+        return True
+    known = cdxj_filenames(index)
+    names = {path.name for path in warcs}
+    if known != names:
+        return True
+    index_mtime = index.stat().st_mtime_ns
+    return any(path.stat().st_mtime_ns > index_mtime for path in warcs)

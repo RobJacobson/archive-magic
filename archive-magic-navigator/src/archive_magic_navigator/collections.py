@@ -119,12 +119,18 @@ def _validate_archive(archives_root: Path, archive_id: str, candidate: Path) -> 
         (entry for entry in resolved_collections.iterdir() if entry.is_dir()),
         key=lambda entry: entry.name,
     )
-    if not entries:
-        raise ValidationError(f"archive {archive_id!r} has no playable collections")
     collections = tuple(
-        _validate_replay_collection(root, archive_id, resolved_collections, entry)
-        for entry in entries
+        collection
+        for collection in (
+            _validate_replay_collection(
+                root, archive_id, resolved_collections, entry
+            )
+            for entry in entries
+        )
+        if collection is not None
     )
+    if not collections:
+        raise ValidationError(f"archive {archive_id!r} has no playable collections")
     return Archive(archive_id=archive_id, root=root, collections=collections)
 
 
@@ -133,7 +139,7 @@ def _validate_replay_collection(
     archive_id: str,
     collections_root: Path,
     candidate: Path,
-) -> ReplayCollection:
+) -> ReplayCollection | None:
     collection_id = validate_collection_id(candidate.name)
     root = _resolve_immediate_child(
         collections_root,
@@ -141,6 +147,8 @@ def _validate_replay_collection(
         f"collection {collection_id!r} in archive {archive_id!r}",
     )
     replay_index = root / f"{archive_id}-{collection_id}-index.cdxj"
+    if not replay_index.is_file():
+        return None
     return ReplayCollection(collection_id, root, replay_index)
 
 

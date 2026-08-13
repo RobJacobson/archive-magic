@@ -13,21 +13,24 @@ from pathlib import Path
 from typing import Optional, Sequence
 from urllib.parse import urlsplit
 
+from .identity import identity_to_dict
 from .models import (
-    DEFAULT_OUTPUT_ROOT,
-    RUN_SCHEMA_VERSION,
-    WARC_TARGET_BYTES,
-    WARC_VERSION,
     IndexArtifact,
     RunMetrics,
     UnresolvedFailure,
     WarcArtifact,
-    identity_to_dict,
+)
+from .policy import (
+    DEFAULT_OUTPUT_ROOT,
+    RUN_SCHEMA_VERSION,
+    WARC_TARGET_BYTES,
+    WARC_VERSION,
 )
 
 
 _WWW_ALIAS_PREFIX = re.compile(r"^www\d*\.")
-_TEMP_NAME = re.compile(r"^\.tmp-|^.*\.(tmp|partial)$")
+_TEMP_NAME = re.compile(r"^\.tmp-|^.*\.tmp$")
+_PARTIAL_WARC_SUFFIX = ".warc.gz.partial"
 _COLLECTION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _LEGACY_NAMES = ("archive", "sources", "index.cdxj", "collection.json", "failures.json")
 
@@ -96,6 +99,14 @@ class ArchiveLayout:
         return self.collection_dir(collection_id) / self.collection_warc_filename(
             collection_id, sequence
         )
+
+    def collection_warc_partial_path(
+        self, collection_id: str, sequence: int
+    ) -> Path:
+        """Return the visible in-progress sibling of one WARC shard."""
+
+        final = self.collection_warc_path(collection_id, sequence)
+        return final.with_name(final.name + ".partial")
 
 
 def normalize_domain(
@@ -201,31 +212,30 @@ def ensure_collection_dirs(layout: ArchiveLayout) -> None:
     layout.root.mkdir(parents=True, exist_ok=True)
     layout.collections_root.mkdir(parents=True, exist_ok=True)
     layout.captures_root.mkdir(parents=True, exist_ok=True)
-    layout.work_root.mkdir(parents=True, exist_ok=True)
 
 
 def cleanup_temps(layout: ArchiveLayout) -> None:
-    """Remove abandoned temporary files under the collection root."""
+    """Remove abandoned short-lived temps; keep visible WARC partials."""
 
     if not layout.root.is_dir():
         return
     for path in layout.root.rglob("*"):
         if not path.is_file():
             continue
-        if _TEMP_NAME.match(path.name) or path.name.endswith(".warc.gz.partial"):
+        if path.name.endswith(_PARTIAL_WARC_SUFFIX):
+            continue
+        if _TEMP_NAME.match(path.name):
             try:
                 path.unlink()
             except OSError:
                 pass
     if layout.work_root.is_dir():
-        for child in layout.work_root.iterdir():
-            try:
-                if child.is_dir():
-                    shutil.rmtree(child, ignore_errors=True)
-                else:
-                    child.unlink()
-            except OSError:
-                pass
+        try:
+            next(layout.work_root.iterdir())
+        except StopIteration:
+            shutil.rmtree(layout.work_root, ignore_errors=True)
+        except OSError:
+            pass
 
 
 def file_sha256(path: Path) -> str:
@@ -288,10 +298,12 @@ def _collection_warc_name_pattern(
 
 
 def reset_collection_data(layout: ArchiveLayout, collection_id: str) -> None:
-    """Remove finalized WARC and CDXJ artifacts for one portable collection."""
+    """Remove WARC, partial, and CDXJ artifacts for one portable collection."""
 
     collection_id = layout.validate_collection_id(collection_id)
     for path in list_collection_warcs(layout, collection_id):
+        path.unlink()
+    for path in list_collection_partials(layout, collection_id):
         path.unlink()
     index_path = layout.collection_index(collection_id)
     if index_path.is_file():
@@ -320,25 +332,57 @@ def list_collection_warcs(
     return [path for _, path in found]
 
 
-def next_collection_warc_sequence(
+def list_collection_partials(
     layout: ArchiveLayout, collection_id: str
-) -> int:
-    """Return the next WARC sequence number for a portable collection."""
+) -> list[Path]:
+    """Return visible in-progress WARC partials for one collection."""
 
     collection_id = layout.validate_collection_id(collection_id)
+    collection_dir = layout.collection_dir(collection_id)
+    if not collection_dir.is_dir():
+        return []
+    found: list[tuple[int, Path]] = []
+    for path in collection_dir.iterdir():
+        if not path.is_file():
+            continue
+        parsed = parse_warc_partial_name(layout, collection_id, path.name)
+        if parsed is None:
+            continue
+        found.append((parsed, path))
+    found.sort(key=lambda item: item[0])
+    return [path for _, path in found]
+
+
+def parse_warc_partial_name(
+    layout: ArchiveLayout, collection_id: str, name: str
+) -> int | None:
+    """Return the shard sequence encoded in a WARC partial basename."""
+
+    collection_id = layout.validate_collection_id(collection_id)
+    pattern = re.compile(
+        rf"^(?:\.tmp-[^.]+\.)?{re.escape(layout.archive_id)}-"
+        rf"{re.escape(collection_id)}-(?P<seq>\d{{3}})\.warc\.gz\.partial$"
+    )
+    match = pattern.fullmatch(name)
+    if match is None:
+        return None
+    return int(match.group("seq"))
+
+
+def last_collection_warc(
+    layout: ArchiveLayout, collection_id: str
+) -> tuple[int, Path] | None:
+    """Return the highest-sequence finalized WARC, if any."""
+
     existing = list_collection_warcs(layout, collection_id)
     if not existing:
-        return 1
-    last = existing[-1].name
-    match = _collection_warc_name_pattern(layout, collection_id).fullmatch(last)
+        return None
+    last = existing[-1]
+    match = _collection_warc_name_pattern(layout, collection_id).fullmatch(
+        last.name
+    )
     assert match is not None
-    nxt = int(match.group("seq")) + 1
-    if nxt > 999:
-        raise RuntimeError(
-            f"WARC sequence would exceed 999 for {layout.archive_id} "
-            f"collection {collection_id}; refusing to create shard 1000"
-        )
-    return nxt
+    return int(match.group("seq")), last
 
 
 def warc_artifact_from_path(

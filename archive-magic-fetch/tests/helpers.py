@@ -6,8 +6,9 @@ import json
 from typing import Optional
 from unittest.mock import MagicMock
 
-from archive_magic_fetch.models import CaptureIdentity, PlaybackResult, make_identity
-from archive_magic_fetch.warc import payload_digest
+from archive_magic_fetch.identity import make_identity
+from archive_magic_fetch.models import CaptureIdentity, PlaybackResult
+from archive_magic_fetch.playback import payload_digest
 
 
 def make_capt(
@@ -160,6 +161,95 @@ def memento_client(
                 if returned_url is not None
                 else identity.original_url
             )
+            return memento
+
+    return Client()
+
+
+def substitution_client(slash_url: str, found_ts: str):
+    """Client whose exact playback is a Wayback slash-normalizing 302."""
+
+    from wayback.exceptions import MementoPlaybackError
+
+    location = f"https://web.archive.org/web/{found_ts}id_/{slash_url}"
+    response = MagicMock()
+    response.headers = {
+        "X-Archive-Redirect-Reason": f"found capture at {found_ts}",
+        "Location": location,
+    }
+
+    class Session:
+        def request(self, method, url, **kwargs):
+            return response
+
+    class Client:
+        def __init__(self):
+            self.session = Session()
+            self.calls = 0
+
+        def get_memento(self, *args, **kwargs):
+            self.calls += 1
+            self.session.request(
+                "GET", "https://web.archive.org/web/x", allow_redirects=False
+            )
+            raise MementoPlaybackError("could not be played")
+
+    return Client()
+
+
+def found_capture_client(
+    nearby_url: str,
+    found_ts: str,
+    body: bytes,
+    *,
+    status: int = 200,
+):
+    """Client whose exact playback is a found-capture-at 302 to another URL."""
+
+    from datetime import datetime, timezone
+
+    from wayback.exceptions import MementoPlaybackError
+
+    location = f"https://web.archive.org/web/{found_ts}id_/{nearby_url}"
+    response = MagicMock()
+    response.headers = {
+        "X-Archive-Redirect-Reason": f"found capture at {found_ts}",
+        "Location": location,
+    }
+
+    class Session:
+        def request(self, method, url, **kwargs):
+            return response
+
+    class Client:
+        def __init__(self):
+            self.session = Session()
+            self.calls = 0
+
+        def get_memento(self, *args, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                self.session.request(
+                    "GET", "https://web.archive.org/web/x", allow_redirects=False
+                )
+                raise MementoPlaybackError("could not be played")
+            memento = MagicMock()
+            memento.__enter__ = lambda s: s
+            memento.__exit__ = MagicMock(return_value=False)
+            memento.content = body
+            memento.status_code = status
+            memento.memento_url = location
+            memento.timestamp = datetime(
+                int(found_ts[0:4]),
+                int(found_ts[4:6]),
+                int(found_ts[6:8]),
+                int(found_ts[8:10]),
+                int(found_ts[10:12]),
+                int(found_ts[12:14]),
+                tzinfo=timezone.utc,
+            )
+            memento.headers = {"Content-Type": "text/html"}
+            memento.url = nearby_url
             return memento
 
     return Client()

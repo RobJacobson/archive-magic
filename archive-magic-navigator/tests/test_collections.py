@@ -94,6 +94,27 @@ def test_select_archive_lists_multiple_portable_collections_sorted(
     ]
 
 
+def test_unindexed_collection_dir_is_skipped(collection_factory):
+    root, archive, _, _ = collection_factory()
+    incomplete = archive / "collections" / "2004"
+    incomplete.mkdir(parents=True)
+    (incomplete / "example.org-2004-001.warc.gz.partial").write_bytes(b"partial")
+
+    selected = select_archive(resolve_archives_root(root), "example.org")
+
+    assert [item.collection_id for item in selected.collections] == ["2020"]
+
+
+def test_archive_with_only_unindexed_year_is_not_playable(tmp_path):
+    root = tmp_path / "archives"
+    collection = root / "example.org" / "collections" / "2004"
+    collection.mkdir(parents=True)
+    (collection / "example.org-2004-001.warc.gz.partial").write_bytes(b"partial")
+
+    with pytest.raises(ValidationError, match="no playable collections"):
+        select_archive(resolve_archives_root(root), "example.org")
+
+
 def test_discovery_rejects_escaping_directory_symlink(
     collection_factory,
     tmp_path,

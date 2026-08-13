@@ -8,16 +8,23 @@ import json
 
 import pytest
 
-from archive_magic_fetch.cdx import fetch_year_cdx, init_run_id, parse_date_bound, year_bounds
+from archive_magic_fetch.cdx import (
+    fetch_year_cdx,
+    init_run_id,
+    normalize_cdx_search,
+    parse_date_bound,
+    year_bounds,
+)
 from archive_magic_fetch.collection import archive_layout, ensure_collection_dirs
 from archive_magic_fetch.fetch import _report_cdx_ingest_skips, build_settings
 from archive_magic_fetch.models import (
     CaptureIdentity,
-    DEFAULT_DATE_START,
     FailureCategory,
     UnresolvedFailure,
 )
-from helpers import FakeSession, cdx_json, make_capt
+from archive_magic_fetch.policy import DEFAULT_DATE_START
+from helpers import FakeSession, cdx_json
+
 
 def test_raw_cdx_saved_before_normalization_and_malformed_in_failures(tmp_path):
     layout = archive_layout("http://example.org/", tmp_path)
@@ -145,6 +152,42 @@ def test_year_end_bound_covers_full_utc_year():
     settings = build_settings("http://example.org/", date_end="2004")
     assert settings.date_end == "20041231235959"
     assert DEFAULT_DATE_START.startswith("1995")
+
+
+def test_normalize_cdx_search_returns_stripped_input():
+    assert normalize_cdx_search("  http://example.org/a  ") == (
+        "http://example.org/a",
+        None,
+    )
+
+
+def test_parse_row_constructs_identity_once(monkeypatch):
+    import archive_magic_fetch.cdx as cdx_mod
+
+    calls = 0
+    real_make_identity = cdx_mod.make_identity
+
+    def counted_make_identity(**kwargs):
+        nonlocal calls
+        calls += 1
+        return real_make_identity(**kwargs)
+
+    monkeypatch.setattr(cdx_mod, "make_identity", counted_make_identity)
+    parsed = cdx_mod._parse_row(
+        [
+            "",
+            "20040615000000",
+            "http://example.org/",
+            "text/html",
+            "200",
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        ],
+        raw_line="row",
+    )
+    assert calls == 1
+    assert isinstance(parsed, cdx_mod.ParsedCapture)
+    assert parsed.identity.urlkey == "org,example)/"
+    assert set(parsed.__dataclass_fields__) == {"identity", "mime"}
 
 
 def test_init_run_id_allocates_unique_id_after_collision(tmp_path):
@@ -288,5 +331,3 @@ def test_cdx_retries_protocol_incomplete_read(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "CDX connection error: retrying in 5s" in out
     assert "ProtocolError" in out
-
-

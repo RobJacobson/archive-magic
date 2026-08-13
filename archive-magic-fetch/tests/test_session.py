@@ -8,7 +8,8 @@ from unittest.mock import MagicMock
 import pytest
 from urllib3 import HTTPResponse
 
-from helpers import make_capt  # noqa: F401
+
+
 def _urllib3_response(body: bytes, headers: dict[str, str]):
     return HTTPResponse(
         body=BytesIO(body),
@@ -39,7 +40,7 @@ def _requests_response(body: bytes, *, content_encoding: str | None, memento: bo
 
 
 def test_session_raises_rate_limit_for_429_memento_response():
-    from archive_magic_fetch.cdx import ArchiveMagicWaybackSession
+    from archive_magic_fetch.playback import ArchiveMagicWaybackSession
     from wayback import WaybackSession
     from wayback.exceptions import RateLimitError
 
@@ -72,7 +73,7 @@ def test_session_repairs_false_gzip_content_encoding_on_mementos():
 
     import gzip as gzip_mod
 
-    from archive_magic_fetch.cdx import ArchiveMagicWaybackSession
+    from archive_magic_fetch.playback import ArchiveMagicWaybackSession
     from wayback import WaybackSession
 
     plaintext = b"<!DOCTYPE html><html><body>ok</body></html>"
@@ -108,7 +109,7 @@ def test_session_repairs_false_gzip_content_encoding_on_mementos():
 def test_session_leaves_non_memento_gzip_bodies_unconsumed():
     """CDX responses must keep streaming; do not eagerly rewrite them."""
 
-    from archive_magic_fetch.cdx import repair_false_gzip_content_encoding
+    from archive_magic_fetch.playback import repair_false_gzip_content_encoding
 
     body = b'[["urlkey","timestamp"]]'
     response = _requests_response(body, content_encoding="gzip", memento=False)
@@ -117,5 +118,3 @@ def test_session_leaves_non_memento_gzip_bodies_unconsumed():
     assert response.headers.get("Content-Encoding") == "gzip"
     # Stream still available for decode_content=False CDX readers.
     assert response.raw.read() == body
-
-

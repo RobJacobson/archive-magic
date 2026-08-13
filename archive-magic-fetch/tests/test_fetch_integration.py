@@ -16,14 +16,26 @@ from archive_magic_fetch.collection import (
 )
 from archive_magic_fetch.fetch import FetchSettings, run_fetch
 from archive_magic_fetch.index import publish_collection_index
-from archive_magic_fetch.models import MISSING_CDX_STATUS, make_identity
-from archive_magic_fetch.warc import (
-    CollectionWarcWriter,
+from archive_magic_fetch.identity import make_identity
+from archive_magic_fetch.policy import (
+    MAX_PLAYBACK_ATTEMPTS,
+    MISSING_CDX_STATUS,
+)
+from archive_magic_fetch.inventory import (
     get_warc_identity,
     inventory_collection,
-    payload_digest,
 )
-from helpers import cdx_json, make_capt, patch_cdx, patch_cdx_by_year, playback
+from archive_magic_fetch.playback import payload_digest
+from archive_magic_fetch.warc import CollectionWarcWriter
+from helpers import (
+    cdx_json,
+    found_capture_client,
+    make_capt,
+    patch_cdx,
+    patch_cdx_by_year,
+    playback,
+    substitution_client,
+)
 
 def test_statusless_capture_three_runs_no_extra_network(tmp_path):
     layout = archive_layout("http://example.org/", tmp_path)
@@ -168,20 +180,266 @@ def test_reset_data_redownloads_instead_of_reusing(tmp_path):
         fetch_mod.fetch_year_cdx = original
 
 
-def test_same_year_representative_revisits_and_redirects_individual(tmp_path):
+def test_slash_redirect_substitution_is_stored_and_revisited(tmp_path):
+    layout = archive_layout("http://example.org/", tmp_path)
+    ensure_collection_dirs(layout)
+    digest = "TV7A2C32YG3CFKH2CYRHAL2D4UPH7RCE"
+    first = make_capt(
+        url="http://example.org/conference",
+        ts="20040303170500",
+        status="301",
+        digest=f"sha1:{digest}",
+        urlkey="org,example)/conference",
+    )
+    second = make_capt(
+        url="http://example.org/conference",
+        ts="20040516142118",
+        status="301",
+        digest=f"sha1:{digest}",
+        urlkey="org,example)/conference",
+    )
+    clients: list[object] = []
+
+    def client_factory():
+        client = substitution_client(
+            "http://example.org/conference/", "20040510064339"
+        )
+        clients.append(client)
+        return client
+
+    body = cdx_json(
+        [
+            [
+                first.urlkey,
+                first.timestamp,
+                first.original_url,
+                "text/html",
+                "301",
+                digest,
+                "379",
+            ],
+            [
+                second.urlkey,
+                second.timestamp,
+                second.original_url,
+                "text/html",
+                "301",
+                digest,
+                "377",
+            ],
+        ]
+    )
+    original, cdx_mod, fetch_mod = patch_cdx(body)
+    try:
+        result = run_fetch(
+            FetchSettings(
+                url_pattern="http://example.org/",
+                date_start="20040303170500",
+                date_end="20040516142118",
+                archives_root=tmp_path,
+            ),
+            client_factory=client_factory,
+            sleep=lambda _s: None,
+        )
+    finally:
+        cdx_mod.fetch_year_cdx = original
+        fetch_mod.fetch_year_cdx = original
+
+    assert result.exit_code == 0
+    assert sum(getattr(client, "calls", 0) for client in clients) == 1
+    warc = list_collection_warcs(layout, "2004")[0]
+    with warc.open("rb") as stream:
+        records = list(ArchiveIterator(stream))
+    responses = [rec for rec in records if rec.rec_type == "response"]
+    revisits = [rec for rec in records if rec.rec_type == "revisit"]
+    assert len(responses) == 1
+    assert len(revisits) == 1
+    assert responses[0].http_headers.get_statuscode() == "301"
+    assert (
+        responses[0].http_headers.get_header("Location")
+        == "http://example.org/conference/"
+    )
+    inv = inventory_collection(layout, "2004")
+    assert inv.contains(first)
+    assert inv.contains(second)
+
+
+def test_found_capture_substitution_is_stored_under_cdx_identity(tmp_path):
+    from archive_magic_fetch.policy import CDX_DIGEST_MATCH_HEADER
+
+    layout = archive_layout("http://example.org/", tmp_path)
+    ensure_collection_dirs(layout)
+    identity = make_capt(
+        url="http://example.org/groups/?PHPSESSID=abc",
+        ts="20041009172745",
+        status="200",
+        digest="sha1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        urlkey="org,example)/groups",
+    )
+    body = b"<html>groups</html>"
+    clients: list[object] = []
+
+    def client_factory():
+        client = found_capture_client(
+            "http://example.org/groups/", "20041009202542", body
+        )
+        clients.append(client)
+        return client
+
+    cdx_body = cdx_json(
+        [
+            [
+                identity.urlkey,
+                identity.timestamp,
+                identity.original_url,
+                "text/html",
+                "200",
+                identity.payload_digest.split(":")[1],
+                "100",
+            ]
+        ]
+    )
+    original, cdx_mod, fetch_mod = patch_cdx(cdx_body)
+    try:
+        result = run_fetch(
+            FetchSettings(
+                url_pattern="http://example.org/",
+                date_start="20041009172745",
+                date_end="20041009172745",
+                archives_root=tmp_path,
+            ),
+            client_factory=client_factory,
+            sleep=lambda _s: None,
+        )
+    finally:
+        cdx_mod.fetch_year_cdx = original
+        fetch_mod.fetch_year_cdx = original
+
+    assert result.exit_code == 0
+    assert result.metrics.downloads == 1
+    assert result.metrics.digest_mismatch_accepted == 1
+    assert sum(getattr(client, "calls", 0) for client in clients) == 2
+    warc = list_collection_warcs(layout, "2004")[0]
+    with warc.open("rb") as stream:
+        stored = None
+        for record in ArchiveIterator(stream):
+            if record.rec_type == "response":
+                assert record.rec_headers.get_header("WARC-Target-URI") == (
+                    identity.original_url
+                )
+                assert record.rec_headers.get_header("WARC-Date") == (
+                    "2004-10-09T17:27:45Z"
+                )
+                assert record.rec_headers.get_header(CDX_DIGEST_MATCH_HEADER) == (
+                    "false"
+                )
+                stored = record.content_stream().read()
+            else:
+                record.raw_stream.read()
+    assert stored == body
+    inv = inventory_collection(layout, "2004")
+    assert inv.contains(identity)
+
+
+def test_slash_redirect_from_cdx_skips_playback_and_revisits(tmp_path):
+    layout = archive_layout("http://example.org/", tmp_path)
+    ensure_collection_dirs(layout)
+    digest = "TV7A2C32YG3CFKH2CYRHAL2D4UPH7RCE"
+    empty_dig = payload_digest(b"").split(":")[1]
+    downloads: list[str] = []
+
+    def download_fn(_client, identity):
+        downloads.append(identity.timestamp)
+        return playback(identity)
+
+    body = cdx_json(
+        [
+            [
+                "org,example)/conference",
+                "20040303170500",
+                "http://example.org/conference",
+                "text/html",
+                "301",
+                digest,
+                "379",
+            ],
+            [
+                "org,example)/conference",
+                "20040303180000",
+                "http://example.org/conference/",
+                "text/html",
+                "200",
+                empty_dig,
+                "0",
+            ],
+            [
+                "org,example)/conference",
+                "20040516142118",
+                "http://example.org/conference",
+                "text/html",
+                "301",
+                digest,
+                "377",
+            ],
+        ]
+    )
+    original, cdx_mod, fetch_mod = patch_cdx(body)
+    try:
+        result = run_fetch(
+            FetchSettings(
+                url_pattern="http://example.org/",
+                date_start="20040303170500",
+                date_end="20040516142118",
+                archives_root=tmp_path,
+            ),
+            client_factory=lambda: MagicMock(),
+            download_fn=download_fn,
+            sleep=lambda _s: None,
+        )
+    finally:
+        cdx_mod.fetch_year_cdx = original
+        fetch_mod.fetch_year_cdx = original
+
+    assert result.exit_code == 0
+    assert downloads == []
+    assert result.metrics.downloads == 0
+    assert result.metrics.payload_reuses == 2
+    assert result.metrics.revisits == 1
+    warc = list_collection_warcs(layout, "2004")[0]
+    with warc.open("rb") as stream:
+        records = list(ArchiveIterator(stream))
+    responses = [rec for rec in records if rec.rec_type == "response"]
+    revisits = [rec for rec in records if rec.rec_type == "revisit"]
+    assert len(responses) == 2
+    assert len(revisits) == 1
+    redirect = next(
+        rec for rec in responses if rec.http_headers.get_statuscode() == "301"
+    )
+    assert redirect.http_headers.get_header("Location") == (
+        "http://example.org/conference/"
+    )
+
+
+def test_same_year_representative_revisits_include_redirects(tmp_path):
+    """Same urlkey+digest+status revisits, including empty 301s; 302 stays distinct."""
+
     layout = archive_layout("http://example.org/", tmp_path)
     ensure_collection_dirs(layout)
     shared_body = b"shared"
     dig = payload_digest(shared_body).split(":")[1]
     a_ts = "20040601000000"
     b_ts = "20040602000000"
-    redir_ts = "20040603000000"
-    downloads: list[str] = []
+    redir_301_a = "20040603000000"
+    redir_301_b = "20040604000000"
+    redir_302 = "20040605000000"
+    downloads: list[tuple[str, str]] = []
 
     def download_fn(_client, identity):
-        downloads.append(identity.timestamp)
-        if identity.status_token == "302":
-            return playback(identity, body=b"", status=302)
+        downloads.append((identity.timestamp, identity.status_token))
+        if identity.status_token in {"301", "302"}:
+            return playback(
+                identity, body=b"", status=int(identity.status_token)
+            )
         return playback(identity, body=shared_body, status=200)
 
     empty_dig = payload_digest(b"").split(":")[1]
@@ -207,10 +465,104 @@ def test_same_year_representative_revisits_and_redirects_individual(tmp_path):
             ],
             [
                 "com,example)/thecase",
-                redir_ts,
+                redir_301_a,
+                "http://example.org/thecase",
+                "text/html",
+                "301",
+                empty_dig,
+                "0",
+            ],
+            [
+                "com,example)/thecase",
+                redir_301_b,
+                "http://example.org/thecase",
+                "text/html",
+                "301",
+                empty_dig,
+                "0",
+            ],
+            [
+                "com,example)/thecase",
+                redir_302,
                 "http://example.org/thecase",
                 "text/html",
                 "302",
+                empty_dig,
+                "0",
+            ],
+        ]
+    )
+    original, cdx_mod, fetch_mod = patch_cdx(body)
+    try:
+        result = run_fetch(
+            FetchSettings(
+                url_pattern="http://example.org/",
+                date_start="20040601000000",
+                date_end="20040605000000",
+                archives_root=tmp_path,
+            ),
+            client_factory=lambda: MagicMock(),
+            download_fn=download_fn,
+            sleep=lambda _s: None,
+        )
+    finally:
+        cdx_mod.fetch_year_cdx = original
+        fetch_mod.fetch_year_cdx = original
+
+    assert result.exit_code == 0
+    assert set(downloads) == {
+        (a_ts, "200"),
+        (redir_301_a, "301"),
+        (redir_302, "302"),
+    }
+    assert result.metrics.downloads == 3
+    assert result.metrics.revisits == 2
+    warc = list_collection_warcs(layout, "2004")[0]
+    types = []
+    with warc.open("rb") as stream:
+        for record in ArchiveIterator(stream):
+            types.append(record.rec_type)
+            record.raw_stream.read()
+    assert types.count("response") == 3
+    assert types.count("revisit") == 2
+
+
+def test_empty_http_200_skips_playback_and_revisits(tmp_path):
+    layout = archive_layout("http://example.org/", tmp_path)
+    ensure_collection_dirs(layout)
+    empty_dig = payload_digest(b"").split(":")[1]
+    downloads: list[str] = []
+
+    def download_fn(_client, identity):
+        downloads.append(identity.timestamp)
+        return playback(identity, body=b"", status=int(identity.status_token))
+
+    body = cdx_json(
+        [
+            [
+                "com,example)/",
+                "20040601000000",
+                "http://example.org/",
+                "text/html",
+                "200",
+                empty_dig,
+                "0",
+            ],
+            [
+                "com,example)/",
+                "20040602000000",
+                "http://example.org/",
+                "text/html",
+                "200",
+                empty_dig,
+                "0",
+            ],
+            [
+                "com,example)/gone",
+                "20040603000000",
+                "http://example.org/gone",
+                "text/html",
+                "301",
                 empty_dig,
                 "0",
             ],
@@ -234,15 +586,24 @@ def test_same_year_representative_revisits_and_redirects_individual(tmp_path):
         fetch_mod.fetch_year_cdx = original
 
     assert result.exit_code == 0
-    assert downloads == [a_ts, redir_ts]
+    assert downloads == ["20040603000000"]
+    assert result.metrics.downloads == 1
+    assert result.metrics.payload_reuses == 1
+    assert result.metrics.revisits == 1
     warc = list_collection_warcs(layout, "2004")[0]
     types = []
+    empty_responses = 0
     with warc.open("rb") as stream:
         for record in ArchiveIterator(stream):
             types.append(record.rec_type)
-            record.raw_stream.read()
+            if record.rec_type == "response" and record.content_stream().read() == b"":
+                empty_responses += 1
+                assert record.http_headers.get_header("Content-Length") == "0"
+            else:
+                record.raw_stream.read()
     assert types.count("response") == 2
     assert types.count("revisit") == 1
+    assert empty_responses == 2
 
 
 def test_matching_payloads_download_once_per_year(tmp_path):
@@ -325,7 +686,10 @@ def test_matching_payloads_download_once_per_year(tmp_path):
 
     inv = inventory_collection(layout, "2005")
     stored = inv.lookup_representative(
-        "com,example)/", payload_digest(body), not_after_timestamp="20050601000000"
+        "com,example)/",
+        payload_digest(body),
+        "200",
+        not_after_timestamp="20050601000000",
     )
     assert stored is not None
     assert stored.identity.timestamp == "20050601000000"
@@ -888,12 +1252,9 @@ def test_representative_failure_promotes_next_same_key_candidate(tmp_path):
 
     # First fails permanently, second downloads as promoted representative,
     # third becomes a revisit.
-    assert downloads == [
-        "20040601000000",
-        "20040601000000",
-        "20040601000000",
-        "20040602000000",
-    ]
+    assert downloads == (
+        ["20040601000000"] * MAX_PLAYBACK_ATTEMPTS + ["20040602000000"]
+    )
     assert result.metrics.downloads == 1
     assert result.metrics.revisits == 1
     assert any(f.identity.timestamp == "20040601000000" for f in result.failures)
@@ -1248,3 +1609,116 @@ def test_legacy_layout_rejects_all_artifacts(tmp_path, legacy_name):
             ),
             client_factory=lambda: MagicMock(),
         )
+
+
+def test_interrupt_finalizes_partial_without_run_json(tmp_path, monkeypatch):
+    import archive_magic_fetch.fetch as fetch_mod
+    import archive_magic_fetch.resolution as resolution_mod
+    import archive_magic_fetch.workers as workers_mod
+
+    monkeypatch.setattr(fetch_mod, "PLAYBACK_WORKERS", 1)
+    monkeypatch.setattr(resolution_mod, "PLAYBACK_WORKERS", 1)
+    monkeypatch.setattr(workers_mod, "PLAYBACK_WORKERS", 1)
+    layout = archive_layout("http://example.org/", tmp_path)
+    ensure_collection_dirs(layout)
+    first = make_capt(url="http://example.org/a", ts="20040601000000")
+    second = make_capt(
+        url="http://example.org/b",
+        ts="20040602000000",
+        digest="sha1:" + "B" * 32,
+        urlkey="org,example)/b",
+    )
+    downloaded: list[str] = []
+
+    def download_fn(_client, identity):
+        downloaded.append(identity.original_url)
+        return playback(identity)
+
+    interrupt_once = {"armed": True}
+    real_log = fetch_mod._log_url_outcome
+
+    def log_then_interrupt(*args, **kwargs):
+        real_log(*args, **kwargs)
+        if interrupt_once["armed"]:
+            interrupt_once["armed"] = False
+            raise KeyboardInterrupt()
+
+    monkeypatch.setattr(fetch_mod, "_log_url_outcome", log_then_interrupt)
+
+    body = cdx_json(
+        [
+            [
+                first.urlkey,
+                first.timestamp,
+                first.original_url,
+                "text/html",
+                "200",
+                first.payload_digest.split(":")[1],
+                "5",
+            ],
+            [
+                second.urlkey,
+                second.timestamp,
+                second.original_url,
+                "text/html",
+                "200",
+                second.payload_digest.split(":")[1],
+                "5",
+            ],
+        ]
+    )
+    original, cdx_mod, fetch_mod_patched = patch_cdx(body)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            run_fetch(
+                FetchSettings(
+                    url_pattern="http://example.org/",
+                    date_start="20040601000000",
+                    date_end="20040602000000",
+                    archives_root=tmp_path,
+                ),
+                client_factory=lambda: MagicMock(),
+                download_fn=download_fn,
+                sleep=lambda _s: None,
+            )
+    finally:
+        cdx_mod.fetch_year_cdx = original
+        fetch_mod_patched.fetch_year_cdx = original
+
+    assert downloaded == [first.original_url]
+    warcs = list_collection_warcs(layout, "2004")
+    assert [path.name for path in warcs] == ["example.org-2004-001.warc.gz"]
+    assert layout.collection_index("2004").is_file()
+    assert inventory_collection(layout, "2004").contains(first)
+    assert not any(
+        (path / "run.json").is_file()
+        for path in (layout.capture_dir("2004") / "runs").iterdir()
+    )
+    assert not layout.collection_warc_partial_path("2004", 1).exists()
+
+    downloaded.clear()
+    original, cdx_mod, fetch_mod_patched = patch_cdx(body)
+    try:
+        result = run_fetch(
+            FetchSettings(
+                url_pattern="http://example.org/",
+                date_start="20040601000000",
+                date_end="20040602000000",
+                archives_root=tmp_path,
+            ),
+            client_factory=lambda: MagicMock(),
+            download_fn=download_fn,
+            sleep=lambda _s: None,
+        )
+    finally:
+        cdx_mod.fetch_year_cdx = original
+        fetch_mod_patched.fetch_year_cdx = original
+
+    assert result.exit_code == 0
+    assert downloaded == [second.original_url]
+    assert [path.name for path in list_collection_warcs(layout, "2004")] == [
+        "example.org-2004-001.warc.gz"
+    ]
+    inv = inventory_collection(layout, "2004")
+    assert inv.contains(first)
+    assert inv.contains(second)

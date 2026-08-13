@@ -16,13 +16,13 @@ from archive_magic_fetch.index import (
     publish_collection_index,
     validate_cdxj_against_warcs,
 )
-from archive_magic_fetch.warc import (
-    CollectionWarcWriter,
+from archive_magic_fetch.inventory import (
     StoredResponse,
     inventory_collection,
-    payload_digest,
     revisit_from_stored,
 )
+from archive_magic_fetch.playback import payload_digest
+from archive_magic_fetch.warc import CollectionWarcWriter
 from helpers import make_capt, playback
 
 
@@ -264,3 +264,16 @@ def test_reset_collection_data_deletes_warc_and_cdxj(tmp_path):
 
     assert list_collection_warcs(layout, "2004") == []
     assert not index_path.is_file()
+
+
+def test_reset_collection_data_deletes_visible_partials(tmp_path):
+    layout = archive_layout("http://example.org/", tmp_path)
+    ensure_collection_dirs(layout)
+    collection_dir = layout.collection_dir("2004")
+    collection_dir.mkdir(parents=True)
+    partial = layout.collection_warc_partial_path("2004", 1)
+    partial.write_bytes(b"in-progress")
+
+    reset_collection_data(layout, "2004")
+
+    assert not partial.exists()
