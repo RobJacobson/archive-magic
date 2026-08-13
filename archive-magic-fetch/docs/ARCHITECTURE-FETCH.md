@@ -20,7 +20,7 @@ immutable run record. Unexpected exceptions return nonzero.
 ├── collections/
 │   └── 2004/
 │       ├── example.org-2004-001.warc.gz
-│       ├── example.org-2004-002.warc.gz
+│       ├── example.org-2004-001.warc.gz.partial
 │       └── example.org-2004-index.cdxj
 └── captures/
     └── 2004/
@@ -45,15 +45,25 @@ Years are selected serially in ascending order. For each selected year Fetch:
 
 1. Creates `captures/<year>/runs/<run-id>/` and durably saves every raw CDX HTTP
    entity as `page-NNN.cdx.gz` before parsing it.
-2. Parses, validates, de-duplicates exact CDX rows, and orders them by timestamp.
+2. Parses, validates, de-duplicates exact CDX rows, orders them by timestamp,
+   and groups them by URL key.
 3. Inventories only finalized WARCs in `collections/<year>/`.
-4. Skips identities already represented; writes a same-collection revisit when
-   an earlier matched response has the same URL key and valid CDX digest; copies
-   an eligible payload with the same IA digest from an earlier collection into
-   a new full response; otherwise attempts exact playback and records any
-   failure for this run.
-5. Finalizes size-bounded WARC shards, builds and validates the collection CDXJ,
-   and atomically publishes it.
+4. Resolves URL groups through bounded playback workers. Fully represented
+   groups stay on the main thread so they do not occupy workers. Each group
+   remains chronological: represented identities are skipped, an earlier matched
+   response with the same URL key, valid CDX digest, and CDX status becomes a
+   revisit, HTTP 200 captures whose CDX digest is the empty payload are
+   materialized locally, and an eligible earlier-collection HTTP 200 payload is
+   copied into a new full response. A CDX 301/302 whose URL group already lists
+   this URL plus a trailing slash is stored as that slash redirect without
+   playback. Other captures use exact playback. When exact `id_` playback of a
+   CDX 301/302 is a Wayback `found capture at …` 302 whose Location is this URL
+   plus a trailing slash, Fetch stores a redirect with that `Location` instead
+   of following the nearby capture. Other `found capture at …` substitutions
+   are fetched once and stored under the CDX identity as inexact keeps.
+5. Finalizes the current shard in `collections/<year>/` (continuing the last
+   shard when it is under the 1 GB cap), rebuilds the collection CDXJ from every
+   finalized WARC, and atomically publishes it.
 6. Atomically publishes `run.json` last. Its presence marks normal completion
    for that collection's slice of the invocation.
 
@@ -70,19 +80,27 @@ Run records are immutable history; Fetch does not carry failures forward.
 
 Finalized WARCs are the recovery source of truth. On a rerun, Fetch requeries
 CDX, inventories existing WARCs, skips represented identities, and retries
-missing captures. Startup reconciliation rebuilds a collection index when a
-crash finalized a WARC before publishing its index.
+missing captures. In-progress shards are written as visible
+`*.warc.gz.partial` siblings in `collections/<year>/`. Startup salvage truncates
+a torn last gzip member and promotes a usable partial to its finalized name.
+Ctrl-C and unexpected failures finalize the open shard and rebuild CDXJ, but
+they do not write `run.json`. A collection directory without a replay index is
+not playable; Navigator skips it.
+
+The last shard is continued when it is under 1 GB compressed. A new sequence
+starts only when that cap is reached. Collection CDXJ is always rebuilt from
+the finalized WARCs; offsets are not preserved across publication.
 
 WARC shards target 1 GB compressed and use sequences `001` through `999`.
-A shard is written to an exclusive temporary path beneath `captures/.work/`,
-closed, validated, and atomically moved into its portable collection.
+A shard is written to `collections/<year>/<archive>-<year>-NNN.warc.gz.partial`,
+closed, validated, and atomically renamed into its portable collection name.
 
 Capture identity preserves URL key, original URL, raw timestamp, raw CDX status,
 and raw CDX digest. Revisit reuse is collection-local and same-URL only, keyed by
-`(urlkey, valid CDX digest)`. Payload reuse across collections is keyed only by
-the valid IA digest and writes a new full response into the current collection.
-Revisits may cross WARC shards inside a collection but never cross collection
-boundaries or point forward in time.
+`(urlkey, valid CDX digest, CDX status)`. Payload reuse across collections is
+keyed only by the valid IA digest, is limited to HTTP 200, and writes a new full
+response into the current collection. Revisits may cross WARC shards inside a
+collection but never cross collection boundaries or point forward in time.
 
 Collection index validation requires every locator to be a basename naming one
 of that collection's immutable WARCs, every byte range to be in bounds, and
@@ -95,16 +113,50 @@ no migration or dual-layout compatibility layer.
 
 ## Network policy
 
-Playback uses one persistent client and one request at a time. Transport
-failures, HTTP 5xx, and HTTP 429 receive at most three total attempts with retry
-delays of 5 and 10 seconds unless `Retry-After` specifies a positive delay.
-Exact mismatches, blocked captures, unusable bodies, truncated stored payloads,
-and other permanent failures continue immediately.
+Playback uses `PLAYBACK_WORKERS` persistent worker clients. One shared gate
+smoothly limits starts to `PLAYBACK_STARTS_PER_SECOND`; retries pass through the
+same gate. Transport failures and HTTP 5xx receive at most three total attempts
+with retry delays of 5 and 10 seconds.
 
-Redirects, non-200 responses, captures without a numeric CDX status, and
-captures without valid CDX digests download individually. Fetch requests exact
-timestamps and URLs, uses original/raw playback, never follows historical
-redirects, and never substitutes a nearest capture.
+HTTP 429 and refused TCP connections are both treated as IA backpressure. They
+pause all new starts: 429 honors `Retry-After` or defaults to
+`BACKPRESSURE_COOLDOWN_S`, while TCP refusal uses that default. Concurrent
+signals retain the largest observed delay and extend the shared monotonic
+deadline. Exact mismatches, blocked captures, unusable bodies, truncated stored
+payloads, and other permanent failures continue immediately.
+
+Workers return completed URL groups without printing or mutating collection
+state. URL groups that need no Wayback GET (fully represented, empty HTTP 200
+payloads, or slash-normalizing redirects already listed in the same CDX group)
+are resolved on the main thread and never queued on playback workers. After a
+download group finishes, those local-only groups are yielded and printed before
+the next Wayback GET is submitted, so skip tables are not held behind the
+following playback. The main thread writes each group to WARC and then prints
+one contiguous URL table with ISO-formatted capture timestamps linked to exact
+``id_`` Wayback playback and the final six characters of each CDX payload
+digest.
+
+Captures without a valid CDX digest download individually. An earlier
+digest-matched response with the same URL key, digest, and CDX status becomes a
+revisit, including empty-bodied 301/302 captures. A 301 does not stand in for a
+302 or a statusless row. Revisit records omit HTTP headers; pywb fills them from
+the referred response, so later redirects inherit that capture's `Location`.
+HTTP 200 captures whose CDX digest is the SHA-1 of zero bytes are materialized
+locally (`Content-Type` from CDX MIME, `Content-Length: 0`) without playback.
+Redirects with that digest still download once so `Location` is captured, unless
+the same URL group already lists this URL plus a trailing slash. In that case
+Fetch writes the slash redirect locally (`Location`, empty body) and does not
+ask Wayback. If exact playback of a CDX 301/302 cannot be played and Wayback
+instead returns a live 302 with `X-Archive-Redirect-Reason: found capture at …`
+pointing at this URL plus a trailing slash, Fetch reconstructs that redirect
+locally and does not store the nearby capture. Other `found capture at …` 302s
+are followed once: Fetch stores the nearby memento under the CDX identity
+(WARC-Date and WARC-Target-URI stay the requested capture; WARC-Source-URI is
+the memento actually fetched). URL, timestamp, status, or digest may disagree;
+digest mismatches do not seed revisits. Fetch uses original/raw playback and
+never follows historical redirects of an archived page.
+Cross-year payload reuse stays HTTP 200 only. Unusable playback means IA
+`Invalid URI` stubs and empty bodies that contradict a non-empty CDX digest.
 
 ## Digest domains and payload reuse
 
@@ -124,16 +176,27 @@ correct and newline-adjusted hashes miss each other and may be downloaded more
 than once. This is a safe false negative. Other explicit digest mismatches are
 kept for capture fidelity but never seed revisits or payload reuse.
 
+Same-URL revisits are a separate path from the payload cache. They may include
+redirects and other non-200 statuses because they stay on one URL and one CDX
+status. They inherit HTTP headers (including `Location`) from the representative
+via pywb. HTTP 200 captures whose CDX digest is the SHA-1 of zero bytes skip
+playback entirely: Fetch writes a full response with an empty body and
+synthesized `Content-Type` / `Content-Length`, then later same-key captures
+become revisits. A 301/302 whose URL group already contains this URL plus a
+trailing slash is the same kind of local materialization: Fetch writes
+`Location` and an empty body without asking Wayback.
+
 The payload cache is an in-memory, rebuildable acquisition accelerator derived
 from finalized CDXJ locators. Its keys intentionally omit URL. Reuse is limited
 to HTTP 200 captures because a payload digest says nothing about status-specific
-metadata such as `Location` or `Content-Range`. A hit range-reads and validates
-the earlier full response, verifies that its WARC timestamp matches the CDXJ
-timestamp and is not later than the current capture, then writes a new full
-response with the current capture identity, status, and CDX MIME. Only
-`Content-Type` and a recomputed `Content-Length` are synthesized; headers from
-the representative capture are not copied across captures. This makes each
-yearly collection independently replayable without attributing another
+metadata such as `Location` or `Content-Range`. An empty-body digest therefore
+cannot attach another capture's redirect metadata to a different URL. A hit
+range-reads and validates the earlier full response, verifies that its WARC
+timestamp matches the CDXJ timestamp and is not later than the current capture,
+then writes a new full response with the current capture identity, status, and
+CDX MIME. Only `Content-Type` and a recomputed `Content-Length` are synthesized;
+headers from the representative capture are not copied across captures. This
+makes each yearly collection independently replayable without attributing another
 capture's cookies, security policy, or other HTTP metadata to the current one.
 Missing, corrupt, future, or invalid candidates are ordinary cache misses and
 fall back to exact playback. CDXJs without the explicit `cdxDigest` and
@@ -156,13 +219,13 @@ rewriting paths.
 | Capture timestamp | **Pass-through** — CDX timestamp → `WARC-Date` |
 | HTTP status | **Pass-through** — exact playback must match CDX status; retained as `CDX-Status` |
 | CDX urlkey / digest | **Pass-through** — stored on the WARC as `CDX-Urlkey` / `CDX-Payload-Digest` |
-| Payload body | **Pass-through** of exact `id_` entity bytes (after false-gzip repair when IA mis-labels encoding) |
+| Payload body | **Pass-through** of exact `id_` entity bytes (after false-gzip repair when IA mis-labels encoding). HTTP 200 with the empty CDX digest is synthesized as zero bytes without playback. CDX 301/302 rows that Wayback will not play exactly, substituting a nearby trailing-slash capture, are stored as an empty redirect with reconstructed `Location` |
 | HTTP entity headers | **Modified** — drop representation headers (`Content-Encoding`, `Transfer-Encoding`, `ETag`, payload digests, etc.) and rewrite `Content-Length` so headers describe the stored body; keep `Content-Range` for HTTP 206 |
 | Status reason / protocol line | **Derived** — synthesized (`200 OK`, `HTTP/1.1`); not taken from the archived reason phrase |
-| Failed / unplayable CDX rows | **Omitted** — recorded in `run.json`; nothing written to WARC/CDXJ |
-| Digest match | **Exact or soft** — exact body SHA-1, or early-IA quirk where CDX hashed `body + "\n"` while `id_` returns `body`; soft matches still store exact playback bytes and can seed revisits and payload reuse |
+| Failed / unplayable CDX rows | **Omitted** — recorded in `run.json`; nothing written to WARC/CDXJ. Includes IA `Invalid URI` stubs and empty playback that contradicts a non-empty CDX digest |
+| Digest match | **Exact or soft** — exact body SHA-1, or early-IA quirk where CDX hashed `body + "\n"` while `id_` returns `body`; soft matches still store exact playback bytes and can seed revisits and payload reuse. HTTP 200 with the empty CDX digest is materialized locally without playback |
 | Digest mismatch | **Kept** — body stored; `WARC-Payload-Digest` is of actual bytes; IA digest preserved; `CDX-Digest-Match: false`; cannot seed revisits or payload reuse |
-| Same-urlkey revisits | **Derived** — collection-local identical-payload revisits; not IA's revisit graph |
+| Same-urlkey revisits | **Derived** — collection-local identical-payload revisits keyed by URL key, CDX digest, and CDX status (including redirects); not IA's revisit graph. Revisit records omit HTTP headers, so pywb inherits `Location` from the representative |
 | Cross-year payload reuse | **Derived** — digest-only IA lookup for HTTP 200 captures; the cached body, current CDX MIME, and recomputed length become a new full response in the current year |
 | Year collections | **Derived** — calendar-year partition; revisits do not cross years and every year retains a full copy of reused payload data |
 | Collection CDXJ | **Derived** — indexed from finalized WARCs (`url`, `status`, `mime`, local/IA digests, offsets); not a copy of IA CDX |

@@ -214,9 +214,11 @@ timeline without requiring a merged root index. Globally unique
 Before starting pywb, Navigator validates without changing the archive:
 
 1. The archives root, selected domain, its `collections/` directory, and every
-   portable collection resolve as contained directories.
-2. At least one portable collection exists.
-3. Each collection contains exactly its expected
+   playable collection resolve as contained directories.
+2. At least one portable collection with a replay index exists. Collection
+   directories that have no `<domain>-<collection>-index.cdxj` (including years
+   that only contain a `*.warc.gz.partial`) are skipped as not yet playable.
+3. Each playable collection contains exactly its expected
    `<domain>-<collection>-index.cdxj` and no additional CDX/CDXJ files.
 4. Each index is a readable, nonempty, sorted UTF-8 CDXJ file.
 5. Every record has `filename`, `offset`, and `length`; ranges accept unsigned

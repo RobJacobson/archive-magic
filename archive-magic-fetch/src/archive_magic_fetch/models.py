@@ -18,7 +18,10 @@ from surt import surt
 
 DEFAULT_OUTPUT_ROOT = Path("../archives")
 WARC_TARGET_BYTES = 1_000_000_000
-MAX_PLAYBACK_ATTEMPTS = 3
+PLAYBACK_WORKERS = 1
+PLAYBACK_STARTS_PER_SECOND = 100.0
+BACKPRESSURE_COOLDOWN_S = 60.0
+MAX_PLAYBACK_ATTEMPTS = 5
 CDX_PAGE_LIMIT = 10_000
 DEFAULT_DATE_START = "19950101000000"
 RUN_SCHEMA_VERSION = 2
@@ -55,6 +58,10 @@ class FailureCategory(str, Enum):
 # SHA-1 (CDX base32) of the literal IA playback stub body ``Invalid URI``.
 # Captures whose CDX digest equals this are skipped without downloading.
 INVALID_URI_PAYLOAD_DIGEST = "sha1:L4XNRRGWXWKNIAJFQOC6D2OULYFIDDTC"
+
+# SHA-1 (CDX base32) of zero bytes. HTTP 200 captures with this digest are
+# materialized locally; 3xx captures still download once for ``Location``.
+EMPTY_PAYLOAD_DIGEST = "sha1:3I42H3S6NNFQ2MSVX7XZKYAYSCX5QBYJ"
 
 
 @dataclass(frozen=True, order=True)
@@ -102,6 +109,8 @@ class PlaybackResult:
     served imperfect bytes; ``digest_matched`` records whether those agreed
     (exact body, or early-IA ``body + \"\\n\"`` soft match). Mismatched
     payloads are retained for this capture only and never seed revisit reuse.
+    ``substituted`` is true when the body came from a Wayback
+    ``found capture at …`` memento rather than exact ``id_`` playback.
     """
 
     identity: CaptureIdentity
@@ -112,6 +121,7 @@ class PlaybackResult:
     source_uri: str
     warc_payload_digest: str
     digest_matched: bool = True
+    substituted: bool = False
 
 
 @dataclass(frozen=True)
@@ -246,14 +256,20 @@ def is_invalid_uri_payload_digest(digest: object) -> bool:
     return normalize_payload_digest(digest) == INVALID_URI_PAYLOAD_DIGEST
 
 
+def is_empty_payload_digest(digest: object) -> bool:
+    """True when CDX digest is the SHA-1 of an empty payload."""
+
+    return normalize_payload_digest(digest) == EMPTY_PAYLOAD_DIGEST
+
+
 def wayback_url(timestamp: str, original_url: str) -> str:
-    """Return the Wayback Machine calendar URL for one capture.
+    """Return the exact original/raw Wayback playback URL for one capture.
 
     Example:
-    ``https://web.archive.org/web/20080503130635/http://example.org/page``
+    ``https://web.archive.org/web/20080503130635id_/http://example.org/page``
     """
 
-    return f"https://web.archive.org/web/{timestamp}/{original_url}"
+    return f"https://web.archive.org/web/{timestamp}id_/{original_url}"
 
 
 def normalize_original_url(url: str) -> str:
@@ -387,6 +403,20 @@ def is_redirect_status_token(token: str) -> bool:
         return False
     code = int(token)
     return 300 <= code < 400
+
+
+def revisit_group_key(
+    identity: CaptureIdentity,
+) -> tuple[str, str, str] | None:
+    """Return ``(urlkey, IA digest, status)`` when this capture can share a payload.
+
+    Same-URL revisits require a valid CDX digest. Status is part of the key so
+    a 301 does not stand in for a 302 or a statusless row.
+    """
+
+    if identity.payload_digest == MISSING_CDX_PAYLOAD_DIGEST:
+        return None
+    return (identity.urlkey, identity.payload_digest, identity.status_token)
 
 
 def make_identity(

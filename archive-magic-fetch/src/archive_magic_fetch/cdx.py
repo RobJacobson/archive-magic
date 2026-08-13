@@ -162,9 +162,14 @@ def repair_false_gzip_content_encoding(response: requests.Response) -> None:
 
 
 def make_client() -> WaybackClient:
-    """Return the persistent client used for serial playback."""
+    """Return a playback client paced by Archive Magic's shared gate."""
 
-    return WaybackClient(session=ArchiveMagicWaybackSession(user_agent=USER_AGENT))
+    return WaybackClient(
+        session=ArchiveMagicWaybackSession(
+            user_agent=USER_AGENT,
+            memento_calls_per_second=0,
+        )
+    )
 
 
 def make_cdx_session() -> ArchiveMagicWaybackSession:

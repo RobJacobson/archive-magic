@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Sequence
 
 from cdxj_indexer.main import CDXJIndexer
 from warcio.archiveiterator import ArchiveIterator
@@ -71,15 +71,15 @@ def index_warc_fragment(
 ) -> Path:
     """Build a sorted temporary CDXJ fragment for one finalized WARC."""
 
-    work = layout.work_root
-    work.mkdir(parents=True, exist_ok=True)
-    tmp = exclusive_temp_path(work, suffix=".fragment.cdxj")
+    collection_dir = warc_path.parent
+    collection_dir.mkdir(parents=True, exist_ok=True)
+    tmp = exclusive_temp_path(collection_dir, suffix=".fragment.cdxj.tmp")
     ArchiveMagicCDXJIndexer(
         output=str(tmp),
         inputs=[str(warc_path)],
         sort=True,
         records="response,revisit",
-        dir_root=str(warc_path.parent),
+        dir_root=str(collection_dir),
     ).process_all()
     return tmp
 
@@ -128,50 +128,38 @@ def publish_collection_index(
     layout: ArchiveLayout,
     collection_id: str,
 ) -> Optional[IndexArtifact]:
-    """Index missing WARCs, merge the portable collection CDXJ, and publish.
-
-    Finalized WARC basenames drive incompleteness detection: only shards not
-    already referenced by the on-disk index are fragment-indexed and merged.
-    """
+    """Rebuild the portable collection CDXJ from every finalized WARC."""
 
     collection_id = layout.validate_collection_id(collection_id)
     collection_warcs = list_collection_warcs(layout, collection_id)
     if not collection_warcs:
         return None
 
+    collection_dir = layout.collection_dir(collection_id)
     index_path = layout.collection_index(collection_id)
-    known = cdxj_filenames(index_path)
-    warc_by_name = {path.name: path for path in collection_warcs}
-    missing_names = {name for name in warc_by_name if name not in known}
-
-    fragments: list[Path] = []
+    tmp = exclusive_temp_path(collection_dir, suffix=".cdxj.tmp")
     try:
-        for name in sorted(missing_names):
-            fragments.append(index_warc_fragment(layout, warc_by_name[name]))
-
-        inputs: list[Path] = []
-        if index_path.is_file():
-            inputs.append(index_path)
-        inputs.extend(fragments)
-        lines = merge_cdxj_lines(inputs)
-
+        ArchiveMagicCDXJIndexer(
+            output=str(tmp),
+            inputs=[str(path) for path in collection_warcs],
+            sort=True,
+            records="response,revisit",
+            dir_root=str(collection_dir),
+        ).process_all()
+        lines = [
+            line for line in tmp.read_text(encoding="utf-8").splitlines() if line
+        ]
         validate_cdxj_against_warcs(layout, collection_id, lines)
         validate_collection_revisit_closure(layout, collection_id)
-
-        tmp = exclusive_temp_path(
-            layout.work_root,
-            suffix=f".{collection_id}.cdxj.tmp",
-        )
-        tmp.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
         publish_file_atomically(tmp, index_path)
         return index_artifact_from_path(
             layout,
             index_path,
             capture_count=len(lines),
         )
-    finally:
-        for path in fragments:
-            path.unlink(missing_ok=True)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def validate_cdxj_against_warcs(
@@ -294,7 +282,7 @@ def validate_collection_revisit_closure(
 
 
 def reconcile_missing_indexes(layout: ArchiveLayout) -> list[str]:
-    """Index finalized WARCs missing from portable collection indexes."""
+    """Rebuild portable indexes that are missing or older than their WARCs."""
 
     updated: list[str] = []
     if not layout.collections_root.is_dir():
@@ -303,10 +291,24 @@ def reconcile_missing_indexes(layout: ArchiveLayout) -> list[str]:
         if not collection_dir.is_dir():
             continue
         collection_id = layout.validate_collection_id(collection_dir.name)
-        index = layout.collection_index(collection_id)
-        known = cdxj_filenames(index)
-        warcs = list_collection_warcs(layout, collection_id)
-        if any(w.name not in known for w in warcs):
+        if _collection_index_is_stale(layout, collection_id):
             publish_collection_index(layout, collection_id)
             updated.append(collection_id)
     return updated
+
+
+def _collection_index_is_stale(
+    layout: ArchiveLayout, collection_id: str
+) -> bool:
+    warcs = list_collection_warcs(layout, collection_id)
+    if not warcs:
+        return False
+    index = layout.collection_index(collection_id)
+    if not index.is_file():
+        return True
+    known = cdxj_filenames(index)
+    names = {path.name for path in warcs}
+    if known != names:
+        return True
+    index_mtime = index.stat().st_mtime_ns
+    return any(path.stat().st_mtime_ns > index_mtime for path in warcs)
