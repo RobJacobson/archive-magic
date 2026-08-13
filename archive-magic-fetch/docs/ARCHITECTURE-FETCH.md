@@ -5,6 +5,17 @@ CDXJ indexes from Internet Archive history for one domain pattern. The current
 CLI partitions captures by UTC calendar year, but collection publication is
 identified by a generic filesystem-safe collection ID.
 
+## Module ownership
+
+Policy constants and data models are isolated in `policy.py` and `models.py`;
+capture normalization lives in `identity.py`. `cdx.py` owns CDX acquisition,
+while `playback.py` owns Wayback sessions and playback interpretation.
+`inventory.py` derives local and cross-collection reuse state, `workers.py`
+owns pacing and retries, and `resolution.py` applies chronological capture
+selection without mutating collection state. `warc.py` owns only WARC record
+construction, validation, salvage, and shard publication. `fetch.py` coordinates
+startup recovery and serial per-year publication on the main writer thread.
+
 ## Command and output
 
 ```text
@@ -115,8 +126,8 @@ no migration or dual-layout compatibility layer.
 
 Playback uses `PLAYBACK_WORKERS` persistent worker clients. One shared gate
 smoothly limits starts to `PLAYBACK_STARTS_PER_SECOND`; retries pass through the
-same gate. Transport failures and HTTP 5xx receive at most three total attempts
-with retry delays of 5 and 10 seconds.
+same gate. Transport failures and HTTP 5xx receive at most
+`MAX_PLAYBACK_ATTEMPTS`, using exponential retry delays.
 
 HTTP 429 and refused TCP connections are both treated as IA backpressure. They
 pause all new starts: 429 honors `Retry-After` or defaults to

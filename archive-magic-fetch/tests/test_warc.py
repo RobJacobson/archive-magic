@@ -13,21 +13,20 @@ from archive_magic_fetch.collection import (
     cleanup_temps,
     ensure_collection_dirs,
     list_collection_warcs,
-    next_collection_warc_sequence,
 )
 from archive_magic_fetch.fetch import FetchSettings, run_fetch
-from archive_magic_fetch.models import (
+from archive_magic_fetch.models import FailureCategory, PlaybackResult
+from archive_magic_fetch.policy import (
     CDX_DIGEST_MATCH_HEADER,
     CDX_URLKEY_HEADER,
-    FailureCategory,
-    PlaybackResult,
 )
-from archive_magic_fetch.warc import (
-    CollectionWarcWriter,
-    classify_playback_error,
+from archive_magic_fetch.inventory import (
     get_warc_identity,
     inventory_collection,
-    payload_digest,
+)
+from archive_magic_fetch.playback import classify_playback_error, payload_digest
+from archive_magic_fetch.warc import (
+    CollectionWarcWriter,
     salvage_collection_partials,
     truncate_incomplete_gzip_warc,
     validate_warc,
@@ -38,11 +37,11 @@ def test_empty_redirect_playback_is_stored_with_location(tmp_path):
     """Historical 3xx captures often have an empty body; still archive them."""
 
     from archive_magic_fetch.collection import archive_layout, ensure_collection_dirs
-    from archive_magic_fetch.warc import (
-        CollectionWarcWriter,
-        download_exact_for_identity,
+    from archive_magic_fetch.playback import (
+        download_exact,
         payload_digest,
     )
+    from archive_magic_fetch.warc import CollectionWarcWriter
     from warcio.archiveiterator import ArchiveIterator
 
     empty_digest = payload_digest(b"")
@@ -53,7 +52,7 @@ def test_empty_redirect_playback_is_stored_with_location(tmp_path):
         digest=empty_digest,
     )
     location = "http://example.org/site/page/the_case"
-    result = download_exact_for_identity(
+    result = download_exact(
         memento_client(identity, b"", headers={"Location": location}),
         identity,
     )
@@ -79,7 +78,7 @@ def test_empty_redirect_playback_is_stored_with_location(tmp_path):
 
 
 def test_slash_redirect_from_cdx_requires_slash_sibling():
-    from archive_magic_fetch.warc import (
+    from archive_magic_fetch.playback import (
         SLASH_REDIRECT_SOURCE_URI,
         slash_redirect_from_cdx,
     )
@@ -131,9 +130,9 @@ def test_slash_redirect_from_cdx_requires_slash_sibling():
 
 
 def test_slash_redirect_substitution_is_reconstructed():
-    from archive_magic_fetch.warc import (
+    from archive_magic_fetch.playback import (
         SLASH_REDIRECT_SOURCE_URI,
-        download_exact_for_identity,
+        download_exact,
     )
 
     identity = make_capt(
@@ -143,7 +142,7 @@ def test_slash_redirect_substitution_is_reconstructed():
         digest="sha1:TV7A2C32YG3CFKH2CYRHAL2D4UPH7RCE",
     )
     client = substitution_client("http://example.org/conference/", "20040510064339")
-    result = download_exact_for_identity(client, identity)
+    result = download_exact(client, identity)
     assert result.status_code == 301
     assert result.body == b""
     assert result.source_uri == SLASH_REDIRECT_SOURCE_URI
@@ -153,7 +152,7 @@ def test_slash_redirect_substitution_is_reconstructed():
 
 
 def test_slash_redirect_substitution_accepts_default_port_and_relative_location():
-    from archive_magic_fetch.warc import download_exact_for_identity
+    from archive_magic_fetch.playback import download_exact
 
     identity = make_capt(
         url="http://example.org/policy/edu",
@@ -175,13 +174,13 @@ def test_slash_redirect_substitution_accepts_default_port_and_relative_location(
             self.session.request("GET", "https://web.archive.org/web/x")
             raise MementoPlaybackError("could not be played")
 
-    result = download_exact_for_identity(Client(), identity)
+    result = download_exact(Client(), identity)
     assert result.status_code == 301
     assert ("Location", "http://example.org/policy/edu/") in result.headers
 
 
 def test_slash_redirect_substitution_rejects_other_paths_and_statuses():
-    from archive_magic_fetch.warc import download_exact_for_identity
+    from archive_magic_fetch.playback import download_exact
 
     redirect_identity = make_capt(
         url="http://example.org/conference",
@@ -216,17 +215,17 @@ def test_slash_redirect_substitution_rejects_other_paths_and_statuses():
         "https://web.archive.org/web/20040510064339id_/http://example.org/elsewhere"
     )
     with pytest.raises(MementoPlaybackError):
-        download_exact_for_identity(other, redirect_identity)
+        download_exact(other, redirect_identity)
 
     as_200 = client_for(
         "https://web.archive.org/web/20040510064339id_/http://example.org/conference/"
     )
     with pytest.raises(MementoPlaybackError):
-        download_exact_for_identity(as_200, ok_identity)
+        download_exact(as_200, ok_identity)
 
 
 def test_found_capture_substitution_is_kept_under_requested_identity():
-    from archive_magic_fetch.warc import download_exact_for_identity
+    from archive_magic_fetch.playback import download_exact
 
     identity = make_capt(
         url="http://example.org/groups/?PHPSESSID=abc",
@@ -240,7 +239,7 @@ def test_found_capture_substitution_is_kept_under_requested_identity():
         "20041009202542",
         body,
     )
-    result = download_exact_for_identity(client, identity)
+    result = download_exact(client, identity)
     assert client.calls == 2
     assert result.substituted is True
     assert result.body == body
@@ -288,7 +287,7 @@ def test_inventory_remembers_redirect_representative_by_status(tmp_path):
 def test_download_exact_accepts_ia_double_encoded_original_url():
     """IA Link rel=original may %25-escape already-encoded query bytes."""
 
-    from archive_magic_fetch.warc import download_exact_for_identity
+    from archive_magic_fetch.playback import download_exact
 
     cdx_url = (
         "http://lideres.nclr.org/groups/index.php?view=browse"
@@ -300,7 +299,7 @@ def test_download_exact_accepts_ia_double_encoded_original_url():
     )
     identity = make_capt(url=cdx_url, ts="20041116040449")
     body = b"<html>ok</html>"
-    result = download_exact_for_identity(
+    result = download_exact(
         memento_client(identity, body, returned_url=link_url),
         identity,
     )
@@ -309,11 +308,11 @@ def test_download_exact_accepts_ia_double_encoded_original_url():
 
 
 def test_download_exact_rejects_different_original_url():
-    from archive_magic_fetch.warc import ExactMismatchError, download_exact_for_identity
+    from archive_magic_fetch.playback import ExactMismatchError, download_exact
 
     identity = make_capt(url="http://example.org/a")
     with pytest.raises(ExactMismatchError, match="URL mismatch"):
-        download_exact_for_identity(
+        download_exact(
             memento_client(
                 identity,
                 b"x",
@@ -323,9 +322,9 @@ def test_download_exact_rejects_different_original_url():
         )
 
 def test_cdx_digest_matches_body_accepts_trailing_newline_soft_match():
-    from archive_magic_fetch.warc import (
+    from archive_magic_fetch.playback import (
         cdx_digest_matches_body,
-        download_exact_for_identity,
+        download_exact,
         payload_digest,
     )
 
@@ -340,7 +339,7 @@ def test_cdx_digest_matches_body_accepts_trailing_newline_soft_match():
     assert cdx_digest_matches_body(None, body) is True
 
     identity = make_capt(digest=soft)
-    result = download_exact_for_identity(
+    result = download_exact(
         memento_client(identity, body), identity
     )
     assert result.digest_matched is True
@@ -359,10 +358,10 @@ def test_trailing_newline_soft_match_seeds_revisit_and_survives_inventory(
     downloads: list[str] = []
 
     def download_fn(_client, identity):
-        from archive_magic_fetch.warc import download_exact_for_identity
+        from archive_magic_fetch.playback import download_exact
 
         downloads.append(identity.timestamp)
-        return download_exact_for_identity(
+        return download_exact(
             memento_client(identity, body), identity
         )
 
@@ -443,22 +442,22 @@ def test_trailing_newline_soft_match_seeds_revisit_and_survives_inventory(
 
 
 def test_empty_non_redirect_playback_is_rejected_when_cdx_digest_is_nonempty():
-    from archive_magic_fetch.warc import (
+    from archive_magic_fetch.playback import (
         UnusablePlaybackError,
-        download_exact_for_identity,
+        download_exact,
     )
 
     identity = make_capt(status="200")
     with pytest.raises(UnusablePlaybackError, match="empty playback body"):
-        download_exact_for_identity(memento_client(identity, b""), identity)
+        download_exact(memento_client(identity, b""), identity)
 
 
 def test_empty_http_200_matching_cdx_digest_is_stored():
-    from archive_magic_fetch.models import EMPTY_PAYLOAD_DIGEST
-    from archive_magic_fetch.warc import download_exact_for_identity
+    from archive_magic_fetch.policy import EMPTY_PAYLOAD_DIGEST
+    from archive_magic_fetch.playback import download_exact
 
     identity = make_capt(status="200", digest=EMPTY_PAYLOAD_DIGEST)
-    result = download_exact_for_identity(memento_client(identity, b""), identity)
+    result = download_exact(memento_client(identity, b""), identity)
     assert result.body == b""
     assert result.status_code == 200
     assert result.digest_matched is True
@@ -466,8 +465,8 @@ def test_empty_http_200_matching_cdx_digest_is_stored():
 
 
 def test_empty_http_200_from_cdx_skips_redirects():
-    from archive_magic_fetch.models import EMPTY_PAYLOAD_DIGEST
-    from archive_magic_fetch.warc import empty_http_200_from_cdx
+    from archive_magic_fetch.policy import EMPTY_PAYLOAD_DIGEST
+    from archive_magic_fetch.playback import empty_http_200_from_cdx
 
     empty_200 = make_capt(status="200", digest=EMPTY_PAYLOAD_DIGEST)
     result = empty_http_200_from_cdx(empty_200, mime="text/html")
@@ -481,15 +480,15 @@ def test_empty_http_200_from_cdx_skips_redirects():
 
 
 def test_invalid_uri_playback_is_always_rejected():
-    from archive_magic_fetch.warc import (
+    from archive_magic_fetch.playback import (
         UnusablePlaybackError,
         classify_playback_error,
-        download_exact_for_identity,
+        download_exact,
     )
 
     identity = make_capt()
     with pytest.raises(UnusablePlaybackError):
-        download_exact_for_identity(
+        download_exact(
             memento_client(identity, b"Invalid URI"), identity
         )
     category, retryable = classify_playback_error(
@@ -523,7 +522,7 @@ def test_custom_cdx_urlkey_survives_warc_inventory(tmp_path):
 
 def test_digest_mismatch_is_kept_but_never_seeds_revisit(tmp_path):
 
-    from archive_magic_fetch.models import CDX_DIGEST_MATCH_HEADER
+    from archive_magic_fetch.policy import CDX_DIGEST_MATCH_HEADER
 
     layout = archive_layout("http://example.org/", tmp_path)
     ensure_collection_dirs(layout)
@@ -656,14 +655,15 @@ def test_warc_rollover_naming_and_rejects_1000(tmp_path):
     assert warcs[0].relative_key.endswith("-2004-001.warc.gz")
     assert warcs[1].relative_key.endswith("-2004-002.warc.gz")
     for artifact in warcs:
-        validate_warc(artifact.path)
+        assert artifact.record_count == 2
+        assert validate_warc(artifact.path) == artifact.record_count
 
     for seq in range(1, 1000):
         path = layout.collection_warc_path("2005", seq)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"placeholder")
     with pytest.raises(RuntimeError, match="999"):
-        next_collection_warc_sequence(layout, "2005")
+        CollectionWarcWriter(layout, "2005", target_bytes=1)
 
 
 def test_writer_uses_visible_partial_beside_destination(tmp_path):
@@ -794,5 +794,3 @@ def test_truncate_drops_warcinfo_only_partial(tmp_path):
     empty.write_bytes(b"")
     assert truncate_incomplete_gzip_warc(empty) is None
     assert not empty.exists()
-
-

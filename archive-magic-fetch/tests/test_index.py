@@ -16,13 +16,13 @@ from archive_magic_fetch.index import (
     publish_collection_index,
     validate_cdxj_against_warcs,
 )
-from archive_magic_fetch.warc import (
-    CollectionWarcWriter,
+from archive_magic_fetch.inventory import (
     StoredResponse,
     inventory_collection,
-    payload_digest,
     revisit_from_stored,
 )
+from archive_magic_fetch.playback import payload_digest
+from archive_magic_fetch.warc import CollectionWarcWriter
 from helpers import make_capt, playback
 
 

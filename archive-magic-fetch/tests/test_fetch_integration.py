@@ -16,17 +16,17 @@ from archive_magic_fetch.collection import (
 )
 from archive_magic_fetch.fetch import FetchSettings, run_fetch
 from archive_magic_fetch.index import publish_collection_index
-from archive_magic_fetch.models import (
+from archive_magic_fetch.identity import make_identity
+from archive_magic_fetch.policy import (
     MAX_PLAYBACK_ATTEMPTS,
     MISSING_CDX_STATUS,
-    make_identity,
 )
-from archive_magic_fetch.warc import (
-    CollectionWarcWriter,
+from archive_magic_fetch.inventory import (
     get_warc_identity,
     inventory_collection,
-    payload_digest,
 )
+from archive_magic_fetch.playback import payload_digest
+from archive_magic_fetch.warc import CollectionWarcWriter
 from helpers import (
     cdx_json,
     found_capture_client,
@@ -265,7 +265,7 @@ def test_slash_redirect_substitution_is_stored_and_revisited(tmp_path):
 
 
 def test_found_capture_substitution_is_stored_under_cdx_identity(tmp_path):
-    from archive_magic_fetch.models import CDX_DIGEST_MATCH_HEADER
+    from archive_magic_fetch.policy import CDX_DIGEST_MATCH_HEADER
 
     layout = archive_layout("http://example.org/", tmp_path)
     ensure_collection_dirs(layout)
@@ -1613,8 +1613,12 @@ def test_legacy_layout_rejects_all_artifacts(tmp_path, legacy_name):
 
 def test_interrupt_finalizes_partial_without_run_json(tmp_path, monkeypatch):
     import archive_magic_fetch.fetch as fetch_mod
+    import archive_magic_fetch.resolution as resolution_mod
+    import archive_magic_fetch.workers as workers_mod
 
     monkeypatch.setattr(fetch_mod, "PLAYBACK_WORKERS", 1)
+    monkeypatch.setattr(resolution_mod, "PLAYBACK_WORKERS", 1)
+    monkeypatch.setattr(workers_mod, "PLAYBACK_WORKERS", 1)
     layout = archive_layout("http://example.org/", tmp_path)
     ensure_collection_dirs(layout)
     first = make_capt(url="http://example.org/a", ts="20040601000000")

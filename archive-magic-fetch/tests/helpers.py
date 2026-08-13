@@ -6,8 +6,9 @@ import json
 from typing import Optional
 from unittest.mock import MagicMock
 
-from archive_magic_fetch.models import CaptureIdentity, PlaybackResult, make_identity
-from archive_magic_fetch.warc import payload_digest
+from archive_magic_fetch.identity import make_identity
+from archive_magic_fetch.models import CaptureIdentity, PlaybackResult
+from archive_magic_fetch.playback import payload_digest
 
 
 def make_capt(

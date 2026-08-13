@@ -16,13 +16,9 @@ from .collection import (
     list_collection_warcs,
     publish_file_atomically,
 )
-from .models import (
-    CDX_DIGEST_MATCH_HEADER,
-    CDX_PAYLOAD_DIGEST_HEADER,
-    IndexArtifact,
-    normalize_original_url,
-    normalize_payload_digest,
-)
+from .identity import normalize_original_url, normalize_payload_digest
+from .models import IndexArtifact
+from .policy import CDX_DIGEST_MATCH_HEADER, CDX_PAYLOAD_DIGEST_HEADER
 
 
 _CDX_DIGEST_FIELD = "archive-magic:cdx-digest"
@@ -65,25 +61,6 @@ class ArchiveMagicCDXJIndexer(CDXJIndexer):
         return super().get_field(record, name, it, filename)
 
 
-def index_warc_fragment(
-    layout: ArchiveLayout,
-    warc_path: Path,
-) -> Path:
-    """Build a sorted temporary CDXJ fragment for one finalized WARC."""
-
-    collection_dir = warc_path.parent
-    collection_dir.mkdir(parents=True, exist_ok=True)
-    tmp = exclusive_temp_path(collection_dir, suffix=".fragment.cdxj.tmp")
-    ArchiveMagicCDXJIndexer(
-        output=str(tmp),
-        inputs=[str(warc_path)],
-        sort=True,
-        records="response,revisit",
-        dir_root=str(collection_dir),
-    ).process_all()
-    return tmp
-
-
 def cdxj_filenames(path: Path) -> set[str]:
     """Return every filename field referenced by a CDXJ file."""
 
@@ -101,27 +78,6 @@ def cdxj_filenames(path: Path) -> set[str]:
         if isinstance(filename, str):
             names.add(filename)
     return names
-
-
-def merge_cdxj_lines(paths: Sequence[Path]) -> list[str]:
-    """Merge sorted CDXJ files, dropping exact duplicate lines."""
-
-    lines: list[str] = []
-    for path in paths:
-        if not path.is_file():
-            continue
-        for line in path.read_text(encoding="utf-8").splitlines():
-            if line:
-                lines.append(line)
-    lines = sorted(set(lines))
-    # Global CDXJ order: urlkey timestamp (fields 0 and 1)
-    lines.sort(
-        key=lambda line: (
-            line.split(" ", 2)[0],
-            line.split(" ", 2)[1] if " " in line else "",
-        )
-    )
-    return lines
 
 
 def publish_collection_index(
@@ -229,8 +185,9 @@ def validate_collection_revisit_closure(
     """
 
     available: set[tuple[str, str, str]] = set()
-    # Collect responses then validate revisits in a second full-collection pass
-    # so cross-shard Refers-To targets are visible regardless of shard order.
+    revisits: list[
+        tuple[str, str, tuple[str, str, str] | None, str]
+    ] = []
     warcs = list_collection_warcs(layout, collection_id)
     for path in warcs:
         with path.open("rb") as stream:
@@ -243,42 +200,46 @@ def validate_collection_revisit_closure(
                     )
                     if key is not None:
                         available.add(key)
+                elif record.rec_type == "revisit":
+                    revisit_date = record.rec_headers.get_header("WARC-Date") or ""
+                    refers_uri = (
+                        record.rec_headers.get_header("WARC-Refers-To-Target-URI")
+                        or ""
+                    )
+                    refers_date = (
+                        record.rec_headers.get_header("WARC-Refers-To-Date") or ""
+                    )
+                    payload = (
+                        record.rec_headers.get_header("WARC-Payload-Digest") or ""
+                    )
+                    revisits.append(
+                        (
+                            revisit_date,
+                            refers_date,
+                            _response_reference_key(
+                                refers_uri, refers_date, payload
+                            ),
+                            payload,
+                        )
+                    )
                 record.raw_stream.read()
 
-    for path in warcs:
-        with path.open("rb") as stream:
-            for record in ArchiveIterator(stream, check_digests=False):
-                if record.rec_type != "revisit":
-                    record.raw_stream.read()
-                    continue
-                revisit_date = record.rec_headers.get_header("WARC-Date") or ""
-                refers_uri = (
-                    record.rec_headers.get_header("WARC-Refers-To-Target-URI")
-                    or ""
-                )
-                refers_date = (
-                    record.rec_headers.get_header("WARC-Refers-To-Date") or ""
-                )
-                payload = (
-                    record.rec_headers.get_header("WARC-Payload-Digest") or ""
-                )
-                key = _response_reference_key(refers_uri, refers_date, payload)
-                if key is None:
-                    raise ValueError(
-                        f"collection revisit in {collection_id} is missing a resolvable "
-                        f"response reference"
-                    )
-                if refers_date > revisit_date:
-                    raise ValueError(
-                        f"collection revisit in {collection_id} has forward reference "
-                        f"from {revisit_date} to {refers_date}"
-                    )
-                if key not in available:
-                    raise ValueError(
-                        f"collection revisit in {collection_id} has no earlier response "
-                        f"for digest {payload}"
-                    )
-                record.raw_stream.read()
+    for revisit_date, refers_date, key, payload in revisits:
+        if key is None:
+            raise ValueError(
+                f"collection revisit in {collection_id} is missing a resolvable "
+                "response reference"
+            )
+        if refers_date > revisit_date:
+            raise ValueError(
+                f"collection revisit in {collection_id} has forward reference "
+                f"from {revisit_date} to {refers_date}"
+            )
+        if key not in available:
+            raise ValueError(
+                f"collection revisit in {collection_id} has no earlier response "
+                f"for digest {payload}"
+            )
 
 
 def reconcile_missing_indexes(layout: ArchiveLayout) -> list[str]:

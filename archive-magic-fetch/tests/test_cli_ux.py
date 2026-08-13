@@ -6,21 +6,27 @@ import threading
 from unittest.mock import MagicMock
 
 from archive_magic_fetch.fetch import (
-    _CaptureOutcome,
-    _DownloadOutcome,
-    _PlaybackWorkers,
-    _StartGate,
-    _UrlOutcome,
-    _backpressure_signal,
     _format_elapsed,
     _log_url_outcome,
     _playback_timing,
     _style_result,
     _timestamp_link,
 )
-from archive_magic_fetch.models import (
+from archive_magic_fetch.policy import (
     BACKPRESSURE_COOLDOWN_S,
     INVALID_URI_PAYLOAD_DIGEST,
+)
+from archive_magic_fetch.models import FailureCategory, UnresolvedFailure
+from archive_magic_fetch.resolution import (
+    CaptureKind,
+    CaptureOutcome,
+    UrlOutcome,
+    iter_url_outcomes,
+)
+from archive_magic_fetch.workers import (
+    PlaybackWorkers,
+    StartGate,
+    backpressure_signal,
 )
 from helpers import make_capt, playback
 
@@ -54,7 +60,7 @@ def test_worker_retry_uses_five_then_ten_seconds():
             raise ConnectionError("temporary")
         return playback(capture)
 
-    workers = _PlaybackWorkers(
+    workers = PlaybackWorkers(
         lambda: MagicMock(),
         download,
         sleep=sleeps.append,
@@ -80,7 +86,7 @@ def test_rate_gate_keeps_maximum_retry_after(capsys):
         sleeps.append(seconds)
         clock["now"] += seconds
 
-    gate = _StartGate(
+    gate = StartGate(
         0,
         clock=lambda: clock["now"],
         sleep=sleep,
@@ -99,7 +105,7 @@ def test_permanent_failure_does_not_retry():
     download = MagicMock(side_effect=RuntimeError("permanent"))
     sleeps: list[float] = []
 
-    workers = _PlaybackWorkers(
+    workers = PlaybackWorkers(
         lambda: MagicMock(),
         download,
         sleep=sleeps.append,
@@ -118,7 +124,7 @@ def test_permanent_failure_does_not_retry():
 
 def test_invalid_uri_digest_skipsplayback():
     download = MagicMock(side_effect=AssertionError("should not download"))
-    workers = _PlaybackWorkers(
+    workers = PlaybackWorkers(
         lambda: MagicMock(),
         download,
         sleep=lambda _seconds: None,
@@ -138,19 +144,21 @@ def test_connection_refused_is_tcp_backpressure():
     error = ConnectionError(
         "Max retries exceeded: [Errno 61] Connection refused"
     )
-    assert _backpressure_signal(error) == (
+    assert backpressure_signal(error) == (
         "tcp",
         BACKPRESSURE_COOLDOWN_S,
     )
 
 
 def test_playback_workers_run_url_groups_in_parallel(monkeypatch):
-    import archive_magic_fetch.fetch as fetch_mod
+    import archive_magic_fetch.resolution as resolution_mod
+    import archive_magic_fetch.workers as workers_mod
 
-    monkeypatch.setattr(fetch_mod, "PLAYBACK_WORKERS", 4)
+    monkeypatch.setattr(resolution_mod, "PLAYBACK_WORKERS", 4)
+    monkeypatch.setattr(workers_mod, "PLAYBACK_WORKERS", 4)
     barrier = threading.Barrier(4)
     threads: set[str] = set()
-    workers = _PlaybackWorkers(
+    workers = PlaybackWorkers(
         lambda: MagicMock(),
         lambda _client, identity: playback(identity),
         sleep=lambda _seconds: None,
@@ -163,7 +171,14 @@ def test_playback_workers_run_url_groups_in_parallel(monkeypatch):
         return group[0]
 
     try:
-        results = list(workers.results([[1], [2], [3], [4]], process))
+        results = list(
+            iter_url_outcomes(
+                [[1], [2], [3], [4]],
+                process,
+                workers,
+                (False, False, False, False),
+            )
+        )
     finally:
         workers.close()
 
@@ -172,12 +187,14 @@ def test_playback_workers_run_url_groups_in_parallel(monkeypatch):
 
 
 def test_represented_url_groups_skip_playback_workers(monkeypatch):
-    import archive_magic_fetch.fetch as fetch_mod
+    import archive_magic_fetch.resolution as resolution_mod
+    import archive_magic_fetch.workers as workers_mod
 
-    monkeypatch.setattr(fetch_mod, "PLAYBACK_WORKERS", 1)
+    monkeypatch.setattr(resolution_mod, "PLAYBACK_WORKERS", 1)
+    monkeypatch.setattr(workers_mod, "PLAYBACK_WORKERS", 1)
     main_thread = threading.current_thread().name
     seen: list[tuple[int, str]] = []
-    workers = _PlaybackWorkers(
+    workers = PlaybackWorkers(
         lambda: MagicMock(),
         lambda _client, identity: playback(identity),
         sleep=lambda _seconds: None,
@@ -190,7 +207,7 @@ def test_represented_url_groups_skip_playback_workers(monkeypatch):
 
     try:
         results = list(
-            fetch_mod._iter_url_outcomes(
+            iter_url_outcomes(
                 [[1], [2], [3]],
                 process,
                 workers,
@@ -208,11 +225,13 @@ def test_represented_url_groups_skip_playback_workers(monkeypatch):
 
 
 def test_skip_groups_yield_before_next_download_starts(monkeypatch):
-    import archive_magic_fetch.fetch as fetch_mod
+    import archive_magic_fetch.resolution as resolution_mod
+    import archive_magic_fetch.workers as workers_mod
 
-    monkeypatch.setattr(fetch_mod, "PLAYBACK_WORKERS", 1)
+    monkeypatch.setattr(resolution_mod, "PLAYBACK_WORKERS", 1)
+    monkeypatch.setattr(workers_mod, "PLAYBACK_WORKERS", 1)
     started_downloads: list[int] = []
-    workers = _PlaybackWorkers(
+    workers = PlaybackWorkers(
         lambda: MagicMock(),
         lambda _client, identity: playback(identity),
         sleep=lambda _seconds: None,
@@ -226,7 +245,7 @@ def test_skip_groups_yield_before_next_download_starts(monkeypatch):
         return n
 
     try:
-        iterator = fetch_mod._iter_url_outcomes(
+        iterator = iter_url_outcomes(
             [[1], [2], [3], [4], [5]],
             process,
             workers,
@@ -251,11 +270,17 @@ def test_url_table_is_rendered_as_one_chronological_section(capsys):
     _log_url_outcome(
         1,
         2,
-        _UrlOutcome(
+        UrlOutcome(
             url=first.original_url,
             captures=(
-                _CaptureOutcome(first, "downloaded", "Downloaded", "success"),
-                _CaptureOutcome(second, "revisit", "Revisit", "revisit"),
+                CaptureOutcome(
+                    first,
+                    CaptureKind.DOWNLOADED,
+                    playback=playback(first),
+                    attempts=1,
+                    elapsed_s=0.1,
+                ),
+                CaptureOutcome(second, CaptureKind.REVISIT),
             ),
             attempts=1,
             playback_bytes=5,
@@ -273,19 +298,17 @@ def test_url_table_is_rendered_as_one_chronological_section(capsys):
 
 
 def test_playback_timing_includes_elapsed_and_attempts():
-    once = _DownloadOutcome(
-        result=None,
-        failure=None,
+    once = CaptureOutcome(
+        identity=make_capt(),
+        kind=CaptureKind.DOWNLOADED,
         attempts=1,
         elapsed_s=1.24,
-        categories=(),
     )
-    retried = _DownloadOutcome(
-        result=None,
-        failure=None,
+    retried = CaptureOutcome(
+        identity=make_capt(),
+        kind=CaptureKind.DOWNLOADED,
         attempts=2,
         elapsed_s=6.0,
-        categories=(),
     )
     assert _playback_timing(once) == "1.2s"
     assert _playback_timing(retried) == "6.0s, 2 attempts"
@@ -296,14 +319,19 @@ def test_url_table_shows_elapsed_on_ignored_fetch(capsys):
     _log_url_outcome(
         1,
         1,
-        _UrlOutcome(
+        UrlOutcome(
             url=identity.original_url,
             captures=(
-                _CaptureOutcome(
+                CaptureOutcome(
                     identity,
-                    "failure",
-                    "Ignored [unavailable] (1.2s)",
-                    "warning",
+                    CaptureKind.FAILURE,
+                    failure=UnresolvedFailure(
+                        identity,
+                        FailureCategory.UNAVAILABLE,
+                        "unavailable",
+                    ),
+                    attempts=1,
+                    elapsed_s=1.24,
                 ),
             ),
             attempts=1,

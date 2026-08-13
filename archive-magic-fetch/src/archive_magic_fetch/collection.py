@@ -13,16 +13,18 @@ from pathlib import Path
 from typing import Optional, Sequence
 from urllib.parse import urlsplit
 
+from .identity import identity_to_dict
 from .models import (
-    DEFAULT_OUTPUT_ROOT,
-    RUN_SCHEMA_VERSION,
-    WARC_TARGET_BYTES,
-    WARC_VERSION,
     IndexArtifact,
     RunMetrics,
     UnresolvedFailure,
     WarcArtifact,
-    identity_to_dict,
+)
+from .policy import (
+    DEFAULT_OUTPUT_ROOT,
+    RUN_SCHEMA_VERSION,
+    WARC_TARGET_BYTES,
+    WARC_VERSION,
 )
 
 
@@ -381,27 +383,6 @@ def last_collection_warc(
     )
     assert match is not None
     return int(match.group("seq")), last
-
-
-def next_collection_warc_sequence(
-    layout: ArchiveLayout, collection_id: str
-) -> int:
-    """Return the next WARC sequence number for a portable collection."""
-
-    collection_id = layout.validate_collection_id(collection_id)
-    existing = list_collection_warcs(layout, collection_id)
-    if not existing:
-        return 1
-    last = existing[-1].name
-    match = _collection_warc_name_pattern(layout, collection_id).fullmatch(last)
-    assert match is not None
-    nxt = int(match.group("seq")) + 1
-    if nxt > 999:
-        raise RuntimeError(
-            f"WARC sequence would exceed 999 for {layout.archive_id} "
-            f"collection {collection_id}; refusing to create shard 1000"
-        )
-    return nxt
 
 
 def warc_artifact_from_path(

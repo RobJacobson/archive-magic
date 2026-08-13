@@ -2,25 +2,26 @@
 
 from __future__ import annotations
 
-import errno
 import os
 import sys
 import threading
 import time
 from collections import defaultdict
-from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable, Iterator, Optional, Sequence
+from typing import Callable, Optional, Sequence
 
 from .cdx import (
-    DEFAULT_DATE_START,
     fetch_year_cdx,
     init_run_id,
-    make_client,
     parse_date_bound,
     validate_date_range,
     years_in_range,
+)
+from .identity import (
+    current_utc_cdx_timestamp,
+    is_invalid_uri_payload_digest,
+    wayback_url,
 )
 from .collection import (
     ArchiveLayout,
@@ -39,40 +40,40 @@ from .index import (
     reconcile_missing_indexes,
 )
 from .models import (
-    BACKPRESSURE_COOLDOWN_S,
-    MAX_PLAYBACK_ATTEMPTS,
-    PLAYBACK_STARTS_PER_SECOND,
-    PLAYBACK_WORKERS,
     CaptureIdentity,
     FailureCategory,
     IndexArtifact,
     ParsedCapture,
-    PlaybackResult,
     RunMetrics,
     UnresolvedFailure,
     WarcArtifact,
-    current_utc_cdx_timestamp,
-    is_invalid_uri_payload_digest,
-    revisit_group_key,
-    wayback_url,
 )
-from .retry import parse_retry_after
-from .warc import (
-    SLASH_REDIRECT_SOURCE_URI,
+from .policy import (
+    DEFAULT_DATE_START,
+    MAX_PLAYBACK_ATTEMPTS,
+    PLAYBACK_STARTS_PER_SECOND,
+    PLAYBACK_WORKERS,
+)
+from .playback import make_client
+from .workers import PlaybackWorkers
+from .resolution import (
+    CaptureKind,
+    CaptureOutcome,
+    UrlOutcome,
+    group_needs_playback,
+    iter_url_outcomes,
+    process_url_group,
+)
+from .inventory import (
     CollectionInventory,
-    CollectionWarcWriter,
     PriorPayloadCache,
     StoredResponse,
-    classify_playback_error,
-    count_warc_records,
-    download_exact_for_identity,
-    empty_http_200_from_cdx,
     inventory_collection,
     revisit_from_stored,
-    salvage_collection_partials,
-    slash_redirect_from_cdx,
     stored_from_playback,
 )
+from .playback import download_exact
+from .warc import CollectionWarcWriter, count_warc_records, salvage_collection_partials
 
 
 _RESULT_STYLES = {
@@ -155,233 +156,12 @@ class FetchResult:
 
 
 @dataclass(frozen=True)
-class _DownloadOutcome:
-    result: PlaybackResult | None
-    failure: UnresolvedFailure | None
-    attempts: int
-    elapsed_s: float
-    categories: tuple[str, ...]
-
-
-@dataclass(frozen=True)
-class _CaptureOutcome:
-    identity: CaptureIdentity
-    kind: str
-    detail: str
-    style: str
-    playback: PlaybackResult | None = None
-    representative: StoredResponse | None = None
-    failure: UnresolvedFailure | None = None
-
-
-@dataclass(frozen=True)
-class _UrlOutcome:
-    url: str
-    captures: tuple[_CaptureOutcome, ...]
-    attempts: int
-    playback_bytes: int
-    categories: tuple[str, ...]
-
-
-class _StartGate:
-    """Smooth request starts and pause every worker on IA backpressure."""
-
-    def __init__(
-        self,
-        starts_per_second: float,
-        *,
-        clock: Callable[[], float] = time.monotonic,
-        sleep: Callable[[float], None] = time.sleep,
-    ) -> None:
-        self._interval = 0.0 if starts_per_second <= 0 else 1 / starts_per_second
-        self._clock = clock
-        self._sleep = sleep
-        self._lock = threading.Lock()
-        self._next_start = 0.0
-        self._blocked_until = 0.0
-        self._max_retry_after = 0.0
-
-    def wait(self) -> None:
-        while True:
-            with self._lock:
-                now = self._clock()
-                deadline = max(self._next_start, self._blocked_until)
-                if now >= deadline:
-                    if now >= self._blocked_until:
-                        self._max_retry_after = 0.0
-                    self._next_start = now + self._interval
-                    return
-            self._sleep(deadline - now)
-
-    def pause(
-        self,
-        kind: str,
-        retry_after: float | None,
-        identity: CaptureIdentity,
-    ) -> None:
-        requested = retry_after or BACKPRESSURE_COOLDOWN_S
-        with self._lock:
-            now = self._clock()
-            if now >= self._blocked_until:
-                self._max_retry_after = 0.0
-            self._max_retry_after = max(self._max_retry_after, requested)
-            self._blocked_until = max(
-                self._blocked_until,
-                now + self._max_retry_after,
-            )
-            maximum = self._max_retry_after
-            remaining = self._blocked_until - now
-        source = "HTTP 429" if kind == "http" else "TCP connection refused"
-        policy = (
-            f"Retry-After={retry_after:g}s, applied={requested:g}s"
-            if retry_after is not None and kind == "http"
-            else (
-                f"Retry-After=absent, applied={requested:g}s"
-                if kind == "http"
-                else f"cooldown={requested:g}s"
-            )
-        )
-        _print_line(
-            f"rate limit: {source} at {identity.timestamp}; "
-            f"{policy}, maximum={maximum:g}s; "
-            f"new starts paused for {remaining:g}s"
-        )
-
-
-class _PlaybackWorkers:
-    """A bounded worker pool with one persistent client per worker."""
-
-    def __init__(
-        self,
-        client_factory: Callable,
-        download_fn: Callable,
-        *,
-        sleep: Callable[[float], None],
-        pace: bool,
-    ) -> None:
-        self._client_factory = client_factory
-        self._download_fn = download_fn
-        self._sleep = sleep
-        self._gate = _StartGate(
-            PLAYBACK_STARTS_PER_SECOND if pace else 0,
-        )
-        self._executor = ThreadPoolExecutor(
-            max_workers=PLAYBACK_WORKERS,
-            thread_name_prefix="playback",
-        )
-        self._local = threading.local()
-        self._owners: list[object] = []
-        self._owners_lock = threading.Lock()
-
-    def close(self) -> None:
-        self._executor.shutdown()
-        for owner in self._owners:
-            exit_fn = getattr(owner, "__exit__", None)
-            if callable(exit_fn):
-                exit_fn(None, None, None)
-                continue
-            close = getattr(owner, "close", None)
-            if callable(close):
-                close()
-
-    def submit(
-        self,
-        fn: Callable[[Sequence[ParsedCapture]], _UrlOutcome],
-        group: Sequence[ParsedCapture],
-    ) -> Future[_UrlOutcome]:
-        return self._executor.submit(fn, group)
-
-    def results(
-        self,
-        groups: Iterable[Sequence[ParsedCapture]],
-        fn: Callable[[Sequence[ParsedCapture]], _UrlOutcome],
-    ) -> Iterator[_UrlOutcome]:
-        """Yield completed groups while keeping at most one task per worker queued."""
-
-        source = iter(groups)
-        pending: set[Future[_UrlOutcome]] = set()
-        for _ in range(PLAYBACK_WORKERS):
-            try:
-                pending.add(self._executor.submit(fn, next(source)))
-            except StopIteration:
-                break
-        while pending:
-            done, pending = wait(pending, return_when=FIRST_COMPLETED)
-            for future in done:
-                yield future.result()
-                try:
-                    pending.add(self._executor.submit(fn, next(source)))
-                except StopIteration:
-                    pass
-
-    def download(self, identity: CaptureIdentity) -> _DownloadOutcome:
-        if is_invalid_uri_payload_digest(identity.payload_digest):
-            return _DownloadOutcome(
-                result=None,
-                failure=UnresolvedFailure(
-                    identity=identity,
-                    category=FailureCategory.UNAVAILABLE,
-                    message="CDX digest is IA Invalid URI stub",
-                ),
-                attempts=0,
-                elapsed_s=0.0,
-                categories=(),
-            )
-
-        started = time.monotonic()
-        categories: list[str] = []
-        for attempt in range(1, MAX_PLAYBACK_ATTEMPTS + 1):
-            self._gate.wait()
-            try:
-                result = self._download_fn(self._client(), identity)
-            except Exception as error:  # noqa: BLE001 - network boundary
-                category, retryable = classify_playback_error(error)
-                categories.append(category.value)
-                backpressure = _backpressure_signal(error)
-                if backpressure is not None:
-                    self._gate.pause(
-                        backpressure[0],
-                        backpressure[1],
-                        identity,
-                    )
-                if retryable and attempt < MAX_PLAYBACK_ATTEMPTS:
-                    if backpressure is None:
-                        self._sleep(
-                            _retry_after_from_error(error)
-                            or float(5 * (2 ** (attempt - 1)))
-                        )
-                    continue
-                return _DownloadOutcome(
-                    result=None,
-                    failure=UnresolvedFailure(
-                        identity=identity,
-                        category=category,
-                        message=str(error) or type(error).__name__,
-                    ),
-                    attempts=attempt,
-                    elapsed_s=time.monotonic() - started,
-                    categories=tuple(categories),
-                )
-            return _DownloadOutcome(
-                result=result,
-                failure=None,
-                attempts=attempt,
-                elapsed_s=time.monotonic() - started,
-                categories=tuple(categories),
-            )
-        raise AssertionError("playback retry loop did not terminate")
-
-    def _client(self):
-        client = getattr(self._local, "client", None)
-        if client is not None:
-            return client
-        owner = self._client_factory()
-        enter = getattr(owner, "__enter__", None)
-        client = enter() if callable(enter) else owner
-        self._local.client = client if client is not None else owner
-        with self._owners_lock:
-            self._owners.append(owner)
-        return self._local.client
+class _YearResult:
+    metrics: RunMetrics
+    failures: tuple[UnresolvedFailure, ...]
+    warcs: tuple[WarcArtifact, ...]
+    index: IndexArtifact | None
+    skip_errors: int
 
 
 def run_fetch(
@@ -395,11 +175,12 @@ def run_fetch(
 
     validate_date_range(settings.date_start, settings.date_end)
     factory = client_factory or make_client
-    workers = _PlaybackWorkers(
+    workers = PlaybackWorkers(
         factory,
-        download_fn or download_exact_for_identity,
+        download_fn or download_exact,
         sleep=sleep,
         pace=download_fn is None,
+        report=_print_line,
     )
     try:
         return _run_fetch(settings, workers=workers, sleep=sleep)
@@ -410,7 +191,7 @@ def run_fetch(
 def _run_fetch(
     settings: FetchSettings,
     *,
-    workers: _PlaybackWorkers,
+    workers: PlaybackWorkers,
     sleep: Callable[[float], None],
 ) -> FetchResult:
     """Execute serial years with parallel playback and one WARC writer."""
@@ -448,131 +229,18 @@ def _run_fetch(
 
     run_skips_errors = 0
     for year in years:
-        collection_id = f"{year:04d}"
-        if settings.reset_data:
-            reset_collection_data(layout, collection_id)
-            print(f"year {year}: reset existing collection data", flush=True)
-        year_metrics = RunMetrics()
-        year_failures: list[UnresolvedFailure] = []
-        year_started = time.monotonic()
-        print(f"year {year}: CDX query", flush=True)
-        cdx_started = time.monotonic()
-        year_cdx = fetch_year_cdx(
-            layout,
-            url_pattern=settings.url_pattern,
+        result = _run_year(
+            settings,
+            layout=layout,
             year=year,
-            date_start=settings.date_start,
-            date_end=settings.date_end,
             run_id=run_id,
+            workers=workers,
             sleep=sleep,
+            payload_cache=payload_cache,
         )
-        year_metrics.cdx_requests += int(year_cdx.query_meta.get("request_count", 1))
-        year_metrics.cdx_duration_s += time.monotonic() - cdx_started
-        year_failures.extend(year_cdx.failures)
-        year_skips_errors = len(year_cdx.failures)
-        _report_cdx_ingest_skips(year, year_cdx.failures)
-
-        selected = _dedupe_captures(year_cdx.captures)
-        year_metrics.selected += len(selected)
-
-        inventory = inventory_collection(layout, collection_id)
-        writer = CollectionWarcWriter(layout, collection_id)
-        grouped: dict[str, list[ParsedCapture]] = defaultdict(list)
-        for capture in selected:
-            grouped[capture.identity.urlkey].append(capture)
-        groups = list(grouped.values())
-        print(
-            f"year {year}: {len(selected)} captures across {len(groups)} URLs",
-            flush=True,
-        )
-        existing_identities = frozenset(inventory.identities)
-        existing_representatives = dict(inventory.by_url_digest)
-        skip_workers = tuple(
-            not _group_needs_playback(group, existing_identities)
-            for group in groups
-        )
-
-        def process(group: Sequence[ParsedCapture]) -> _UrlOutcome:
-            return _process_url_group(
-                group,
-                workers=workers,
-                payload_cache=payload_cache,
-                collection_id=collection_id,
-                existing_identities=existing_identities,
-                existing_representatives=existing_representatives,
-            )
-
-        try:
-            for group_number, outcome in enumerate(
-                _iter_url_outcomes(groups, process, workers, skip_workers),
-                start=1,
-            ):
-                year_metrics.playback_attempts += outcome.attempts
-                year_metrics.playback_bytes += outcome.playback_bytes
-                for category in outcome.categories:
-                    year_metrics.bump_attempt(category)
-                for capture_outcome in outcome.captures:
-                    failure = _commit_capture_outcome(
-                        capture_outcome,
-                        inventory=inventory,
-                        writer=writer,
-                        metrics=year_metrics,
-                    )
-                    if failure is not None:
-                        year_failures.append(failure)
-                        year_skips_errors += 1
-                _log_url_outcome(group_number, len(groups), outcome)
-            close_started = time.monotonic()
-            new_warcs = writer.close()
-            year_metrics.warc_write_s += time.monotonic() - close_started
-        except (KeyboardInterrupt, Exception):
-            _finalize_interrupted_year(layout, collection_id, writer)
-            raise
-
-        for artifact in new_warcs:
-            print(f"  published {artifact.relative_key}", flush=True)
-
-        collection_index: IndexArtifact | None = None
-        collection_warcs = list_collection_warcs(layout, collection_id)
-        if collection_warcs:
-            index_path = layout.collection_index(collection_id)
-            if new_warcs or not index_path.is_file():
-                idx_started = time.monotonic()
-                collection_index = publish_collection_index(layout, collection_id)
-                year_metrics.index_s += time.monotonic() - idx_started
-            else:
-                collection_index = index_artifact_from_path(layout, index_path)
-            payload_cache.add_collection(layout, collection_id)
-
-        year_metrics.unresolved = len(year_failures)
-        year_warcs = _collect_warc_artifacts(
-            layout, collection_id, new_warcs
-        )
-        write_run_record(
-            layout,
-            collection_id=collection_id,
-            run_id=run_id,
-            url_pattern=settings.url_pattern,
-            date_start=str(year_cdx.query_meta["from"]),
-            date_end=str(year_cdx.query_meta["to"]),
-            query=year_cdx.query_meta,
-            warcs=year_warcs,
-            index=collection_index,
-            metrics=year_metrics,
-            failures=year_failures,
-        )
-        _accumulate_metrics(metrics, year_metrics)
-        all_failures.extend(year_failures)
-        run_skips_errors += year_skips_errors
-        print(
-            f"year {year} done: downloads={year_metrics.downloads} "
-            f"payload-reuses={year_metrics.payload_reuses} "
-            f"revisits={year_metrics.revisits} "
-            f"already-represented={year_metrics.local_reuses} "
-            f"skips/errors={year_skips_errors}",
-            flush=True,
-        )
-        print(f"elapsed {_format_elapsed(time.monotonic() - year_started)}", flush=True)
+        _accumulate_metrics(metrics, result.metrics)
+        all_failures.extend(result.failures)
+        run_skips_errors += result.skip_errors
 
     print(
         f"done: downloads={metrics.downloads} revisits={metrics.revisits} "
@@ -586,6 +254,150 @@ def _run_fetch(
         layout=layout,
         metrics=metrics,
         failures=all_failures,
+    )
+
+
+def _run_year(
+    settings: FetchSettings,
+    *,
+    layout: ArchiveLayout,
+    year: int,
+    run_id: str,
+    workers: PlaybackWorkers,
+    sleep: Callable[[float], None],
+    payload_cache: PriorPayloadCache,
+) -> _YearResult:
+    """Acquire, resolve, publish, and record one yearly collection."""
+
+    collection_id = f"{year:04d}"
+    if settings.reset_data:
+        reset_collection_data(layout, collection_id)
+        print(f"year {year}: reset existing collection data", flush=True)
+    year_metrics = RunMetrics()
+    year_failures: list[UnresolvedFailure] = []
+    year_started = time.monotonic()
+    print(f"year {year}: CDX query", flush=True)
+    cdx_started = time.monotonic()
+    year_cdx = fetch_year_cdx(
+        layout,
+        url_pattern=settings.url_pattern,
+        year=year,
+        date_start=settings.date_start,
+        date_end=settings.date_end,
+        run_id=run_id,
+        sleep=sleep,
+    )
+    year_metrics.cdx_requests += int(year_cdx.query_meta.get("request_count", 1))
+    year_metrics.cdx_duration_s += time.monotonic() - cdx_started
+    year_failures.extend(year_cdx.failures)
+    year_skips_errors = len(year_cdx.failures)
+    _report_cdx_ingest_skips(year, year_cdx.failures)
+
+    selected = _dedupe_captures(year_cdx.captures)
+    year_metrics.selected += len(selected)
+
+    inventory = inventory_collection(layout, collection_id)
+    writer = CollectionWarcWriter(layout, collection_id)
+    grouped: dict[str, list[ParsedCapture]] = defaultdict(list)
+    for capture in selected:
+        grouped[capture.identity.urlkey].append(capture)
+    groups = list(grouped.values())
+    print(
+        f"year {year}: {len(selected)} captures across {len(groups)} URLs",
+        flush=True,
+    )
+    existing_identities = frozenset(inventory.identities)
+    existing_representatives = dict(inventory.by_url_digest)
+    skip_workers = tuple(
+        not group_needs_playback(group, existing_identities)
+        for group in groups
+    )
+
+    def process(group: Sequence[ParsedCapture]) -> UrlOutcome:
+        return process_url_group(
+            group,
+            workers=workers,
+            payload_cache=payload_cache,
+            collection_id=collection_id,
+            existing_identities=existing_identities,
+            existing_representatives=existing_representatives,
+        )
+
+    try:
+        for group_number, outcome in enumerate(
+            iter_url_outcomes(groups, process, workers, skip_workers),
+            start=1,
+        ):
+            year_metrics.playback_attempts += outcome.attempts
+            year_metrics.playback_bytes += outcome.playback_bytes
+            for category in outcome.categories:
+                year_metrics.bump_attempt(category)
+            for capture_outcome in outcome.captures:
+                failure = _commit_capture_outcome(
+                    capture_outcome,
+                    inventory=inventory,
+                    writer=writer,
+                    metrics=year_metrics,
+                )
+                if failure is not None:
+                    year_failures.append(failure)
+                    year_skips_errors += 1
+            _log_url_outcome(group_number, len(groups), outcome)
+        close_started = time.monotonic()
+        new_warcs = writer.close()
+        year_metrics.warc_write_s += time.monotonic() - close_started
+    except (KeyboardInterrupt, Exception):
+        _finalize_interrupted_year(layout, collection_id, writer)
+        raise
+
+    for artifact in new_warcs:
+        print(f"  published {artifact.relative_key}", flush=True)
+
+    collection_index: IndexArtifact | None = None
+    collection_warcs = list_collection_warcs(layout, collection_id)
+    if collection_warcs:
+        index_path = layout.collection_index(collection_id)
+        if new_warcs or not index_path.is_file():
+            idx_started = time.monotonic()
+            collection_index = publish_collection_index(layout, collection_id)
+            year_metrics.index_s += time.monotonic() - idx_started
+        else:
+            collection_index = index_artifact_from_path(layout, index_path)
+        payload_cache.add_collection(layout, collection_id)
+
+    year_metrics.unresolved = len(year_failures)
+    year_warcs = _collect_warc_artifacts(
+        layout, collection_id, new_warcs
+    )
+    write_run_record(
+        layout,
+        collection_id=collection_id,
+        run_id=run_id,
+        url_pattern=settings.url_pattern,
+        date_start=str(year_cdx.query_meta["from"]),
+        date_end=str(year_cdx.query_meta["to"]),
+        query=year_cdx.query_meta,
+        warcs=year_warcs,
+        index=collection_index,
+        metrics=year_metrics,
+        failures=year_failures,
+    )
+    print(
+        f"year {year} done: downloads={year_metrics.downloads} "
+        f"payload-reuses={year_metrics.payload_reuses} "
+        f"revisits={year_metrics.revisits} "
+        f"already-represented={year_metrics.local_reuses} "
+        f"skips/errors={year_skips_errors}",
+        flush=True,
+    )
+    print(f"elapsed {_format_elapsed(time.monotonic() - year_started)}", flush=True)
+
+    return _YearResult(
+        metrics=year_metrics,
+        failures=tuple(year_failures),
+        warcs=tuple(year_warcs),
+        index=collection_index,
+        skip_errors=year_skips_errors,
     )
 
 
@@ -652,244 +464,17 @@ def _report_cdx_ingest_skips(
         print(f"  ... and {remaining} more", flush=True)
 
 
-def _playback_timing(downloaded: _DownloadOutcome) -> str:
+def _playback_timing(outcome: CaptureOutcome) -> str:
     """Format playback elapsed time and retry count for a result row."""
 
-    text = f"{downloaded.elapsed_s:.1f}s"
-    if downloaded.attempts > 1:
-        text += f", {downloaded.attempts} attempts"
+    text = f"{outcome.elapsed_s:.1f}s"
+    if outcome.attempts > 1:
+        text += f", {outcome.attempts} attempts"
     return text
 
 
-def _group_needs_playback(
-    group: Sequence[ParsedCapture],
-    existing_identities: frozenset[CaptureIdentity],
-) -> bool:
-    """True when any capture in the group still requires a Wayback GET."""
-
-    group_urls = tuple(capture.identity.original_url for capture in group)
-    for capture in group:
-        identity = capture.identity
-        if identity in existing_identities:
-            continue
-        if empty_http_200_from_cdx(identity, mime=capture.mime) is not None:
-            continue
-        if slash_redirect_from_cdx(identity, group_urls=group_urls) is not None:
-            continue
-        return True
-    return False
-
-
-def _iter_url_outcomes(
-    groups: Sequence[Sequence[ParsedCapture]],
-    process: Callable[[Sequence[ParsedCapture]], _UrlOutcome],
-    workers: _PlaybackWorkers,
-    skip_workers: Sequence[bool],
-) -> Iterator[_UrlOutcome]:
-    """Yield URL groups in CDX order without queuing local-only groups on workers.
-
-    After a download completes, intervening skip groups are yielded on the main
-    thread before the next playback job is submitted. Prefetching that next job
-    first made skip tables sit behind the following Wayback GET.
-    """
-
-    pending: dict[int, Future[_UrlOutcome]] = {}
-    next_submit = 0
-    total = len(groups)
-
-    def fill() -> None:
-        nonlocal next_submit
-        while next_submit < total and len(pending) < PLAYBACK_WORKERS:
-            if skip_workers[next_submit]:
-                next_submit += 1
-                continue
-            pending[next_submit] = workers.submit(process, groups[next_submit])
-            next_submit += 1
-
-    for index, group in enumerate(groups):
-        if skip_workers[index]:
-            yield process(group)
-            continue
-        fill()
-        yield pending.pop(index).result()
-
-
-def _process_url_group(
-    captures: Sequence[ParsedCapture],
-    *,
-    workers: _PlaybackWorkers,
-    payload_cache: PriorPayloadCache,
-    collection_id: str,
-    existing_identities: frozenset[CaptureIdentity],
-    existing_representatives: dict[tuple[str, str, str], StoredResponse],
-) -> _UrlOutcome:
-    """Resolve one URL's captures chronologically without shared mutations."""
-
-    local_representatives: dict[tuple[str, str, str], StoredResponse] = {}
-    outcomes: list[_CaptureOutcome] = []
-    attempts = 0
-    playback_bytes = 0
-    categories: list[str] = []
-    group_urls = tuple(capture.identity.original_url for capture in captures)
-
-    for capture in captures:
-        identity = capture.identity
-        if identity in existing_identities:
-            outcomes.append(
-                _CaptureOutcome(
-                    identity,
-                    "existing",
-                    "Ignored [already represented]",
-                    "dim",
-                )
-            )
-            continue
-
-        key = revisit_group_key(identity)
-        representative = None
-        if key is not None:
-            representative = local_representatives.get(key)
-            if representative is None:
-                candidate = existing_representatives.get(key)
-                if (
-                    candidate is not None
-                    and candidate.identity.timestamp <= identity.timestamp
-                ):
-                    representative = candidate
-        if representative is not None:
-            outcomes.append(
-                _CaptureOutcome(
-                    identity,
-                    "revisit",
-                    "Revisit",
-                    "revisit",
-                    representative=representative,
-                )
-            )
-            continue
-
-        synthesized = empty_http_200_from_cdx(identity, mime=capture.mime)
-        if synthesized is not None:
-            outcomes.append(
-                _CaptureOutcome(
-                    identity,
-                    "empty",
-                    "Empty payload",
-                    "revisit",
-                    playback=synthesized,
-                )
-            )
-            if key is not None:
-                local_representatives[key] = stored_from_playback(synthesized)
-            continue
-
-        synthesized_slash = slash_redirect_from_cdx(
-            identity, group_urls=group_urls
-        )
-        if synthesized_slash is not None:
-            outcomes.append(
-                _CaptureOutcome(
-                    identity,
-                    "slash_redirect",
-                    "Slash redirect",
-                    "revisit",
-                    playback=synthesized_slash,
-                )
-            )
-            if key is not None:
-                local_representatives[key] = stored_from_playback(synthesized_slash)
-            continue
-
-        cached = payload_cache.materialize(
-            identity,
-            mime=capture.mime,
-            current_collection_id=collection_id,
-        )
-        if cached is not None:
-            outcomes.append(
-                _CaptureOutcome(
-                    identity,
-                    "cached",
-                    "Payload reused",
-                    "revisit",
-                    playback=cached,
-                )
-            )
-            if key is not None:
-                local_representatives[key] = stored_from_playback(cached)
-            continue
-
-        downloaded = workers.download(identity)
-        attempts += downloaded.attempts
-        categories.extend(downloaded.categories)
-        if downloaded.failure is not None:
-            reason = downloaded.failure.category.value.replace("_", " ")
-            if is_invalid_uri_payload_digest(identity.payload_digest):
-                reason = "invalid URI"
-            detail = f"Ignored [{reason}]"
-            if downloaded.attempts > 0:
-                detail += f" ({_playback_timing(downloaded)})"
-            outcomes.append(
-                _CaptureOutcome(
-                    identity,
-                    "failure",
-                    detail,
-                    "warning",
-                    failure=downloaded.failure,
-                )
-            )
-            continue
-
-        result = downloaded.result
-        assert result is not None
-        playback_bytes += len(result.body)
-        if result.source_uri == SLASH_REDIRECT_SOURCE_URI:
-            detail = "Slash redirect"
-            if downloaded.attempts > 0:
-                detail += f" ({_playback_timing(downloaded)})"
-            outcomes.append(
-                _CaptureOutcome(
-                    identity,
-                    "slash_redirect",
-                    detail,
-                    "revisit",
-                    playback=result,
-                )
-            )
-            if key is not None:
-                local_representatives[key] = stored_from_playback(result)
-            continue
-        extra = _playback_timing(downloaded)
-        if result.substituted:
-            extra += ", substituted"
-        if not result.digest_matched:
-            extra += ", digest mismatch kept"
-        detail = f"Downloaded ({extra})"
-        outcomes.append(
-            _CaptureOutcome(
-                identity,
-                "downloaded",
-                detail,
-                "warning"
-                if result.substituted or not result.digest_matched
-                else "success",
-                playback=result,
-            )
-        )
-        if result.digest_matched and key is not None:
-            local_representatives[key] = stored_from_playback(result)
-
-    return _UrlOutcome(
-        url=captures[0].identity.original_url,
-        captures=tuple(outcomes),
-        attempts=attempts,
-        playback_bytes=playback_bytes,
-        categories=tuple(categories),
-    )
-
-
 def _commit_capture_outcome(
-    outcome: _CaptureOutcome,
+    outcome: CaptureOutcome,
     *,
     inventory: CollectionInventory,
     writer: CollectionWarcWriter,
@@ -897,14 +482,14 @@ def _commit_capture_outcome(
 ) -> UnresolvedFailure | None:
     """Apply one worker result on the single writer thread."""
 
-    if outcome.kind == "existing":
+    if outcome.kind is CaptureKind.EXISTING:
         metrics.local_reuses += 1
         metrics.represented += 1
         return None
-    if outcome.kind == "failure":
+    if outcome.kind is CaptureKind.FAILURE:
         assert outcome.failure is not None
         return outcome.failure
-    if outcome.kind == "revisit":
+    if outcome.kind is CaptureKind.REVISIT:
         assert outcome.representative is not None
         _write_revisit(
             identity=outcome.identity,
@@ -922,29 +507,75 @@ def _commit_capture_outcome(
     metrics.warc_write_s += time.monotonic() - started
     metrics.represented += 1
     inventory.identities.add(outcome.identity)
-    if outcome.kind == "cached" or outcome.kind == "empty" or outcome.kind == "slash_redirect":
+    if outcome.kind in {
+        CaptureKind.CACHED,
+        CaptureKind.EMPTY,
+        CaptureKind.SLASH_REDIRECT,
+    }:
         metrics.payload_reuses += 1
     else:
         metrics.downloads += 1
         if not result.digest_matched:
             metrics.digest_mismatch_accepted += 1
-    if result.digest_matched or outcome.kind == "slash_redirect":
+    if result.digest_matched or outcome.kind is CaptureKind.SLASH_REDIRECT:
         inventory.remember_representative(stored_from_playback(result))
     return None
 
 
-def _log_url_outcome(number: int, total: int, outcome: _UrlOutcome) -> None:
+def _log_url_outcome(number: int, total: int, outcome: UrlOutcome) -> None:
     lines = [
         f"{number}/{total} {_terminal_safe(outcome.url)}",
         "  Capture              Digest  Result",
     ]
     for capture in outcome.captures:
+        detail, style = _format_capture_outcome(capture)
         lines.append(
             f"  {_timestamp_link(capture.identity)}  "
             f"{_terminal_safe(capture.identity.payload_digest[-6:]):>6}  "
-            f"{_style_result(capture.detail, capture.style)}"
+            f"{_style_result(detail, style)}"
         )
     _print_line("\n".join(lines))
+
+
+def _format_capture_outcome(outcome: CaptureOutcome) -> tuple[str, str]:
+    """Derive terminal presentation from a semantic capture result."""
+
+    if outcome.kind is CaptureKind.EXISTING:
+        return "Ignored [already represented]", "dim"
+    if outcome.kind is CaptureKind.REVISIT:
+        return "Revisit", "revisit"
+    if outcome.kind is CaptureKind.EMPTY:
+        return "Empty payload", "revisit"
+    if outcome.kind is CaptureKind.CACHED:
+        return "Payload reused", "revisit"
+    if outcome.kind is CaptureKind.FAILURE:
+        assert outcome.failure is not None
+        reason = outcome.failure.category.value.replace("_", " ")
+        if is_invalid_uri_payload_digest(outcome.identity.payload_digest):
+            reason = "invalid URI"
+        detail = f"Ignored [{reason}]"
+        if outcome.attempts:
+            detail += f" ({_playback_timing(outcome)})"
+        return detail, "warning"
+    if outcome.kind is CaptureKind.SLASH_REDIRECT:
+        detail = "Slash redirect"
+        if outcome.attempts:
+            detail += f" ({_playback_timing(outcome)})"
+        return detail, "revisit"
+
+    assert outcome.kind is CaptureKind.DOWNLOADED
+    assert outcome.playback is not None
+    extra = _playback_timing(outcome)
+    if outcome.playback.substituted:
+        extra += ", substituted"
+    if not outcome.playback.digest_matched:
+        extra += ", digest mismatch kept"
+    style = (
+        "warning"
+        if outcome.playback.substituted or not outcome.playback.digest_matched
+        else "success"
+    )
+    return f"Downloaded ({extra})", style
 
 
 def _write_revisit(
@@ -961,64 +592,6 @@ def _write_revisit(
     inventory.identities.add(identity)
     metrics.revisits += 1
     metrics.represented += 1
-
-
-def _iter_error_chain(error: BaseException):
-    seen: set[int] = set()
-    current: BaseException | None = error
-    while current is not None and id(current) not in seen:
-        yield current
-        seen.add(id(current))
-        nested = getattr(current, "cause", None)
-        current = (
-            nested
-            if isinstance(nested, BaseException)
-            else current.__cause__ or current.__context__
-        )
-
-
-def _retry_after_from_error(error: BaseException) -> float | None:
-    delays: list[float] = []
-    for candidate in _iter_error_chain(error):
-        values = [getattr(candidate, "retry_after", None)]
-        response = getattr(candidate, "response", None)
-        headers = getattr(response, "headers", None) or {}
-        values.append(headers.get("Retry-After") or headers.get("retry-after"))
-        for value in values:
-            parsed = parse_retry_after(value)
-            if parsed is not None and parsed > 0:
-                delays.append(parsed)
-    return max(delays, default=None)
-
-
-def _backpressure_signal(error: BaseException) -> tuple[str, float | None] | None:
-    """Recognize HTTP 429 and refused TCP connections through wrapper chains."""
-
-    http = False
-    tcp = False
-    for candidate in _iter_error_chain(error):
-        name = type(candidate).__name__
-        message = str(candidate).lower()
-        response = getattr(candidate, "response", None)
-        if (
-            "RateLimit" in name
-            or getattr(candidate, "status_code", None) == 429
-            or getattr(response, "status_code", None) == 429
-            or "rate limit" in message
-            or "too many requests" in message
-        ):
-            http = True
-        if (
-            isinstance(candidate, ConnectionRefusedError)
-            or getattr(candidate, "errno", None) == errno.ECONNREFUSED
-            or "connection refused" in message
-        ):
-            tcp = True
-    if http:
-        return "http", _retry_after_from_error(error)
-    if tcp:
-        return "tcp", BACKPRESSURE_COOLDOWN_S
-    return None
 
 
 def _dedupe_captures(

@@ -18,28 +18,24 @@ from urllib.parse import urlencode
 
 import requests
 from urllib3.exceptions import ProtocolError
-from wayback import WaybackClient, WaybackSession
-from wayback._client import read_and_close
-from wayback.exceptions import RateLimitError, WaybackRetryError
+from wayback.exceptions import WaybackRetryError
 
-from .collection import ArchiveLayout, ensure_collection_dirs, exclusive_temp_path, publish_file_atomically
+from .collection import (
+    ArchiveLayout,
+    ensure_collection_dirs,
+    exclusive_temp_path,
+    normalize_domain,
+    publish_file_atomically,
+)
+from .identity import current_run_id, make_identity
 from .models import (
-    CDX_PAGE_LIMIT,
-    DEFAULT_DATE_START as DEFAULT_DATE_START,
-    USER_AGENT,
     CaptureIdentity,
     FailureCategory,
     ParsedCapture,
     UnresolvedFailure,
-    cdx_payload_digest_token,
-    cdx_status_token,
-    current_run_id,
-    is_redirect_status_token,
-    make_identity,
-    normalize_payload_digest,
-    timestamp_year,
 )
-from .collection import normalize_domain
+from .playback import ArchiveMagicWaybackSession
+from .policy import CDX_PAGE_LIMIT, USER_AGENT
 from .retry import parse_retry_after
 
 
@@ -53,123 +49,7 @@ _CDX_FIELDS = (
     "digest",
     "length",
 )
-_CDX_TIMESTAMP = re.compile(r"^\d{1,14}$")
 _DATE_BOUND = re.compile(r"^\d{4,14}$")
-
-
-# Gzip member header magic (RFC 1952). Used to detect bodies that are not
-# actually compressed despite a Content-Encoding: gzip claim from IA.
-_GZIP_MAGIC = b"\x1f\x8b"
-
-
-class ArchiveMagicWaybackSession(WaybackSession):
-    """Wayback session tuned for Archive Magic fetch.
-
-    Library retries stay disabled so Fetch owns its small synchronous retry
-    loops and request volume remains explicit.
-
-    Wayback treats any response with ``Memento-Datetime`` as a successful
-    memento, which can let HTTP 429 slip through as a playback error with no
-    ``retry_after``. Always surface 429 as ``RateLimitError`` and carry an
-    explicit `Retry-After` value when IA supplied one.
-
-    Some memento responses also advertise ``Content-Encoding: gzip`` while the
-    transfer body is already plaintext (for example HTML starting with
-    ``<!DOCTYPE``). ``requests`` then raises ``ContentDecodingError`` when
-    reading ``.content``. This session forces ``stream=True``, and for mementos
-    that claim gzip it reads the raw body and only decompresses when the gzip
-    magic is present.
-    """
-
-    def __init__(self, *args, **kwargs) -> None:
-        kwargs.setdefault("retries", 0)
-        super().__init__(*args, **kwargs)
-
-    def send(self, request, **kwargs):
-        # requests.Session.send() eagerly reads ``response.content`` unless
-        # stream=True. That triggers ContentDecodingError on IA's false gzip
-        # claims before we can inspect the raw body, so always defer loading.
-        kwargs["stream"] = True
-        response = super().send(request, **kwargs)
-        if getattr(response, "status_code", None) == 429:
-            delay = parse_retry_after(response.headers.get("Retry-After"))
-            read_and_close(response)
-            raise RateLimitError(response, delay)
-        repair_false_gzip_content_encoding(response)
-        return response
-
-
-def repair_false_gzip_content_encoding(response: requests.Response) -> None:
-    """Decode memento bodies that falsely claim ``Content-Encoding: gzip``.
-
-    Edge case: Internet Archive occasionally returns a memento with
-    ``Content-Encoding: gzip`` whose on-the-wire body is already uncompressed
-    (magic bytes are HTML/PDF/etc., not ``\\x1f\\x8b``). urllib3/requests then
-    fail with ``ContentDecodingError`` ("incorrect header check").
-
-    Callers must obtain the response with ``stream=True`` (the session
-    ``send()`` override does this) so ``requests`` has not already attempted
-    content decoding.
-
-    Only memento responses (those with ``Memento-Datetime``) are rewritten, and
-    only when they claim gzip. CDX entity downloads keep streaming with
-    ``decode_content=False`` and must not have their bodies eagerly consumed
-    here. After repair, ``Content-Encoding`` is removed and ``response.content``
-    is the logical payload (decompressed when the body was real gzip).
-
-    Mismatched usable bodies are kept for that capture only.
-    """
-
-    headers = getattr(response, "headers", None)
-    if headers is None or "Memento-Datetime" not in headers:
-        return
-
-    encoding = (headers.get("Content-Encoding") or "").split(",")[0].strip().lower()
-    if encoding not in {"gzip", "x-gzip"}:
-        return
-
-    # Already materialized (for example by a prior hook); do not re-read.
-    if getattr(response, "_content", False) is not False:
-        return
-
-    raw_stream = getattr(response, "raw", None)
-    if raw_stream is None:
-        return
-
-    # Disable urllib3's content-decoder so we can inspect the true payload.
-    if hasattr(raw_stream, "decode_content"):
-        raw_stream.decode_content = False
-    raw = raw_stream.read()
-    if raw.startswith(_GZIP_MAGIC):
-        try:
-            body = gzip.decompress(raw)
-        except OSError:
-            # Truncated or corrupt gzip: keep bytes for caller classification.
-            body = raw
-    else:
-        # False Content-Encoding: IA claimed gzip but sent plaintext. Keep the
-        # bytes so the caller can compare them with the CDX digest and retain
-        # the response without treating it as reusable when they disagree.
-        body = raw
-
-    # Body is now the logical entity; drop the misleading transfer coding.
-    try:
-        del response.headers["Content-Encoding"]
-    except KeyError:
-        pass
-    response._content = body
-    response._content_consumed = True
-
-
-def make_client() -> WaybackClient:
-    """Return a playback client paced by Archive Magic's shared gate."""
-
-    return WaybackClient(
-        session=ArchiveMagicWaybackSession(
-            user_agent=USER_AGENT,
-            memento_calls_per_second=0,
-        )
-    )
 
 
 def make_cdx_session() -> ArchiveMagicWaybackSession:
@@ -193,7 +73,7 @@ def normalize_cdx_search(url_pattern: str) -> tuple[str, Optional[str]]:
         return domain_target, "domain"
     if text.endswith("/*"):
         return text.removesuffix("*"), "prefix"
-    return url_pattern, None
+    return text, None
 
 
 def _domain_wildcard_target(url_pattern: str) -> Optional[str]:
@@ -703,30 +583,9 @@ def _parse_row(
     except ValueError as error:
         return _malformed(raw_line, str(error))
 
-    # Prefer SURT from original if urlkey field was empty/odd.
-    if not urlkey:
-        identity = make_identity(
-            original_url=original,
-            timestamp=timestamp,
-            status_token=statuscode,
-            payload_digest=digest,
-        )
-
-    status_token = cdx_status_token(statuscode)
-    digest_token = cdx_payload_digest_token(digest)
     return ParsedCapture(
-        identity=identity if identity.payload_digest == digest_token else make_identity(
-            original_url=original,
-            timestamp=timestamp,
-            status_token=status_token,
-            payload_digest=digest_token,
-            urlkey=identity.urlkey,
-        ),
-        year=timestamp_year(timestamp),
-        is_redirect=is_redirect_status_token(status_token),
-        has_usable_digest=normalize_payload_digest(digest) is not None,
+        identity=identity,
         mime=mimetype or "-",
-        raw_line=raw_line,
     )
 
 
@@ -771,7 +630,11 @@ def init_run_id(layout: ArchiveLayout, run_id: str | None = None) -> str:
 
     # Microsecond IDs normally suffice; check all existing collection runs.
     for attempt in range(1000):
-        candidate = current_run_id() if attempt == 0 else f"{current_run_id()}-{attempt:02d}"
+        candidate = (
+            current_run_id()
+            if attempt == 0
+            else f"{current_run_id()}-{attempt:02d}"
+        )
         if not any(layout.captures_root.glob(f"*/runs/{candidate}")):
             return candidate
     raise RuntimeError("unable to allocate a unique run source directory")
