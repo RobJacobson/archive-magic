@@ -5,6 +5,7 @@ from __future__ import annotations
 import gzip
 import hashlib
 import json
+from pathlib import Path
 
 import pytest
 
@@ -15,7 +16,8 @@ from archive_magic_fetch.cdx import (
     parse_date_bound,
     year_ranges,
 )
-from archive_magic_fetch.collection import archive_layout, ensure_collection_dirs
+from archive_magic_fetch.collection import ArchiveLayout, ensure_collection_dirs
+from archive_magic_fetch.config import StorageConfig
 from archive_magic_fetch.fetch import _report_cdx_ingest_skips, build_settings
 from archive_magic_fetch.models import (
     CaptureIdentity,
@@ -26,7 +28,7 @@ from helpers import FakeSession, cdx_json
 
 
 def test_raw_cdx_saved_before_normalization_and_malformed_in_failures(tmp_path):
-    layout = archive_layout("http://example.org/", tmp_path)
+    layout = ArchiveLayout(tmp_path, "example.org")
     ensure_collection_dirs(layout)
 
     good = [
@@ -91,7 +93,7 @@ def test_malformed_rows_keep_distinct_failure_identities():
 
 
 def test_non_list_cdx_entries_become_malformed_failures(tmp_path):
-    layout = archive_layout("http://example.org/", tmp_path)
+    layout = ArchiveLayout(tmp_path, "example.org")
     ensure_collection_dirs(layout)
     good = [
         "com,example)/",
@@ -150,7 +152,11 @@ def test_year_end_bound_covers_full_utc_year():
     ]
     with pytest.raises(ValueError):
         parse_date_bound("200413", default="", bound="start")
-    settings = build_settings("http://example.org/", date_end="2004")
+    settings = build_settings(
+        "http://example.org/",
+        date_end="2004",
+        storage=StorageConfig("local", Path("/tmp/workspace")),
+    )
     assert settings.date_end == "20041231235959"
     assert settings.date_start == "19950101000000"
 
@@ -176,6 +182,7 @@ def test_parse_date_bound_strips_hyphens_and_pads_precision():
         "http://example.org/",
         date_start="2004-06",
         date_end="2004-12-31",
+        storage=StorageConfig("local", Path("/tmp/workspace")),
     )
     assert settings.date_start == "20040601000000"
     assert settings.date_end == "20041231235959"
@@ -229,7 +236,7 @@ def test_parse_row_constructs_identity_once(monkeypatch):
 
 
 def test_init_run_id_allocates_unique_id_after_collision(tmp_path):
-    layout = archive_layout("http://example.org/", tmp_path)
+    layout = ArchiveLayout(tmp_path, "example.org")
     ensure_collection_dirs(layout)
     first = init_run_id(layout)
     (layout.run_dir("2004", first)).mkdir(parents=True)
@@ -241,7 +248,7 @@ def test_init_run_id_allocates_unique_id_after_collision(tmp_path):
 def test_multipage_cdx_metadata_coherent_and_parsed_from_disk(tmp_path):
     import hashlib
 
-    layout = archive_layout("http://example.org/", tmp_path)
+    layout = ArchiveLayout(tmp_path, "example.org")
     ensure_collection_dirs(layout)
     page1_row = [
         "com,example)/",
@@ -301,7 +308,7 @@ def test_cdx_retries_protocol_incomplete_read(tmp_path, capsys):
 
     from helpers import FakeRaw
 
-    layout = archive_layout("http://example.org/", tmp_path)
+    layout = ArchiveLayout(tmp_path, "example.org")
     ensure_collection_dirs(layout)
     row = [
         "com,example)/",

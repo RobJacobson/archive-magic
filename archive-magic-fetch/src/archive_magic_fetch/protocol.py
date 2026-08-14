@@ -1,0 +1,14 @@
+"""Archive Magic's durable CDX/WARC field and sentinel values."""
+
+CDX_PAYLOAD_DIGEST_HEADER = "CDX-Payload-Digest"
+CDX_STATUS_HEADER = "CDX-Status"
+CDX_URLKEY_HEADER = "CDX-Urlkey"
+CDX_DIGEST_MATCH_HEADER = "CDX-Digest-Match"
+MISSING_CDX_PAYLOAD_DIGEST = "-"
+MISSING_CDX_STATUS = "-"
+
+# SHA-1 (CDX base32) of the literal IA playback stub body ``Invalid URI``.
+INVALID_URI_PAYLOAD_DIGEST = "sha1:L4XNRRGWXWKNIAJFQOC6D2OULYFIDDTC"
+
+# SHA-1 (CDX base32) of zero bytes.
+EMPTY_PAYLOAD_DIGEST = "sha1:3I42H3S6NNFQ2MSVX7XZKYAYSCX5QBYJ"

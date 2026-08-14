@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import threading
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from archive_magic_fetch.fetch import (
@@ -12,8 +14,7 @@ from archive_magic_fetch.fetch import (
     _style_result,
     _timestamp_link,
 )
-from archive_magic_fetch.policy import (
-    BACKPRESSURE_COOLDOWN_S,
+from archive_magic_fetch.protocol import (
     INVALID_URI_PAYLOAD_DIGEST,
 )
 from archive_magic_fetch.models import FailureCategory, UnresolvedFailure
@@ -29,6 +30,41 @@ from archive_magic_fetch.workers import (
     backpressure_signal,
 )
 from helpers import make_capt, playback
+
+
+def write_cli_descriptor(
+    directory: Path,
+    *,
+    authority: str = "local",
+) -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    remote = ""
+    if authority == "remote":
+        remote = """
+[storage.remote]
+bucket = "bucket"
+prefix = "example.org"
+endpoint_url = "https://s3.example.invalid"
+region = "auto"
+"""
+    path = directory / "archive.toml"
+    path.write_text(
+        f"""
+schema_version = 1
+[archive]
+id = "example.org"
+url_pattern = "*.example.org"
+[storage]
+authority = "{authority}"
+workspace_directory = "workspace"
+{remote}
+[fetch]
+start = "2000-01-01"
+end = "2001-12-31"
+""",
+        encoding="utf-8",
+    )
+    return path
 
 
 def test_console_timestamp_links_to_full_capture():
@@ -146,16 +182,11 @@ def test_connection_refused_is_tcp_backpressure():
     )
     assert backpressure_signal(error) == (
         "tcp",
-        BACKPRESSURE_COOLDOWN_S,
+        60.0,
     )
 
 
-def test_playback_workers_run_url_groups_in_parallel(monkeypatch):
-    import archive_magic_fetch.resolution as resolution_mod
-    import archive_magic_fetch.workers as workers_mod
-
-    monkeypatch.setattr(resolution_mod, "PLAYBACK_WORKERS", 4)
-    monkeypatch.setattr(workers_mod, "PLAYBACK_WORKERS", 4)
+def test_playback_workers_run_url_groups_in_parallel():
     barrier = threading.Barrier(4)
     threads: set[str] = set()
     workers = PlaybackWorkers(
@@ -186,12 +217,7 @@ def test_playback_workers_run_url_groups_in_parallel(monkeypatch):
     assert len(threads) == 4
 
 
-def test_represented_url_groups_skip_playback_workers(monkeypatch):
-    import archive_magic_fetch.resolution as resolution_mod
-    import archive_magic_fetch.workers as workers_mod
-
-    monkeypatch.setattr(resolution_mod, "PLAYBACK_WORKERS", 1)
-    monkeypatch.setattr(workers_mod, "PLAYBACK_WORKERS", 1)
+def test_represented_url_groups_skip_playback_workers():
     main_thread = threading.current_thread().name
     seen: list[tuple[int, str]] = []
     workers = PlaybackWorkers(
@@ -199,6 +225,7 @@ def test_represented_url_groups_skip_playback_workers(monkeypatch):
         lambda _client, identity: playback(identity),
         sleep=lambda _seconds: None,
         pace=False,
+        max_workers=1,
     )
 
     def process(group):
@@ -224,18 +251,14 @@ def test_represented_url_groups_skip_playback_workers(monkeypatch):
     assert seen[2] == (3, main_thread)
 
 
-def test_skip_groups_yield_before_next_download_starts(monkeypatch):
-    import archive_magic_fetch.resolution as resolution_mod
-    import archive_magic_fetch.workers as workers_mod
-
-    monkeypatch.setattr(resolution_mod, "PLAYBACK_WORKERS", 1)
-    monkeypatch.setattr(workers_mod, "PLAYBACK_WORKERS", 1)
+def test_skip_groups_yield_before_next_download_starts():
     started_downloads: list[int] = []
     workers = PlaybackWorkers(
         lambda: MagicMock(),
         lambda _client, identity: playback(identity),
         sleep=lambda _seconds: None,
         pace=False,
+        max_workers=1,
     )
 
     def process(group):
@@ -349,12 +372,13 @@ def test_elapsed_format_uses_unbounded_hours():
     assert _format_elapsed(25 * 60 * 60 + 2) == "25:00:02"
 
 
-def test_cli_rejects_reversed_range():
+def test_cli_rejects_reversed_range(tmp_path):
     from archive_magic_fetch.cli import main
 
+    descriptor = write_cli_descriptor(tmp_path)
     code = main(
         [
-            "http://example.org/",
+            str(descriptor),
             "--start",
             "20050101",
             "--end",
@@ -364,11 +388,52 @@ def test_cli_rejects_reversed_range():
     assert code == 2
 
 
-def test_cli_reset_data_flag():
+def test_cli_reset_data_flag(tmp_path):
     from archive_magic_fetch.cli import parse_args
 
-    args = parse_args(["http://example.org/", "--reset-data"])
+    descriptor = write_cli_descriptor(tmp_path)
+    args = parse_args([str(descriptor), "--reset-data"])
     assert args.reset_data is True
 
-    args = parse_args(["http://example.org/"])
+    args = parse_args([str(descriptor)])
     assert args.reset_data is False
+
+
+def test_cli_uses_descriptor_configured_history(tmp_path, monkeypatch):
+    from archive_magic_fetch import cli
+
+    descriptor = write_cli_descriptor(tmp_path)
+    captured = []
+
+    def run(settings):
+        captured.append(settings)
+        return SimpleNamespace(exit_code=0)
+
+    monkeypatch.setattr(cli, "run_fetch", run)
+    assert cli.main([str(descriptor.parent)]) == 0
+    assert captured[0].archive_id == "example.org"
+    assert captured[0].date_start == "20000101000000"
+    assert captured[0].date_end == "20011231235959"
+    assert captured[0].storage.workspace_directory == (tmp_path / "workspace").resolve()
+
+
+def test_remote_reset_rejects_dates_and_warns_before_full_rebuild(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    from archive_magic_fetch import cli
+
+    descriptor = write_cli_descriptor(tmp_path, authority="remote")
+    assert cli.main([str(descriptor), "--reset-data", "--start", "2001"]) == 2
+    assert "complete configured date range" in capsys.readouterr().err
+
+    monkeypatch.setattr(
+        cli,
+        "run_fetch",
+        lambda settings: SimpleNamespace(exit_code=0),
+    )
+    assert cli.main([str(descriptor), "--reset-data"]) == 0
+    warning = capsys.readouterr().err
+    assert "delete and rebuild the entire remote archive prefix" in warning
+    assert "playback will be unavailable" in warning

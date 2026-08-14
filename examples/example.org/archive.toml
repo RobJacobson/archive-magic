@@ -1,0 +1,26 @@
+schema_version = 1
+
+[archive]
+id = "example.org"
+url_pattern = "*.example.org"
+
+[storage]
+authority = "local" # "local" or "remote"
+workspace_directory = "workspace"
+
+# Required only when authority = "remote".
+# [storage.remote]
+# bucket = "archive-magic"
+# prefix = "example.org"
+# endpoint_url = "https://s3.example.invalid"
+# region = "auto"
+
+[fetch]
+start = "1995-01-01"
+# end omitted means the current time at the start of each Fetch run.
+warc_target_bytes = 250000000
+playback_workers = 4
+playback_starts_per_second = 20.0
+
+[playback]
+wayback_fallback = true

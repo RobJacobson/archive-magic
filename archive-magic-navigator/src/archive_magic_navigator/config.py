@@ -29,7 +29,8 @@ def _collection_config(
             for collection in archive.collections
         },
         "archive_paths": [
-            str(collection.root) + os.sep for collection in archive.collections
+            collection.archive_path or (str(collection.root) + os.sep)
+            for collection in archive.collections
         ],
     }
     if not wayback_fallback:
@@ -59,7 +60,7 @@ def package_asset_paths() -> tuple[Path, Path]:
 def build_config(
     archives: Sequence[Archive],
     *,
-    wayback_fallback: bool = True,
+    wayback_fallback: bool | dict[str, bool] = True,
 ) -> dict[str, Any]:
     """Build one safe pywb configuration from validated inputs."""
 
@@ -68,7 +69,11 @@ def build_config(
         "collections": {
             archive.archive_id: _collection_config(
                 archive,
-                wayback_fallback=wayback_fallback,
+                wayback_fallback=(
+                    wayback_fallback.get(archive.archive_id, True)
+                    if isinstance(wayback_fallback, dict)
+                    else wayback_fallback
+                ),
             )
             for archive in archives
         },

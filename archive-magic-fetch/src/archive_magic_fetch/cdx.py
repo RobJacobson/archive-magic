@@ -36,8 +36,9 @@ from .models import (
     UnresolvedFailure,
 )
 from .playback import ArchiveMagicWaybackSession
-from .policy import CDX_PAGE_LIMIT, USER_AGENT
 from .retry import parse_retry_after
+
+_CDX_PAGE_LIMIT = 10_000
 
 
 # Standard CDX field order used by IA and wayback.
@@ -61,7 +62,7 @@ def make_cdx_session() -> ArchiveMagicWaybackSession:
     connect failures are logged and retried without nesting wayback's loop.
     """
 
-    return ArchiveMagicWaybackSession(user_agent=USER_AGENT)
+    return ArchiveMagicWaybackSession(user_agent="archive-magic-fetch")
 
 
 def normalize_cdx_search(url_pattern: str) -> tuple[str, Optional[str]]:
@@ -246,7 +247,7 @@ def fetch_year_cdx(
         "output": "json",
         "fl": ",".join(_CDX_FIELDS),
         "showResumeKey": "true",
-        "limit": str(CDX_PAGE_LIMIT),
+        "limit": str(_CDX_PAGE_LIMIT),
     }
     if match_type is not None:
         params["matchType"] = match_type

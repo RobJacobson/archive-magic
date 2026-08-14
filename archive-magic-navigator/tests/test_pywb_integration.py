@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 import socket
 import subprocess
@@ -10,19 +11,22 @@ import time
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import ClassVar
 from urllib.error import HTTPError
-from urllib.parse import unquote
+from urllib.parse import unquote, urlparse
 from urllib.request import urlopen
 
 import pytest
-
 from archive_magic_navigator import config as navigator_config
-from archive_magic_navigator.collections import Archive, ReplayCollection, select_archive
+from archive_magic_navigator.collections import (
+    Archive,
+    ReplayCollection,
+    select_archive_root,
+)
 from archive_magic_navigator.config import build_config, write_config
 from archive_magic_navigator.errors import StartupError
 from archive_magic_navigator.process import find_wayback, run_wayback
 from archive_magic_navigator.validation import validate_archive
-
 
 FIXTURE = Path(__file__).parent / "fixtures" / "collection"
 
@@ -60,9 +64,7 @@ def snapshot_tree(root: Path):
         stat = path.lstat()
         relative = path.relative_to(root).as_posix()
         digest = (
-            hashlib.sha256(path.read_bytes()).hexdigest()
-            if path.is_file()
-            else None
+            hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
         )
         result[relative] = (
             stat.st_mode,
@@ -80,7 +82,13 @@ def free_port():
 
 
 @contextmanager
-def pywb_server(tmp_path, collections, *, wayback_fallback=False):
+def pywb_server(
+    tmp_path,
+    collections,
+    *,
+    wayback_fallback=False,
+    child_environment=None,
+):
     runtime = tmp_path / f"runtime-{free_port()}"
     runtime.mkdir()
     write_config(
@@ -106,6 +114,7 @@ def pywb_server(tmp_path, collections, *, wayback_fallback=False):
         stdout=log,
         stderr=subprocess.STDOUT,
         start_new_session=True,
+        env=child_environment,
     )
     base = f"http://127.0.0.1:{port}"
     try:
@@ -137,6 +146,60 @@ def pywb_server(tmp_path, collections, *, wayback_fallback=False):
 def get(url):
     with urlopen(url, timeout=5) as response:
         return response.status, response.read(), response.headers
+
+
+@contextmanager
+def private_s3_server(root: Path):
+    class S3Handler(BaseHTTPRequestHandler):
+        ranges: ClassVar[list[tuple[str, str | None, str | None]]] = []
+
+        def do_GET(self):
+            path = unquote(urlparse(self.path).path).removeprefix("/bucket/")
+            try:
+                source = (root / path).resolve()
+                source.relative_to(root.resolve())
+            except (OSError, ValueError):
+                self.send_error(404)
+                return
+            if not source.is_file():
+                self.send_error(404)
+                return
+
+            range_header = self.headers.get("Range")
+            authorization = self.headers.get("Authorization")
+            type(self).ranges.append((path, range_header, authorization))
+            if not authorization or not authorization.startswith(
+                "AWS4-HMAC-SHA256 "
+            ):
+                self.send_error(403, "AWS Signature Version 4 is required")
+                return
+            data = source.read_bytes()
+            if not range_header or not range_header.startswith("bytes="):
+                self.send_error(400, "a byte range is required")
+                return
+            start_text, end_text = range_header.removeprefix("bytes=").split("-", 1)
+            start = int(start_text)
+            end = min(int(end_text), len(data) - 1)
+            body = data[start : end + 1]
+            self.send_response(206)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Content-Range", f"bytes {start}-{end}/{len(data)}")
+            self.send_header("Accept-Ranges", "bytes")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), S3Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield server, S3Handler
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
 
 
 class SentinelHandler(BaseHTTPRequestHandler):
@@ -214,9 +277,7 @@ def memento_server():
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
-        source = (
-            f"memento+http://127.0.0.1:{server.server_port}/web/"
-        )
+        source = f"memento+http://127.0.0.1:{server.server_port}/web/"
         yield source, IsolatedMementoHandler
     finally:
         server.shutdown()
@@ -270,9 +331,7 @@ def test_real_pywb_replays_versions_revisit_and_subresources_read_only(
             assert b"/fixture//fixture/" not in search
 
             _, cdx, _ = get(
-                base
-                + "/fixture/cdx?url=http%3A%2F%2Fexample.test%2F"
-                + "&output=json"
+                base + "/fixture/cdx?url=http%3A%2F%2Fexample.test%2F" + "&output=json"
             )
             records = [json.loads(line) for line in cdx.splitlines()]
             assert [record["timestamp"] for record in records] == [
@@ -283,24 +342,17 @@ def test_real_pywb_replays_versions_revisit_and_subresources_read_only(
             assert records[-1]["mime"] == "warc/revisit"
 
             _, first, _ = get(
-                base
-                + "/fixture/20200101000000mp_/"
-                + "http://example.test/"
+                base + "/fixture/20200101000000mp_/" + "http://example.test/"
             )
             _, second, _ = get(
-                base
-                + "/fixture/20210101000000id_/"
-                + "http://example.test/"
+                base + "/fixture/20210101000000id_/" + "http://example.test/"
             )
             _, revisit, _ = get(
-                base
-                + "/fixture/20220101000000id_/"
-                + "http://example.test/"
+                base + "/fixture/20220101000000id_/" + "http://example.test/"
             )
             assert b"Archived version one" in first
             assert (
-                b"/fixture/20200101000000cs_/"
-                b"http://example.test/assets/site.css"
+                b"/fixture/20200101000000cs_/http://example.test/assets/site.css"
             ) in first
             assert b"Archived version two" in second
             assert revisit == second
@@ -314,9 +366,7 @@ def test_real_pywb_replays_versions_revisit_and_subresources_read_only(
             assert headers.get_content_type() == "text/css"
 
             _, local_redirect_target, _ = get(
-                base
-                + "/fixture/20200101000003mp_/"
-                + "http://local-redirect.test/"
+                base + "/fixture/20200101000003mp_/" + "http://local-redirect.test/"
             )
             assert b"Redirect target captured locally" in local_redirect_target
 
@@ -334,6 +384,53 @@ def test_real_pywb_replays_versions_revisit_and_subresources_read_only(
         thread.join(timeout=2)
 
     assert snapshot_tree(archives) == before
+
+
+@pytest.mark.integration
+def test_real_pywb_reads_private_s3_warc_byte_ranges(tmp_path):
+    collection_root = (FIXTURE / "collections" / "2020").resolve()
+    replay = ReplayCollection(
+        "2020",
+        collection_root,
+        collection_root / "fixture-2020-index.cdxj",
+        "s3://bucket/collections/2020/",
+    )
+    archive = Archive("fixture", FIXTURE.resolve(), (replay,))
+
+    with private_s3_server(FIXTURE.resolve()) as (server, handler):
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "AWS_ACCESS_KEY_ID": "test-read-key",
+                "AWS_SECRET_ACCESS_KEY": "test-read-secret",
+                "AWS_ENDPOINT_URL_S3": (f"http://127.0.0.1:{server.server_port}"),
+                "AWS_REGION": "us-east-1",
+                "AWS_DEFAULT_REGION": "us-east-1",
+                "AWS_EC2_METADATA_DISABLED": "true",
+                "NO_PROXY": "127.0.0.1,localhost",
+            }
+        )
+        with pywb_server(
+            tmp_path,
+            [archive],
+            child_environment=environment,
+        ) as base:
+            _, body, _ = get(
+                base + "/fixture/20200101000000id_/" + "http://example.test/"
+            )
+
+    assert b"Archived version one" in body
+    assert handler.ranges
+    assert all(
+        filename.startswith("collections/2020/")
+        and byte_range is not None
+        and byte_range.startswith("bytes=")
+        and authorization is not None
+        and authorization.startswith("AWS4-HMAC-SHA256 ")
+        for filename, byte_range, authorization in handler.ranges
+    )
+
+
 @pytest.mark.integration
 def test_real_pywb_uses_wayback_fallback_for_redirect_and_assets(
     tmp_path,
@@ -356,23 +453,18 @@ def test_real_pywb_uses_wayback_fallback_for_redirect_and_assets(
             wayback_fallback=True,
         ) as base:
             _, local, _ = get(
-                base
-                + "/fixture/20200101000000id_/"
-                + "http://example.test/"
+                base + "/fixture/20200101000000id_/" + "http://example.test/"
             )
             assert b"Archived version one" in local
             assert handler.timegate_requests == []
             assert handler.resource_requests == []
 
             _, fallback, _ = get(
-                base
-                + "/fixture/20200101000002mp_/"
-                + "http://redirect.test/"
+                base + "/fixture/20200101000002mp_/" + "http://redirect.test/"
             )
             assert b"Wayback fallback page" in fallback
             assert (
-                b"/fixture/20200101000002cs_/"
-                b"http://fallback.test/asset.css"
+                b"/fixture/20200101000002cs_/http://fallback.test/asset.css"
             ) in fallback
             assert handler.timegate_requests == [
                 (
@@ -383,9 +475,7 @@ def test_real_pywb_uses_wayback_fallback_for_redirect_and_assets(
             assert len(handler.resource_requests) == 1
 
             _, css, headers = get(
-                base
-                + "/fixture/20200101000002cs_/"
-                + "http://fallback.test/asset.css"
+                base + "/fixture/20200101000002cs_/" + "http://fallback.test/asset.css"
             )
             assert css == b"body { background: rgb(1, 2, 3); }\n"
             assert headers.get_content_type() == "text/css"
@@ -416,9 +506,7 @@ def test_real_pywb_lists_multiple_explicit_collections(tmp_path):
         assert b"collection-a" in home
         assert b"collection-b" in home
         _, body, _ = get(
-            base
-            + "/collection-a/20200101000000id_/"
-            + "http://example.test/"
+            base + "/collection-a/20200101000000id_/" + "http://example.test/"
         )
         assert b"Archived version one" in body
 
@@ -611,18 +699,14 @@ def test_real_pywb_aggregates_flat_collections_and_replays_same_collection_revis
         encoding="utf-8",
     )
 
-    collection = select_archive(archives.resolve(), "annual")
+    collection = select_archive_root(archives / "annual", "annual")
     assert validate_archive(collection).record_count == 3
     assert [item.collection_id for item in collection.collections] == ["2020", "2021"]
     before = snapshot_tree(archives)
 
     with pywb_server(tmp_path, [collection]) as base:
-        _, original, _ = get(
-            base + "/annual/20200601000000id_/http://example.org/"
-        )
-        _, revisited, _ = get(
-            base + "/annual/20200701000000id_/http://example.org/"
-        )
+        _, original, _ = get(base + "/annual/20200601000000id_/http://example.org/")
+        _, revisited, _ = get(base + "/annual/20200701000000id_/http://example.org/")
         assert b"Annual shard body" in original
         assert revisited == original
         _, second_body, _ = get(

@@ -6,7 +6,7 @@ from unittest.mock import MagicMock
 from archive_magic_fetch.identity import revisit_group_key
 from archive_magic_fetch.inventory import stored_from_playback
 from archive_magic_fetch.models import FailureCategory, ParsedCapture, UnresolvedFailure
-from archive_magic_fetch.policy import EMPTY_PAYLOAD_DIGEST
+from archive_magic_fetch.protocol import EMPTY_PAYLOAD_DIGEST
 from archive_magic_fetch.resolution import CaptureKind, _resolve_capture
 from archive_magic_fetch.workers import DownloadOutcome
 from helpers import make_capt, playback
@@ -18,20 +18,15 @@ def resolve(
     downloaded: DownloadOutcome | None = None,
     existing=frozenset(),
     representatives=None,
-    cached=None,
     group_urls=None,
 ):
     workers = MagicMock()
     if downloaded is not None:
         workers.download.return_value = downloaded
-    cache = MagicMock()
-    cache.materialize.return_value = cached
     outcome, download = _resolve_capture(
         capture,
         group_urls=group_urls or (capture.identity.original_url,),
         workers=workers,
-        payload_cache=cache,
-        collection_id="2004",
         existing_identities=existing,
         existing_representatives=representatives or {},
         local_representatives={},
@@ -39,7 +34,7 @@ def resolve(
     return outcome, download, workers
 
 
-def test_resolves_existing_revisit_empty_slash_and_cache_without_playback():
+def test_resolves_existing_revisit_empty_and_slash_without_playback():
     identity = make_capt()
     capture = ParsedCapture(identity, "text/html")
 
@@ -70,12 +65,6 @@ def test_resolves_existing_revisit_empty_slash_and_cache_without_playback():
     )
     assert (outcome.kind, download) == (CaptureKind.SLASH_REDIRECT, None)
     workers.download.assert_not_called()
-
-    cached = playback(identity)
-    outcome, download, workers = resolve(capture, cached=cached)
-    assert (outcome.kind, download) == (CaptureKind.CACHED, None)
-    workers.download.assert_not_called()
-
 
 def test_resolves_download_variants_and_failure_semantically():
     identity = make_capt()

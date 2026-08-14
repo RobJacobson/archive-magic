@@ -10,15 +10,15 @@ import pytest
 from warcio.archiveiterator import ArchiveIterator
 
 from archive_magic_fetch.collection import (
-    archive_layout,
+    ArchiveLayout,
     ensure_collection_dirs,
     list_collection_warcs,
 )
+from archive_magic_fetch.config import StorageConfig
 from archive_magic_fetch.fetch import FetchSettings, run_fetch
 from archive_magic_fetch.index import publish_collection_index
 from archive_magic_fetch.identity import make_identity
-from archive_magic_fetch.policy import (
-    MAX_PLAYBACK_ATTEMPTS,
+from archive_magic_fetch.protocol import (
     MISSING_CDX_STATUS,
 )
 from archive_magic_fetch.inventory import (
@@ -38,7 +38,7 @@ from helpers import (
 )
 
 def test_statusless_capture_three_runs_no_extra_network(tmp_path):
-    layout = archive_layout("http://example.org/", tmp_path)
+    layout = ArchiveLayout(tmp_path, "example.org")
     ensure_collection_dirs(layout)
     digest = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
     identity = make_identity(
@@ -82,7 +82,8 @@ def test_statusless_capture_three_runs_no_extra_network(tmp_path):
                     url_pattern="http://example.org/",
                     date_start="20040615000000",
                     date_end="20040615000000",
-                    archives_root=tmp_path,
+                    archive_id="example.org",
+                storage=StorageConfig("local", tmp_path),
                 ),
                 client_factory=lambda: MagicMock(),
                 download_fn=download_fn,
@@ -107,7 +108,7 @@ def test_statusless_capture_three_runs_no_extra_network(tmp_path):
 
 
 def test_reset_data_redownloads_instead_of_reusing(tmp_path):
-    layout = archive_layout("http://example.org/", tmp_path)
+    layout = ArchiveLayout(tmp_path, "example.org")
     ensure_collection_dirs(layout)
     identity = make_capt(urlkey="com,example)/")
     calls = {"n": 0}
@@ -133,7 +134,8 @@ def test_reset_data_redownloads_instead_of_reusing(tmp_path):
         url_pattern="http://example.org/",
         date_start="20040615000000",
         date_end="20040615000000",
-        archives_root=tmp_path,
+        archive_id="example.org",
+                    storage=StorageConfig("local", tmp_path),
     )
     try:
         assert (
@@ -165,7 +167,8 @@ def test_reset_data_redownloads_instead_of_reusing(tmp_path):
                     url_pattern=settings.url_pattern,
                     date_start=settings.date_start,
                     date_end=settings.date_end,
-                    archives_root=settings.archives_root,
+                    archive_id=settings.archive_id,
+                    storage=settings.storage,
                     reset_data=True,
                 ),
                 client_factory=lambda: MagicMock(),
@@ -181,7 +184,7 @@ def test_reset_data_redownloads_instead_of_reusing(tmp_path):
 
 
 def test_slash_redirect_substitution_is_stored_and_revisited(tmp_path):
-    layout = archive_layout("http://example.org/", tmp_path)
+    layout = ArchiveLayout(tmp_path, "example.org")
     ensure_collection_dirs(layout)
     digest = "TV7A2C32YG3CFKH2CYRHAL2D4UPH7RCE"
     first = make_capt(
@@ -236,7 +239,8 @@ def test_slash_redirect_substitution_is_stored_and_revisited(tmp_path):
                 url_pattern="http://example.org/",
                 date_start="20040303170500",
                 date_end="20040516142118",
-                archives_root=tmp_path,
+                archive_id="example.org",
+                storage=StorageConfig("local", tmp_path),
             ),
             client_factory=client_factory,
             sleep=lambda _s: None,
@@ -265,9 +269,9 @@ def test_slash_redirect_substitution_is_stored_and_revisited(tmp_path):
 
 
 def test_found_capture_substitution_is_stored_under_cdx_identity(tmp_path):
-    from archive_magic_fetch.policy import CDX_DIGEST_MATCH_HEADER
+    from archive_magic_fetch.protocol import CDX_DIGEST_MATCH_HEADER
 
-    layout = archive_layout("http://example.org/", tmp_path)
+    layout = ArchiveLayout(tmp_path, "example.org")
     ensure_collection_dirs(layout)
     identity = make_capt(
         url="http://example.org/groups/?PHPSESSID=abc",
@@ -306,7 +310,8 @@ def test_found_capture_substitution_is_stored_under_cdx_identity(tmp_path):
                 url_pattern="http://example.org/",
                 date_start="20041009172745",
                 date_end="20041009172745",
-                archives_root=tmp_path,
+                archive_id="example.org",
+                storage=StorageConfig("local", tmp_path),
             ),
             client_factory=client_factory,
             sleep=lambda _s: None,
@@ -342,7 +347,7 @@ def test_found_capture_substitution_is_stored_under_cdx_identity(tmp_path):
 
 
 def test_slash_redirect_from_cdx_skips_playback_and_revisits(tmp_path):
-    layout = archive_layout("http://example.org/", tmp_path)
+    layout = ArchiveLayout(tmp_path, "example.org")
     ensure_collection_dirs(layout)
     digest = "TV7A2C32YG3CFKH2CYRHAL2D4UPH7RCE"
     empty_dig = payload_digest(b"").split(":")[1]
@@ -390,7 +395,8 @@ def test_slash_redirect_from_cdx_skips_playback_and_revisits(tmp_path):
                 url_pattern="http://example.org/",
                 date_start="20040303170500",
                 date_end="20040516142118",
-                archives_root=tmp_path,
+                archive_id="example.org",
+                storage=StorageConfig("local", tmp_path),
             ),
             client_factory=lambda: MagicMock(),
             download_fn=download_fn,
@@ -423,7 +429,7 @@ def test_slash_redirect_from_cdx_skips_playback_and_revisits(tmp_path):
 def test_same_year_representative_revisits_include_redirects(tmp_path):
     """Same urlkey+digest+status revisits, including empty 301s; 302 stays distinct."""
 
-    layout = archive_layout("http://example.org/", tmp_path)
+    layout = ArchiveLayout(tmp_path, "example.org")
     ensure_collection_dirs(layout)
     shared_body = b"shared"
     dig = payload_digest(shared_body).split(":")[1]
@@ -499,7 +505,8 @@ def test_same_year_representative_revisits_include_redirects(tmp_path):
                 url_pattern="http://example.org/",
                 date_start="20040601000000",
                 date_end="20040605000000",
-                archives_root=tmp_path,
+                archive_id="example.org",
+                storage=StorageConfig("local", tmp_path),
             ),
             client_factory=lambda: MagicMock(),
             download_fn=download_fn,
@@ -528,7 +535,7 @@ def test_same_year_representative_revisits_include_redirects(tmp_path):
 
 
 def test_empty_http_200_skips_playback_and_revisits(tmp_path):
-    layout = archive_layout("http://example.org/", tmp_path)
+    layout = ArchiveLayout(tmp_path, "example.org")
     ensure_collection_dirs(layout)
     empty_dig = payload_digest(b"").split(":")[1]
     downloads: list[str] = []
@@ -575,7 +582,8 @@ def test_empty_http_200_skips_playback_and_revisits(tmp_path):
                 url_pattern="http://example.org/",
                 date_start="20040601000000",
                 date_end="20040603000000",
-                archives_root=tmp_path,
+                archive_id="example.org",
+                storage=StorageConfig("local", tmp_path),
             ),
             client_factory=lambda: MagicMock(),
             download_fn=download_fn,
@@ -606,8 +614,8 @@ def test_empty_http_200_skips_playback_and_revisits(tmp_path):
     assert empty_responses == 2
 
 
-def test_matching_payloads_download_once_per_year(tmp_path):
-    layout = archive_layout("http://example.org/", tmp_path)
+def test_matching_payloads_in_different_years_are_downloaded_from_ia(tmp_path):
+    layout = ArchiveLayout(tmp_path, "example.org")
     ensure_collection_dirs(layout)
     body = b"logo"
     dig = payload_digest(body).split(":")[1]
@@ -652,7 +660,8 @@ def test_matching_payloads_download_once_per_year(tmp_path):
                 url_pattern="http://example.org/",
                 date_start="20040601000000",
                 date_end="20050601000000",
-                archives_root=tmp_path,
+                archive_id="example.org",
+                storage=StorageConfig("local", tmp_path),
             ),
             client_factory=lambda: MagicMock(),
             download_fn=download_fn,
@@ -663,9 +672,9 @@ def test_matching_payloads_download_once_per_year(tmp_path):
         fetch_mod.fetch_year_cdx = original
 
     assert result.exit_code == 0
-    assert downloads == ["20040601000000"]
-    assert result.metrics.downloads == 1
-    assert result.metrics.payload_reuses == 1
+    assert downloads == ["20040601000000", "20050601000000"]
+    assert result.metrics.downloads == 2
+    assert result.metrics.payload_reuses == 0
     assert result.metrics.revisits == 0
 
     types_2004 = []
@@ -695,113 +704,6 @@ def test_matching_payloads_download_once_per_year(tmp_path):
     assert stored.identity.timestamp == "20050601000000"
 
 
-def test_cross_year_payload_reuse_uses_current_cdx_metadata(
-    tmp_path,
-):
-    layout = archive_layout("http://example.org/", tmp_path)
-    ensure_collection_dirs(layout)
-    body = b"shared-across-urls"
-    digest = payload_digest(body).split(":")[1]
-    downloads: list[str] = []
-
-    def download_fn(_client, identity):
-        downloads.append(identity.timestamp)
-        result = playback(identity, body=body)
-        return replace(
-            result,
-            headers=(
-                ("Content-Type", "application/octet-stream"),
-                ("X-Archived-Source", "2004"),
-                ("Content-Length", str(len(body))),
-            ),
-        )
-
-    rows = {
-        2004: cdx_json(
-            [["com,example)/a", "20040601000000", "http://example.org/a",
-              "application/octet-stream", "200", digest, str(len(body))]]
-        ),
-        2005: cdx_json(
-            [["com,example)/b", "20050601000000", "http://example.org/b",
-              "text/plain", "200", digest, str(len(body))]]
-        ),
-    }
-    original, cdx_mod, fetch_mod = patch_cdx_by_year(rows)
-    try:
-        result = run_fetch(
-            FetchSettings(
-                url_pattern="http://example.org/*",
-                date_start="20040601000000",
-                date_end="20050601000000",
-                archives_root=tmp_path,
-            ),
-            client_factory=lambda: MagicMock(),
-            download_fn=download_fn,
-            sleep=lambda _s: None,
-        )
-    finally:
-        cdx_mod.fetch_year_cdx = original
-        fetch_mod.fetch_year_cdx = original
-
-    assert downloads == ["20040601000000"]
-    assert result.metrics.payload_reuses == 1
-    layout.collection_dir("2004").rename(tmp_path / "detached-2004")
-    with list_collection_warcs(layout, "2005")[0].open("rb") as stream:
-        response = next(
-            record for record in ArchiveIterator(stream)
-            if record.rec_type == "response"
-        )
-        assert response.rec_headers.get_header("WARC-Target-URI") == (
-            "http://example.org/b"
-        )
-        assert response.http_headers.get_statuscode() == "200"
-        assert response.http_headers.get_header("Content-Type") == "text/plain"
-        assert response.http_headers.get_header("X-Archived-Source") is None
-        assert response.content_stream().read() == body
-
-
-def test_cross_year_payload_cache_uses_ia_digest_for_soft_match(tmp_path):
-    layout = archive_layout("http://example.org/", tmp_path)
-    ensure_collection_dirs(layout)
-    body = b"early-arc"
-    ia_digest = payload_digest(body + b"\n").split(":")[1]
-    downloads: list[str] = []
-
-    def download_fn(_client, identity):
-        downloads.append(identity.timestamp)
-        return playback(identity, body=body)
-
-    rows = {
-        year: cdx_json(
-            [["com,example)/", f"{year}0601000000", "http://example.org/",
-              "text/html", "200", ia_digest, str(len(body))]]
-        )
-        for year in (2004, 2005)
-    }
-    original, cdx_mod, fetch_mod = patch_cdx_by_year(rows)
-    try:
-        result = run_fetch(
-            FetchSettings(
-                url_pattern="http://example.org/",
-                date_start="20040601000000",
-                date_end="20050601000000",
-                archives_root=tmp_path,
-            ),
-            client_factory=lambda: MagicMock(),
-            download_fn=download_fn,
-            sleep=lambda _s: None,
-        )
-    finally:
-        cdx_mod.fetch_year_cdx = original
-        fetch_mod.fetch_year_cdx = original
-
-    assert downloads == ["20040601000000"]
-    assert result.metrics.payload_reuses == 1
-    meta = json.loads(layout.collection_index("2005").read_text().split(" ", 2)[2])
-    assert meta["cdxDigest"] == f"sha1:{ia_digest}"
-    assert meta["digest"] == payload_digest(body)
-
-
 def test_cross_year_identical_bytes_with_different_ia_digests_download_twice(
     tmp_path,
 ):
@@ -825,7 +727,8 @@ def test_cross_year_identical_bytes_with_different_ia_digests_download_twice(
                 url_pattern="http://example.org/",
                 date_start="20040601000000",
                 date_end="20050601000000",
-                archives_root=tmp_path,
+                archive_id="example.org",
+                storage=StorageConfig("local", tmp_path),
             ),
             client_factory=lambda: MagicMock(),
             download_fn=lambda _client, identity: (
@@ -839,231 +742,10 @@ def test_cross_year_identical_bytes_with_different_ia_digests_download_twice(
 
     assert downloads == ["20040601000000", "20050601000000"]
     assert result.metrics.payload_reuses == 0
-
-
-def test_digest_mismatch_response_never_seeds_cross_year_cache(tmp_path):
-    layout = archive_layout("http://example.org/", tmp_path)
-    ensure_collection_dirs(layout)
-    claimed = "F" * 32
-    downloads: list[str] = []
-
-    def download_fn(_client, identity):
-        downloads.append(identity.timestamp)
-        result = playback(identity, body=f"body-{identity.timestamp}".encode())
-        return replace(result, digest_matched=False)
-
-    rows = {
-        year: cdx_json(
-            [["com,example)/", f"{year}0601000000", "http://example.org/",
-              "text/html", "200", claimed, "4"]]
-        )
-        for year in (2004, 2005)
-    }
-    original, cdx_mod, fetch_mod = patch_cdx_by_year(rows)
-    try:
-        result = run_fetch(
-            FetchSettings(
-                url_pattern="http://example.org/",
-                date_start="20040601000000",
-                date_end="20050601000000",
-                archives_root=tmp_path,
-            ),
-            client_factory=lambda: MagicMock(),
-            download_fn=download_fn,
-            sleep=lambda _s: None,
-        )
-    finally:
-        cdx_mod.fetch_year_cdx = original
-        fetch_mod.fetch_year_cdx = original
-
-    assert downloads == ["20040601000000", "20050601000000"]
-    assert result.metrics.payload_reuses == 0
-
-
-@pytest.mark.parametrize(
-    ("source_status", "status", "digest_token", "strip_cache_fields"),
-    (
-        (200, "-", "valid", False),
-        (200, "201", "valid", False),
-        (200, "206", "valid", False),
-        (200, "302", "valid", False),
-        (200, "200", "-", False),
-        (201, "200", "valid", False),
-        (206, "200", "valid", False),
-        (302, "200", "valid", False),
-        (200, "200", "valid", True),
-    ),
-)
-def test_ineligible_current_capture_downloads_individually(
-    tmp_path,
-    source_status,
-    status,
-    digest_token,
-    strip_cache_fields,
-):
-    layout = archive_layout("http://example.org/", tmp_path)
-    ensure_collection_dirs(layout)
-    body = b"status-sensitive"
-    digest = payload_digest(body).split(":")[1]
-    older = make_capt(
-        ts="20040601000000",
-        status=str(source_status),
-        digest=f"sha1:{digest}",
-    )
-    writer = CollectionWarcWriter(layout, "2004")
-    writer.write_playback(playback(older, body=body, status=source_status))
-    writer.close()
-    publish_collection_index(layout, "2004")
-    if strip_cache_fields:
-        index_path = layout.collection_index("2004")
-        parts = index_path.read_text().strip().split(" ", 2)
-        meta = json.loads(parts[2])
-        meta.pop("cdxDigest")
-        meta.pop("cdxDigestMatch")
-        index_path.write_text(f"{parts[0]} {parts[1]} {json.dumps(meta)}\n")
-
-    current_digest = digest if digest_token == "valid" else digest_token
-    row = [["com,example)/", "20050601000000", "http://example.org/",
-            "text/html", status, current_digest, str(len(body))]]
-    downloads: list[str] = []
-    original, cdx_mod, fetch_mod = patch_cdx(cdx_json(row))
-    try:
-        result = run_fetch(
-            FetchSettings(
-                url_pattern="http://example.org/",
-                date_start="20050601000000",
-                date_end="20050601000000",
-                archives_root=tmp_path,
-            ),
-            client_factory=lambda: MagicMock(),
-            download_fn=lambda _client, identity: (
-                downloads.append(identity.timestamp) or playback(identity, body=body)
-            ),
-            sleep=lambda _s: None,
-        )
-    finally:
-        cdx_mod.fetch_year_cdx = original
-        fetch_mod.fetch_year_cdx = original
-
-    assert downloads == ["20050601000000"]
-    assert result.metrics.payload_reuses == 0
-
-
-@pytest.mark.parametrize("corruption", ("timestamp", "range"))
-def test_future_or_corrupt_payload_cache_entry_falls_back_to_download(
-    tmp_path,
-    corruption,
-):
-    layout = archive_layout("http://example.org/", tmp_path)
-    ensure_collection_dirs(layout)
-    body = b"ordered-cache"
-    digest = payload_digest(body).split(":")[1]
-    future = make_capt(ts="20050601000000", digest=f"sha1:{digest}")
-    writer = CollectionWarcWriter(layout, "2005")
-    writer.write_playback(playback(future, body=body))
-    writer.close()
-    publish_collection_index(layout, "2005")
-
-    row = [["com,example)/", "20040601000000", "http://example.org/",
-            "text/html", "200", digest, str(len(body))]]
-    downloads: list[str] = []
-
-    def download_fn(_client, identity):
-        downloads.append(identity.timestamp)
-        return playback(identity, body=body)
-
-    original, cdx_mod, fetch_mod = patch_cdx(cdx_json(row))
-    try:
-        first = run_fetch(
-            FetchSettings(
-                url_pattern="http://example.org/",
-                date_start="20040601000000",
-                date_end="20040601000000",
-                archives_root=tmp_path,
-            ),
-            client_factory=lambda: MagicMock(),
-            download_fn=download_fn,
-            sleep=lambda _s: None,
-        )
-    finally:
-        cdx_mod.fetch_year_cdx = original
-        fetch_mod.fetch_year_cdx = original
-
-    assert first.metrics.payload_reuses == 0
-    assert downloads == ["20040601000000"]
-
-    # Corrupt the earlier locator and request a later year with the same digest.
-    index_path = layout.collection_index("2004")
-    parts = index_path.read_text().strip().split(" ", 2)
-    meta = json.loads(parts[2])
-    if corruption == "timestamp":
-        parts[1] = "20030601000000"
-    else:
-        meta["length"] = "999999999"
-    index_path.write_text(f"{parts[0]} {parts[1]} {json.dumps(meta)}\n")
-    later_row = [["com,example)/", "20060601000000", "http://example.org/",
-                  "text/html", "200", digest, str(len(body))]]
-    original, cdx_mod, fetch_mod = patch_cdx(cdx_json(later_row))
-    try:
-        second = run_fetch(
-            FetchSettings(
-                url_pattern="http://example.org/",
-                date_start="20060601000000",
-                date_end="20060601000000",
-                archives_root=tmp_path,
-            ),
-            client_factory=lambda: MagicMock(),
-            download_fn=download_fn,
-            sleep=lambda _s: None,
-        )
-    finally:
-        cdx_mod.fetch_year_cdx = original
-        fetch_mod.fetch_year_cdx = original
-
-    assert second.metrics.payload_reuses == 0
-    assert downloads[-1] == "20060601000000"
-
-
-def test_reset_data_allows_prior_year_payload_reuse(tmp_path):
-    layout = archive_layout("http://example.org/", tmp_path)
-    ensure_collection_dirs(layout)
-    body = b"reset-cache"
-    digest = payload_digest(body).split(":")[1]
-    older = make_capt(ts="20040601000000", digest=f"sha1:{digest}")
-    writer = CollectionWarcWriter(layout, "2004")
-    writer.write_playback(playback(older, body=body))
-    writer.close()
-    publish_collection_index(layout, "2004")
-
-    row = [["com,example)/", "20050601000000", "http://example.org/",
-            "text/html", "200", digest, str(len(body))]]
-    downloads: list[str] = []
-    original, cdx_mod, fetch_mod = patch_cdx(cdx_json(row))
-    try:
-        result = run_fetch(
-            FetchSettings(
-                url_pattern="http://example.org/",
-                date_start="20050601000000",
-                date_end="20050601000000",
-                archives_root=tmp_path,
-                reset_data=True,
-            ),
-            client_factory=lambda: MagicMock(),
-            download_fn=lambda _client, identity: (
-                downloads.append(identity.timestamp) or playback(identity, body=body)
-            ),
-            sleep=lambda _s: None,
-        )
-    finally:
-        cdx_mod.fetch_year_cdx = original
-        fetch_mod.fetch_year_cdx = original
-
-    assert downloads == []
-    assert result.metrics.payload_reuses == 1
 
 
 def test_different_ia_digest_downloads_twice(tmp_path):
-    layout = archive_layout("http://example.org/", tmp_path)
+    layout = ArchiveLayout(tmp_path, "example.org")
     ensure_collection_dirs(layout)
     body = b"same-bytes"
     dig_a = payload_digest(body).split(":")[1]
@@ -1103,7 +785,8 @@ def test_different_ia_digest_downloads_twice(tmp_path):
                 url_pattern="http://example.org/",
                 date_start="20040601000000",
                 date_end="20040602000000",
-                archives_root=tmp_path,
+                archive_id="example.org",
+                storage=StorageConfig("local", tmp_path),
             ),
             client_factory=lambda: MagicMock(),
             download_fn=download_fn,
@@ -1119,7 +802,7 @@ def test_different_ia_digest_downloads_twice(tmp_path):
 
 
 def test_failed_older_capture_does_not_use_later_success(tmp_path):
-    layout = archive_layout("http://example.org/", tmp_path)
+    layout = ArchiveLayout(tmp_path, "example.org")
     ensure_collection_dirs(layout)
     body = b"payload"
     dig = payload_digest(body).split(":")[1]
@@ -1164,7 +847,8 @@ def test_failed_older_capture_does_not_use_later_success(tmp_path):
                 url_pattern="http://example.org/",
                 date_start="20040601000000",
                 date_end="20050601000000",
-                archives_root=tmp_path,
+                archive_id="example.org",
+                storage=StorageConfig("local", tmp_path),
             ),
             client_factory=lambda: MagicMock(),
             download_fn=download_fn,
@@ -1190,7 +874,7 @@ def test_failed_older_capture_does_not_use_later_success(tmp_path):
 
 
 def test_representative_failure_promotes_next_same_key_candidate(tmp_path):
-    layout = archive_layout("http://example.org/", tmp_path)
+    layout = ArchiveLayout(tmp_path, "example.org")
     ensure_collection_dirs(layout)
     body = b"shared"
     dig = payload_digest(body).split(":")[1]
@@ -1240,7 +924,8 @@ def test_representative_failure_promotes_next_same_key_candidate(tmp_path):
                 url_pattern="http://example.org/",
                 date_start="20040601000000",
                 date_end="20040603000000",
-                archives_root=tmp_path,
+                archive_id="example.org",
+                storage=StorageConfig("local", tmp_path),
             ),
             client_factory=lambda: MagicMock(),
             download_fn=download_fn,
@@ -1253,7 +938,7 @@ def test_representative_failure_promotes_next_same_key_candidate(tmp_path):
     # First fails permanently, second downloads as promoted representative,
     # third becomes a revisit.
     assert downloads == (
-        ["20040601000000"] * MAX_PLAYBACK_ATTEMPTS + ["20040602000000"]
+        ["20040601000000"] * 4 + ["20040602000000"]
     )
     assert result.metrics.downloads == 1
     assert result.metrics.revisits == 1
@@ -1268,7 +953,7 @@ def test_representative_failure_promotes_next_same_key_candidate(tmp_path):
 
 
 def test_completed_run_reports_expected_failures(tmp_path, capsys):
-    layout = archive_layout("http://example.org/", tmp_path)
+    layout = ArchiveLayout(tmp_path, "example.org")
     ensure_collection_dirs(layout)
     good_body = b"good"
     good_digest = payload_digest(good_body).split(":")[1]
@@ -1310,7 +995,8 @@ def test_completed_run_reports_expected_failures(tmp_path, capsys):
                 url_pattern="http://example.org/",
                 date_start="20040601000000",
                 date_end="20040602000000",
-                archives_root=tmp_path,
+                archive_id="example.org",
+                storage=StorageConfig("local", tmp_path),
             ),
             client_factory=lambda: MagicMock(),
             download_fn=download_fn,
@@ -1324,7 +1010,9 @@ def test_completed_run_reports_expected_failures(tmp_path, capsys):
     run_dirs = list((layout.capture_dir("2004") / "runs").iterdir())
     assert len(run_dirs) == 1
     record = json.loads((run_dirs[0] / "run.json").read_text())
-    assert record["schema_version"] == 2
+    assert "schema_version" not in record
+    assert "warc_version" not in record
+    assert "warc_target_bytes" not in record
     assert record["archive_id"] == "example.org"
     assert record["collection_id"] == "2004"
     assert record["counts"]["payload_reused"] == 0
@@ -1359,7 +1047,7 @@ def test_completed_run_reports_expected_failures(tmp_path, capsys):
 
 
 def test_scoped_rerun_keeps_prior_collection_and_records_only_current_failures(tmp_path):
-    layout = archive_layout("http://example.org/", tmp_path)
+    layout = ArchiveLayout(tmp_path, "example.org")
     ensure_collection_dirs(layout)
     # Seed a portable 2004 collection; a 2005-only run must leave it unchanged.
     capt = make_capt(ts="20040615000000")
@@ -1393,7 +1081,8 @@ def test_scoped_rerun_keeps_prior_collection_and_records_only_current_failures(t
                 url_pattern="http://example.org/",
                 date_start="20050601000000",
                 date_end="20050601000000",
-                archives_root=tmp_path,
+                archive_id="example.org",
+                storage=StorageConfig("local", tmp_path),
             ),
             client_factory=lambda: MagicMock(),
             download_fn=download_fn,
@@ -1413,7 +1102,7 @@ def test_scoped_rerun_keeps_prior_collection_and_records_only_current_failures(t
 
 
 def test_failed_capture_retries_successfully_on_rerun(tmp_path):
-    layout = archive_layout("http://example.org/", tmp_path)
+    layout = ArchiveLayout(tmp_path, "example.org")
     ensure_collection_dirs(layout)
     body_bytes = b"eventually-ok"
     dig = payload_digest(body_bytes).split(":")[1]
@@ -1448,7 +1137,8 @@ def test_failed_capture_retries_successfully_on_rerun(tmp_path):
         url_pattern="http://example.org/",
         date_start="20040615000000",
         date_end="20040615000000",
-        archives_root=tmp_path,
+        archive_id="example.org",
+                    storage=StorageConfig("local", tmp_path),
     )
     original, cdx_mod, fetch_mod = patch_cdx(cdx_body)
     try:
@@ -1527,7 +1217,8 @@ def test_multi_year_empty_run_shares_id_without_playback_collections(
             url_pattern="http://example.org/",
             date_start="20040101000000",
             date_end="20051231235959",
-            archives_root=tmp_path,
+            archive_id="example.org",
+                    storage=StorageConfig("local", tmp_path),
         ),
         client_factory=lambda: MagicMock(),
     )
@@ -1543,7 +1234,7 @@ def test_multi_year_empty_run_shares_id_without_playback_collections(
 
 
 def test_run_record_is_published_after_index(tmp_path):
-    layout = archive_layout("http://example.org/", tmp_path)
+    layout = ArchiveLayout(tmp_path, "example.org")
     ensure_collection_dirs(layout)
     dig = payload_digest(b"ordered").split(":")[1]
     body = cdx_json(
@@ -1570,7 +1261,8 @@ def test_run_record_is_published_after_index(tmp_path):
                 url_pattern="http://example.org/",
                 date_start="20040615000000",
                 date_end="20040615000000",
-                archives_root=tmp_path,
+                archive_id="example.org",
+                storage=StorageConfig("local", tmp_path),
             ),
             client_factory=lambda: MagicMock(),
             download_fn=download_fn,
@@ -1592,8 +1284,7 @@ def test_run_record_is_published_after_index(tmp_path):
     ("archive", "sources", "index.cdxj", "collection.json", "failures.json"),
 )
 def test_legacy_layout_rejects_all_artifacts(tmp_path, legacy_name):
-    layout = archive_layout("http://example.org/", tmp_path)
-    layout.root.mkdir(parents=True)
+    layout = ArchiveLayout(tmp_path, "example.org")
     target = layout.root / legacy_name
     if legacy_name in {"archive", "sources"}:
         target.mkdir()
@@ -1605,7 +1296,8 @@ def test_legacy_layout_rejects_all_artifacts(tmp_path, legacy_name):
                 url_pattern="http://example.org/",
                 date_start="20040601000000",
                 date_end="20040601000000",
-                archives_root=tmp_path,
+                archive_id="example.org",
+                storage=StorageConfig("local", tmp_path),
             ),
             client_factory=lambda: MagicMock(),
         )
@@ -1613,13 +1305,7 @@ def test_legacy_layout_rejects_all_artifacts(tmp_path, legacy_name):
 
 def test_interrupt_finalizes_partial_without_run_json(tmp_path, monkeypatch):
     import archive_magic_fetch.fetch as fetch_mod
-    import archive_magic_fetch.resolution as resolution_mod
-    import archive_magic_fetch.workers as workers_mod
-
-    monkeypatch.setattr(fetch_mod, "PLAYBACK_WORKERS", 1)
-    monkeypatch.setattr(resolution_mod, "PLAYBACK_WORKERS", 1)
-    monkeypatch.setattr(workers_mod, "PLAYBACK_WORKERS", 1)
-    layout = archive_layout("http://example.org/", tmp_path)
+    layout = ArchiveLayout(tmp_path, "example.org")
     ensure_collection_dirs(layout)
     first = make_capt(url="http://example.org/a", ts="20040601000000")
     second = make_capt(
@@ -1675,7 +1361,9 @@ def test_interrupt_finalizes_partial_without_run_json(tmp_path, monkeypatch):
                     url_pattern="http://example.org/",
                     date_start="20040601000000",
                     date_end="20040602000000",
-                    archives_root=tmp_path,
+                    archive_id="example.org",
+                storage=StorageConfig("local", tmp_path),
+                    playback_workers=1,
                 ),
                 client_factory=lambda: MagicMock(),
                 download_fn=download_fn,
@@ -1704,7 +1392,8 @@ def test_interrupt_finalizes_partial_without_run_json(tmp_path, monkeypatch):
                 url_pattern="http://example.org/",
                 date_start="20040601000000",
                 date_end="20040602000000",
-                archives_root=tmp_path,
+                archive_id="example.org",
+                storage=StorageConfig("local", tmp_path),
             ),
             client_factory=lambda: MagicMock(),
             download_fn=download_fn,

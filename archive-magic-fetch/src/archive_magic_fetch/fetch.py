@@ -9,7 +9,7 @@ import time
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Optional, Sequence
+from typing import Callable, Mapping, Optional, Sequence
 
 from .cdx import (
     fetch_year_cdx,
@@ -25,17 +25,18 @@ from .identity import (
 )
 from .collection import (
     ArchiveLayout,
-    archive_layout,
     cleanup_temps,
     ensure_collection_dirs,
     index_artifact_from_path,
     list_collection_warcs,
+    normalize_archive_id,
     reject_legacy_layout,
     reset_collection_data,
-    warc_artifact_from_path,
     write_run_record,
 )
+from .config import DEFAULT_WARC_TARGET_BYTES, StorageConfig
 from .index import (
+    parse_cdxj_line,
     publish_collection_index,
     reconcile_missing_indexes,
 )
@@ -47,12 +48,6 @@ from .models import (
     RunMetrics,
     UnresolvedFailure,
     WarcArtifact,
-)
-from .policy import (
-    DEFAULT_DATE_START,
-    MAX_PLAYBACK_ATTEMPTS,
-    PLAYBACK_STARTS_PER_SECOND,
-    PLAYBACK_WORKERS,
 )
 from .playback import make_client
 from .workers import PlaybackWorkers
@@ -66,14 +61,14 @@ from .resolution import (
 )
 from .inventory import (
     CollectionInventory,
-    PriorPayloadCache,
     StoredResponse,
     inventory_collection,
     revisit_from_stored,
     stored_from_playback,
 )
 from .playback import download_exact
-from .warc import CollectionWarcWriter, count_warc_records, salvage_collection_partials
+from .warc import CollectionWarcWriter, salvage_collection_partials
+from .storage import PublicationManager
 
 
 _RESULT_STYLES = {
@@ -141,9 +136,12 @@ class FetchSettings:
     url_pattern: str
     date_start: str
     date_end: str
-    archives_root: Optional[Path] = None
+    archive_id: str
+    storage: StorageConfig
     reset_data: bool = False
-
+    warc_target_bytes: int = DEFAULT_WARC_TARGET_BYTES
+    playback_workers: int = 4
+    playback_starts_per_second: float = 20.0
 
 @dataclass
 class FetchResult:
@@ -181,6 +179,8 @@ def run_fetch(
         sleep=sleep,
         pace=download_fn is None,
         report=_print_line,
+        max_workers=settings.playback_workers,
+        starts_per_second=settings.playback_starts_per_second,
     )
     try:
         return _run_fetch(settings, workers=workers, sleep=sleep)
@@ -197,7 +197,11 @@ def _run_fetch(
     """Execute serial years with parallel playback and one WARC writer."""
 
     validate_date_range(settings.date_start, settings.date_end)
-    layout = archive_layout(settings.url_pattern, settings.archives_root)
+    layout = ArchiveLayout(settings.storage.workspace_directory, settings.archive_id)
+    publisher = PublicationManager(settings.storage)
+    if settings.reset_data and settings.storage.authority == "remote":
+        publisher.reset_archive(layout)
+    publisher.prepare(layout)
     reject_legacy_layout(layout)
     ensure_collection_dirs(layout)
     salvaged = salvage_collection_partials(layout)
@@ -208,13 +212,12 @@ def _run_fetch(
             flush=True,
         )
     cleanup_temps(layout)
-    reconcile_missing_indexes(layout)
+    if settings.storage.authority == "local":
+        reconcile_missing_indexes(layout)
 
     metrics = RunMetrics()
     run_id = init_run_id(layout)
     all_failures: list[UnresolvedFailure] = []
-    payload_cache = PriorPayloadCache.from_layout(layout)
-
     first_year = int(settings.date_start[:4])
     last_year = int(settings.date_end[:4])
     print(
@@ -222,9 +225,8 @@ def _run_fetch(
         flush=True,
     )
     print(
-        f"playback policy: workers={PLAYBACK_WORKERS}, "
-        f"starts/second={PLAYBACK_STARTS_PER_SECOND:g}, "
-        f"attempts={MAX_PLAYBACK_ATTEMPTS}",
+        f"playback policy: workers={settings.playback_workers}, "
+        f"starts/second={settings.playback_starts_per_second:g}",
         flush=True,
     )
 
@@ -241,7 +243,7 @@ def _run_fetch(
             run_id=run_id,
             workers=workers,
             sleep=sleep,
-            payload_cache=payload_cache,
+            publisher=publisher,
         )
         _accumulate_metrics(metrics, result.metrics)
         all_failures.extend(result.failures)
@@ -272,7 +274,7 @@ def _run_year(
     run_id: str,
     workers: PlaybackWorkers,
     sleep: Callable[[float], None],
-    payload_cache: PriorPayloadCache,
+    publisher: PublicationManager,
 ) -> _YearResult:
     """Acquire, resolve, publish, and record one yearly collection."""
 
@@ -280,6 +282,8 @@ def _run_year(
     if settings.reset_data:
         reset_collection_data(layout, collection_id)
         print(f"year {year}: reset existing collection data", flush=True)
+    else:
+        publisher.materialize_collection(layout, collection_id)
     year_metrics = RunMetrics()
     year_failures: list[UnresolvedFailure] = []
     year_started = time.monotonic()
@@ -304,7 +308,11 @@ def _run_year(
     year_metrics.selected += len(selected)
 
     inventory = inventory_collection(layout, collection_id)
-    writer = CollectionWarcWriter(layout, collection_id)
+    writer = CollectionWarcWriter(
+        layout,
+        collection_id,
+        target_bytes=settings.warc_target_bytes,
+    )
     grouped: dict[str, list[ParsedCapture]] = defaultdict(list)
     for capture in selected:
         grouped[capture.identity.urlkey].append(capture)
@@ -324,8 +332,6 @@ def _run_year(
         return process_url_group(
             group,
             workers=workers,
-            payload_cache=payload_cache,
-            collection_id=collection_id,
             existing_identities=existing_identities,
             existing_representatives=existing_representatives,
         )
@@ -354,7 +360,12 @@ def _run_year(
         new_warcs = writer.close()
         year_metrics.warc_write_s += time.monotonic() - close_started
     except (KeyboardInterrupt, Exception):
-        _finalize_interrupted_year(layout, collection_id, writer)
+        _finalize_interrupted_year(
+            layout,
+            collection_id,
+            writer,
+            warc_sizes=publisher.collection_warc_sizes(layout, collection_id),
+        )
         raise
 
     for artifact in new_warcs:
@@ -366,16 +377,23 @@ def _run_year(
         index_path = layout.collection_index(collection_id)
         if new_warcs or not index_path.is_file():
             idx_started = time.monotonic()
-            collection_index = publish_collection_index(layout, collection_id)
+            collection_index = publish_collection_index(
+                layout,
+                collection_id,
+                changed_warcs=[item.path for item in new_warcs],
+                warc_sizes=publisher.collection_warc_sizes(layout, collection_id),
+            )
             year_metrics.index_s += time.monotonic() - idx_started
         else:
             collection_index = index_artifact_from_path(layout, index_path)
-        payload_cache.add_collection(layout, collection_id)
 
     year_metrics.unresolved = len(year_failures)
-    year_warcs = _collect_warc_artifacts(
-        layout, collection_id, new_warcs
+    publisher.publish_collection(
+        layout,
+        collection_id,
+        reset=settings.reset_data,
     )
+    year_warcs = _manifest_warc_artifacts(layout, collection_id, publisher)
     write_run_record(
         layout,
         collection_id=collection_id,
@@ -389,6 +407,7 @@ def _run_year(
         metrics=year_metrics,
         failures=year_failures,
     )
+    publisher.evict_collection(layout, collection_id)
     print(
         f"year {year} done: downloads={year_metrics.downloads} "
         f"payload-reuses={year_metrics.payload_reuses} "
@@ -419,9 +438,12 @@ def _finalize_interrupted_year(
     layout: ArchiveLayout,
     collection_id: str,
     writer: CollectionWarcWriter,
+    *,
+    warc_sizes: Mapping[str, int] | None = None,
 ) -> None:
-    """Publish any open shard and rebuild CDXJ; do not write run.json."""
+    """Finalize any open shard and rebuild CDXJ; do not publish remotely."""
 
+    artifacts: list[WarcArtifact] = []
     try:
         artifacts = writer.close()
         for artifact in artifacts:
@@ -434,7 +456,12 @@ def _finalize_interrupted_year(
     if not list_collection_warcs(layout, collection_id):
         return
     try:
-        index = publish_collection_index(layout, collection_id)
+        index = publish_collection_index(
+            layout,
+            collection_id,
+            changed_warcs=[item.path for item in artifacts],
+            warc_sizes=warc_sizes,
+        )
         if index is not None:
             print(f"  published {index.relative_key}", flush=True)
     except Exception as error:  # noqa: BLE001 - next run reconciles
@@ -515,7 +542,6 @@ def _commit_capture_outcome(
     metrics.represented += 1
     inventory.identities.add(outcome.identity)
     if outcome.kind in {
-        CaptureKind.CACHED,
         CaptureKind.EMPTY,
         CaptureKind.SLASH_REDIRECT,
     }:
@@ -553,8 +579,6 @@ def _format_capture_outcome(outcome: CaptureOutcome) -> tuple[str, str]:
         return "Revisit", "revisit"
     if outcome.kind is CaptureKind.EMPTY:
         return "Empty payload", "revisit"
-    if outcome.kind is CaptureKind.CACHED:
-        return "Payload reused", "revisit"
     if outcome.kind is CaptureKind.FAILURE:
         assert outcome.failure is not None
         reason = outcome.failure.category.value.replace("_", " ")
@@ -614,26 +638,41 @@ def _dedupe_captures(
     return result
 
 
-def _collect_warc_artifacts(
+def _manifest_warc_artifacts(
     layout: ArchiveLayout,
     collection_id: str,
-    new_warcs: Sequence[WarcArtifact],
+    publisher: PublicationManager,
 ) -> list[WarcArtifact]:
-    known = {item.relative_key: item for item in new_warcs}
-    artifacts: list[WarcArtifact] = []
-    for path in list_collection_warcs(layout, collection_id):
-        rel = path.relative_to(layout.root).as_posix()
-        if rel in known:
-            artifacts.append(known[rel])
-        else:
-            artifacts.append(
-                warc_artifact_from_path(
-                    layout,
-                    path,
-                    record_count=count_warc_records(path),
-                )
-            )
-    return artifacts
+    """Summarize committed WARCs from manifest metadata and CDXJ counts."""
+
+    collection = publisher.manifest.collections.get(collection_id)
+    index_path = layout.collection_index(collection_id)
+    if collection is None or not index_path.is_file():
+        return []
+    capture_counts: dict[str, int] = defaultdict(int)
+    for line in index_path.read_text(encoding="utf-8").splitlines():
+        if not line:
+            continue
+        try:
+            filename = parse_cdxj_line(line)[2]["filename"]
+        except (KeyError, TypeError, ValueError):
+            continue
+        if isinstance(filename, str):
+            capture_counts[filename] += 1
+    return [
+        WarcArtifact(
+            relative_key=item.key,
+            collection_id=collection_id,
+            sequence=int(
+                Path(item.key).name.removesuffix(".warc.gz").rsplit("-", 1)[1]
+            ),
+            path=layout.root / item.key,
+            size_bytes=item.size_bytes,
+            sha256=item.sha256,
+            record_count=capture_counts[Path(item.key).name] + 1,
+        )
+        for item in collection.warcs
+    ]
 
 
 def _accumulate_metrics(total: RunMetrics, current: RunMetrics) -> None:
@@ -664,25 +703,37 @@ def _accumulate_metrics(total: RunMetrics, current: RunMetrics) -> None:
 
 def build_settings(
     url_pattern: str,
+    archive_id: str | None = None,
     date_start: Optional[str] = None,
     date_end: Optional[str] = None,
-    archives_root: Optional[Path] = None,
     *,
     reset_data: bool = False,
+    storage: StorageConfig,
+    warc_target_bytes: int = DEFAULT_WARC_TARGET_BYTES,
+    playback_workers: int = 4,
+    playback_starts_per_second: float = 20.0,
+    default_start: str = "1995-01-01",
+    default_end: str | None = None,
 ) -> FetchSettings:
     """Validate CLI-facing inputs into settings."""
 
     start = parse_date_bound(
-        date_start, default=DEFAULT_DATE_START, bound="start"
+        date_start, default=default_start, bound="start"
     )
     end = parse_date_bound(
-        date_end, default=current_utc_cdx_timestamp(), bound="end"
+        date_end,
+        default=default_end or current_utc_cdx_timestamp(),
+        bound="end",
     )
     validate_date_range(start, end)
     return FetchSettings(
         url_pattern=url_pattern.strip(),
+        archive_id=archive_id or normalize_archive_id(url_pattern),
         date_start=start,
         date_end=end,
-        archives_root=archives_root,
         reset_data=reset_data,
+        storage=storage,
+        warc_target_bytes=warc_target_bytes,
+        playback_workers=playback_workers,
+        playback_starts_per_second=playback_starts_per_second,
     )

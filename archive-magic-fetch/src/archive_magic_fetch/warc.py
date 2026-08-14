@@ -24,16 +24,15 @@ from .collection import (
     publish_file_atomically,
     warc_artifact_from_path,
 )
+from .config import DEFAULT_WARC_TARGET_BYTES
 from .models import PlaybackResult, RevisitResult, WarcArtifact
-from .policy import (
+from .protocol import (
     CDX_DIGEST_MATCH_HEADER,
     CDX_PAYLOAD_DIGEST_HEADER,
     CDX_STATUS_HEADER,
     CDX_URLKEY_HEADER,
-    SOFTWARE_ID,
-    WARC_TARGET_BYTES,
-    WARC_VERSION,
 )
+
 
 def _status_line(status_code: int) -> str:
     try:
@@ -61,7 +60,7 @@ def build_response_record(result: PlaybackResult):
     }
     if not result.digest_matched:
         warc_headers[CDX_DIGEST_MATCH_HEADER] = "false"
-    builder = RecordBuilder(warc_version=WARC_VERSION)
+    builder = RecordBuilder(warc_version=RecordBuilder.WARC_1_1)
     return builder.create_warc_record(
         result.identity.original_url,
         "response",
@@ -85,7 +84,7 @@ def build_revisit_record(result: RevisitResult):
         [],
         protocol="HTTP/1.1",
     )
-    builder = RecordBuilder(warc_version=WARC_VERSION)
+    builder = RecordBuilder(warc_version=RecordBuilder.WARC_1_1)
     return builder.create_warc_record(
         result.identity.original_url,
         "revisit",
@@ -266,7 +265,7 @@ class CollectionWarcWriter:
 
     layout: ArchiveLayout
     collection_id: str
-    target_bytes: int = WARC_TARGET_BYTES
+    target_bytes: int = DEFAULT_WARC_TARGET_BYTES
     sequence: int = 0
     stream: BinaryIO | None = None
     writer: WARCWriter | None = None
@@ -347,7 +346,7 @@ class CollectionWarcWriter:
             self.writer = WARCWriter(
                 self.stream,
                 gzip=True,
-                warc_version=WARC_VERSION,
+                warc_version=RecordBuilder.WARC_1_1,
             )
             self.record_count = 0
             return
@@ -356,14 +355,11 @@ class CollectionWarcWriter:
         self.writer = WARCWriter(
             self.stream,
             gzip=True,
-            warc_version=WARC_VERSION,
+            warc_version=RecordBuilder.WARC_1_1,
         )
         warcinfo = self.writer.create_warcinfo_record(
             final_name,
-            {
-                "software": SOFTWARE_ID,
-                "format": f"WARC File Format {WARC_VERSION}",
-            },
+            {},
         )
         self.writer.write_record(warcinfo)
         self._flush()
