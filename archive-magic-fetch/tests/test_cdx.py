@@ -13,7 +13,7 @@ from archive_magic_fetch.cdx import (
     init_run_id,
     normalize_cdx_search,
     parse_date_bound,
-    year_bounds,
+    year_ranges,
 )
 from archive_magic_fetch.collection import archive_layout, ensure_collection_dirs
 from archive_magic_fetch.fetch import _report_cdx_ingest_skips, build_settings
@@ -22,7 +22,6 @@ from archive_magic_fetch.models import (
     FailureCategory,
     UnresolvedFailure,
 )
-from archive_magic_fetch.policy import DEFAULT_DATE_START
 from helpers import FakeSession, cdx_json
 
 
@@ -146,12 +145,51 @@ def test_cdx_ingest_skips_are_logged(capsys):
 def test_year_end_bound_covers_full_utc_year():
     end = parse_date_bound("2004", default="", bound="end")
     assert end == "20041231235959"
-    assert year_bounds(2004, "20040101000000", end) is not None
+    assert list(year_ranges("20040101000000", end)) == [
+        (2004, "20040101000000", "20041231235959")
+    ]
     with pytest.raises(ValueError):
         parse_date_bound("200413", default="", bound="start")
     settings = build_settings("http://example.org/", date_end="2004")
     assert settings.date_end == "20041231235959"
-    assert DEFAULT_DATE_START.startswith("1995")
+    assert settings.date_start == "19950101000000"
+
+
+def test_parse_date_bound_strips_hyphens_and_pads_precision():
+    assert parse_date_bound(None, default="1995-01-01", bound="start") == (
+        "19950101000000"
+    )
+    assert parse_date_bound("1995", default="", bound="start") == "19950101000000"
+    assert parse_date_bound("1995", default="", bound="end") == "19951231235959"
+    assert parse_date_bound("2004-06", default="", bound="start") == "20040601000000"
+    assert parse_date_bound("2004-06", default="", bound="end") == "20040630235959"
+    assert parse_date_bound("200406", default="", bound="end") == "20040630235959"
+    assert parse_date_bound("2004-06-15", default="1995-01-01", bound="start") == (
+        "20040615000000"
+    )
+    assert parse_date_bound("2004-12-31", default="1995-01-01", bound="end") == (
+        "20041231235959"
+    )
+    with pytest.raises(ValueError, match="invalid date bound"):
+        parse_date_bound("2004-06-15T00:00:00", default="", bound="start")
+    settings = build_settings(
+        "http://example.org/",
+        date_start="2004-06",
+        date_end="2004-12-31",
+    )
+    assert settings.date_start == "20040601000000"
+    assert settings.date_end == "20041231235959"
+    assert list(year_ranges(settings.date_start, settings.date_end)) == [
+        (2004, "20040601000000", "20041231235959")
+    ]
+
+
+def test_year_ranges_clips_first_and_last_years():
+    assert list(year_ranges("20030601120000", "20050301120000")) == [
+        (2003, "20030601120000", "20031231235959"),
+        (2004, "20040101000000", "20041231235959"),
+        (2005, "20050101000000", "20050301120000"),
+    ]
 
 
 def test_normalize_cdx_search_returns_stripped_input():

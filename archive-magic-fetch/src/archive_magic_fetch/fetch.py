@@ -16,7 +16,7 @@ from .cdx import (
     init_run_id,
     parse_date_bound,
     validate_date_range,
-    years_in_range,
+    year_ranges,
 )
 from .identity import (
     current_utc_cdx_timestamp,
@@ -215,9 +215,10 @@ def _run_fetch(
     all_failures: list[UnresolvedFailure] = []
     payload_cache = PriorPayloadCache.from_layout(layout)
 
-    years = years_in_range(settings.date_start, settings.date_end)
+    first_year = int(settings.date_start[:4])
+    last_year = int(settings.date_end[:4])
     print(
-        f"archive {layout.archive_id}: collections {years[0]}-{years[-1]}",
+        f"archive {layout.archive_id}: collections {first_year}-{last_year}",
         flush=True,
     )
     print(
@@ -228,11 +229,15 @@ def _run_fetch(
     )
 
     run_skips_errors = 0
-    for year in years:
+    for year, year_start, year_end in year_ranges(
+        settings.date_start, settings.date_end
+    ):
         result = _run_year(
             settings,
             layout=layout,
             year=year,
+            date_start=year_start,
+            date_end=year_end,
             run_id=run_id,
             workers=workers,
             sleep=sleep,
@@ -262,6 +267,8 @@ def _run_year(
     *,
     layout: ArchiveLayout,
     year: int,
+    date_start: str,
+    date_end: str,
     run_id: str,
     workers: PlaybackWorkers,
     sleep: Callable[[float], None],
@@ -282,8 +289,8 @@ def _run_year(
         layout,
         url_pattern=settings.url_pattern,
         year=year,
-        date_start=settings.date_start,
-        date_end=settings.date_end,
+        date_start=date_start,
+        date_end=date_end,
         run_id=run_id,
         sleep=sleep,
     )

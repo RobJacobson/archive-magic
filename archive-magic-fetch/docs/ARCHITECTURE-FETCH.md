@@ -22,9 +22,13 @@ startup recovery and serial per-year publication on the main writer thread.
 archive-magic-fetch URL_PATTERN [--start DATE] [--end DATE]
 ```
 
-The default range is 1995 through the current UTC time. Expected capture-level
-failures do not fail the command; they are reported in the corresponding
-immutable run record. Unexpected exceptions return nonzero.
+The default range is 1995-01-01 through the current UTC time. `--start` and
+`--end` accept the same calendar grammar as TOML: year, month, or day precision,
+with or without hyphens (`1995`, `1995-01`, `1995-01-01`, or compact CDX digits).
+A partial start expands to the beginning of that precision; a partial end expands
+to its last instant (`--end 2004` is `20041231235959`). Omitted `--end` means
+now. Expected capture-level failures do not fail the command; they are reported
+in the corresponding immutable run record. Unexpected exceptions return nonzero.
 
 ```text
 <archives-root>/example.org/
@@ -52,7 +56,10 @@ pywb's archive path.
 
 ## Collection processing
 
-Years are selected serially in ascending order. For each selected year Fetch:
+The requested range is normalized once to 14-digit UTC CDX timestamps, then
+split into yearly slices. The first and last years are clipped to the requested
+bounds; intervening years use the full calendar year. Years are processed
+serially in ascending order. For each selected year Fetch:
 
 1. Creates `captures/<year>/runs/<run-id>/` and durably saves every raw CDX HTTP
    entity as `page-NNN.cdx.gz` before parsing it.
