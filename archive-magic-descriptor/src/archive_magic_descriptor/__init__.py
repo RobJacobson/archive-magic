@@ -2,6 +2,7 @@
 
 from .descriptor import (
     DEFAULT_WARC_TARGET_BYTES,
+    DEFAULT_RETRIES,
     DESCRIPTOR_NAME,
     SCHEMA_VERSION,
     ArchiveDescriptor,
@@ -20,6 +21,7 @@ from .manifest import (
 
 __all__ = [
     "DEFAULT_WARC_TARGET_BYTES",
+    "DEFAULT_RETRIES",
     "DESCRIPTOR_NAME",
     "MANIFEST_NAME",
     "SCHEMA_VERSION",

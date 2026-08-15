@@ -8,7 +8,6 @@ from pathlib import Path
 
 
 class FailureCategory(str, Enum):
-    MALFORMED_CDX = "malformed_cdx"
     BLOCKED = "blocked"
     EXACT_MISMATCH = "exact_mismatch"
     UNAVAILABLE = "unavailable"
@@ -92,7 +91,6 @@ class IndexArtifact:
 
 @dataclass
 class RunMetrics:
-    cdx_requests: int = 0
     cdx_duration_s: float = 0.0
     playback_attempts: int = 0
     playback_bytes: int = 0

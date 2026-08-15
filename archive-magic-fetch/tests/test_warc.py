@@ -29,8 +29,6 @@ from archive_magic_fetch.inventory import (
 from archive_magic_fetch.playback import classify_playback_error, download_exact, payload_digest
 from archive_magic_fetch.warc import (
     CollectionWarcWriter,
-    salvage_collection_partials,
-    truncate_incomplete_gzip_warc,
     validate_warc,
 )
 from helpers import cdx_json, found_capture_client, make_capt, memento_client, patch_cdx, playback, substitution_client
@@ -387,8 +385,8 @@ def test_trailing_newline_soft_match_seeds_revisit_and_survives_inventory(
             sleep=lambda _s: None,
         )
     finally:
-        cdx_mod.fetch_year_cdx = original
-        fetch_mod.fetch_year_cdx = original
+        cdx_mod.fetch_cdx = original
+        fetch_mod.fetch_cdx = original
 
     assert result.exit_code == 0
     assert downloads == ["20040601000000"]
@@ -567,8 +565,8 @@ def test_digest_mismatch_is_kept_but_never_seeds_revisit(tmp_path):
             sleep=lambda _s: None,
         )
     finally:
-        cdx_mod.fetch_year_cdx = original
-        fetch_mod.fetch_year_cdx = original
+        cdx_mod.fetch_cdx = original
+        fetch_mod.fetch_cdx = original
 
     assert result.exit_code == 0
     assert downloads == ["20040601000000", "20040602000000"]
@@ -626,7 +624,7 @@ def test_wrapped_incomplete_read_is_permanent_truncated_failure():
     assert retryable is False
 
 
-def test_warc_rollover_naming_and_rejects_1000(tmp_path):
+def test_warc_rollover_naming_has_no_arbitrary_sequence_limit(tmp_path):
     layout = ArchiveLayout(tmp_path, "example.org")
     ensure_collection_dirs(layout)
     writer = CollectionWarcWriter(layout, "2004", target_bytes=1)
@@ -644,29 +642,9 @@ def test_warc_rollover_naming_and_rejects_1000(tmp_path):
         assert artifact.record_count == 2
         assert validate_warc(artifact.path) == artifact.record_count
 
-    for seq in range(1, 1000):
-        path = layout.collection_warc_path("2005", seq)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(b"placeholder")
-    with pytest.raises(RuntimeError, match="999"):
-        CollectionWarcWriter(layout, "2005", target_bytes=1)
-
-
-def test_writer_uses_visible_partial_beside_destination(tmp_path):
-    layout = ArchiveLayout(tmp_path, "example.org")
-    ensure_collection_dirs(layout)
-    writer = CollectionWarcWriter(layout, "2004")
+    writer = CollectionWarcWriter(layout, "2005", target_bytes=1, sequence=1000)
     writer.write_playback(playback(make_capt()))
-    partial = layout.collection_warc_partial_path("2004", 1)
-    assert writer.temp_path == partial
-    assert partial.name == "example.org-2004-001.warc.gz.partial"
-    assert not partial.name.startswith(".")
-    assert partial.parent == layout.collection_dir("2004")
-    writer.close()
-    assert not partial.exists()
-    assert list_collection_warcs(layout, "2004")[0].name == (
-        "example.org-2004-001.warc.gz"
-    )
+    assert writer.close()[0].path.name.endswith("-1000.warc.gz")
 
 
 def test_resume_appends_to_same_shard_under_size_cap(tmp_path):
@@ -680,6 +658,8 @@ def test_resume_appends_to_same_shard_under_size_cap(tmp_path):
     writer = CollectionWarcWriter(layout, "2004")
     writer.write_playback(playback(first))
     writer.close()
+    path = layout.collection_warc_path("2004", 1)
+    prefix = path.read_bytes()
 
     writer = CollectionWarcWriter(layout, "2004")
     writer.write_playback(playback(second, body=b"later"))
@@ -687,6 +667,7 @@ def test_resume_appends_to_same_shard_under_size_cap(tmp_path):
 
     warcs = list_collection_warcs(layout, "2004")
     assert [path.name for path in warcs] == ["example.org-2004-001.warc.gz"]
+    assert warcs[0].read_bytes().startswith(prefix)
     publish_collection_index(layout, "2004")
     inv = inventory_collection(layout, "2004")
     assert inv.contains(first)
@@ -717,47 +698,17 @@ def test_resume_starts_next_shard_when_last_is_at_cap(tmp_path):
     ]
 
 
-def test_salvage_promotes_collection_partial_and_truncates_garbage(tmp_path):
-    layout = ArchiveLayout(tmp_path, "example.org")
-    ensure_collection_dirs(layout)
-    capt = make_capt()
-    writer = CollectionWarcWriter(layout, "2004")
-    writer.write_playback(playback(capt))
-    partial = writer.temp_path
-    assert partial is not None
-    writer.stream.close()
-    writer.stream = None
-    writer.writer = None
-    partial.write_bytes(partial.read_bytes() + b"\x00torn-member")
-
-    salvaged = salvage_collection_partials(layout)
-
-    assert len(salvaged) == 1
-    assert salvaged[0].path.name == "example.org-2004-001.warc.gz"
-    assert not partial.exists()
-    publish_collection_index(layout, "2004")
-    assert inventory_collection(layout, "2004").contains(capt)
-    validate_warc(salvaged[0].path)
-
-
-def test_cleanup_temps_keeps_visible_warc_partials(tmp_path):
+def test_cleanup_temps_removes_legacy_warc_partials(tmp_path):
     layout = ArchiveLayout(tmp_path, "example.org")
     ensure_collection_dirs(layout)
     collection_dir = layout.collection_dir("2004")
     collection_dir.mkdir(parents=True)
-    partial = layout.collection_warc_partial_path("2004", 1)
+    partial = collection_dir / "example.org-2004-001.warc.gz.partial"
     partial.write_bytes(b"keep-me")
     stray = collection_dir / ".tmp-index.cdxj.tmp"
     stray.write_text("x", encoding="utf-8")
 
     cleanup_temps(layout)
 
-    assert partial.exists()
+    assert not partial.exists()
     assert not stray.exists()
-
-
-def test_truncate_drops_warcinfo_only_partial(tmp_path):
-    empty = tmp_path / "empty.warc.gz.partial"
-    empty.write_bytes(b"")
-    assert truncate_incomplete_gzip_warc(empty) is None
-    assert not empty.exists()

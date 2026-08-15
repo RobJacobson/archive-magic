@@ -34,6 +34,7 @@ def test_descriptor_and_directory_shorthand_resolve_relative_workspace(tmp_path)
 [fetch]
 start = "2000-01-01"
 playback_workers = 2
+retries = 5
 [playback]
 wayback_fallback = false
 """,
@@ -45,6 +46,7 @@ wayback_fallback = false
     assert config.storage.workspace_directory == (tmp_path / "workspace").resolve()
     assert config.warc_target_bytes == DEFAULT_WARC_TARGET_BYTES
     assert config.playback_workers == 2
+    assert config.retries == 5
     assert config.wayback_fallback is False
 
 

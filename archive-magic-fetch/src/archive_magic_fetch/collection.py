@@ -24,7 +24,6 @@ from .models import (
 
 _WWW_ALIAS_PREFIX = re.compile(r"^www\d*\.")
 _TEMP_NAME = re.compile(r"^\.tmp-|^.*\.tmp$")
-_PARTIAL_WARC_SUFFIX = ".warc.gz.partial"
 _COLLECTION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _LEGACY_NAMES = ("archive", "sources", "index.cdxj", "collection.json", "failures.json")
 
@@ -78,25 +77,14 @@ class ArchiveLayout:
 
     def collection_warc_filename(self, collection_id: str, sequence: int) -> str:
         collection_id = self.validate_collection_id(collection_id)
-        if sequence < 1 or sequence > 999:
-            raise ValueError(
-                f"WARC sequence must be 001-999, got {sequence}"
-            )
+        if sequence < 1:
+            raise ValueError(f"WARC sequence must be positive, got {sequence}")
         return f"{self.archive_id}-{collection_id}-{sequence:03d}.warc.gz"
 
     def collection_warc_path(self, collection_id: str, sequence: int) -> Path:
         return self.collection_dir(collection_id) / self.collection_warc_filename(
             collection_id, sequence
         )
-
-    def collection_warc_partial_path(
-        self, collection_id: str, sequence: int
-    ) -> Path:
-        """Return the visible in-progress sibling of one WARC shard."""
-
-        final = self.collection_warc_path(collection_id, sequence)
-        return final.with_name(final.name + ".partial")
-
 
 def normalize_domain(
     value: str,
@@ -183,16 +171,14 @@ def ensure_collection_dirs(layout: ArchiveLayout) -> None:
 
 
 def cleanup_temps(layout: ArchiveLayout) -> None:
-    """Remove abandoned short-lived temps; keep visible WARC partials."""
+    """Remove abandoned short-lived temporary and legacy partial files."""
 
     if not layout.root.is_dir():
         return
     for path in layout.root.rglob("*"):
         if not path.is_file():
             continue
-        if path.name.endswith(_PARTIAL_WARC_SUFFIX):
-            continue
-        if _TEMP_NAME.match(path.name):
+        if _TEMP_NAME.match(path.name) or path.name.endswith(".warc.gz.partial"):
             try:
                 path.unlink()
             except OSError:
@@ -254,18 +240,20 @@ def _collection_warc_name_pattern(
 
     return re.compile(
         rf"{re.escape(layout.archive_id)}-{re.escape(collection_id)}-"
-        r"(?P<seq>\d{3})\.warc\.gz"
+        r"(?P<seq>\d{3,})\.warc\.gz"
     )
 
 
 def reset_collection_data(layout: ArchiveLayout, collection_id: str) -> None:
-    """Remove WARC, partial, and CDXJ artifacts for one portable collection."""
+    """Remove WARC, legacy partial, and CDXJ artifacts for one collection."""
 
     collection_id = layout.validate_collection_id(collection_id)
     for path in list_collection_warcs(layout, collection_id):
         path.unlink()
-    for path in list_collection_partials(layout, collection_id):
-        path.unlink()
+    collection_dir = layout.collection_dir(collection_id)
+    if collection_dir.is_dir():
+        for path in collection_dir.glob("*.warc.gz.partial"):
+            path.unlink()
     index_path = layout.collection_index(collection_id)
     if index_path.is_file():
         index_path.unlink()
@@ -291,43 +279,6 @@ def list_collection_warcs(
         found.append((int(match.group("seq")), path))
     found.sort(key=lambda item: item[0])
     return [path for _, path in found]
-
-
-def list_collection_partials(
-    layout: ArchiveLayout, collection_id: str
-) -> list[Path]:
-    """Return visible in-progress WARC partials for one collection."""
-
-    collection_id = layout.validate_collection_id(collection_id)
-    collection_dir = layout.collection_dir(collection_id)
-    if not collection_dir.is_dir():
-        return []
-    found: list[tuple[int, Path]] = []
-    for path in collection_dir.iterdir():
-        if not path.is_file():
-            continue
-        parsed = parse_warc_partial_name(layout, collection_id, path.name)
-        if parsed is None:
-            continue
-        found.append((parsed, path))
-    found.sort(key=lambda item: item[0])
-    return [path for _, path in found]
-
-
-def parse_warc_partial_name(
-    layout: ArchiveLayout, collection_id: str, name: str
-) -> int | None:
-    """Return the shard sequence encoded in a WARC partial basename."""
-
-    collection_id = layout.validate_collection_id(collection_id)
-    pattern = re.compile(
-        rf"^{re.escape(layout.archive_id)}-"
-        rf"{re.escape(collection_id)}-(?P<seq>\d{{3}})\.warc\.gz\.partial$"
-    )
-    match = pattern.fullmatch(name)
-    if match is None:
-        return None
-    return int(match.group("seq"))
 
 
 def last_collection_warc(
@@ -434,7 +385,6 @@ def write_run_record(
             "unresolved": metrics.unresolved,
         },
         "metrics": {
-            "cdx_requests": metrics.cdx_requests,
             "cdx_duration_s": round(metrics.cdx_duration_s, 3),
             "playback_attempts": metrics.playback_attempts,
             "playback_bytes": metrics.playback_bytes,

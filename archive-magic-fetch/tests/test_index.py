@@ -221,7 +221,7 @@ def test_reset_collection_data_deletes_warc_and_cdxj(tmp_path):
     index_path = layout.collection_index("2004")
     assert list_collection_warcs(layout, "2004")
     assert index_path.is_file()
-    partial = layout.collection_warc_partial_path("2004", 1)
+    partial = layout.collection_dir("2004") / "example.org-2004-001.warc.gz.partial"
     partial.write_bytes(b"in-progress")
 
     reset_collection_data(layout, "2004")

@@ -10,6 +10,7 @@ from pathlib import Path
 DESCRIPTOR_NAME = "archive.toml"
 SCHEMA_VERSION = 1
 DEFAULT_WARC_TARGET_BYTES = 250_000_000
+DEFAULT_RETRIES = 4
 
 
 @dataclass(frozen=True)
@@ -35,6 +36,7 @@ class ArchiveDescriptor:
     warc_target_bytes: int = DEFAULT_WARC_TARGET_BYTES
     playback_workers: int = 4
     playback_starts_per_second: float = 20.0
+    retries: int = DEFAULT_RETRIES
     start: str = "1995-01-01"
     end: str | None = None
     wayback_fallback: bool = True
@@ -89,6 +91,7 @@ def load_descriptor(value: Path | str) -> ArchiveDescriptor:
             "warc_target_bytes",
             "playback_workers",
             "playback_starts_per_second",
+            "retries",
             "start",
             "end",
         },
@@ -135,6 +138,9 @@ def load_descriptor(value: Path | str) -> ArchiveDescriptor:
         playback_starts_per_second=_positive_number(
             fetch.get("playback_starts_per_second", 20.0),
             "fetch.playback_starts_per_second",
+        ),
+        retries=_nonnegative_int(
+            fetch.get("retries", DEFAULT_RETRIES), "fetch.retries"
         ),
         start=_string(fetch.get("start", "1995-01-01"), "fetch.start"),
         end=None if end_value is None else _string(end_value, "fetch.end"),
@@ -203,6 +209,12 @@ def _path(base: Path, value: object, label: str) -> Path:
 def _positive_int(value: object, label: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ValueError(f"{label} must be a positive integer")
+    return value
+
+
+def _nonnegative_int(value: object, label: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{label} must be a nonnegative integer")
     return value
 
 

@@ -90,8 +90,8 @@ def test_statusless_capture_three_runs_no_extra_network(tmp_path):
             )
             assert result.exit_code == 0
     finally:
-        cdx_mod.fetch_year_cdx = original
-        fetch_mod.fetch_year_cdx = original
+        cdx_mod.fetch_cdx = original
+        fetch_mod.fetch_cdx = original
 
     assert calls["n"] == 1
     inv = inventory_collection(layout, "2004")
@@ -178,8 +178,8 @@ def test_reset_data_redownloads_instead_of_reusing(tmp_path):
         )
         assert calls["n"] == 2
     finally:
-        cdx_mod.fetch_year_cdx = original
-        fetch_mod.fetch_year_cdx = original
+        cdx_mod.fetch_cdx = original
+        fetch_mod.fetch_cdx = original
 
 
 def test_slash_redirect_substitution_is_stored_and_revisited(tmp_path):
@@ -245,8 +245,8 @@ def test_slash_redirect_substitution_is_stored_and_revisited(tmp_path):
             sleep=lambda _s: None,
         )
     finally:
-        cdx_mod.fetch_year_cdx = original
-        fetch_mod.fetch_year_cdx = original
+        cdx_mod.fetch_cdx = original
+        fetch_mod.fetch_cdx = original
 
     assert result.exit_code == 0
     assert sum(getattr(client, "calls", 0) for client in clients) == 1
@@ -316,8 +316,8 @@ def test_found_capture_substitution_is_stored_under_cdx_identity(tmp_path):
             sleep=lambda _s: None,
         )
     finally:
-        cdx_mod.fetch_year_cdx = original
-        fetch_mod.fetch_year_cdx = original
+        cdx_mod.fetch_cdx = original
+        fetch_mod.fetch_cdx = original
 
     assert result.exit_code == 0
     assert result.metrics.downloads == 1
@@ -402,8 +402,8 @@ def test_slash_redirect_from_cdx_skips_playback_and_revisits(tmp_path):
             sleep=lambda _s: None,
         )
     finally:
-        cdx_mod.fetch_year_cdx = original
-        fetch_mod.fetch_year_cdx = original
+        cdx_mod.fetch_cdx = original
+        fetch_mod.fetch_cdx = original
 
     assert result.exit_code == 0
     assert downloads == []
@@ -512,8 +512,8 @@ def test_same_year_representative_revisits_include_redirects(tmp_path):
             sleep=lambda _s: None,
         )
     finally:
-        cdx_mod.fetch_year_cdx = original
-        fetch_mod.fetch_year_cdx = original
+        cdx_mod.fetch_cdx = original
+        fetch_mod.fetch_cdx = original
 
     assert result.exit_code == 0
     assert set(downloads) == {
@@ -589,8 +589,8 @@ def test_empty_http_200_skips_playback_and_revisits(tmp_path):
             sleep=lambda _s: None,
         )
     finally:
-        cdx_mod.fetch_year_cdx = original
-        fetch_mod.fetch_year_cdx = original
+        cdx_mod.fetch_cdx = original
+        fetch_mod.fetch_cdx = original
 
     assert result.exit_code == 0
     assert downloads == ["20040603000000"]
@@ -667,8 +667,8 @@ def test_matching_payloads_in_different_years_are_downloaded_from_ia(tmp_path):
             sleep=lambda _s: None,
         )
     finally:
-        cdx_mod.fetch_year_cdx = original
-        fetch_mod.fetch_year_cdx = original
+        cdx_mod.fetch_cdx = original
+        fetch_mod.fetch_cdx = original
 
     assert result.exit_code == 0
     assert downloads == ["20040601000000", "20050601000000"]
@@ -752,8 +752,8 @@ def test_different_ia_digest_downloads_twice(tmp_path):
             sleep=lambda _s: None,
         )
     finally:
-        cdx_mod.fetch_year_cdx = original
-        fetch_mod.fetch_year_cdx = original
+        cdx_mod.fetch_cdx = original
+        fetch_mod.fetch_cdx = original
 
     assert result.exit_code == 0
     assert result.metrics.downloads == 2
@@ -814,8 +814,8 @@ def test_failed_older_capture_does_not_use_later_success(tmp_path):
             sleep=lambda _s: None,
         )
     finally:
-        cdx_mod.fetch_year_cdx = original
-        fetch_mod.fetch_year_cdx = original
+        cdx_mod.fetch_cdx = original
+        fetch_mod.fetch_cdx = original
 
     assert result.exit_code == 0
     assert result.metrics.downloads == 1
@@ -891,13 +891,13 @@ def test_representative_failure_promotes_next_same_key_candidate(tmp_path):
             sleep=lambda _s: None,
         )
     finally:
-        cdx_mod.fetch_year_cdx = original
-        fetch_mod.fetch_year_cdx = original
+        cdx_mod.fetch_cdx = original
+        fetch_mod.fetch_cdx = original
 
     # First fails permanently, second downloads as promoted representative,
     # third becomes a revisit.
     assert downloads == (
-        ["20040601000000"] * 4 + ["20040602000000"]
+        ["20040601000000"] * 5 + ["20040602000000"]
     )
     assert result.metrics.downloads == 1
     assert result.metrics.revisits == 1
@@ -962,8 +962,8 @@ def test_completed_run_reports_expected_failures(tmp_path):
             sleep=lambda _s: None,
         )
     finally:
-        cdx_mod.fetch_year_cdx = original
-        fetch_mod.fetch_year_cdx = original
+        cdx_mod.fetch_cdx = original
+        fetch_mod.fetch_cdx = original
 
     assert result.exit_code == 0
     run_dirs = list((layout.capture_dir("2004") / "runs").iterdir())
@@ -976,7 +976,6 @@ def test_completed_run_reports_expected_failures(tmp_path):
     assert record["collection_id"] == "2004"
     assert record["counts"]["payload_reused"] == 0
     assert set(record["metrics"]) == {
-        "cdx_requests",
         "cdx_duration_s",
         "playback_attempts",
         "playback_bytes",
@@ -986,7 +985,7 @@ def test_completed_run_reports_expected_failures(tmp_path):
     }
     assert len(record["failures"]) == 1
     assert record["failures"][0]["identity"]["timestamp"] == bad.timestamp
-    assert record["query"]["raw_file"] == "page-001.cdx.gz"
+    assert record["query"]["client"] == "wayback"
     assert list_collection_warcs(layout, "2004")
     assert all(w["record_count"] > 0 for w in record["warcs"])
     assert record["index"]["filename"] == (
@@ -1037,8 +1036,8 @@ def test_scoped_rerun_keeps_prior_collection_and_records_only_current_failures(t
             sleep=lambda _s: None,
         )
     finally:
-        cdx_mod.fetch_year_cdx = original
-        fetch_mod.fetch_year_cdx = original
+        cdx_mod.fetch_cdx = original
+        fetch_mod.fetch_cdx = original
 
     assert result.exit_code == 0
     assert layout.collection_index("2004").read_bytes() == original_index
@@ -1112,8 +1111,8 @@ def test_failed_capture_retries_successfully_on_rerun(tmp_path):
             sleep=lambda _s: None,
         )
     finally:
-        cdx_mod.fetch_year_cdx = original
-        fetch_mod.fetch_year_cdx = original
+        cdx_mod.fetch_cdx = original
+        fetch_mod.fetch_cdx = original
 
     assert second.exit_code == 0
     assert attempts["n"] == 2
@@ -1132,34 +1131,19 @@ def test_failed_capture_retries_successfully_on_rerun(tmp_path):
 def test_multi_year_empty_run_shares_id_without_playback_collections(
     tmp_path, monkeypatch
 ):
-    from archive_magic_fetch.cdx import YearCdxResult
+    from archive_magic_fetch.cdx import CdxResult
     import archive_magic_fetch.fetch as fetch_mod
 
-    seen_ids = []
-
-    def empty_year(layout, *, year, run_id, **_kwargs):
-        seen_ids.append(run_id)
-        run_dir = layout.run_dir(str(year), run_id)
-        run_dir.mkdir(parents=True)
-        raw = run_dir / "page-001.cdx.gz"
-        raw.write_bytes(b"[]")
-        return YearCdxResult(
-            year=year,
-            source_dir=run_dir,
-            raw_path=raw,
+    def empty_year(*, date_start, date_end, **_kwargs):
+        return CdxResult(
             captures=(),
-            failures=(),
-            query_meta={
-                "year": year,
-                "from": f"{year}0101000000",
-                "to": f"{year}1231235959",
-                "request_count": 1,
-                "raw_file": raw.name,
-                "pages": [{"page": 1, "raw_file": raw.name}],
+            query={
+                "from": date_start,
+                "to": date_end,
             },
         )
 
-    monkeypatch.setattr(fetch_mod, "fetch_year_cdx", empty_year)
+    monkeypatch.setattr(fetch_mod, "fetch_cdx", empty_year)
     result = run_fetch(
         FetchSettings(
             url_pattern="http://example.org/",
@@ -1172,11 +1156,15 @@ def test_multi_year_empty_run_shares_id_without_playback_collections(
     )
 
     assert result.exit_code == 0
-    assert len(seen_ids) == 2 and len(set(seen_ids)) == 1
     layout = result.layout
+    run_ids = []
     for year in ("2004", "2005"):
-        assert layout.run_record(year, seen_ids[0]).is_file()
+        runs = list((layout.capture_dir(year) / "runs").iterdir())
+        assert len(runs) == 1
+        run_ids.append(runs[0].name)
+        assert layout.run_record(year, runs[0].name).is_file()
         assert not layout.collection_dir(year).exists()
+    assert run_ids[0] == run_ids[1]
 
 
 @pytest.mark.parametrize(
@@ -1203,7 +1191,7 @@ def test_legacy_layout_rejects_all_artifacts(tmp_path, legacy_name):
         )
 
 
-def test_interrupt_finalizes_partial_without_run_json(tmp_path, monkeypatch):
+def test_interrupt_finalizes_appended_records_without_run_json(tmp_path, monkeypatch):
     import archive_magic_fetch.fetch as fetch_mod
     layout = ArchiveLayout(tmp_path, "example.org")
     ensure_collection_dirs(layout)
@@ -1270,19 +1258,19 @@ def test_interrupt_finalizes_partial_without_run_json(tmp_path, monkeypatch):
                 sleep=lambda _s: None,
             )
     finally:
-        cdx_mod.fetch_year_cdx = original
-        fetch_mod_patched.fetch_year_cdx = original
+        cdx_mod.fetch_cdx = original
+        fetch_mod_patched.fetch_cdx = original
 
     assert downloaded == [first.original_url]
     warcs = list_collection_warcs(layout, "2004")
     assert [path.name for path in warcs] == ["example.org-2004-001.warc.gz"]
     assert layout.collection_index("2004").is_file()
     assert inventory_collection(layout, "2004").contains(first)
-    assert not any(
-        (path / "run.json").is_file()
-        for path in (layout.capture_dir("2004") / "runs").iterdir()
+    runs = layout.capture_dir("2004") / "runs"
+    assert not runs.exists() or not any(
+        (path / "run.json").is_file() for path in runs.iterdir()
     )
-    assert not layout.collection_warc_partial_path("2004", 1).exists()
+    assert not list(layout.collection_dir("2004").glob("*.partial"))
 
     downloaded.clear()
     original, cdx_mod, fetch_mod_patched = patch_cdx(body)
@@ -1300,8 +1288,8 @@ def test_interrupt_finalizes_partial_without_run_json(tmp_path, monkeypatch):
             sleep=lambda _s: None,
         )
     finally:
-        cdx_mod.fetch_year_cdx = original
-        fetch_mod_patched.fetch_year_cdx = original
+        cdx_mod.fetch_cdx = original
+        fetch_mod_patched.fetch_cdx = original
 
     assert result.exit_code == 0
     assert downloaded == [second.original_url]

@@ -55,6 +55,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             warc_target_bytes=config.warc_target_bytes,
             playback_workers=config.playback_workers,
             playback_starts_per_second=config.playback_starts_per_second,
+            retries=config.retries,
             default_start=config.start,
             default_end=config.end,
         )

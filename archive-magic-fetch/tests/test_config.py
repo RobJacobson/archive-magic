@@ -34,12 +34,14 @@ def test_fetch_build_settings_uses_descriptor_defaults(tmp_path):
 [fetch]
 start = "2000-01-01"
 playback_workers = 2
+retries = 5
 [playback]
 wayback_fallback = false
 """,
     )
     config = load_config(tmp_path)
     assert config.warc_target_bytes == DEFAULT_WARC_TARGET_BYTES
+    assert config.retries == 5
     settings = build_settings(
         config.url_pattern,
         archive_id=config.archive_id,
