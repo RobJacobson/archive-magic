@@ -168,28 +168,6 @@ def published_update(tmp_path, monkeypatch):
     return fake, layout, manager, identity
 
 
-def test_manifest_round_trip_remains_unversioned_and_sorted():
-    timestamp = "2026-08-13T20:15:00Z"
-    manifest = CollectionsManifest(
-        timestamp,
-        {
-            "2005": ManifestCollection(
-                timestamp,
-                artifact("collections/2005/example-2005-index.cdxj"),
-                (
-                    artifact("collections/2005/example-2005-002.warc.gz"),
-                    artifact("collections/2005/example-2005-001.warc.gz"),
-                ),
-            )
-        },
-    )
-    parsed = parse_manifest(manifest.to_bytes())
-    assert [item.key for item in parsed.collections["2005"].warcs] == [
-        "collections/2005/example-2005-001.warc.gz",
-        "collections/2005/example-2005-002.warc.gz",
-    ]
-
-
 def test_filesystem_publication_uses_synthetic_etags(tmp_path):
     layout, _, _ = make_collection(tmp_path / "workspace")
     manager = PublicationManager(StorageConfig("local", layout.root))

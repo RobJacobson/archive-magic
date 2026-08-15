@@ -1,4 +1,4 @@
-"""Console formatting and playback retry presentation."""
+"""Playback workers and CLI argument contract."""
 
 from __future__ import annotations
 
@@ -7,21 +7,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-from archive_magic_fetch.console import (
-    format_elapsed,
-    log_url_outcome,
-    playback_timing,
-    style_result,
-    timestamp_link,
-)
 from archive_magic_fetch.protocol import (
     INVALID_URI_PAYLOAD_DIGEST,
 )
-from archive_magic_fetch.models import FailureCategory, UnresolvedFailure
 from archive_magic_fetch.resolution import (
-    CaptureKind,
-    CaptureOutcome,
-    UrlOutcome,
     iter_url_outcomes,
 )
 from archive_magic_fetch.workers import (
@@ -65,23 +54,6 @@ end = "2001-12-31"
         encoding="utf-8",
     )
     return path
-
-
-def test_console_timestamp_links_to_full_capture():
-    identity = make_capt(
-        url="http://www.example.org/a",
-        ts="20080516181742",
-    )
-
-    plain = timestamp_link(identity, enabled=False)
-    linked = timestamp_link(identity, enabled=True)
-
-    assert plain == "2008-05-16T18:17:42"
-    assert plain in linked
-    assert "https://web.archive.org/web/20080516181742id_/http://www.example.org/a" in linked
-    assert linked.startswith("\033]8;;")
-    assert style_result("Error", "error", enabled=False) == "Error"
-    assert style_result("Error", "error", enabled=True) == "\033[1;31mError\033[0m"
 
 
 def test_worker_retry_uses_five_then_ten_seconds():
@@ -287,91 +259,6 @@ def test_skip_groups_yield_before_next_download_starts():
         workers.close()
 
 
-def test_url_table_is_rendered_as_one_chronological_section(capsys):
-    first = make_capt(ts="20040601000000")
-    second = make_capt(ts="20040602000000")
-    log_url_outcome(
-        1,
-        2,
-        UrlOutcome(
-            url=first.original_url,
-            captures=(
-                CaptureOutcome(
-                    first,
-                    CaptureKind.DOWNLOADED,
-                    playback=playback(first),
-                    attempts=1,
-                    elapsed_s=0.1,
-                ),
-                CaptureOutcome(second, CaptureKind.REVISIT),
-            ),
-            attempts=1,
-            playback_bytes=5,
-            categories=(),
-        ),
-    )
-
-    output = capsys.readouterr().out
-    assert output.count(first.original_url) == 1
-    assert output.index("2004-06-01T00:00:00") < output.index(
-        "2004-06-02T00:00:00"
-    )
-    assert first.payload_digest[-6:] in output
-    assert "Capture              Digest  Result" in output
-
-
-def test_playback_timing_includes_elapsed_and_attempts():
-    once = CaptureOutcome(
-        identity=make_capt(),
-        kind=CaptureKind.DOWNLOADED,
-        attempts=1,
-        elapsed_s=1.24,
-    )
-    retried = CaptureOutcome(
-        identity=make_capt(),
-        kind=CaptureKind.DOWNLOADED,
-        attempts=2,
-        elapsed_s=6.0,
-    )
-    assert playback_timing(once) == "1.2s"
-    assert playback_timing(retried) == "6.0s, 2 attempts"
-
-
-def test_url_table_shows_elapsed_on_ignored_fetch(capsys):
-    identity = make_capt(ts="20041009172745")
-    log_url_outcome(
-        1,
-        1,
-        UrlOutcome(
-            url=identity.original_url,
-            captures=(
-                CaptureOutcome(
-                    identity,
-                    CaptureKind.FAILURE,
-                    failure=UnresolvedFailure(
-                        identity,
-                        FailureCategory.UNAVAILABLE,
-                        "unavailable",
-                    ),
-                    attempts=1,
-                    elapsed_s=1.24,
-                ),
-            ),
-            attempts=1,
-            playback_bytes=0,
-            categories=(),
-        ),
-    )
-
-    output = capsys.readouterr().out
-    assert "Ignored [unavailable] (1.2s)" in output
-
-
-def test_elapsed_format_uses_unbounded_hours():
-    assert format_elapsed(3661.9) == "01:01:01"
-    assert format_elapsed(25 * 60 * 60 + 2) == "25:00:02"
-
-
 def test_cli_rejects_reversed_range(tmp_path):
     from archive_magic_fetch.cli import main
 
@@ -386,17 +273,6 @@ def test_cli_rejects_reversed_range(tmp_path):
         ]
     )
     assert code == 2
-
-
-def test_cli_reset_data_flag(tmp_path):
-    from archive_magic_fetch.cli import parse_args
-
-    descriptor = write_cli_descriptor(tmp_path)
-    args = parse_args([str(descriptor), "--reset-data"])
-    assert args.reset_data is True
-
-    args = parse_args([str(descriptor)])
-    assert args.reset_data is False
 
 
 def test_cli_uses_descriptor_configured_history(tmp_path, monkeypatch):

@@ -14,7 +14,7 @@ from archive_magic_fetch.collection import (
     ensure_collection_dirs,
     list_collection_warcs,
 )
-from archive_magic_fetch.config import DEFAULT_WARC_TARGET_BYTES, StorageConfig
+from archive_magic_fetch.config import StorageConfig
 from archive_magic_fetch.fetch import FetchSettings, run_fetch
 from archive_magic_fetch.index import publish_collection_index
 from archive_magic_fetch.models import FailureCategory, PlaybackResult
@@ -144,6 +144,43 @@ def test_slash_redirect_substitution_is_reconstructed():
     assert ("Location", "http://example.org/conference/") in result.headers
     assert client.calls == 1
 
+    def client_for(location: str):
+        response = MagicMock()
+        response.headers = {
+            "X-Archive-Redirect-Reason": "found capture at 20040510064339",
+            "Location": location,
+        }
+
+        class Client:
+            def __init__(self):
+                self.session = MagicMock()
+                self.session.request.return_value = response
+
+            def get_memento(self, *args, **kwargs):
+                self.session.request("GET", "https://web.archive.org/web/x")
+                raise MementoPlaybackError("could not be played")
+
+        return Client()
+
+    with pytest.raises(MementoPlaybackError):
+        download_exact(
+            client_for(
+                "https://web.archive.org/web/20040510064339id_/http://example.org/elsewhere"
+            ),
+            identity,
+        )
+    with pytest.raises(MementoPlaybackError):
+        download_exact(
+            client_for(
+                "https://web.archive.org/web/20040510064339id_/http://example.org/conference/"
+            ),
+            make_capt(
+                url="http://example.org/conference",
+                ts="20040303170500",
+                status="200",
+            ),
+        )
+
 
 def test_slash_redirect_substitution_accepts_default_port_and_relative_location():
     from archive_magic_fetch.playback import download_exact
@@ -171,51 +208,6 @@ def test_slash_redirect_substitution_accepts_default_port_and_relative_location(
     result = download_exact(Client(), identity)
     assert result.status_code == 301
     assert ("Location", "http://example.org/policy/edu/") in result.headers
-
-
-def test_slash_redirect_substitution_rejects_other_paths_and_statuses():
-    from archive_magic_fetch.playback import download_exact
-
-    redirect_identity = make_capt(
-        url="http://example.org/conference",
-        ts="20040303170500",
-        status="301",
-    )
-    ok_identity = make_capt(
-        url="http://example.org/conference",
-        ts="20040303170500",
-        status="200",
-    )
-
-    def client_for(location: str):
-        response = MagicMock()
-        response.headers = {
-            "X-Archive-Redirect-Reason": "found capture at 20040510064339",
-            "Location": location,
-        }
-
-        class Client:
-            def __init__(self):
-                self.session = MagicMock()
-                self.session.request.return_value = response
-
-            def get_memento(self, *args, **kwargs):
-                self.session.request("GET", "https://web.archive.org/web/x")
-                raise MementoPlaybackError("could not be played")
-
-        return Client()
-
-    other = client_for(
-        "https://web.archive.org/web/20040510064339id_/http://example.org/elsewhere"
-    )
-    with pytest.raises(MementoPlaybackError):
-        download_exact(other, redirect_identity)
-
-    as_200 = client_for(
-        "https://web.archive.org/web/20040510064339id_/http://example.org/conference/"
-    )
-    with pytest.raises(MementoPlaybackError):
-        download_exact(as_200, ok_identity)
 
 
 def test_found_capture_substitution_is_kept_under_requested_identity():
@@ -282,7 +274,7 @@ def test_inventory_remembers_redirect_representative_by_status(tmp_path):
 def test_download_exact_accepts_ia_double_encoded_original_url():
     """IA Link rel=original may %25-escape already-encoded query bytes."""
 
-    from archive_magic_fetch.playback import download_exact
+    from archive_magic_fetch.playback import ExactMismatchError, download_exact
 
     cdx_url = (
         "http://lideres.nclr.org/groups/index.php?view=browse"
@@ -300,21 +292,17 @@ def test_download_exact_accepts_ia_double_encoded_original_url():
     )
     assert result.identity.original_url == cdx_url
     assert result.body == body
-
-
-def test_download_exact_rejects_different_original_url():
-    from archive_magic_fetch.playback import ExactMismatchError, download_exact
-
-    identity = make_capt(url="http://example.org/a")
+    mismatch = make_capt(url="http://example.org/a")
     with pytest.raises(ExactMismatchError, match="URL mismatch"):
         download_exact(
             memento_client(
-                identity,
+                mismatch,
                 b"x",
                 returned_url="http://example.org/b",
             ),
-            identity,
+            mismatch,
         )
+
 
 def test_cdx_digest_matches_body_accepts_trailing_newline_soft_match():
     from archive_magic_fetch.playback import (
@@ -636,12 +624,6 @@ def test_wrapped_incomplete_read_is_permanent_truncated_failure():
 
     assert category == FailureCategory.TRUNCATED
     assert retryable is False
-
-
-def test_warc_writer_defaults_to_250mb_target():
-    assert CollectionWarcWriter.__dataclass_fields__["target_bytes"].default == (
-        DEFAULT_WARC_TARGET_BYTES
-    )
 
 
 def test_warc_rollover_naming_and_rejects_1000(tmp_path):

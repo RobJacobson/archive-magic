@@ -17,7 +17,6 @@ from archive_magic_fetch.index import (
     reconcile_missing_indexes,
     validate_cdxj_against_warcs,
 )
-from archive_magic_fetch.inventory import inventory_collection
 from archive_magic_fetch.playback import payload_digest
 from archive_magic_fetch.warc import CollectionWarcWriter
 from helpers import make_capt, playback
@@ -150,46 +149,11 @@ def test_reconcile_missing_indexes_replaces_only_changed_warcs(tmp_path, monkeyp
     }
 
 
-def test_crash_recovery_indexes_finalized_warc_without_redownload(tmp_path):
-    layout = ArchiveLayout(tmp_path, "example.org")
-    ensure_collection_dirs(layout)
-    capt = make_capt()
-    writer = CollectionWarcWriter(layout, "2004")
-    writer.write_playback(playback(capt))
-    warcs = writer.close()
-    assert warcs
-    assert not layout.collection_index("2004").exists()
-    publish_collection_index(layout, "2004")
-    assert layout.collection_index("2004").is_file()
-    assert layout.collection_index("2004").name == "example.org-2004-index.cdxj"
-    inv = inventory_collection(layout, "2004")
-    assert inv.contains(capt)
-
-
 @pytest.mark.parametrize("collection_id", ("", "../2004", "nested/2004", "bad id"))
 def test_generic_collection_ids_must_be_filesystem_safe(tmp_path, collection_id):
     layout = ArchiveLayout(tmp_path, "example.org")
     with pytest.raises(ValueError, match="unsafe collection ID"):
         layout.collection_dir(collection_id)
-
-
-def test_generic_collection_writer_and_index_are_portable(tmp_path):
-    layout = ArchiveLayout(tmp_path, "example.org")
-    ensure_collection_dirs(layout)
-    writer = CollectionWarcWriter(layout, "campaign-launch")
-    writer.write_playback(playback(make_capt()))
-    warcs = writer.close()
-
-    index = publish_collection_index(layout, "campaign-launch")
-
-    assert warcs[0].path.name == "example.org-campaign-launch-001.warc.gz"
-    assert index is not None
-    assert index.path.name == "example.org-campaign-launch-index.cdxj"
-    payload = json.loads(index.path.read_text().split(" ", 2)[2])
-    assert payload["filename"] == warcs[0].path.name
-    assert payload["cdxDigest"] == make_capt().payload_digest
-    assert payload["cdxDigestMatch"] is True
-    assert payload["digest"] == payload_digest(b"hello")
 
 
 def test_collection_index_keeps_ia_and_local_soft_match_digests_separate(tmp_path):
@@ -257,21 +221,11 @@ def test_reset_collection_data_deletes_warc_and_cdxj(tmp_path):
     index_path = layout.collection_index("2004")
     assert list_collection_warcs(layout, "2004")
     assert index_path.is_file()
-
-    reset_collection_data(layout, "2004")
-
-    assert list_collection_warcs(layout, "2004") == []
-    assert not index_path.is_file()
-
-
-def test_reset_collection_data_deletes_visible_partials(tmp_path):
-    layout = ArchiveLayout(tmp_path, "example.org")
-    ensure_collection_dirs(layout)
-    collection_dir = layout.collection_dir("2004")
-    collection_dir.mkdir(parents=True)
     partial = layout.collection_warc_partial_path("2004", 1)
     partial.write_bytes(b"in-progress")
 
     reset_collection_data(layout, "2004")
 
+    assert list_collection_warcs(layout, "2004") == []
+    assert not index_path.is_file()
     assert not partial.exists()

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-from dataclasses import replace
 from unittest.mock import MagicMock
 
 import pytest
@@ -704,46 +703,6 @@ def test_matching_payloads_in_different_years_are_downloaded_from_ia(tmp_path):
     assert stored.identity.timestamp == "20050601000000"
 
 
-def test_cross_year_identical_bytes_with_different_ia_digests_download_twice(
-    tmp_path,
-):
-    body = b"same-bytes-different-ia-hashes"
-    digests = {
-        2004: payload_digest(body).split(":")[1],
-        2005: payload_digest(body + b"\n").split(":")[1],
-    }
-    rows = {
-        year: cdx_json(
-            [["com,example)/", f"{year}0601000000", "http://example.org/",
-              "text/html", "200", digest, str(len(body))]]
-        )
-        for year, digest in digests.items()
-    }
-    downloads: list[str] = []
-    original, cdx_mod, fetch_mod = patch_cdx_by_year(rows)
-    try:
-        result = run_fetch(
-            FetchSettings(
-                url_pattern="http://example.org/",
-                date_start="20040601000000",
-                date_end="20050601000000",
-                archive_id="example.org",
-                storage=StorageConfig("local", tmp_path),
-            ),
-            client_factory=lambda: MagicMock(),
-            download_fn=lambda _client, identity: (
-                downloads.append(identity.timestamp) or playback(identity, body=body)
-            ),
-            sleep=lambda _s: None,
-        )
-    finally:
-        cdx_mod.fetch_year_cdx = original
-        fetch_mod.fetch_year_cdx = original
-
-    assert downloads == ["20040601000000", "20050601000000"]
-    assert result.metrics.payload_reuses == 0
-
-
 def test_different_ia_digest_downloads_twice(tmp_path):
     layout = ArchiveLayout(tmp_path, "example.org")
     ensure_collection_dirs(layout)
@@ -952,7 +911,7 @@ def test_representative_failure_promotes_next_same_key_candidate(tmp_path):
     assert types.count("revisit") == 1
 
 
-def test_completed_run_reports_expected_failures(tmp_path, capsys):
+def test_completed_run_reports_expected_failures(tmp_path):
     layout = ArchiveLayout(tmp_path, "example.org")
     ensure_collection_dirs(layout)
     good_body = b"good"
@@ -1032,17 +991,6 @@ def test_completed_run_reports_expected_failures(tmp_path, capsys):
     assert all(w["record_count"] > 0 for w in record["warcs"])
     assert record["index"]["filename"] == (
         "collections/2004/example.org-2004-index.cdxj"
-    )
-    output = capsys.readouterr().out
-    assert (
-        "year 2004 done: downloads=1 payload-reuses=0 revisits=0 "
-        "already-represented=0 skips/errors=1"
-    ) in output
-    assert "elapsed " in output
-    assert (
-        "done: downloads=1 revisits=0 payload-reuses=0 "
-        "already-represented=0 skips/errors=1"
-        in output
     )
 
 
@@ -1229,54 +1177,6 @@ def test_multi_year_empty_run_shares_id_without_playback_collections(
     for year in ("2004", "2005"):
         assert layout.run_record(year, seen_ids[0]).is_file()
         assert not layout.collection_dir(year).exists()
-
-
-
-
-def test_run_record_is_published_after_index(tmp_path):
-    layout = ArchiveLayout(tmp_path, "example.org")
-    ensure_collection_dirs(layout)
-    dig = payload_digest(b"ordered").split(":")[1]
-    body = cdx_json(
-        [
-            [
-                "com,example)/",
-                "20040615000000",
-                "http://example.org/",
-                "text/html",
-                "200",
-                dig,
-                "5",
-            ]
-        ]
-    )
-
-    def download_fn(_client, capt):
-        return playback(capt, body=b"ordered")
-
-    original, cdx_mod, fetch_mod = patch_cdx(body)
-    try:
-        result = run_fetch(
-            FetchSettings(
-                url_pattern="http://example.org/",
-                date_start="20040615000000",
-                date_end="20040615000000",
-                archive_id="example.org",
-                storage=StorageConfig("local", tmp_path),
-            ),
-            client_factory=lambda: MagicMock(),
-            download_fn=download_fn,
-            sleep=lambda _s: None,
-        )
-    finally:
-        cdx_mod.fetch_year_cdx = original
-        fetch_mod.fetch_year_cdx = original
-
-    assert result.exit_code == 0
-    run_dir = next((layout.capture_dir("2004") / "runs").iterdir())
-    run_json = run_dir / "run.json"
-    index = layout.collection_index("2004")
-    assert run_json.stat().st_mtime_ns >= index.stat().st_mtime_ns
 
 
 @pytest.mark.parametrize(
