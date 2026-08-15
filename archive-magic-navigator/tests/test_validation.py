@@ -10,7 +10,7 @@ from archive_magic_navigator import validation
 
 
 def selected(collection):
-    root = collection.resolve() / "collections" / "2020"
+    root = collection.resolve()
     return ReplayCollection(
         "2020", root, root / "example.org-2020-index.cdxj"
     )
@@ -165,12 +165,11 @@ def test_escaping_index_symlink_is_rejected(collection_factory, tmp_path):
         validate(collection)
 
 
-def test_unexpected_second_index_is_rejected(collection_factory):
+def test_unmanaged_index_is_ignored(collection_factory):
     _, collection, index, _ = collection_factory()
     (index.parent / "foreign.cdxj").write_text("x\n", encoding="utf-8")
 
-    with pytest.raises(ValidationError, match="unexpected indexes"):
-        validate(collection)
+    assert validate(collection).record_count == 1
 
 
 def test_foreign_collection_warc_basename_is_rejected(collection_factory):

@@ -14,8 +14,8 @@ configuration.
 
 Copy [`examples/example.org/archive.toml`](examples/example.org/archive.toml) to a
 directory you control and edit it. Relative paths are resolved from the descriptor
-directory. `workspace_directory` is the exact archive root, not a parent to which
-the archive ID is appended.
+directory. `data_directory` is the exact data path, not a parent to which the
+archive ID is appended.
 
 For example, this layout keeps high-volume data visible and separate from either
 implementation checkout:
@@ -24,14 +24,17 @@ implementation checkout:
 archives/
   example.org/
     archive.toml
-    workspace/
-      collections/
-      captures/
+    data/
       collections-manifest.json
+      example.org-2004-001.warc.gz
+      example.org-2004-index.cdxj
+    logs/
+      <run-id>/
+        2004.json
     navigator-cache/       # created only for remote playback
 ```
 
-For remote authority, finalized WARC/CDXJ working copies under `workspace/` are
+For remote authority, finalized WARC/CDXJ working copies under `data/` are
 removed after each successful publication; the bucket remains their source of
 truth.
 
@@ -46,8 +49,8 @@ archive-magic-navigator /data/archives/example.org
 
 ## Local-authoritative archive
 
-Use `authority = "local"`. Fetch updates `workspace/collections`, and Navigator
-serves that workspace directly:
+Use `authority = "local"`. Fetch updates the flat `data/` directory, and Navigator
+serves that data directly:
 
 ```console
 archive-magic-fetch ~/archives/example.org
@@ -70,16 +73,17 @@ archive-magic-navigator ~/archives/example.org --source auto --poll-interval 60
 ```
 
 The bucket prefix is the source of truth. Before fetching, Fetch validates or
-downloads the selected collection's CDXJ and final WARC into the workspace. It
+downloads the selected collection's CDXJ and final WARC into `data/`. It
 runs the same append/index pipeline as local authority, publishes changed
 WARC/index objects, and commits `collections-manifest.json` last. After a verified
-commit and run record it removes the finalized local working copies.
+commit it removes the finalized local working copies. Fetch keeps successful
+per-year run records grouped by invocation under `logs/`.
 Navigator keeps indexes in the visible `navigator-cache/`, streams WARC ranges
 from the bucket, and continues using its last validated index during an incomplete
 publication or transient bucket error.
 
 One Fetch process on one machine owns an archive prefix. Failed publications keep
-their local WARC/CDXJ working files for the next run; losing that workspace during
+their local WARC/CDXJ working files for the next run; losing that data during
 an incomplete update requires reset and regeneration.
 
 ## Dates, rollover, and reset
@@ -95,7 +99,7 @@ archive-magic-fetch ~/archives/example.org --start 2026-01-01 --end 2026-12-31
 ```
 
 `--reset-data` is exceptional maintenance. With remote authority it rejects date
-overrides, deletes the complete configured prefix, clears the workspace, and
+overrides, deletes the complete configured prefix, clears `data/`, and
 rebuilds the full configured range. Playback is unavailable until the new manifest
 is published. With local authority it preserves the existing selected-collection
 reset behavior.

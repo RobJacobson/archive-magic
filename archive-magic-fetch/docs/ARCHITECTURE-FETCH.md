@@ -39,7 +39,7 @@ url_pattern = "*.example.org"
 
 [storage]
 authority = "remote" # "local" or "remote"
-workspace_directory = "workspace"
+data_directory = "data"
 
 [storage.remote]
 bucket = "archive-magic"
@@ -64,7 +64,8 @@ Rules:
 - `schema_version` must be exactly `1`; unknown keys are errors.
 - Archive IDs must be route-safe and cannot be `.`, `..`, or `static`.
 - Relative paths and `~` are resolved from the descriptor directory.
-- `workspace_directory` is the exact archive root. The archive ID is not appended.
+- `data_directory` is the exact managed artifact root. The archive ID is not appended.
+- Run records are written to `logs/` beside `data_directory`.
 - `storage.remote` is required for remote authority and forbidden for local
   authority.
 - Bucket credentials come exclusively from Boto3's standard credential chain.
@@ -80,25 +81,27 @@ Rules:
 Fetch validates the complete shared descriptor, including playback keys, so Fetch
 and Navigator reject the same malformed contract.
 
-## Workspace and publication layout
+## Data, logging, and publication layout
 
 ```text
-<workspace_directory>/
+<data_directory>/
   collections-manifest.json
-  collections/
-    2004/
-      example.org-2004-001.warc.gz
-      example.org-2004-002.warc.gz
-      example.org-2004-index.cdxj
-  captures/
-    2004/
-      runs/<run-id>/run.json
+  example.org-2004-001.warc.gz
+  example.org-2004-002.warc.gz
+  example.org-2004-index.cdxj
+
+<data-directory-parent>/logs/
+  <run-id>/
+    2004.json
+    2005.json
 ```
 
-`collections/` is portable playback data. `captures/` records local diagnostics,
-queries, and run state; it is deliberately not bucket-authoritative archive
-content. `collections-manifest.json` is generated publication state and retains its
-existing unversioned JSON shape. It must never be edited as configuration.
+The data directory is a flat portable namespace. Strict artifact filenames and
+the manifest retain the logical yearly collection boundary without year folders.
+Each successful year writes its existing JSON run record under the invocation's
+directory. Run records are local diagnostics rather than bucket-authoritative content.
+`collections-manifest.json` is generated, versioned publication state and must
+never be edited as configuration.
 
 CDXJ and manifest files use same-directory temporary names followed by atomic local
 replacement. WARC records are validated as independent gzip members before being
@@ -139,7 +142,7 @@ records. A year-level failure (including CDX) skips that year, continues with th
 rest of the range, and produces a nonzero exit. Uncaught exceptions at the process
 boundary also produce a nonzero exit. The next run keeps any leftover local
 tail/CDXJ, rebuilds the index if needed, and republishes. `--reset-data` is the
-recovery tool when the workspace was lost or the prefix is confused.
+recovery tool when the data directory was lost or the prefix is confused.
 
 Payloads are never reused across collections: a capture missing from its current
 collection is downloaded from Internet Archive unless CDX metadata can synthesize
@@ -169,15 +172,15 @@ created without the required identity fields must be reset and regenerated.
 
 ## Local authority
 
-With `authority = "local"`, the workspace is authoritative. Fetch appends
+With `authority = "local"`, the data directory is authoritative. Fetch appends
 validated WARC members and atomically replaces CDXJ and manifest files. Navigator
-may serve the same workspace directly. Normal publication preserves all previous
+may serve the same data directly. Normal publication preserves all previous
 collections; `--reset-data` retains selected-collection reset behavior.
 
 ## Remote authority and bounded materialization
 
 With `authority = "remote"`, the bucket prefix and its manifest are authoritative.
-The workspace is a bounded working area. At startup Fetch reads the manifest.
+The data directory is a bounded working area. At startup Fetch reads the manifest.
 Missing manifest means an empty archive. For each selected year it then:
 
 1. Downloads the committed CDXJ if no local copy is present.
@@ -186,13 +189,12 @@ Missing manifest means an empty archive. For each selected year it then:
    a local file that is already at least as large as the committed tail.
 4. Runs the same local append and incremental-index code used by local authority.
 5. Publishes changed/new artifacts and commits the manifest last.
-6. Writes the run record, then deletes that collection's finalized local
-   WARC/CDXJ files.
+6. Deletes that collection's finalized local WARC/CDXJ files after commit.
 
-`captures/`, run diagnostics, and the small cached manifest remain local. A failed
-upload keeps the workspace; the next run continues from those files.
+Run records plus the small cached manifest remain local. A failed
+upload keeps the data directory; the next run continues from those files.
 Missing local artifacts are never interpreted as remote deletions. If the
-workspace was lost after a partial same-key publication, reset and regenerate.
+data directory was lost after a partial same-key publication, reset and regenerate.
 
 ## Remote publication
 
@@ -204,12 +206,12 @@ order:
 2. Replace the live CDXJ. A single S3 key is atomic, so readers see
    either all old bytes or all new bytes.
 3. Replace `collections-manifest.json` last. This is the commit point.
-4. Write the run record, then evict finalized local working files.
+4. Write the year's run record, then evict finalized local working files.
 
 There is intentionally a short window after CDXJ replacement and before manifest
 commit in which a fresh remote reader may reject the archive. Cached Navigator
 instances continue with their last validated index; the next Fetch run republishes
-if the workspace was retained. No versioned index keys or reader fallback protocol
+if the data directory was retained. No versioned index keys or reader fallback protocol
 are added.
 
 ## Destructive reset
@@ -219,7 +221,7 @@ Remote `--reset-data` is explicit authorization for whole-archive maintenance. I
 - rejects `--start` and `--end` overrides;
 - prints a prominent deletion/playback-downtime warning;
 - deletes only the descriptor's complete configured bucket prefix;
-- clears only the exact workspace archive root; and
+- clears only the exact managed data directory; and
 - rebuilds the descriptor's full configured range.
 
 There is no interactive prompt. The old manifest is absent during the rebuild, so
@@ -232,7 +234,7 @@ same bucket are not touched.
 - `cli.py`: public argument contract and exit-code boundary.
 - `fetch.py`: configured-history orchestration and yearly lifecycle.
 - `console.py`: terminal progress, URL tables, colors, and Wayback links.
-- `collection.py`: exact workspace paths, atomic files, and run records.
+- `collection.py`: flat managed-data paths and atomic artifact files.
 - `warc.py`: record construction, pre-append validation, append-only writing, and
   rollover.
 - `index.py`: deterministic full or incremental collection CDXJ generation.

@@ -151,7 +151,7 @@ def _run_fetch(
 ) -> FetchResult:
     """Execute serial years with parallel playback and one WARC writer."""
 
-    layout = ArchiveLayout(settings.storage.workspace_directory, settings.archive_id)
+    layout = ArchiveLayout(settings.storage.data_directory, settings.archive_id)
     publisher = PublicationManager(settings.storage)
     if settings.reset_data and settings.storage.authority == "remote":
         publisher.reset_archive(layout)

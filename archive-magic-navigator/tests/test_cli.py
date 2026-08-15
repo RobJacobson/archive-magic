@@ -16,7 +16,7 @@ id = "{archive_id}"
 url_pattern = "{archive_id}"
 [storage]
 authority = "local"
-workspace_directory = "{workspace}"
+data_directory = "{workspace}"
 [playback]
 wayback_fallback = {str(fallback).lower()}
 """,
@@ -43,7 +43,7 @@ id = "{archive_id}"
 url_pattern = "{archive_id}"
 [storage]
 authority = "remote"
-workspace_directory = "{workspace}"
+data_directory = "{workspace}"
 [storage.remote]
 bucket = "bucket"
 prefix = "{archive_id}"

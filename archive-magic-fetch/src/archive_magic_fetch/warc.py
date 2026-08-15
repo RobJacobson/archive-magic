@@ -206,7 +206,12 @@ class CollectionWarcWriter:
             self._reset_current()
             raise
         self.finalized.append(
-            warc_artifact_from_path(self.layout, path, record_count=count)
+            warc_artifact_from_path(
+                self.layout,
+                path,
+                collection_id=self.collection_id,
+                record_count=count,
+            )
         )
         self._reset_current()
         self.sequence += 1

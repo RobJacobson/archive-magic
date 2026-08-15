@@ -54,7 +54,7 @@ def test_empty_redirect_playback_is_stored_with_location(tmp_path):
     assert result.warc_payload_digest == empty_digest
     assert any(name.lower() == "location" and value == location for name, value in result.headers)
 
-    layout = ArchiveLayout(tmp_path, "example.org")
+    layout = ArchiveLayout(tmp_path / "data", "example.org")
     ensure_collection_dirs(layout)
     writer = CollectionWarcWriter(layout, "2008")
     writer.write_playback(result)
@@ -235,7 +235,7 @@ def test_found_capture_substitution_is_kept_under_requested_identity():
 
 
 def test_inventory_remembers_redirect_representative_by_status(tmp_path):
-    layout = ArchiveLayout(tmp_path, "example.org")
+    layout = ArchiveLayout(tmp_path / "data", "example.org")
     ensure_collection_dirs(layout)
     empty = payload_digest(b"")
     identity = make_capt(
@@ -368,7 +368,7 @@ def test_trailing_newline_soft_match_seeds_revisit_and_survives_inventory(
             ],
         ]
     )
-    layout = ArchiveLayout(tmp_path, "example.org")
+    layout = ArchiveLayout(tmp_path / "data", "example.org")
     ensure_collection_dirs(layout)
     original, cdx_mod, fetch_mod = patch_cdx(cdx_body)
     try:
@@ -378,7 +378,7 @@ def test_trailing_newline_soft_match_seeds_revisit_and_survives_inventory(
                 date_start="20040601000000",
                 date_end="20040602000000",
                 archive_id="example.org",
-                    storage=StorageConfig("local", tmp_path),
+                    storage=StorageConfig("local", tmp_path / "data"),
             ),
             client_factory=lambda: MagicMock(),
             download_fn=download_fn,
@@ -481,7 +481,7 @@ def test_invalid_uri_playback_is_always_rejected():
 
 
 def test_custom_cdx_urlkey_survives_warc_inventory(tmp_path):
-    layout = ArchiveLayout(tmp_path, "example.org")
+    layout = ArchiveLayout(tmp_path / "data", "example.org")
     ensure_collection_dirs(layout)
     identity = make_capt(urlkey="custom,key)/special")
     writer = CollectionWarcWriter(layout, "2004")
@@ -507,7 +507,7 @@ def test_digest_mismatch_is_kept_but_never_seeds_revisit(tmp_path):
 
     from archive_magic_fetch.protocol import CDX_DIGEST_MATCH_HEADER
 
-    layout = ArchiveLayout(tmp_path, "example.org")
+    layout = ArchiveLayout(tmp_path / "data", "example.org")
     ensure_collection_dirs(layout)
     claimed = "sha1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
     body = b"imperfect-but-kept"
@@ -558,7 +558,7 @@ def test_digest_mismatch_is_kept_but_never_seeds_revisit(tmp_path):
                 date_start="20040601000000",
                 date_end="20040602000000",
                 archive_id="example.org",
-                    storage=StorageConfig("local", tmp_path),
+                    storage=StorageConfig("local", tmp_path / "data"),
             ),
             client_factory=lambda: MagicMock(),
             download_fn=download_fn,
@@ -625,7 +625,7 @@ def test_wrapped_incomplete_read_is_permanent_truncated_failure():
 
 
 def test_warc_rollover_naming_has_no_arbitrary_sequence_limit(tmp_path):
-    layout = ArchiveLayout(tmp_path, "example.org")
+    layout = ArchiveLayout(tmp_path / "data", "example.org")
     ensure_collection_dirs(layout)
     writer = CollectionWarcWriter(layout, "2004", target_bytes=1)
     for i in range(2):
@@ -648,7 +648,7 @@ def test_warc_rollover_naming_has_no_arbitrary_sequence_limit(tmp_path):
 
 
 def test_resume_appends_to_same_shard_under_size_cap(tmp_path):
-    layout = ArchiveLayout(tmp_path, "example.org")
+    layout = ArchiveLayout(tmp_path / "data", "example.org")
     ensure_collection_dirs(layout)
     first = make_capt(ts="20040601000000")
     second = make_capt(
@@ -675,7 +675,7 @@ def test_resume_appends_to_same_shard_under_size_cap(tmp_path):
 
 
 def test_resume_starts_next_shard_when_last_is_at_cap(tmp_path):
-    layout = ArchiveLayout(tmp_path, "example.org")
+    layout = ArchiveLayout(tmp_path / "data", "example.org")
     ensure_collection_dirs(layout)
     writer = CollectionWarcWriter(layout, "2004", target_bytes=1)
     writer.write_playback(playback(make_capt(ts="20040601000000")))
@@ -699,10 +699,10 @@ def test_resume_starts_next_shard_when_last_is_at_cap(tmp_path):
 
 
 def test_cleanup_temps_removes_legacy_warc_partials(tmp_path):
-    layout = ArchiveLayout(tmp_path, "example.org")
+    layout = ArchiveLayout(tmp_path / "data", "example.org")
     ensure_collection_dirs(layout)
     collection_dir = layout.collection_dir("2004")
-    collection_dir.mkdir(parents=True)
+    collection_dir.mkdir(parents=True, exist_ok=True)
     partial = collection_dir / "example.org-2004-001.warc.gz.partial"
     partial.write_bytes(b"keep-me")
     stray = collection_dir / ".tmp-index.cdxj.tmp"

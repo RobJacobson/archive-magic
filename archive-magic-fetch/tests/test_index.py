@@ -23,7 +23,7 @@ from helpers import make_capt, playback
 
 
 def test_collection_index_beside_warcs_covers_multi_shard_year(tmp_path):
-    layout = ArchiveLayout(tmp_path, "example.org")
+    layout = ArchiveLayout(tmp_path / "data", "example.org")
     ensure_collection_dirs(layout)
     writer = CollectionWarcWriter(layout, "2004", target_bytes=1)
     for i in range(2):
@@ -37,7 +37,7 @@ def test_collection_index_beside_warcs_covers_multi_shard_year(tmp_path):
 
     index = publish_collection_index(layout, "2004")
     assert index is not None
-    assert index.relative_key == "collections/2004/example.org-2004-index.cdxj"
+    assert index.relative_key == "example.org-2004-index.cdxj"
     assert layout.collection_index("2004") == (
         layout.collection_dir("2004") / "example.org-2004-index.cdxj"
     )
@@ -65,7 +65,7 @@ def test_collection_index_beside_warcs_covers_multi_shard_year(tmp_path):
 
 
 def test_incremental_index_replaces_tail_lines_without_reading_earlier_warcs(tmp_path):
-    layout = ArchiveLayout(tmp_path, "example.org")
+    layout = ArchiveLayout(tmp_path / "data", "example.org")
     ensure_collection_dirs(layout)
     writer = CollectionWarcWriter(layout, "2004", target_bytes=1)
     first = make_capt(ts="20040601000000", digest="sha1:" + "A" * 32)
@@ -109,7 +109,7 @@ def test_incremental_index_replaces_tail_lines_without_reading_earlier_warcs(tmp
 
 
 def test_reconcile_missing_indexes_replaces_only_changed_warcs(tmp_path, monkeypatch):
-    layout = ArchiveLayout(tmp_path, "example.org")
+    layout = ArchiveLayout(tmp_path / "data", "example.org")
     ensure_collection_dirs(layout)
     writer = CollectionWarcWriter(layout, "2004", target_bytes=1)
     first = make_capt(ts="20040601000000", digest="sha1:" + "A" * 32)
@@ -151,13 +151,13 @@ def test_reconcile_missing_indexes_replaces_only_changed_warcs(tmp_path, monkeyp
 
 @pytest.mark.parametrize("collection_id", ("", "../2004", "nested/2004", "bad id"))
 def test_generic_collection_ids_must_be_filesystem_safe(tmp_path, collection_id):
-    layout = ArchiveLayout(tmp_path, "example.org")
+    layout = ArchiveLayout(tmp_path / "data", "example.org")
     with pytest.raises(ValueError, match="unsafe collection ID"):
         layout.collection_dir(collection_id)
 
 
 def test_collection_index_keeps_ia_and_local_soft_match_digests_separate(tmp_path):
-    layout = ArchiveLayout(tmp_path, "example.org")
+    layout = ArchiveLayout(tmp_path / "data", "example.org")
     ensure_collection_dirs(layout)
     body = b"soft-match"
     ia_digest = payload_digest(body + b"\n")
@@ -184,7 +184,7 @@ def test_collection_index_keeps_ia_and_local_soft_match_digests_separate(tmp_pat
     ),
 )
 def test_validate_cdxj_rejects_unsafe_locators(tmp_path, filename, match):
-    layout = ArchiveLayout(tmp_path, "example.org")
+    layout = ArchiveLayout(tmp_path / "data", "example.org")
     ensure_collection_dirs(layout)
     writer = CollectionWarcWriter(layout, "2004")
     writer.write_playback(playback(make_capt(ts="20040601000000")))
@@ -211,7 +211,7 @@ def test_validate_cdxj_rejects_unsafe_locators(tmp_path, filename, match):
 
 
 def test_reset_collection_data_deletes_warc_and_cdxj(tmp_path):
-    layout = ArchiveLayout(tmp_path, "example.org")
+    layout = ArchiveLayout(tmp_path / "data", "example.org")
     ensure_collection_dirs(layout)
     writer = CollectionWarcWriter(layout, "2004")
     writer.write_playback(playback(make_capt(ts="20040601000000")))

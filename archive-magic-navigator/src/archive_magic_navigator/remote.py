@@ -229,9 +229,9 @@ class RemoteArchiveStore:
         collections = tuple(
             ReplayCollection(
                 collection_id,
-                (root / "collections" / collection_id).resolve(),
+                root,
                 self._index_path(archive_id, collection_id, collection.index).resolve(),
-                self._archive_path(collection_id),
+                self._archive_path(),
             )
             for collection_id, collection in sorted(manifest.collections.items())
         )
@@ -277,14 +277,12 @@ class RemoteArchiveStore:
         return (
             self.cache_directory
             / archive_id
-            / "collections"
-            / collection_id
             / PurePosixPath(artifact.key).name
         )
 
-    def _archive_path(self, collection_id: str) -> str:
-        key = self._object_key(f"collections/{collection_id}/")
-        return f"s3://{self.config.bucket}/{key}"
+    def _archive_path(self) -> str:
+        key = self._object_key("").rstrip("/")
+        return f"s3://{self.config.bucket}/{key + '/' if key else ''}"
 
     def _object_key(self, relative: str) -> str:
         return "/".join(part for part in (self.config.prefix, relative) if part)

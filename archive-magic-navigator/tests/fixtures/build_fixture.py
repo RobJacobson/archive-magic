@@ -12,7 +12,7 @@ from warcio.warcwriter import WARCWriter
 
 
 ROOT = Path(__file__).parent / "collection"
-COLLECTION = ROOT / "collections" / "2020"
+COLLECTION = ROOT
 WARC = COLLECTION / "fixture-2020-001.warc.gz"
 LOCAL_REDIRECT_WARC = COLLECTION / "fixture-2020-002.warc.gz"
 LOCAL_TARGET_WARC = COLLECTION / "fixture-2020-003.warc.gz"

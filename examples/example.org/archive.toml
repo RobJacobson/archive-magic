@@ -6,7 +6,7 @@ url_pattern = "*.example.org"
 
 [storage]
 authority = "local" # "local" or "remote"
-workspace_directory = "workspace"
+data_directory = "data"
 
 # Required only when authority = "remote".
 # [storage.remote]

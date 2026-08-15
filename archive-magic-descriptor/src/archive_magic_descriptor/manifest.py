@@ -110,8 +110,7 @@ def _artifact(value: object, collection_id: str, *, warc: bool) -> ManifestArtif
         raise ValueError("invalid manifest artifact")
     key = _text(value["key"], "artifact.key")
     path = PurePosixPath(key)
-    expected = PurePosixPath("collections") / collection_id
-    if path.is_absolute() or ".." in path.parts or path.parent != expected:
+    if path.is_absolute() or ".." in path.parts or path.parent != PurePosixPath("."):
         raise ValueError(f"unsafe manifest artifact key: {key}")
     if warc != key.endswith(".warc.gz"):
         raise ValueError(f"unexpected manifest artifact type: {key}")

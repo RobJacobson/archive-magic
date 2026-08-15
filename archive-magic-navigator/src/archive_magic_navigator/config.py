@@ -28,10 +28,12 @@ def _collection_config(
             collection.collection_id: str(collection.replay_index)
             for collection in archive.collections
         },
-        "archive_paths": [
-            collection.archive_path or (str(collection.root) + os.sep)
-            for collection in archive.collections
-        ],
+        "archive_paths": list(
+            dict.fromkeys(
+                collection.archive_path or (str(collection.root) + os.sep)
+                for collection in archive.collections
+            )
+        ),
     }
     if not wayback_fallback:
         return local
