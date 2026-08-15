@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from typing import Optional
 from unittest.mock import MagicMock
+from wayback import CdxRecord
 
 from archive_magic_fetch.identity import make_identity
 from archive_magic_fetch.models import CaptureIdentity, PlaybackResult
@@ -86,20 +88,46 @@ class FakeSession:
         return None
 
 
+class FakeCdxClient:
+    def __init__(self, rows: list[list[str]]) -> None:
+        self.rows = rows
+        self.closed = False
+
+    def search(self, *args, **kwargs):
+        for row in self.rows:
+            if not isinstance(row, list) or len(row) < 7:
+                continue
+            urlkey, timestamp, original, mimetype, status, digest, length = row[:7]
+            yield CdxRecord(
+                urlkey=urlkey,
+                timestamp=datetime.strptime(timestamp, "%Y%m%d%H%M%S").replace(
+                    tzinfo=timezone.utc
+                ),
+                original=original,
+                mimetype=mimetype,
+                statuscode=None if status == "-" else int(status),
+                digest=digest,
+                length=None if length == "-" else int(length),
+            )
+
+    def close(self):
+        self.closed = True
+
+
 def patch_cdx(body: bytes):
     from archive_magic_fetch import cdx as cdx_mod
     from archive_magic_fetch import fetch as fetch_mod
 
-    original = cdx_mod.fetch_year_cdx
+    original = cdx_mod.fetch_cdx
+    rows = json.loads(body)
 
-    def fake_fetch_year_cdx(layout, **kwargs):
+    def fake_fetch_cdx(**kwargs):
         kwargs = dict(kwargs)
-        kwargs["session"] = FakeSession([body])
-        kwargs["sleep"] = lambda _s: None
-        return original(layout, **kwargs)
+        kwargs["client"] = FakeCdxClient(rows)
+        return original(**kwargs)
 
-    cdx_mod.fetch_year_cdx = fake_fetch_year_cdx
-    fetch_mod.fetch_year_cdx = fake_fetch_year_cdx
+    cdx_mod.fetch_cdx = fake_fetch_cdx
+    fetch_mod.fetch_cdx = fake_fetch_cdx
     return original, cdx_mod, fetch_mod
 
 
@@ -107,18 +135,17 @@ def patch_cdx_by_year(bodies_by_year: dict[int, bytes]):
     from archive_magic_fetch import cdx as cdx_mod
     from archive_magic_fetch import fetch as fetch_mod
 
-    original = cdx_mod.fetch_year_cdx
+    original = cdx_mod.fetch_cdx
 
-    def fake_fetch_year_cdx(layout, **kwargs):
+    def fake_fetch_cdx(**kwargs):
         kwargs = dict(kwargs)
-        year = int(kwargs["year"])
-        body = bodies_by_year.get(year, b"[]")
-        kwargs["session"] = FakeSession([body])
-        kwargs["sleep"] = lambda _s: None
-        return original(layout, **kwargs)
+        year = int(str(kwargs["date_start"])[:4])
+        rows = json.loads(bodies_by_year.get(year, b"[]"))
+        kwargs["client"] = FakeCdxClient(rows)
+        return original(**kwargs)
 
-    cdx_mod.fetch_year_cdx = fake_fetch_year_cdx
-    fetch_mod.fetch_year_cdx = fake_fetch_year_cdx
+    cdx_mod.fetch_cdx = fake_fetch_cdx
+    fetch_mod.fetch_cdx = fake_fetch_cdx
     return original, cdx_mod, fetch_mod
 
 

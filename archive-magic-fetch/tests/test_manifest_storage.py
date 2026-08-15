@@ -332,8 +332,8 @@ def test_remote_two_run_fetch_extends_same_tail_and_evicts_working_files(
             )
             assert result.exit_code == 0
         finally:
-            cdx_mod.fetch_year_cdx = original
-            fetch_mod.fetch_year_cdx = original
+            cdx_mod.fetch_cdx = original
+            fetch_mod.fetch_cdx = original
 
     warc_keys = sorted(key for key in fake.objects if key.endswith(".warc.gz"))
     assert warc_keys == ["example.org/collections/2004/example.org-2004-001.warc.gz"]
@@ -387,8 +387,8 @@ def test_noop_remote_year_downloads_index_not_tail(tmp_path, monkeypatch):
         )
         assert second.exit_code == 0
     finally:
-        cdx_mod.fetch_year_cdx = original
-        fetch_mod.fetch_year_cdx = original
+        cdx_mod.fetch_cdx = original
+        fetch_mod.fetch_cdx = original
 
     gets = [op[1] for op in fake.operations if op[0] == "get"]
     assert any(key.endswith("index.cdxj") for key in gets)
@@ -578,8 +578,8 @@ def test_remote_run_record_is_written_before_working_files_are_evicted(
             sleep=lambda _seconds: None,
         )
     finally:
-        cdx_mod.fetch_year_cdx = original
-        fetch_mod.fetch_year_cdx = original
+        cdx_mod.fetch_cdx = original
+        fetch_mod.fetch_cdx = original
 
     assert result.exit_code == 0
     assert observed["run_record"]

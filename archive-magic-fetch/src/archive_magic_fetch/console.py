@@ -5,10 +5,8 @@ from __future__ import annotations
 import os
 import sys
 import threading
-from typing import Sequence
-
 from .identity import is_invalid_uri_payload_digest, wayback_url
-from .models import CaptureIdentity, FailureCategory, UnresolvedFailure
+from .models import CaptureIdentity
 from .resolution import CaptureKind, CaptureOutcome, UrlOutcome
 
 _RESULT_STYLES = {
@@ -87,26 +85,6 @@ def log_url_outcome(number: int, total: int, outcome: UrlOutcome) -> None:
             f"{style_result(detail, style, enabled=color)}"
         )
     emit("\n".join(lines))
-
-
-def report_cdx_ingest_skips(year: int, failures: Sequence[UnresolvedFailure]) -> None:
-    malformed = [
-        item for item in failures if item.category == FailureCategory.MALFORMED_CDX
-    ]
-    if not malformed:
-        return
-    emit(f"year {year}: skipping {len(malformed)} malformed CDX row(s)")
-    preview = malformed[:5]
-    for item in preview:
-        url = item.identity.original_url
-        if url and url != "-":
-            emit(f"  skip: {url}")
-            emit(f"        {item.message}")
-        else:
-            emit(f"  skip: {item.message}")
-    extra = len(malformed) - len(preview)
-    if extra:
-        emit(f"  ... and {extra} more")
 
 
 def _safe(value: str) -> str:

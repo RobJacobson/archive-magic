@@ -1,68 +1,25 @@
-"""Annual CDX acquisition, raw persistence, and row parsing."""
+"""Internet Archive CDX search and date-range helpers."""
 
 from __future__ import annotations
 
 import calendar
-import gzip
-import hashlib
 import importlib.metadata
-import json
 import re
 import time
-from dataclasses import dataclass
-from datetime import datetime, timezone
-from http.client import IncompleteRead
-from pathlib import Path
 from collections.abc import Iterator
-from typing import Callable, Literal, Optional
-from urllib.parse import urlencode
+from dataclasses import dataclass
+from typing import Optional
 
-import requests
-from urllib3.exceptions import ProtocolError
-from wayback.exceptions import WaybackRetryError
+from wayback import WaybackClient
 
-from .collection import (
-    ArchiveLayout,
-    ensure_collection_dirs,
-    exclusive_temp_path,
-    normalize_domain,
-    publish_file_atomically,
-)
+from .collection import ArchiveLayout, ensure_collection_dirs, normalize_domain
 from .identity import current_run_id, make_identity
-from .models import (
-    CaptureIdentity,
-    FailureCategory,
-    ParsedCapture,
-    UnresolvedFailure,
-)
+from .models import ParsedCapture
 from .playback import ArchiveMagicWaybackSession
-from .retry import parse_retry_after
-
-_CDX_PAGE_LIMIT = 10_000
 
 
-# Standard CDX field order used by IA and wayback.
-_CDX_FIELDS = (
-    "urlkey",
-    "timestamp",
-    "original",
-    "mimetype",
-    "statuscode",
-    "digest",
-    "length",
-)
 _DATE_BOUND = re.compile(r"^\d{4,14}$")
 _HYPHENATED_DATE = re.compile(r"^\d{4}(?:-\d{2}){0,2}$")
-
-
-def make_cdx_session() -> ArchiveMagicWaybackSession:
-    """Return a Wayback session for CDX queries.
-
-    Retries stay at 0 here; ``_get_cdx_entity_bytes`` owns transient backoff so
-    connect failures are logged and retried without nesting wayback's loop.
-    """
-
-    return ArchiveMagicWaybackSession(user_agent="archive-magic-fetch")
 
 
 def normalize_cdx_search(url_pattern: str) -> tuple[str, Optional[str]]:
@@ -93,9 +50,7 @@ def _domain_wildcard_target(url_pattern: str) -> Optional[str]:
             f"URL pattern must use a single leading *. on the host: {url_pattern}"
         )
     host, port = normalize_domain(host_part, allow_bare=True)
-    if port is None:
-        return host
-    return f"{host}:{port}"
+    return host if port is None else f"{host}:{port}"
 
 
 def _validate_calendar_date(year: int, month: int, day: int) -> None:
@@ -112,15 +67,9 @@ def parse_date_bound(
     value: Optional[str],
     *,
     default: str,
-    bound: Literal["start", "end"] = "start",
+    bound: str = "start",
 ) -> str:
-    """Parse a date bound into a validated 14-digit UTC CDX timestamp.
-
-    Accepts compact CDX digits or hyphenated calendar dates at year, month, or
-    day precision (``1995``, ``1995-01``, ``1995-01-01``). Partial values expand
-    to the start or end of that precision. For example, ``2004`` as an end bound
-    becomes ``20041231235959``.
-    """
+    """Parse a date bound into a validated 14-digit UTC CDX timestamp."""
 
     raw = default if value is None or value == "" else value
     if not isinstance(raw, str) or not raw.strip():
@@ -138,9 +87,7 @@ def parse_date_bound(
     year = int(text[0:4])
     if len(text) == 4:
         _validate_calendar_date(year, 1, 1)
-        if bound == "end":
-            return f"{year:04d}1231235959"
-        return f"{year:04d}0101000000"
+        return f"{year:04d}{'1231235959' if bound == 'end' else '0101000000'}"
 
     month = int(text[4:6])
     if len(text) == 6:
@@ -153,45 +100,33 @@ def parse_date_bound(
     day = int(text[6:8])
     _validate_calendar_date(year, month, day)
     if len(text) == 8:
-        if bound == "end":
-            return f"{text}235959"
-        return f"{text}000000"
+        return f"{text}{'235959' if bound == 'end' else '000000'}"
 
     hour = int(text[8:10])
     if hour > 23:
         raise ValueError(f"invalid date hour: {raw!r}")
     if len(text) == 10:
-        if bound == "end":
-            return f"{text}5959"
-        return f"{text}0000"
+        return f"{text}{'5959' if bound == 'end' else '0000'}"
 
     minute = int(text[10:12])
     if minute > 59:
         raise ValueError(f"invalid date minute: {raw!r}")
     if len(text) == 12:
-        if bound == "end":
-            return f"{text}59"
-        return f"{text}00"
+        return f"{text}{'59' if bound == 'end' else '00'}"
 
-    second = int(text[12:14])
-    if second > 59:
+    if int(text[12:14]) > 59:
         raise ValueError(f"invalid date second: {raw!r}")
     return text
 
 
 def validate_date_range(date_start: str, date_end: str) -> None:
-    """Reject invalid or reversed CDX date ranges."""
+    """Reject a reversed CDX date range."""
 
     if date_start > date_end:
-        raise ValueError(
-            f"start date {date_start} is after end date {date_end}"
-        )
+        raise ValueError(f"start date {date_start} is after end date {date_end}")
 
 
-def year_ranges(
-    date_start: str,
-    date_end: str,
-) -> Iterator[tuple[int, str, str]]:
+def year_ranges(date_start: str, date_end: str) -> Iterator[tuple[int, str, str]]:
     """Yield each calendar year and its clipped CDX bounds."""
 
     for year in range(int(date_start[:4]), int(date_end[:4]) + 1):
@@ -210,408 +145,83 @@ def _wayback_version() -> str:
 
 
 @dataclass(frozen=True)
-class YearCdxResult:
-    """Raw and parsed annual CDX acquisition result."""
+class CdxResult:
+    """Parsed captures and concise provenance for one CDX query."""
 
-    year: int
-    source_dir: Path
-    raw_path: Path
     captures: tuple[ParsedCapture, ...]
-    failures: tuple[UnresolvedFailure, ...]
-    query_meta: dict[str, object]
+    query: dict[str, object]
 
 
-def fetch_year_cdx(
-    layout: ArchiveLayout,
+def make_cdx_client(retries: int) -> WaybackClient:
+    """Build a CDX client using the archive's configured retry policy."""
+
+    session = ArchiveMagicWaybackSession(
+        user_agent="archive-magic-fetch",
+        retries=retries,
+    )
+    return WaybackClient(session=session)
+
+
+def fetch_cdx(
     *,
     url_pattern: str,
-    year: int,
     date_start: str,
     date_end: str,
-    run_id: str,
-    session: Optional[requests.Session] = None,
-    sleep: Callable[[float], None] = time.sleep,
-) -> YearCdxResult:
-    """Query one year of CDX, preserve raw bytes, and parse rows."""
-
-    ensure_collection_dirs(layout)
-    collection_id = f"{year:04d}"
-    source_dir = layout.run_dir(collection_id, run_id)
-    source_dir.mkdir(parents=True, exist_ok=True)
+    retries: int,
+    client: WaybackClient | None = None,
+) -> CdxResult:
+    """Fetch and parse a CDX range through ``WaybackClient.search``."""
 
     search_url, match_type = normalize_cdx_search(url_pattern)
-    params: dict[str, object] = {
-        "url": search_url,
-        "from": date_start,
-        "to": date_end,
-        "output": "json",
-        "fl": ",".join(_CDX_FIELDS),
-        "showResumeKey": "true",
-        "limit": str(_CDX_PAGE_LIMIT),
-    }
-    if match_type is not None:
-        params["matchType"] = match_type
-
-    owned_session = session is None
-    session = session or make_cdx_session()
-    page_metas: list[dict[str, object]] = []
-    page = 0
-    resume_key: Optional[str] = None
-    started = time.time()
-    request_count = 0
-    raw_path: Optional[Path] = None
-
+    owned_client = client is None
+    client = client or make_cdx_client(retries)
+    started = time.monotonic()
     try:
-        while True:
-            page_params = dict(params)
-            if resume_key is not None:
-                page_params["resumeKey"] = resume_key
-            query_url = (
-                "https://web.archive.org/cdx/search/cdx?"
-                + urlencode(page_params)
-            )
-            entity, content_encoding = _get_cdx_entity_bytes(
-                session,
-                query_url,
-                sleep=sleep,
-            )
-            request_count += 1
-            page += 1
-            page_path = _write_raw_cdx_page(
-                source_dir,
-                year=year,
-                page=page,
-                entity=entity,
-                content_encoding=content_encoding,
-            )
-            if raw_path is None:
-                raw_path = page_path
-            stored_entity = page_path.read_bytes()
-            page_metas.append(
-                {
-                    "page": page,
-                    "raw_file": page_path.name,
-                    "storage_encoding": "gzip",
-                    "response_encoding": content_encoding,
-                    "byte_length": len(stored_entity),
-                    "sha256": hashlib.sha256(stored_entity).hexdigest(),
-                    "response_byte_length": len(entity),
-                    "response_sha256": hashlib.sha256(entity).hexdigest(),
-                    "query_url": query_url,
-                }
-            )
-            # Resume-key discovery only; durable parse happens from disk below.
-            parse_body = _decode_cdx_entity(entity, content_encoding)
-            _rows, next_key = _split_cdx_json_pages(parse_body)
-            if not next_key:
-                break
-            resume_key = next_key
-    finally:
-        if owned_session:
-            session.close()
-
-    if raw_path is None:
-        raise RuntimeError(f"CDX query for {year} returned no response pages")
-
-    # Parse from durable published pages so source and processed input match.
-    captures: list[ParsedCapture] = []
-    failures: list[UnresolvedFailure] = []
-    seen: set[CaptureIdentity] = set()
-    for page_meta in page_metas:
-        page_path = source_dir / str(page_meta["raw_file"])
-        entity = page_path.read_bytes()
-        parse_body = _decode_cdx_entity(entity, "gzip")
-        page_rows, _ = _split_cdx_json_pages(parse_body)
-        for raw_line, fields in page_rows:
-            parsed = _parse_row(fields, raw_line=raw_line)
-            if isinstance(parsed, UnresolvedFailure):
-                failures.append(parsed)
-                continue
-            if parsed.identity in seen:
-                continue
-            seen.add(parsed.identity)
-            captures.append(parsed)
-
-    captures.sort(key=lambda item: item.identity.sort_key())
-    # Top-level byte_length/sha256/raw_file always describe page one so they
-    # stay coherent; pages[] carries per-page totals for multi-page years.
-    primary = page_metas[0]
-    query_meta = {
-        "year": year,
-        "url_pattern": url_pattern,
-        "search_url": search_url,
-        "match_type": match_type,
-        "from": date_start,
-        "to": date_end,
-        "response_encoding": str(primary["response_encoding"]),
-        "byte_length": int(primary["byte_length"]),
-        "sha256": str(primary["sha256"]),
-        "retrieved_at": datetime.now(timezone.utc).strftime(
-            "%Y-%m-%dT%H:%M:%SZ"
-        ),
-        "client": "archive-magic-fetch+requests",
-        "wayback_version": _wayback_version(),
-        "request_count": request_count,
-        "duration_s": round(time.time() - started, 3),
-        "page_count": len(page_metas),
-        "raw_file": str(primary["raw_file"]),
-        "pages": page_metas,
-    }
-    return YearCdxResult(
-        year=year,
-        source_dir=source_dir,
-        raw_path=raw_path,
-        captures=tuple(captures),
-        failures=tuple(failures),
-        query_meta=query_meta,
-    )
-
-
-def _write_raw_cdx_page(
-    source_dir: Path,
-    *,
-    year: int,
-    page: int,
-    entity: bytes,
-    content_encoding: str,
-) -> Path:
-    """Persist one CDX HTTP entity before any parsing."""
-
-    page_path = source_dir / f"page-{page:03d}.cdx.gz"
-    stored_entity = (
-        entity if content_encoding.lower().startswith("gzip") else gzip.compress(entity)
-    )
-    tmp = exclusive_temp_path(source_dir, suffix=f".{page_path.name}.tmp")
-    tmp.write_bytes(stored_entity)
-    publish_file_atomically(tmp, page_path)
-    return page_path
-
-
-def _decode_cdx_entity(entity: bytes, content_encoding: str) -> bytes:
-    encoding = content_encoding.lower().strip() or "identity"
-    if encoding in {"identity", "utf-8", "json"}:
-        return entity
-    if encoding.startswith("gzip"):
-        return gzip.decompress(entity)
-    raise ValueError(f"unsupported CDX content encoding: {content_encoding!r}")
-
-
-def _get_cdx_entity_bytes(
-    session: requests.Session,
-    url: str,
-    *,
-    sleep: Callable[[float], None],
-    max_attempts: int = 8,
-) -> tuple[bytes, str]:
-    """GET exact CDX HTTP entity bytes without content-encoding decode.
-
-    Mid-transfer truncations from ``response.raw.read()`` surface as urllib3
-    ``ProtocolError`` / ``IncompleteRead`` (not ``requests.ConnectionError``),
-    so those are retried here with the same exponential backoff as connect
-    failures. Playback treats IncompleteRead as a permanent truncated payload;
-    CDX treats it as a failed transfer of an otherwise available index page.
-    """
-
-    attempt = 0
-    while True:
-        attempt += 1
-        response = None
-        try:
-            response = session.get(url, stream=True, timeout=120)
-            if response.status_code == 429:
-                delay = parse_retry_after(
-                    response.headers.get("Retry-After")
-                ) or 60.0
-                response.close()
-                response = None
-                if attempt >= max_attempts:
-                    raise RuntimeError(
-                        f"CDX rate limited after {attempt} attempts "
-                        f"(retry_after={delay})"
+        records = client.search(
+            search_url,
+            match_type=match_type,
+            from_date=date_start,
+            to_date=date_end,
+            resolve_revisits=False,
+            skip_malformed_results=True,
+        )
+        captures = tuple(
+            sorted(
+                (
+                    ParsedCapture(
+                        identity=make_identity(
+                            original_url=record.original,
+                            timestamp=record.timestamp.strftime("%Y%m%d%H%M%S"),
+                            status_token=(
+                                "-" if record.statuscode is None else str(record.statuscode)
+                            ),
+                            payload_digest=record.digest or "-",
+                            urlkey=record.urlkey,
+                        ),
+                        mime=record.mimetype or "-",
                     )
-                print(
-                    f"  rate limit: CDX pausing {delay:g}s "
-                    f"(attempt {attempt}/{max_attempts})",
-                    flush=True,
-                )
-                sleep(delay)
-                continue
-            if response.status_code >= 500:
-                status = response.status_code
-                if attempt >= max_attempts:
-                    response.raise_for_status()
-                response.close()
-                response = None
-                delay = min(5 * (2 ** (attempt - 1)), 300)
-                print(
-                    f"  CDX server error {status}: "
-                    f"retrying in {delay:g}s "
-                    f"(attempt {attempt}/{max_attempts})",
-                    flush=True,
-                )
-                sleep(delay)
-                continue
-            response.raise_for_status()
-            headers = getattr(response, "headers", {}) or {}
-            content_encoding = str(
-                headers.get("Content-Encoding")
-                or headers.get("content-encoding")
-                or "identity"
-            ).lower()
-            body = _read_raw_entity_bytes(response)
-            response.close()
-            response = None
-            return body, content_encoding
-        except (
-            requests.ConnectionError,
-            requests.Timeout,
-            requests.exceptions.ChunkedEncodingError,
-            ProtocolError,
-            IncompleteRead,
-            WaybackRetryError,
-            OSError,
-        ) as error:
-            if response is not None:
-                response.close()
-            if attempt >= max_attempts:
-                raise
-            delay = min(5 * (2 ** (attempt - 1)), 300)
-            print(
-                f"  CDX connection error: retrying in {delay:g}s "
-                f"(attempt {attempt}/{max_attempts}) "
-                f"[{type(error).__name__}: {error}]",
-                flush=True,
+                    for record in records
+                ),
+                key=lambda item: item.identity.sort_key(),
             )
-            sleep(delay)
-
-
-def _read_raw_entity_bytes(response: object) -> bytes:
-    """Return the HTTP entity body without decoding Content-Encoding."""
-
-    raw = getattr(response, "raw", None)
-    if raw is not None:
-        read = getattr(raw, "read", None)
-        if callable(read):
-            try:
-                body = read(decode_content=False)
-            except TypeError:
-                body = read()
-            if isinstance(body, (bytes, bytearray)):
-                return bytes(body)
-    content = getattr(response, "content", None)
-    if isinstance(content, (bytes, bytearray)):
-        return bytes(content)
-    raise TypeError("CDX response did not provide readable entity bytes")
-
-
-def _split_cdx_json_pages(
-    body: bytes,
-) -> tuple[list[tuple[str, list[str]]], Optional[str]]:
-    """Parse IA CDX JSON that may include a trailing resume key block."""
-
-    text = body.decode("utf-8", errors="replace").strip()
-    if not text:
-        return [], None
-    try:
-        payload = json.loads(text)
-    except json.JSONDecodeError:
-        # Fallback: treat as CDX line format.
-        rows: list[tuple[str, list[str]]] = []
-        for line in text.splitlines():
-            if not line.strip():
-                continue
-            fields = line.split(" ")
-            rows.append((line, fields))
-        return rows, None
-
-    if not isinstance(payload, list):
-        raise ValueError("CDX JSON response must be a list")
-
-    rows = []
-    resume_key: Optional[str] = None
-    for index, item in enumerate(payload):
-        if item == []:
-            # Resume-key separator used by showResumeKey.
-            if index + 1 < len(payload) and isinstance(payload[index + 1], list):
-                key_row = payload[index + 1]
-                if key_row and isinstance(key_row[0], str):
-                    resume_key = key_row[0]
-            break
-        if not isinstance(item, list):
-            # Preserve unexpected JSON entries as deterministic malformed rows
-            # rather than silently dropping them from the durable source parse.
-            raw_line = json.dumps(item, sort_keys=True, default=str)
-            rows.append((raw_line, []))
-            continue
-        # Skip header row when present.
-        if item and item[0] == "urlkey":
-            continue
-        fields = [str(part) for part in item]
-        raw_line = " ".join(fields)
-        rows.append((raw_line, fields))
-    return rows, resume_key
-
-
-def _parse_row(
-    fields: list[str],
-    *,
-    raw_line: str,
-) -> ParsedCapture | UnresolvedFailure:
-    """Parse one raw CDX field list into a capture or failure."""
-
-    if len(fields) < 6:
-        return _malformed(raw_line, "too few fields")
-
-    urlkey, timestamp, original, mimetype, statuscode, digest = fields[:6]
-    # Pad/repair is not applied here: require exact 14-digit timestamps.
-    if not re.fullmatch(r"\d{14}", timestamp):
-        return _malformed(raw_line, f"invalid timestamp {timestamp!r}")
-    if not original:
-        return _malformed(raw_line, "missing original URL")
-
-    try:
-        identity = make_identity(
-            original_url=original,
-            timestamp=timestamp,
-            status_token=statuscode,
-            payload_digest=digest,
-            urlkey=urlkey or None,
         )
-    except ValueError as error:
-        return _malformed(raw_line, str(error))
+    finally:
+        if owned_client:
+            client.close()
 
-    return ParsedCapture(
-        identity=identity,
-        mime=mimetype or "-",
-    )
-
-
-def _malformed(raw_line: str, message: str) -> UnresolvedFailure:
-    # Distinct synthetic identity per malformed source row so publication
-    # cannot collapse unrelated bad rows in the current run record.
-    row_digest = hashlib.sha1(raw_line.encode("utf-8", errors="replace")).hexdigest()
-    identity = CaptureIdentity(
-        urlkey=f"malformed:{row_digest}",
-        original_url="-",
-        timestamp="00000000000000",
-        status_token="-",
-        payload_digest=f"malformed:{row_digest}",
-    )
-    parts = raw_line.split(" ")
-    if len(parts) >= 3 and re.fullmatch(r"\d{14}", parts[1]):
-        identity = CaptureIdentity(
-            urlkey=parts[0] or f"malformed:{row_digest}",
-            original_url=parts[2] or "-",
-            timestamp=parts[1],
-            status_token=parts[4] if len(parts) > 4 else "-",
-            # Always keep the row hash so distinct malformed rows that share
-            # timestamp/url fields remain distinct in run.json.
-            payload_digest=f"malformed:{row_digest}",
-        )
-    return UnresolvedFailure(
-        identity=identity,
-        category=FailureCategory.MALFORMED_CDX,
-        message=f"{message}: {raw_line[:200]}",
+    return CdxResult(
+        captures=captures,
+        query={
+            "url_pattern": url_pattern,
+            "search_url": search_url,
+            "match_type": match_type,
+            "from": date_start,
+            "to": date_end,
+            "client": "wayback",
+            "wayback_version": _wayback_version(),
+            "result_count": len(captures),
+            "duration_s": round(time.monotonic() - started, 3),
+        },
     )
 
 
@@ -625,7 +235,6 @@ def init_run_id(layout: ArchiveLayout, run_id: str | None = None) -> str:
             raise FileExistsError(f"run ID already exists: {run_id}")
         return run_id
 
-    # Microsecond IDs normally suffice; check all existing collection runs.
     for attempt in range(1000):
         candidate = (
             current_run_id()

@@ -50,8 +50,9 @@ _GZIP_MAGIC = b"\x1f\x8b"
 class ArchiveMagicWaybackSession(WaybackSession):
     """Wayback session tuned for Archive Magic fetch.
 
-    Library retries stay disabled so Fetch owns its small synchronous retry
-    loops and request volume remains explicit.
+    Playback clients leave library retries disabled because Fetch owns their
+    synchronous retry loop. CDX clients override this with `[fetch].retries` so
+    `WaybackClient.search()` owns CDX retry and `Retry-After` behavior.
 
     Wayback treats any response with ``Memento-Datetime`` as a successful
     memento, which can let HTTP 429 slip through as a playback error with no

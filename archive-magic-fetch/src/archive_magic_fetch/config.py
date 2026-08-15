@@ -1,6 +1,7 @@
 """Load and validate one versioned Archive Magic archive descriptor."""
 
 from archive_magic_descriptor import (
+    DEFAULT_RETRIES,
     DEFAULT_WARC_TARGET_BYTES,
     ArchiveDescriptor as FetchConfig,
     RemoteConfig,
@@ -11,6 +12,7 @@ from archive_magic_descriptor import (
 
 __all__ = [
     "DEFAULT_WARC_TARGET_BYTES",
+    "DEFAULT_RETRIES",
     "FetchConfig",
     "RemoteConfig",
     "StorageConfig",

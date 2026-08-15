@@ -22,7 +22,6 @@ from .retry import parse_retry_after
 
 
 _BACKPRESSURE_COOLDOWN_SECONDS = 60.0
-_MAX_PLAYBACK_ATTEMPTS = 4
 
 
 @dataclass(frozen=True)
@@ -118,6 +117,7 @@ class PlaybackWorkers:
         max_workers: int = 4,
         starts_per_second: float = 20.0,
         report: Callable[[str], None] = _default_report,
+        retries: int = 4,
     ) -> None:
         self._client_factory = client_factory
         self._download_fn = download_fn
@@ -134,6 +134,7 @@ class PlaybackWorkers:
         self._owners: list[object] = []
         self._owners_lock = threading.Lock()
         self.max_workers = max_workers
+        self.max_attempts = retries + 1
 
     def close(self) -> None:
         self._executor.shutdown()
@@ -169,7 +170,7 @@ class PlaybackWorkers:
 
         started = time.monotonic()
         categories: list[str] = []
-        for attempt in range(1, _MAX_PLAYBACK_ATTEMPTS + 1):
+        for attempt in range(1, self.max_attempts + 1):
             self._gate.wait()
             try:
                 result = self._download_fn(self._client(), identity)
@@ -179,7 +180,7 @@ class PlaybackWorkers:
                 backpressure = backpressure_signal(error)
                 if backpressure is not None:
                     self._gate.pause(*backpressure, identity)
-                if retryable and attempt < _MAX_PLAYBACK_ATTEMPTS:
+                if retryable and attempt < self.max_attempts:
                     if backpressure is None:
                         self._sleep(
                             retry_after_from_error(error)
