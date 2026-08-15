@@ -16,8 +16,8 @@ from archive_magic_fetch.resolution import (
 from archive_magic_fetch.workers import (
     PlaybackWorkers,
     StartGate,
-    backpressure_signal,
 )
+from archive_magic_fetch.retry import backpressure_signal
 from helpers import make_capt, playback
 
 

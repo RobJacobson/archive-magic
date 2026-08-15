@@ -11,7 +11,6 @@ from typing import Callable, Mapping, Optional, Sequence
 
 from .cdx import (
     fetch_cdx,
-    init_run_id,
     parse_date_bound,
     validate_date_range,
     year_ranges,
@@ -22,6 +21,7 @@ from .collection import (
     cleanup_temps,
     ensure_collection_dirs,
     index_artifact_from_path,
+    init_run_id,
     list_collection_warcs,
     normalize_archive_id,
     reject_legacy_layout,
@@ -88,6 +88,7 @@ class FetchResult:
     layout: ArchiveLayout
     metrics: RunMetrics
     failures: list[UnresolvedFailure]
+    failed_years: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -125,7 +126,6 @@ def run_fetch(
 ) -> FetchResult:
     """Execute the annual fetch pipeline with bounded playback workers."""
 
-    validate_date_range(settings.date_start, settings.date_end)
     factory = client_factory or make_client
     workers = PlaybackWorkers(
         factory,
@@ -138,7 +138,7 @@ def run_fetch(
         retries=settings.retries,
     )
     try:
-        return _run_fetch(settings, workers=workers)
+        return _run_fetch(settings, workers=workers, sleep=sleep)
     finally:
         workers.close()
 
@@ -147,10 +147,10 @@ def _run_fetch(
     settings: FetchSettings,
     *,
     workers: PlaybackWorkers,
+    sleep,
 ) -> FetchResult:
     """Execute serial years with parallel playback and one WARC writer."""
 
-    validate_date_range(settings.date_start, settings.date_end)
     layout = ArchiveLayout(settings.storage.workspace_directory, settings.archive_id)
     publisher = PublicationManager(settings.storage)
     if settings.reset_data and settings.storage.authority == "remote":
@@ -174,19 +174,28 @@ def _run_fetch(
     )
 
     run_skips_errors = 0
+    failed_years: list[int] = []
     for year, year_start, year_end in year_ranges(
         settings.date_start, settings.date_end
     ):
-        result = _run_year(
-            settings,
-            layout=layout,
-            year=year,
-            date_start=year_start,
-            date_end=year_end,
-            run_id=run_id,
-            workers=workers,
-            publisher=publisher,
-        )
+        try:
+            result = _run_year(
+                settings,
+                layout=layout,
+                year=year,
+                date_start=year_start,
+                date_end=year_end,
+                run_id=run_id,
+                workers=workers,
+                publisher=publisher,
+                sleep=sleep,
+            )
+        except Exception as error:  # noqa: BLE001 - isolate years
+            emit(
+                f"year {year}: failed ({error}); continuing with remaining years"
+            )
+            failed_years.append(year)
+            continue
         _accumulate_metrics(metrics, result.metrics)
         all_failures.extend(result.failures)
         run_skips_errors += result.skip_errors
@@ -197,11 +206,14 @@ def _run_fetch(
         f"already-represented={metrics.local_reuses} "
         f"skips/errors={run_skips_errors}"
     )
+    if failed_years:
+        emit("failed years: " + ", ".join(str(year) for year in failed_years))
     return FetchResult(
-        exit_code=0,
+        exit_code=1 if failed_years else 0,
         layout=layout,
         metrics=metrics,
         failures=all_failures,
+        failed_years=tuple(failed_years),
     )
 
 
@@ -215,6 +227,7 @@ def _run_year(
     run_id: str,
     workers: PlaybackWorkers,
     publisher: PublicationManager,
+    sleep,
 ) -> _YearResult:
     """Acquire, resolve, publish, and record one yearly collection."""
 
@@ -241,6 +254,7 @@ def _run_year(
         date_start=date_start,
         date_end=date_end,
         retries=settings.retries,
+        sleep=sleep,
     )
     year_metrics.cdx_duration_s += time.monotonic() - cdx_started
     selected = _dedupe_captures(year_cdx.captures)
@@ -290,9 +304,14 @@ def _run_year(
         collection_id=collection_id,
         run_id=run_id,
         url_pattern=settings.url_pattern,
-        date_start=str(year_cdx.query["from"]),
-        date_end=str(year_cdx.query["to"]),
-        query=year_cdx.query,
+        date_start=date_start,
+        date_end=date_end,
+        query={
+            "url_pattern": settings.url_pattern,
+            "search_url": year_cdx.search_url,
+            "match_type": year_cdx.match_type,
+            "result_count": len(year_cdx.captures),
+        },
         warcs=year_warcs,
         index=collection_index,
         metrics=year_metrics,

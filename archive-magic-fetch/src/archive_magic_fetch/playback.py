@@ -51,8 +51,9 @@ class ArchiveMagicWaybackSession(WaybackSession):
     """Wayback session tuned for Archive Magic fetch.
 
     Playback clients leave library retries disabled because Fetch owns their
-    synchronous retry loop. CDX clients override this with `[fetch].retries` so
-    `WaybackClient.search()` owns CDX retry and `Retry-After` behavior.
+    synchronous retry loop. CDX clients also leave library retries disabled;
+    `fetch_cdx` owns CDX retries, including a 60s pause for HTTP 429 and TCP
+    connection refused.
 
     Wayback treats any response with ``Memento-Datetime`` as a successful
     memento, which can let HTTP 429 slip through as a playback error with no

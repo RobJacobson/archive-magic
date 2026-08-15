@@ -985,7 +985,8 @@ def test_completed_run_reports_expected_failures(tmp_path):
     }
     assert len(record["failures"]) == 1
     assert record["failures"][0]["identity"]["timestamp"] == bad.timestamp
-    assert record["query"]["client"] == "wayback"
+    assert record["query"]["url_pattern"] == "http://example.org/"
+    assert record["query"]["match_type"] is None
     assert list_collection_warcs(layout, "2004")
     assert all(w["record_count"] > 0 for w in record["warcs"])
     assert record["index"]["filename"] == (
@@ -1137,10 +1138,8 @@ def test_multi_year_empty_run_shares_id_without_playback_collections(
     def empty_year(*, date_start, date_end, **_kwargs):
         return CdxResult(
             captures=(),
-            query={
-                "from": date_start,
-                "to": date_end,
-            },
+            search_url="http://example.org/",
+            match_type=None,
         )
 
     monkeypatch.setattr(fetch_mod, "fetch_cdx", empty_year)
@@ -1165,6 +1164,65 @@ def test_multi_year_empty_run_shares_id_without_playback_collections(
         assert layout.run_record(year, runs[0].name).is_file()
         assert not layout.collection_dir(year).exists()
     assert run_ids[0] == run_ids[1]
+
+
+def test_cdx_year_failure_continues_with_later_years(tmp_path, monkeypatch, capsys):
+    from archive_magic_fetch.cdx import CdxResult
+    from archive_magic_fetch.models import ParsedCapture
+    import archive_magic_fetch.fetch as fetch_mod
+
+    first = make_capt(ts="20040601000000")
+    later = make_capt(
+        ts="20060601000000",
+        digest="sha1:" + "B" * 32,
+        urlkey="org,example)/b",
+        url="http://example.org/b",
+    )
+    queried: list[int] = []
+    downloads: list[str] = []
+
+    def fake_fetch_cdx(*, date_start, date_end, **_kwargs):
+        year = int(str(date_start)[:4])
+        queried.append(year)
+        if year == 2005:
+            raise RuntimeError("CDX query failed after 5 attempts: Connection refused")
+        capture = first if year == 2004 else later
+        return CdxResult(
+            captures=(ParsedCapture(identity=capture, mime="text/html"),),
+            search_url="http://example.org/",
+            match_type=None,
+        )
+
+    def download_fn(_client, identity):
+        downloads.append(identity.timestamp)
+        return playback(identity)
+
+    monkeypatch.setattr(fetch_mod, "fetch_cdx", fake_fetch_cdx)
+    result = run_fetch(
+        FetchSettings(
+            url_pattern="http://example.org/",
+            date_start="20040101000000",
+            date_end="20061231235959",
+            archive_id="example.org",
+            storage=StorageConfig("local", tmp_path),
+        ),
+        client_factory=lambda: MagicMock(),
+        download_fn=download_fn,
+        sleep=lambda _seconds: None,
+    )
+
+    assert queried == [2004, 2005, 2006]
+    assert result.exit_code == 1
+    assert result.failed_years == (2005,)
+    assert downloads == [first.timestamp, later.timestamp]
+    layout = result.layout
+    assert inventory_collection(layout, "2004").contains(first)
+    assert inventory_collection(layout, "2006").contains(later)
+    assert not list_collection_warcs(layout, "2005")
+    output = capsys.readouterr().out
+    assert "year 2005: failed (" in output
+    assert "continuing with remaining years" in output
+    assert "failed years: 2005" in output
 
 
 @pytest.mark.parametrize(

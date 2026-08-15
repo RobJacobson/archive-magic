@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Optional, Sequence
 from urllib.parse import urlsplit
 
-from .identity import identity_to_dict
+from .identity import current_run_id, identity_to_dict
 from .models import (
     IndexArtifact,
     RunMetrics,
@@ -93,8 +93,6 @@ def normalize_domain(
 ) -> tuple[str, Optional[int]]:
     """Return normalized host and significant port for one URL pattern."""
 
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError("URL must be a non-empty string")
     text = value.strip()
     has_scheme = "://" in text
     parsed = urlsplit(text if has_scheme else f"//{text}")
@@ -132,8 +130,6 @@ def normalize_domain(
 def normalize_archive_id(url_pattern: str) -> str:
     """Derive one safe domain-archive directory name from a URL pattern."""
 
-    if not isinstance(url_pattern, str) or not url_pattern.strip():
-        raise ValueError("URL pattern must be a non-empty string")
     pattern = url_pattern.strip()
     if pattern.startswith("*."):
         pattern = pattern[2:]
@@ -144,7 +140,7 @@ def normalize_archive_id(url_pattern: str) -> str:
             f"{url_pattern}"
         )
     name = host if port is None else f"{host}%3A{port}"
-    if not name or name in {".", ".."} or "/" in name or "\\" in name:
+    if name in {".", ".."} or "/" in name or "\\" in name:
         raise ValueError(
             f"URL pattern produced an unsafe archive name: {name}"
         )
@@ -168,6 +164,17 @@ def ensure_collection_dirs(layout: ArchiveLayout) -> None:
     layout.root.mkdir(parents=True, exist_ok=True)
     layout.collections_root.mkdir(parents=True, exist_ok=True)
     layout.captures_root.mkdir(parents=True, exist_ok=True)
+
+
+def init_run_id(layout: ArchiveLayout) -> str:
+    """Allocate one invocation ID shared by every selected collection."""
+
+    base = current_run_id()
+    for attempt in range(1000):
+        candidate = base if attempt == 0 else f"{base}-{attempt:02d}"
+        if not any(layout.captures_root.glob(f"*/runs/{candidate}")):
+            return candidate
+    raise RuntimeError("unable to allocate a unique run source directory")
 
 
 def cleanup_temps(layout: ArchiveLayout) -> None:

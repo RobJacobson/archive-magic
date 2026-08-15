@@ -3,120 +3,95 @@
 from __future__ import annotations
 
 import calendar
-import importlib.metadata
 import re
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
-from typing import Optional
+from datetime import datetime
 
-from wayback import WaybackClient
+from wayback import CdxRecord, WaybackClient
 
-from .collection import ArchiveLayout, ensure_collection_dirs, normalize_domain
-from .identity import current_run_id, make_identity
+from .collection import normalize_domain
+from .console import emit
+from .identity import make_identity
 from .models import ParsedCapture
-from .playback import ArchiveMagicWaybackSession
+from .playback import ArchiveMagicWaybackSession, classify_playback_error
+from .retry import (
+    BACKPRESSURE_COOLDOWN_SECONDS,
+    backpressure_signal,
+    iter_error_chain,
+    retry_after_from_error,
+)
 
 
-_DATE_BOUND = re.compile(r"^\d{4,14}$")
-_HYPHENATED_DATE = re.compile(r"^\d{4}(?:-\d{2}){0,2}$")
+# Compact CDX timestamps at year, month, day, or full second precision.
+_CDX_FORMATS = {
+    4: "%Y",
+    6: "%Y%m",
+    8: "%Y%m%d",
+    14: "%Y%m%d%H%M%S",
+}
+# "*.example.org" (optional scheme and trailing /) is sugar for a CDX domain
+# query. The host group is the hostname plus optional port; extra * or a
+# leading dot is rejected so this stays a single-site wildcard.
+_DOMAIN_WILDCARD = re.compile(
+    r"""
+    ^
+    (?:[a-zA-Z][a-zA-Z0-9+.-]*://)?  # optional http:// or https://
+    \*\.                              # one leading *.
+    (?P<host>[^*/?#.][^*/?#]*)        # host[:port], no extra * or path
+    /?                                # optional trailing slash
+    $
+    """,
+    re.VERBOSE,
+)
 
 
-def normalize_cdx_search(url_pattern: str) -> tuple[str, Optional[str]]:
-    """Rewrite URL sugar into an explicit CDX match type when needed."""
+def normalize_cdx_search(url_pattern: str) -> tuple[str, str | None]:
+    """Map url_pattern sugar to a CDX URL and match_type.
 
-    if not isinstance(url_pattern, str) or not url_pattern:
-        raise ValueError("URL pattern must be a non-empty string")
+    ``*.example.org`` becomes ``("example.org", "domain")``. A trailing
+    ``/*`` becomes a prefix match. Anything else is searched as written.
+    """
+
     text = url_pattern.strip()
-    domain_target = _domain_wildcard_target(text)
-    if domain_target is not None:
-        return domain_target, "domain"
+    wildcard = _DOMAIN_WILDCARD.fullmatch(text)
+    if wildcard is not None:
+        host, port = normalize_domain(wildcard["host"], allow_bare=True)
+        return (host if port is None else f"{host}:{port}"), "domain"
     if text.endswith("/*"):
         return text.removesuffix("*"), "prefix"
     return text, None
 
 
-def _domain_wildcard_target(url_pattern: str) -> Optional[str]:
-    remainder = url_pattern
-    if "://" in remainder:
-        remainder = remainder.split("://", 1)[1]
-    if remainder.startswith("//"):
-        remainder = remainder[2:]
-    if not remainder.startswith("*."):
-        return None
-    host_part = remainder[2:].split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
-    if not host_part or "*" in host_part or host_part.startswith("."):
-        raise ValueError(
-            f"URL pattern must use a single leading *. on the host: {url_pattern}"
-        )
-    host, port = normalize_domain(host_part, allow_bare=True)
-    return host if port is None else f"{host}:{port}"
-
-
-def _validate_calendar_date(year: int, month: int, day: int) -> None:
-    if year < 1991 or year > 9999:
-        raise ValueError(f"invalid date year: {year}")
-    if month < 1 or month > 12:
-        raise ValueError(f"invalid date month: {month}")
-    last_day = calendar.monthrange(year, month)[1]
-    if day < 1 or day > last_day:
-        raise ValueError(f"invalid date day: {year:04d}-{month:02d}-{day:02d}")
-
-
 def parse_date_bound(
-    value: Optional[str],
+    value: str | None,
     *,
     default: str,
     bound: str = "start",
 ) -> str:
     """Parse a date bound into a validated 14-digit UTC CDX timestamp."""
 
-    raw = default if value is None or value == "" else value
-    if not isinstance(raw, str) or not raw.strip():
-        raise ValueError("date bound must be a non-empty string")
-    text = raw.strip()
-    if "-" in text:
-        if not _HYPHENATED_DATE.fullmatch(text):
-            raise ValueError(f"invalid date bound: {raw!r}")
-        text = text.replace("-", "")
-    if not _DATE_BOUND.fullmatch(text):
+    raw = value or default
+    text = raw.strip().replace("-", "")
+    fmt = _CDX_FORMATS.get(len(text))
+    if fmt is None or not text.isdigit():
         raise ValueError(f"invalid date bound: {raw!r}")
-    if len(text) not in {4, 6, 8, 10, 12, 14}:
-        raise ValueError(f"invalid date bound length: {raw!r}")
-
-    year = int(text[0:4])
-    if len(text) == 4:
-        _validate_calendar_date(year, 1, 1)
-        return f"{year:04d}{'1231235959' if bound == 'end' else '0101000000'}"
-
-    month = int(text[4:6])
-    if len(text) == 6:
-        _validate_calendar_date(year, month, 1)
-        if bound == "end":
-            last = calendar.monthrange(year, month)[1]
-            return f"{year:04d}{month:02d}{last:02d}235959"
-        return f"{year:04d}{month:02d}01000000"
-
-    day = int(text[6:8])
-    _validate_calendar_date(year, month, day)
-    if len(text) == 8:
-        return f"{text}{'235959' if bound == 'end' else '000000'}"
-
-    hour = int(text[8:10])
-    if hour > 23:
-        raise ValueError(f"invalid date hour: {raw!r}")
-    if len(text) == 10:
-        return f"{text}{'5959' if bound == 'end' else '0000'}"
-
-    minute = int(text[10:12])
-    if minute > 59:
-        raise ValueError(f"invalid date minute: {raw!r}")
-    if len(text) == 12:
-        return f"{text}{'59' if bound == 'end' else '00'}"
-
-    if int(text[12:14]) > 59:
-        raise ValueError(f"invalid date second: {raw!r}")
-    return text
+    try:
+        parsed = datetime.strptime(text, fmt)
+    except ValueError as error:
+        raise ValueError(f"invalid date bound: {raw!r}") from error
+    if bound == "end":
+        # Fill unspecified fields to the last instant of this precision.
+        if len(text) <= 4:
+            parsed = parsed.replace(month=12, day=31)
+        if len(text) <= 6:
+            parsed = parsed.replace(
+                day=calendar.monthrange(parsed.year, parsed.month)[1]
+            )
+        if len(text) <= 8:
+            parsed = parsed.replace(hour=23, minute=59, second=59)
+    return parsed.strftime("%Y%m%d%H%M%S")
 
 
 def validate_date_range(date_start: str, date_end: str) -> None:
@@ -137,29 +112,26 @@ def year_ranges(date_start: str, date_end: str) -> Iterator[tuple[int, str, str]
         )
 
 
-def _wayback_version() -> str:
-    try:
-        return importlib.metadata.version("wayback")
-    except importlib.metadata.PackageNotFoundError:
-        return "unknown"
-
-
 @dataclass(frozen=True)
 class CdxResult:
-    """Parsed captures and concise provenance for one CDX query."""
+    """Parsed captures and the CDX search that produced them."""
 
     captures: tuple[ParsedCapture, ...]
-    query: dict[str, object]
+    search_url: str
+    match_type: str | None
 
 
-def make_cdx_client(retries: int) -> WaybackClient:
-    """Build a CDX client using the archive's configured retry policy."""
-
-    session = ArchiveMagicWaybackSession(
-        user_agent="archive-magic-fetch",
-        retries=retries,
+def _parsed_capture(record: CdxRecord) -> ParsedCapture:
+    return ParsedCapture(
+        identity=make_identity(
+            original_url=record.original,
+            timestamp=record.timestamp.strftime("%Y%m%d%H%M%S"),
+            status_token="-" if record.statuscode is None else str(record.statuscode),
+            payload_digest=record.digest or "-",
+            urlkey=record.urlkey,
+        ),
+        mime=record.mimetype or "-",
     )
-    return WaybackClient(session=session)
 
 
 def fetch_cdx(
@@ -168,79 +140,86 @@ def fetch_cdx(
     date_start: str,
     date_end: str,
     retries: int,
-    client: WaybackClient | None = None,
+    sleep: Callable[[float], None] = time.sleep,
+    report: Callable[[str], None] = emit,
 ) -> CdxResult:
-    """Fetch and parse a CDX range through ``WaybackClient.search``."""
+    """Fetch and parse a CDX range through ``WaybackClient.search``.
+
+    Fetch owns CDX retries. Wayback library retries stay disabled so a refused
+    TCP connection or HTTP 429 pauses for 60s (or ``Retry-After``) instead of
+    giving up after a few seconds of inner backoff. A failed query is retried
+    from the start of the year range so the result is never a partial listing.
+    """
 
     search_url, match_type = normalize_cdx_search(url_pattern)
-    owned_client = client is None
-    client = client or make_cdx_client(retries)
-    started = time.monotonic()
-    try:
-        records = client.search(
-            search_url,
-            match_type=match_type,
-            from_date=date_start,
-            to_date=date_end,
-            resolve_revisits=False,
-            skip_malformed_results=True,
-        )
-        captures = tuple(
-            sorted(
-                (
-                    ParsedCapture(
-                        identity=make_identity(
-                            original_url=record.original,
-                            timestamp=record.timestamp.strftime("%Y%m%d%H%M%S"),
-                            status_token=(
-                                "-" if record.statuscode is None else str(record.statuscode)
-                            ),
-                            payload_digest=record.digest or "-",
-                            urlkey=record.urlkey,
-                        ),
-                        mime=record.mimetype or "-",
-                    )
-                    for record in records
-                ),
-                key=lambda item: item.identity.sort_key(),
+    max_attempts = retries + 1
+    last_error: BaseException | None = None
+    for attempt in range(1, max_attempts + 1):
+        client = WaybackClient(
+            session=ArchiveMagicWaybackSession(
+                user_agent="archive-magic-fetch",
+                retries=0,
             )
         )
-    finally:
-        if owned_client:
+        try:
+            records = client.search(
+                search_url,
+                match_type=match_type,
+                from_date=date_start,
+                to_date=date_end,
+                resolve_revisits=False,
+                skip_malformed_results=True,
+            )
+            captures = tuple(
+                sorted(
+                    map(_parsed_capture, records),
+                    key=lambda item: item.identity.sort_key(),
+                )
+            )
+            return CdxResult(captures, search_url, match_type)
+        except Exception as error:  # noqa: BLE001 - network boundary
+            last_error = error
+            _, retryable = classify_playback_error(error)
+            if retryable and attempt < max_attempts:
+                delay = _cdx_retry_delay(error, attempt)
+                report(_cdx_retry_message(error, delay, attempt, max_attempts))
+                sleep(delay)
+                continue
+            break
+        finally:
             client.close()
-
-    return CdxResult(
-        captures=captures,
-        query={
-            "url_pattern": url_pattern,
-            "search_url": search_url,
-            "match_type": match_type,
-            "from": date_start,
-            "to": date_end,
-            "client": "wayback",
-            "wayback_version": _wayback_version(),
-            "result_count": len(captures),
-            "duration_s": round(time.monotonic() - started, 3),
-        },
-    )
+    assert last_error is not None
+    detail = _unwrap_wayback_retry(last_error)
+    raise RuntimeError(
+        f"CDX query failed after {attempt} attempts: {detail}"
+    ) from last_error
 
 
-def init_run_id(layout: ArchiveLayout, run_id: str | None = None) -> str:
-    """Allocate one invocation ID shared by every selected collection."""
+def _cdx_retry_delay(error: BaseException, attempt: int) -> float:
+    backpressure = backpressure_signal(error)
+    if backpressure is not None:
+        _, retry_after = backpressure
+        return retry_after or BACKPRESSURE_COOLDOWN_SECONDS
+    return retry_after_from_error(error) or float(5 * (2 ** (attempt - 1)))
 
-    ensure_collection_dirs(layout)
-    if run_id is not None:
-        layout.validate_run_id(run_id)
-        if any(layout.captures_root.glob(f"*/runs/{run_id}")):
-            raise FileExistsError(f"run ID already exists: {run_id}")
-        return run_id
 
-    for attempt in range(1000):
-        candidate = (
-            current_run_id()
-            if attempt == 0
-            else f"{current_run_id()}-{attempt:02d}"
-        )
-        if not any(layout.captures_root.glob(f"*/runs/{candidate}")):
+def _cdx_retry_message(
+    error: BaseException,
+    delay: float,
+    attempt: int,
+    max_attempts: int,
+) -> str:
+    backpressure = backpressure_signal(error)
+    suffix = f"pausing {delay:g}s before attempt {attempt + 1}/{max_attempts}"
+    if backpressure is None:
+        return f"CDX query error during attempt {attempt}/{max_attempts}; {suffix} ({error})"
+    kind, _retry_after = backpressure
+    source = "HTTP 429" if kind == "http" else "TCP connection refused"
+    return f"rate limit: {source} during CDX query; {suffix}"
+
+
+def _unwrap_wayback_retry(error: BaseException) -> BaseException:
+    for candidate in iter_error_chain(error):
+        if "WaybackRetry" not in type(candidate).__name__:
             return candidate
-    raise RuntimeError("unable to allocate a unique run source directory")
+    return error

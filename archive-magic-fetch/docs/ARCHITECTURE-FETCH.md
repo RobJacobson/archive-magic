@@ -72,7 +72,10 @@ Rules:
 - The compressed WARC rollover target defaults to 250,000,000 bytes and remains
   configurable per archive.
 - `[fetch].retries` applies to both CDX and playback requests and defaults to four
-  retries after the initial request.
+  retries after the initial request. CDX retries are owned by Fetch: HTTP 429 and
+  TCP connection refused pause for 60 seconds (or `Retry-After`) before the next
+  attempt, matching playback backpressure. A CDX failure skips that year, continues
+  with later years, and makes the process exit nonzero.
 
 Fetch validates the complete shared descriptor, including playback keys, so Fetch
 and Navigator reject the same malformed contract.
@@ -109,7 +112,9 @@ For each year in the selected range, Fetch:
    downloads the committed CDXJ only if no local copy exists. Leftover local
    WARCs from an interrupted run are reindexed before inventory.
 2. Queries Internet Archive CDX history through `WaybackClient.search()`, which
-   owns parsing, resume-key pagination, rate limiting, and retry behavior.
+   owns parsing and resume-key pagination. Fetch owns CDX retries and treats
+   connection refused like HTTP 429: pause 60s (or `Retry-After`) and retry the
+   whole year query. Giving up on a year does not abort later years.
 3. Parses and deduplicates captures by canonical capture identity.
 4. Inventories existing captures from CDXJ identity metadata and skips those
    already represented.
@@ -130,10 +135,11 @@ downloaded or rewritten.
 
 Acquisition can be parallel; WARC mutation and publication remain serialized.
 Failures for individual captures are recorded without corrupting already committed
-records. At the process boundary, exceptions produce a nonzero exit. The next run
-keeps any leftover local tail/CDXJ, rebuilds the index if needed, and republishes.
-`--reset-data` is the recovery tool when the workspace was lost or the prefix is
-confused.
+records. A year-level failure (including CDX) skips that year, continues with the
+rest of the range, and produces a nonzero exit. Uncaught exceptions at the process
+boundary also produce a nonzero exit. The next run keeps any leftover local
+tail/CDXJ, rebuilds the index if needed, and republishes. `--reset-data` is the
+recovery tool when the workspace was lost or the prefix is confused.
 
 Payloads are never reused across collections: a capture missing from its current
 collection is downloaded from Internet Archive unless CDX metadata can synthesize

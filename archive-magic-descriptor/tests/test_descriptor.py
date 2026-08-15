@@ -80,6 +80,11 @@ region = "auto"
     [
         ("schema_version=2\n", "schema_version"),
         (
+            "schema_version=1\n[archive]\nid='x'\nurl_pattern=''\n"
+            "[storage]\nauthority='local'\n",
+            "url_pattern",
+        ),
+        (
             "schema_version=1\n[archive]\nid='bad/id'\nurl_pattern='x'\n"
             "[storage]\nauthority='local'\n",
             "invalid archive ID",
