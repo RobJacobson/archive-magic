@@ -9,6 +9,13 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import boto3
+from archive_magic_descriptor import (
+    MANIFEST_NAME,
+    CollectionsManifest,
+    ManifestArtifact,
+    ManifestCollection,
+    parse_manifest,
+)
 from botocore.exceptions import ClientError
 
 from .collection import (
@@ -19,13 +26,6 @@ from .collection import (
     publish_file_atomically,
 )
 from .config import StorageConfig
-from .manifest import (
-    MANIFEST_NAME,
-    CollectionsManifest,
-    ManifestArtifact,
-    ManifestCollection,
-    parse_manifest,
-)
 
 
 @dataclass(frozen=True)

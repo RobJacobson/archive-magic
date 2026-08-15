@@ -214,9 +214,9 @@ same bucket are not touched.
 ## Module map
 
 - `config.py`: descriptor path resolution and strict schema validation.
-- `manifest.py`: re-export of the shared collections-manifest parser.
 - `cli.py`: public argument contract and exit-code boundary.
 - `fetch.py`: configured-history orchestration and yearly lifecycle.
+- `console.py`: terminal progress, URL tables, colors, and Wayback links.
 - `collection.py`: exact workspace paths, atomic files, and run records.
 - `warc.py`: append-only WARC writer, rollover, and partial salvage.
 - `index.py`: deterministic full or incremental collection CDXJ generation.

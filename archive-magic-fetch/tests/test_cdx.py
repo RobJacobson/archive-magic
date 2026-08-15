@@ -18,7 +18,8 @@ from archive_magic_fetch.cdx import (
 )
 from archive_magic_fetch.collection import ArchiveLayout, ensure_collection_dirs
 from archive_magic_fetch.config import StorageConfig
-from archive_magic_fetch.fetch import _report_cdx_ingest_skips, build_settings
+from archive_magic_fetch.console import report_cdx_ingest_skips
+from archive_magic_fetch.fetch import build_settings
 from archive_magic_fetch.models import (
     CaptureIdentity,
     FailureCategory,
@@ -123,8 +124,6 @@ def test_non_list_cdx_entries_become_malformed_failures(tmp_path):
 
 
 def test_cdx_ingest_skips_are_logged(capsys):
-    from archive_magic_fetch.fetch import _report_cdx_ingest_skips
-
     failures = [
         UnresolvedFailure(
             identity=CaptureIdentity(
@@ -138,7 +137,7 @@ def test_cdx_ingest_skips_are_logged(capsys):
             message="invalid timestamp: bad-row",
         ),
     ]
-    _report_cdx_ingest_skips(2008, failures)
+    report_cdx_ingest_skips(2008, failures)
     out = capsys.readouterr().out
     assert "year 2008: skipping 1 malformed CDX row(s)" in out
     assert "skip: invalid timestamp: bad-row" in out

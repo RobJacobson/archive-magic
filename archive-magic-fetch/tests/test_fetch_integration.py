@@ -1321,7 +1321,7 @@ def test_interrupt_finalizes_partial_without_run_json(tmp_path, monkeypatch):
         return playback(identity)
 
     interrupt_once = {"armed": True}
-    real_log = fetch_mod._log_url_outcome
+    real_log = fetch_mod.log_url_outcome
 
     def log_then_interrupt(*args, **kwargs):
         real_log(*args, **kwargs)
@@ -1329,7 +1329,7 @@ def test_interrupt_finalizes_partial_without_run_json(tmp_path, monkeypatch):
             interrupt_once["armed"] = False
             raise KeyboardInterrupt()
 
-    monkeypatch.setattr(fetch_mod, "_log_url_outcome", log_then_interrupt)
+    monkeypatch.setattr(fetch_mod, "log_url_outcome", log_then_interrupt)
 
     body = cdx_json(
         [

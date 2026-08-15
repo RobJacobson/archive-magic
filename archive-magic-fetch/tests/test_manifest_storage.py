@@ -7,17 +7,17 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
-from archive_magic_fetch.collection import ArchiveLayout, ensure_collection_dirs
-from archive_magic_fetch.config import RemoteConfig, StorageConfig
-from archive_magic_fetch.fetch import FetchSettings, run_fetch
-from archive_magic_fetch.index import parse_cdxj_line, publish_collection_index
-from archive_magic_fetch.inventory import inventory_collection
-from archive_magic_fetch.manifest import (
+from archive_magic_descriptor import (
     CollectionsManifest,
     ManifestArtifact,
     ManifestCollection,
     parse_manifest,
 )
+from archive_magic_fetch.collection import ArchiveLayout, ensure_collection_dirs
+from archive_magic_fetch.config import RemoteConfig, StorageConfig
+from archive_magic_fetch.fetch import FetchSettings, run_fetch
+from archive_magic_fetch.index import parse_cdxj_line, publish_collection_index
+from archive_magic_fetch.inventory import inventory_collection
 from archive_magic_fetch.playback import payload_digest
 from archive_magic_fetch.storage import MANIFEST_NAME, PublicationManager
 from archive_magic_fetch.warc import CollectionWarcWriter

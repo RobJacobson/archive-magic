@@ -7,12 +7,12 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-from archive_magic_fetch.fetch import (
-    _format_elapsed,
-    _log_url_outcome,
-    _playback_timing,
-    _style_result,
-    _timestamp_link,
+from archive_magic_fetch.console import (
+    format_elapsed,
+    log_url_outcome,
+    playback_timing,
+    style_result,
+    timestamp_link,
 )
 from archive_magic_fetch.protocol import (
     INVALID_URI_PAYLOAD_DIGEST,
@@ -73,15 +73,15 @@ def test_console_timestamp_links_to_full_capture():
         ts="20080516181742",
     )
 
-    plain = _timestamp_link(identity, enabled=False)
-    linked = _timestamp_link(identity, enabled=True)
+    plain = timestamp_link(identity, enabled=False)
+    linked = timestamp_link(identity, enabled=True)
 
     assert plain == "2008-05-16T18:17:42"
     assert plain in linked
     assert "https://web.archive.org/web/20080516181742id_/http://www.example.org/a" in linked
     assert linked.startswith("\033]8;;")
-    assert _style_result("Error", "error", enabled=False) == "Error"
-    assert _style_result("Error", "error", enabled=True) == "\033[1;31mError\033[0m"
+    assert style_result("Error", "error", enabled=False) == "Error"
+    assert style_result("Error", "error", enabled=True) == "\033[1;31mError\033[0m"
 
 
 def test_worker_retry_uses_five_then_ten_seconds():
@@ -290,7 +290,7 @@ def test_skip_groups_yield_before_next_download_starts():
 def test_url_table_is_rendered_as_one_chronological_section(capsys):
     first = make_capt(ts="20040601000000")
     second = make_capt(ts="20040602000000")
-    _log_url_outcome(
+    log_url_outcome(
         1,
         2,
         UrlOutcome(
@@ -333,13 +333,13 @@ def test_playback_timing_includes_elapsed_and_attempts():
         attempts=2,
         elapsed_s=6.0,
     )
-    assert _playback_timing(once) == "1.2s"
-    assert _playback_timing(retried) == "6.0s, 2 attempts"
+    assert playback_timing(once) == "1.2s"
+    assert playback_timing(retried) == "6.0s, 2 attempts"
 
 
 def test_url_table_shows_elapsed_on_ignored_fetch(capsys):
     identity = make_capt(ts="20041009172745")
-    _log_url_outcome(
+    log_url_outcome(
         1,
         1,
         UrlOutcome(
@@ -368,8 +368,8 @@ def test_url_table_shows_elapsed_on_ignored_fetch(capsys):
 
 
 def test_elapsed_format_uses_unbounded_hours():
-    assert _format_elapsed(3661.9) == "01:01:01"
-    assert _format_elapsed(25 * 60 * 60 + 2) == "25:00:02"
+    assert format_elapsed(3661.9) == "01:01:01"
+    assert format_elapsed(25 * 60 * 60 + 2) == "25:00:02"
 
 
 def test_cli_rejects_reversed_range(tmp_path):
