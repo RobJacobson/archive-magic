@@ -18,13 +18,11 @@ from .models import (
     UnresolvedFailure,
 )
 from .playback import classify_playback_error
-from .policy import (
-    BACKPRESSURE_COOLDOWN_S,
-    MAX_PLAYBACK_ATTEMPTS,
-    PLAYBACK_STARTS_PER_SECOND,
-    PLAYBACK_WORKERS,
-)
 from .retry import parse_retry_after
+
+
+_BACKPRESSURE_COOLDOWN_SECONDS = 60.0
+_MAX_PLAYBACK_ATTEMPTS = 4
 
 
 @dataclass(frozen=True)
@@ -78,7 +76,7 @@ class StartGate:
         retry_after: float | None,
         identity: CaptureIdentity,
     ) -> None:
-        requested = retry_after or BACKPRESSURE_COOLDOWN_S
+        requested = retry_after or _BACKPRESSURE_COOLDOWN_SECONDS
         with self._lock:
             now = self._clock()
             if now >= self._blocked_until:
@@ -117,22 +115,25 @@ class PlaybackWorkers:
         *,
         sleep: Callable[[float], None],
         pace: bool,
+        max_workers: int = 4,
+        starts_per_second: float = 20.0,
         report: Callable[[str], None] = _default_report,
     ) -> None:
         self._client_factory = client_factory
         self._download_fn = download_fn
         self._sleep = sleep
         self._gate = StartGate(
-            PLAYBACK_STARTS_PER_SECOND if pace else 0,
+            starts_per_second if pace else 0,
             report=report,
         )
         self._executor = ThreadPoolExecutor(
-            max_workers=PLAYBACK_WORKERS,
+            max_workers=max_workers,
             thread_name_prefix="playback",
         )
         self._local = threading.local()
         self._owners: list[object] = []
         self._owners_lock = threading.Lock()
+        self.max_workers = max_workers
 
     def close(self) -> None:
         self._executor.shutdown()
@@ -168,7 +169,7 @@ class PlaybackWorkers:
 
         started = time.monotonic()
         categories: list[str] = []
-        for attempt in range(1, MAX_PLAYBACK_ATTEMPTS + 1):
+        for attempt in range(1, _MAX_PLAYBACK_ATTEMPTS + 1):
             self._gate.wait()
             try:
                 result = self._download_fn(self._client(), identity)
@@ -178,7 +179,7 @@ class PlaybackWorkers:
                 backpressure = backpressure_signal(error)
                 if backpressure is not None:
                     self._gate.pause(*backpressure, identity)
-                if retryable and attempt < MAX_PLAYBACK_ATTEMPTS:
+                if retryable and attempt < _MAX_PLAYBACK_ATTEMPTS:
                     if backpressure is None:
                         self._sleep(
                             retry_after_from_error(error)
@@ -272,5 +273,5 @@ def backpressure_signal(error: BaseException) -> tuple[str, float | None] | None
     if http:
         return "http", retry_after_from_error(error)
     if tcp:
-        return "tcp", BACKPRESSURE_COOLDOWN_S
+        return "tcp", _BACKPRESSURE_COOLDOWN_SECONDS
     return None

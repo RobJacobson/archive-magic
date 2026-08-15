@@ -9,14 +9,16 @@ from wayback.exceptions import MementoPlaybackError
 from warcio.archiveiterator import ArchiveIterator
 
 from archive_magic_fetch.collection import (
-    archive_layout,
+    ArchiveLayout,
     cleanup_temps,
     ensure_collection_dirs,
     list_collection_warcs,
 )
+from archive_magic_fetch.config import StorageConfig
 from archive_magic_fetch.fetch import FetchSettings, run_fetch
+from archive_magic_fetch.index import publish_collection_index
 from archive_magic_fetch.models import FailureCategory, PlaybackResult
-from archive_magic_fetch.policy import (
+from archive_magic_fetch.protocol import (
     CDX_DIGEST_MATCH_HEADER,
     CDX_URLKEY_HEADER,
 )
@@ -24,7 +26,7 @@ from archive_magic_fetch.inventory import (
     get_warc_identity,
     inventory_collection,
 )
-from archive_magic_fetch.playback import classify_playback_error, payload_digest
+from archive_magic_fetch.playback import classify_playback_error, download_exact, payload_digest
 from archive_magic_fetch.warc import (
     CollectionWarcWriter,
     salvage_collection_partials,
@@ -35,14 +37,6 @@ from helpers import cdx_json, found_capture_client, make_capt, memento_client, p
 
 def test_empty_redirect_playback_is_stored_with_location(tmp_path):
     """Historical 3xx captures often have an empty body; still archive them."""
-
-    from archive_magic_fetch.collection import archive_layout, ensure_collection_dirs
-    from archive_magic_fetch.playback import (
-        download_exact,
-        payload_digest,
-    )
-    from archive_magic_fetch.warc import CollectionWarcWriter
-    from warcio.archiveiterator import ArchiveIterator
 
     empty_digest = payload_digest(b"")
     identity = make_capt(
@@ -62,7 +56,7 @@ def test_empty_redirect_playback_is_stored_with_location(tmp_path):
     assert result.warc_payload_digest == empty_digest
     assert any(name.lower() == "location" and value == location for name, value in result.headers)
 
-    layout = archive_layout("http://example.org/", tmp_path)
+    layout = ArchiveLayout(tmp_path, "example.org")
     ensure_collection_dirs(layout)
     writer = CollectionWarcWriter(layout, "2008")
     writer.write_playback(result)
@@ -150,6 +144,43 @@ def test_slash_redirect_substitution_is_reconstructed():
     assert ("Location", "http://example.org/conference/") in result.headers
     assert client.calls == 1
 
+    def client_for(location: str):
+        response = MagicMock()
+        response.headers = {
+            "X-Archive-Redirect-Reason": "found capture at 20040510064339",
+            "Location": location,
+        }
+
+        class Client:
+            def __init__(self):
+                self.session = MagicMock()
+                self.session.request.return_value = response
+
+            def get_memento(self, *args, **kwargs):
+                self.session.request("GET", "https://web.archive.org/web/x")
+                raise MementoPlaybackError("could not be played")
+
+        return Client()
+
+    with pytest.raises(MementoPlaybackError):
+        download_exact(
+            client_for(
+                "https://web.archive.org/web/20040510064339id_/http://example.org/elsewhere"
+            ),
+            identity,
+        )
+    with pytest.raises(MementoPlaybackError):
+        download_exact(
+            client_for(
+                "https://web.archive.org/web/20040510064339id_/http://example.org/conference/"
+            ),
+            make_capt(
+                url="http://example.org/conference",
+                ts="20040303170500",
+                status="200",
+            ),
+        )
+
 
 def test_slash_redirect_substitution_accepts_default_port_and_relative_location():
     from archive_magic_fetch.playback import download_exact
@@ -179,51 +210,6 @@ def test_slash_redirect_substitution_accepts_default_port_and_relative_location(
     assert ("Location", "http://example.org/policy/edu/") in result.headers
 
 
-def test_slash_redirect_substitution_rejects_other_paths_and_statuses():
-    from archive_magic_fetch.playback import download_exact
-
-    redirect_identity = make_capt(
-        url="http://example.org/conference",
-        ts="20040303170500",
-        status="301",
-    )
-    ok_identity = make_capt(
-        url="http://example.org/conference",
-        ts="20040303170500",
-        status="200",
-    )
-
-    def client_for(location: str):
-        response = MagicMock()
-        response.headers = {
-            "X-Archive-Redirect-Reason": "found capture at 20040510064339",
-            "Location": location,
-        }
-
-        class Client:
-            def __init__(self):
-                self.session = MagicMock()
-                self.session.request.return_value = response
-
-            def get_memento(self, *args, **kwargs):
-                self.session.request("GET", "https://web.archive.org/web/x")
-                raise MementoPlaybackError("could not be played")
-
-        return Client()
-
-    other = client_for(
-        "https://web.archive.org/web/20040510064339id_/http://example.org/elsewhere"
-    )
-    with pytest.raises(MementoPlaybackError):
-        download_exact(other, redirect_identity)
-
-    as_200 = client_for(
-        "https://web.archive.org/web/20040510064339id_/http://example.org/conference/"
-    )
-    with pytest.raises(MementoPlaybackError):
-        download_exact(as_200, ok_identity)
-
-
 def test_found_capture_substitution_is_kept_under_requested_identity():
     from archive_magic_fetch.playback import download_exact
 
@@ -251,7 +237,7 @@ def test_found_capture_substitution_is_kept_under_requested_identity():
 
 
 def test_inventory_remembers_redirect_representative_by_status(tmp_path):
-    layout = archive_layout("http://example.org/", tmp_path)
+    layout = ArchiveLayout(tmp_path, "example.org")
     ensure_collection_dirs(layout)
     empty = payload_digest(b"")
     identity = make_capt(
@@ -263,6 +249,7 @@ def test_inventory_remembers_redirect_representative_by_status(tmp_path):
     writer = CollectionWarcWriter(layout, "2004")
     writer.write_playback(playback(identity, body=b"", status=301))
     writer.close()
+    publish_collection_index(layout, "2004")
 
     inv = inventory_collection(layout, "2004")
     stored = inv.lookup_representative(
@@ -287,7 +274,7 @@ def test_inventory_remembers_redirect_representative_by_status(tmp_path):
 def test_download_exact_accepts_ia_double_encoded_original_url():
     """IA Link rel=original may %25-escape already-encoded query bytes."""
 
-    from archive_magic_fetch.playback import download_exact
+    from archive_magic_fetch.playback import ExactMismatchError, download_exact
 
     cdx_url = (
         "http://lideres.nclr.org/groups/index.php?view=browse"
@@ -305,21 +292,17 @@ def test_download_exact_accepts_ia_double_encoded_original_url():
     )
     assert result.identity.original_url == cdx_url
     assert result.body == body
-
-
-def test_download_exact_rejects_different_original_url():
-    from archive_magic_fetch.playback import ExactMismatchError, download_exact
-
-    identity = make_capt(url="http://example.org/a")
+    mismatch = make_capt(url="http://example.org/a")
     with pytest.raises(ExactMismatchError, match="URL mismatch"):
         download_exact(
             memento_client(
-                identity,
+                mismatch,
                 b"x",
                 returned_url="http://example.org/b",
             ),
-            identity,
+            mismatch,
         )
+
 
 def test_cdx_digest_matches_body_accepts_trailing_newline_soft_match():
     from archive_magic_fetch.playback import (
@@ -387,7 +370,7 @@ def test_trailing_newline_soft_match_seeds_revisit_and_survives_inventory(
             ],
         ]
     )
-    layout = archive_layout("http://example.org/", tmp_path)
+    layout = ArchiveLayout(tmp_path, "example.org")
     ensure_collection_dirs(layout)
     original, cdx_mod, fetch_mod = patch_cdx(cdx_body)
     try:
@@ -396,7 +379,8 @@ def test_trailing_newline_soft_match_seeds_revisit_and_survives_inventory(
                 url_pattern="http://example.org/",
                 date_start="20040601000000",
                 date_end="20040602000000",
-                archives_root=tmp_path,
+                archive_id="example.org",
+                    storage=StorageConfig("local", tmp_path),
             ),
             client_factory=lambda: MagicMock(),
             download_fn=download_fn,
@@ -453,7 +437,7 @@ def test_empty_non_redirect_playback_is_rejected_when_cdx_digest_is_nonempty():
 
 
 def test_empty_http_200_matching_cdx_digest_is_stored():
-    from archive_magic_fetch.policy import EMPTY_PAYLOAD_DIGEST
+    from archive_magic_fetch.protocol import EMPTY_PAYLOAD_DIGEST
     from archive_magic_fetch.playback import download_exact
 
     identity = make_capt(status="200", digest=EMPTY_PAYLOAD_DIGEST)
@@ -465,7 +449,7 @@ def test_empty_http_200_matching_cdx_digest_is_stored():
 
 
 def test_empty_http_200_from_cdx_skips_redirects():
-    from archive_magic_fetch.policy import EMPTY_PAYLOAD_DIGEST
+    from archive_magic_fetch.protocol import EMPTY_PAYLOAD_DIGEST
     from archive_magic_fetch.playback import empty_http_200_from_cdx
 
     empty_200 = make_capt(status="200", digest=EMPTY_PAYLOAD_DIGEST)
@@ -499,7 +483,7 @@ def test_invalid_uri_playback_is_always_rejected():
 
 
 def test_custom_cdx_urlkey_survives_warc_inventory(tmp_path):
-    layout = archive_layout("http://example.org/", tmp_path)
+    layout = ArchiveLayout(tmp_path, "example.org")
     ensure_collection_dirs(layout)
     identity = make_capt(urlkey="custom,key)/special")
     writer = CollectionWarcWriter(layout, "2004")
@@ -516,15 +500,16 @@ def test_custom_cdx_urlkey_survives_warc_inventory(tmp_path):
                 assert rebuilt.urlkey == "custom,key)/special"
                 assert rebuilt == identity
                 record.raw_stream.read()
+    publish_collection_index(layout, "2004")
     inv = inventory_collection(layout, "2004")
     assert inv.contains(identity)
 
 
 def test_digest_mismatch_is_kept_but_never_seeds_revisit(tmp_path):
 
-    from archive_magic_fetch.policy import CDX_DIGEST_MATCH_HEADER
+    from archive_magic_fetch.protocol import CDX_DIGEST_MATCH_HEADER
 
-    layout = archive_layout("http://example.org/", tmp_path)
+    layout = ArchiveLayout(tmp_path, "example.org")
     ensure_collection_dirs(layout)
     claimed = "sha1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
     body = b"imperfect-but-kept"
@@ -574,7 +559,8 @@ def test_digest_mismatch_is_kept_but_never_seeds_revisit(tmp_path):
                 url_pattern="http://example.org/",
                 date_start="20040601000000",
                 date_end="20040602000000",
-                archives_root=tmp_path,
+                archive_id="example.org",
+                    storage=StorageConfig("local", tmp_path),
             ),
             client_factory=lambda: MagicMock(),
             download_fn=download_fn,
@@ -641,7 +627,7 @@ def test_wrapped_incomplete_read_is_permanent_truncated_failure():
 
 
 def test_warc_rollover_naming_and_rejects_1000(tmp_path):
-    layout = archive_layout("http://example.org/", tmp_path)
+    layout = ArchiveLayout(tmp_path, "example.org")
     ensure_collection_dirs(layout)
     writer = CollectionWarcWriter(layout, "2004", target_bytes=1)
     for i in range(2):
@@ -667,7 +653,7 @@ def test_warc_rollover_naming_and_rejects_1000(tmp_path):
 
 
 def test_writer_uses_visible_partial_beside_destination(tmp_path):
-    layout = archive_layout("http://example.org/", tmp_path)
+    layout = ArchiveLayout(tmp_path, "example.org")
     ensure_collection_dirs(layout)
     writer = CollectionWarcWriter(layout, "2004")
     writer.write_playback(playback(make_capt()))
@@ -684,7 +670,7 @@ def test_writer_uses_visible_partial_beside_destination(tmp_path):
 
 
 def test_resume_appends_to_same_shard_under_size_cap(tmp_path):
-    layout = archive_layout("http://example.org/", tmp_path)
+    layout = ArchiveLayout(tmp_path, "example.org")
     ensure_collection_dirs(layout)
     first = make_capt(ts="20040601000000")
     second = make_capt(
@@ -701,13 +687,14 @@ def test_resume_appends_to_same_shard_under_size_cap(tmp_path):
 
     warcs = list_collection_warcs(layout, "2004")
     assert [path.name for path in warcs] == ["example.org-2004-001.warc.gz"]
+    publish_collection_index(layout, "2004")
     inv = inventory_collection(layout, "2004")
     assert inv.contains(first)
     assert inv.contains(second)
 
 
 def test_resume_starts_next_shard_when_last_is_at_cap(tmp_path):
-    layout = archive_layout("http://example.org/", tmp_path)
+    layout = ArchiveLayout(tmp_path, "example.org")
     ensure_collection_dirs(layout)
     writer = CollectionWarcWriter(layout, "2004", target_bytes=1)
     writer.write_playback(playback(make_capt(ts="20040601000000")))
@@ -731,7 +718,7 @@ def test_resume_starts_next_shard_when_last_is_at_cap(tmp_path):
 
 
 def test_salvage_promotes_collection_partial_and_truncates_garbage(tmp_path):
-    layout = archive_layout("http://example.org/", tmp_path)
+    layout = ArchiveLayout(tmp_path, "example.org")
     ensure_collection_dirs(layout)
     capt = make_capt()
     writer = CollectionWarcWriter(layout, "2004")
@@ -748,33 +735,13 @@ def test_salvage_promotes_collection_partial_and_truncates_garbage(tmp_path):
     assert len(salvaged) == 1
     assert salvaged[0].path.name == "example.org-2004-001.warc.gz"
     assert not partial.exists()
+    publish_collection_index(layout, "2004")
     assert inventory_collection(layout, "2004").contains(capt)
     validate_warc(salvaged[0].path)
 
 
-def test_salvage_promotes_legacy_work_partial(tmp_path):
-    layout = archive_layout("http://example.org/", tmp_path)
-    ensure_collection_dirs(layout)
-    capt = make_capt()
-    writer = CollectionWarcWriter(layout, "2004")
-    writer.write_playback(playback(capt))
-    writer.close()
-    warc = list_collection_warcs(layout, "2004")[0]
-    layout.work_root.mkdir(parents=True)
-    leftover = layout.work_root / ".tmp-abcd1234.example.org-2004-001.warc.gz.partial"
-    leftover.write_bytes(warc.read_bytes())
-    warc.unlink()
-
-    salvaged = salvage_collection_partials(layout)
-
-    assert salvaged[0].path == layout.collection_warc_path("2004", 1)
-    assert inventory_collection(layout, "2004").contains(capt)
-    assert not leftover.exists()
-    assert not layout.work_root.exists()
-
-
 def test_cleanup_temps_keeps_visible_warc_partials(tmp_path):
-    layout = archive_layout("http://example.org/", tmp_path)
+    layout = ArchiveLayout(tmp_path, "example.org")
     ensure_collection_dirs(layout)
     collection_dir = layout.collection_dir("2004")
     collection_dir.mkdir(parents=True)

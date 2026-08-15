@@ -31,10 +31,7 @@ from .identity import (
     warc_date_to_cdx,
 )
 from .models import CaptureIdentity, FailureCategory, PlaybackResult
-from .policy import (
-    EMPTY_PAYLOAD_DIGEST,
-    USER_AGENT,
-)
+from .protocol import EMPTY_PAYLOAD_DIGEST
 from .retry import parse_retry_after
 
 
@@ -154,7 +151,7 @@ def make_client() -> WaybackClient:
 
     return WaybackClient(
         session=ArchiveMagicWaybackSession(
-            user_agent=USER_AGENT,
+            user_agent="archive-magic-fetch",
             memento_calls_per_second=0,
         )
     )
@@ -195,7 +192,7 @@ def empty_http_200_from_cdx(
     """Materialize an HTTP 200 whose CDX digest is the empty payload.
 
     CDX already attested that the entity is zero bytes, so playback is skipped.
-    Headers match payload-cache synthesis: CDX MIME and ``Content-Length: 0``.
+    Headers use the CDX MIME and ``Content-Length: 0``.
     """
 
     if identity.status_token != "200":

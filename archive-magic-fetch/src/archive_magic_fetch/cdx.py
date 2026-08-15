@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from http.client import IncompleteRead
 from pathlib import Path
+from collections.abc import Iterator
 from typing import Callable, Literal, Optional
 from urllib.parse import urlencode
 
@@ -35,8 +36,9 @@ from .models import (
     UnresolvedFailure,
 )
 from .playback import ArchiveMagicWaybackSession
-from .policy import CDX_PAGE_LIMIT, USER_AGENT
 from .retry import parse_retry_after
+
+_CDX_PAGE_LIMIT = 10_000
 
 
 # Standard CDX field order used by IA and wayback.
@@ -50,6 +52,7 @@ _CDX_FIELDS = (
     "length",
 )
 _DATE_BOUND = re.compile(r"^\d{4,14}$")
+_HYPHENATED_DATE = re.compile(r"^\d{4}(?:-\d{2}){0,2}$")
 
 
 def make_cdx_session() -> ArchiveMagicWaybackSession:
@@ -59,7 +62,7 @@ def make_cdx_session() -> ArchiveMagicWaybackSession:
     connect failures are logged and retried without nesting wayback's loop.
     """
 
-    return ArchiveMagicWaybackSession(user_agent=USER_AGENT)
+    return ArchiveMagicWaybackSession(user_agent="archive-magic-fetch")
 
 
 def normalize_cdx_search(url_pattern: str) -> tuple[str, Optional[str]]:
@@ -111,19 +114,26 @@ def parse_date_bound(
     default: str,
     bound: Literal["start", "end"] = "start",
 ) -> str:
-    """Parse a CDX date bound into a validated 14-digit UTC timestamp.
+    """Parse a date bound into a validated 14-digit UTC CDX timestamp.
 
-    Partial values expand to the start or end of that precision in UTC.
-    For example, ``2004`` as an end bound becomes ``20041231235959``.
+    Accepts compact CDX digits or hyphenated calendar dates at year, month, or
+    day precision (``1995``, ``1995-01``, ``1995-01-01``). Partial values expand
+    to the start or end of that precision. For example, ``2004`` as an end bound
+    becomes ``20041231235959``.
     """
 
-    if value is None or value == "":
-        return default
-    text = value.strip()
+    raw = default if value is None or value == "" else value
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError("date bound must be a non-empty string")
+    text = raw.strip()
+    if "-" in text:
+        if not _HYPHENATED_DATE.fullmatch(text):
+            raise ValueError(f"invalid date bound: {raw!r}")
+        text = text.replace("-", "")
     if not _DATE_BOUND.fullmatch(text):
-        raise ValueError(f"invalid date bound: {value!r}")
+        raise ValueError(f"invalid date bound: {raw!r}")
     if len(text) not in {4, 6, 8, 10, 12, 14}:
-        raise ValueError(f"invalid date bound length: {value!r}")
+        raise ValueError(f"invalid date bound length: {raw!r}")
 
     year = int(text[0:4])
     if len(text) == 4:
@@ -149,7 +159,7 @@ def parse_date_bound(
 
     hour = int(text[8:10])
     if hour > 23:
-        raise ValueError(f"invalid date hour: {value!r}")
+        raise ValueError(f"invalid date hour: {raw!r}")
     if len(text) == 10:
         if bound == "end":
             return f"{text}5959"
@@ -157,7 +167,7 @@ def parse_date_bound(
 
     minute = int(text[10:12])
     if minute > 59:
-        raise ValueError(f"invalid date minute: {value!r}")
+        raise ValueError(f"invalid date minute: {raw!r}")
     if len(text) == 12:
         if bound == "end":
             return f"{text}59"
@@ -165,7 +175,7 @@ def parse_date_bound(
 
     second = int(text[12:14])
     if second > 59:
-        raise ValueError(f"invalid date second: {value!r}")
+        raise ValueError(f"invalid date second: {raw!r}")
     return text
 
 
@@ -178,26 +188,18 @@ def validate_date_range(date_start: str, date_end: str) -> None:
         )
 
 
-def year_bounds(
-    year: int,
+def year_ranges(
     date_start: str,
     date_end: str,
-) -> Optional[tuple[str, str]]:
-    """Return the intersection of a calendar year with the requested range."""
+) -> Iterator[tuple[int, str, str]]:
+    """Yield each calendar year and its clipped CDX bounds."""
 
-    year_start = f"{year:04d}0101000000"
-    year_end = f"{year:04d}1231235959"
-    start = max(year_start, date_start)
-    end = min(year_end, date_end)
-    if start > end:
-        return None
-    return start, end
-
-
-def years_in_range(date_start: str, date_end: str) -> list[int]:
-    """Return ascending calendar years intersecting the requested range."""
-
-    return list(range(int(date_start[0:4]), int(date_end[0:4]) + 1))
+    for year in range(int(date_start[:4]), int(date_end[:4]) + 1):
+        yield (
+            year,
+            max(date_start, f"{year:04d}0101000000"),
+            min(date_end, f"{year:04d}1231235959"),
+        )
 
 
 def _wayback_version() -> str:
@@ -232,11 +234,6 @@ def fetch_year_cdx(
 ) -> YearCdxResult:
     """Query one year of CDX, preserve raw bytes, and parse rows."""
 
-    bounds = year_bounds(year, date_start, date_end)
-    if bounds is None:
-        raise ValueError(f"year {year} is outside {date_start}-{date_end}")
-    year_start, year_end = bounds
-
     ensure_collection_dirs(layout)
     collection_id = f"{year:04d}"
     source_dir = layout.run_dir(collection_id, run_id)
@@ -245,12 +242,12 @@ def fetch_year_cdx(
     search_url, match_type = normalize_cdx_search(url_pattern)
     params: dict[str, object] = {
         "url": search_url,
-        "from": year_start,
-        "to": year_end,
+        "from": date_start,
+        "to": date_end,
         "output": "json",
         "fl": ",".join(_CDX_FIELDS),
         "showResumeKey": "true",
-        "limit": str(CDX_PAGE_LIMIT),
+        "limit": str(_CDX_PAGE_LIMIT),
     }
     if match_type is not None:
         params["matchType"] = match_type
@@ -344,8 +341,8 @@ def fetch_year_cdx(
         "url_pattern": url_pattern,
         "search_url": search_url,
         "match_type": match_type,
-        "from": year_start,
-        "to": year_end,
+        "from": date_start,
+        "to": date_end,
         "response_encoding": str(primary["response_encoding"]),
         "byte_length": int(primary["byte_length"]),
         "sha256": str(primary["sha256"]),

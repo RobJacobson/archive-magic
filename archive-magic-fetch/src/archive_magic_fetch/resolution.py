@@ -8,14 +8,13 @@ from enum import Enum
 from typing import Callable, Iterator, Sequence
 
 from .identity import revisit_group_key
-from .inventory import PriorPayloadCache, StoredResponse, stored_from_playback
+from .inventory import StoredResponse, stored_from_playback
 from .models import CaptureIdentity, ParsedCapture, PlaybackResult, UnresolvedFailure
 from .playback import (
     SLASH_REDIRECT_SOURCE_URI,
     empty_http_200_from_cdx,
     slash_redirect_from_cdx,
 )
-from .policy import PLAYBACK_WORKERS
 from .workers import DownloadOutcome, PlaybackWorkers
 
 
@@ -24,7 +23,6 @@ class CaptureKind(str, Enum):
     REVISIT = "revisit"
     EMPTY = "empty"
     SLASH_REDIRECT = "slash_redirect"
-    CACHED = "cached"
     DOWNLOADED = "downloaded"
     FAILURE = "failure"
 
@@ -80,7 +78,7 @@ def iter_url_outcomes(
 
     def fill() -> None:
         nonlocal next_submit
-        while next_submit < total and len(pending) < PLAYBACK_WORKERS:
+        while next_submit < total and len(pending) < workers.max_workers:
             if skip_workers[next_submit]:
                 next_submit += 1
                 continue
@@ -99,8 +97,6 @@ def process_url_group(
     captures: Sequence[ParsedCapture],
     *,
     workers: PlaybackWorkers,
-    payload_cache: PriorPayloadCache,
-    collection_id: str,
     existing_identities: frozenset[CaptureIdentity],
     existing_representatives: dict[tuple[str, str, str], StoredResponse],
 ) -> UrlOutcome:
@@ -118,8 +114,6 @@ def process_url_group(
             capture,
             group_urls=group_urls,
             workers=workers,
-            payload_cache=payload_cache,
-            collection_id=collection_id,
             existing_identities=existing_identities,
             existing_representatives=existing_representatives,
             local_representatives=local_representatives,
@@ -145,8 +139,6 @@ def _resolve_capture(
     *,
     group_urls: Sequence[str],
     workers: PlaybackWorkers,
-    payload_cache: PriorPayloadCache,
-    collection_id: str,
     existing_identities: frozenset[CaptureIdentity],
     existing_representatives: dict[tuple[str, str, str], StoredResponse],
     local_representatives: dict[tuple[str, str, str], StoredResponse],
@@ -180,15 +172,6 @@ def _resolve_capture(
         return CaptureOutcome(
             identity, CaptureKind.SLASH_REDIRECT, playback=synthesized
         ), None
-
-    cached = payload_cache.materialize(
-        identity,
-        mime=capture.mime,
-        current_collection_id=collection_id,
-    )
-    if cached is not None:
-        _remember_representative(key, cached, local_representatives)
-        return CaptureOutcome(identity, CaptureKind.CACHED, playback=cached), None
 
     downloaded = workers.download(identity)
     if downloaded.failure is not None:

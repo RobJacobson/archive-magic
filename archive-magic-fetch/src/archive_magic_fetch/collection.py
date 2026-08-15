@@ -20,12 +20,6 @@ from .models import (
     UnresolvedFailure,
     WarcArtifact,
 )
-from .policy import (
-    DEFAULT_OUTPUT_ROOT,
-    RUN_SCHEMA_VERSION,
-    WARC_TARGET_BYTES,
-    WARC_VERSION,
-)
 
 
 _WWW_ALIAS_PREFIX = re.compile(r"^www\d*\.")
@@ -39,12 +33,11 @@ _LEGACY_NAMES = ("archive", "sources", "index.cdxj", "collection.json", "failure
 class ArchiveLayout:
     """Filesystem boundaries for one domain archive and its collections."""
 
-    archives_root: Path
+    root: Path
     archive_id: str
 
-    @property
-    def root(self) -> Path:
-        return self.archives_root / self.archive_id
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "root", Path(self.root).expanduser().resolve())
 
     @property
     def collections_root(self) -> Path:
@@ -53,10 +46,6 @@ class ArchiveLayout:
     @property
     def captures_root(self) -> Path:
         return self.root / "captures"
-
-    @property
-    def work_root(self) -> Path:
-        return self.captures_root / ".work"
 
     def validate_collection_id(self, collection_id: str) -> str:
         if not _COLLECTION_ID.fullmatch(collection_id) or collection_id in {".", ".."}:
@@ -174,27 +163,6 @@ def normalize_archive_id(url_pattern: str) -> str:
     return name
 
 
-def default_archives_root() -> Path:
-    """Return the default archives root sibling of this project."""
-
-    project_root = Path(__file__).resolve().parents[2]
-    return (project_root / DEFAULT_OUTPUT_ROOT).resolve()
-
-
-def archive_layout(
-    url_pattern: str,
-    archives_root: Path | str | None = None,
-) -> ArchiveLayout:
-    """Build domain-archive layout for one URL pattern."""
-
-    root = (
-        Path(archives_root).expanduser().resolve()
-        if archives_root is not None
-        else default_archives_root()
-    )
-    return ArchiveLayout(root, normalize_archive_id(url_pattern))
-
-
 def reject_legacy_layout(layout: ArchiveLayout) -> None:
     """Reject pre-flat Archive Magic output rather than mixing schemas."""
 
@@ -229,13 +197,6 @@ def cleanup_temps(layout: ArchiveLayout) -> None:
                 path.unlink()
             except OSError:
                 pass
-    if layout.work_root.is_dir():
-        try:
-            next(layout.work_root.iterdir())
-        except StopIteration:
-            shutil.rmtree(layout.work_root, ignore_errors=True)
-        except OSError:
-            pass
 
 
 def file_sha256(path: Path) -> str:
@@ -360,7 +321,7 @@ def parse_warc_partial_name(
 
     collection_id = layout.validate_collection_id(collection_id)
     pattern = re.compile(
-        rf"^(?:\.tmp-[^.]+\.)?{re.escape(layout.archive_id)}-"
+        rf"^{re.escape(layout.archive_id)}-"
         rf"{re.escape(collection_id)}-(?P<seq>\d{{3}})\.warc\.gz\.partial$"
     )
     match = pattern.fullmatch(name)
@@ -455,15 +416,12 @@ def write_run_record(
         key=lambda item: (item.identity.sort_key(), item.category.value, item.message),
     )
     payload = {
-        "schema_version": RUN_SCHEMA_VERSION,
         "run_id": run_id,
         "archive_id": layout.archive_id,
         "collection_id": collection_id,
         "url_pattern": url_pattern,
         "date_start": date_start,
         "date_end": date_end,
-        "warc_version": WARC_VERSION,
-        "warc_target_bytes": WARC_TARGET_BYTES,
         "query": query,
         "counts": {
             "selected": metrics.selected,

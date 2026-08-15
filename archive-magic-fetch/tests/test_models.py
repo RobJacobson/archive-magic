@@ -8,7 +8,7 @@ from archive_magic_fetch.identity import (
     revisit_group_key,
     same_original_url,
 )
-from archive_magic_fetch.policy import MISSING_CDX_PAYLOAD_DIGEST
+from archive_magic_fetch.protocol import MISSING_CDX_PAYLOAD_DIGEST
 
 def test_normalize_original_url_strips_default_ports():
     assert (
@@ -97,7 +97,7 @@ def test_revisit_group_key_includes_status_and_skips_missing_digest():
 
 def test_empty_payload_digest_matches_sha1_of_zero_bytes():
     from archive_magic_fetch.identity import is_empty_payload_digest
-    from archive_magic_fetch.policy import EMPTY_PAYLOAD_DIGEST
+    from archive_magic_fetch.protocol import EMPTY_PAYLOAD_DIGEST
     from archive_magic_fetch.playback import payload_digest
 
     assert payload_digest(b"") == EMPTY_PAYLOAD_DIGEST

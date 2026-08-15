@@ -173,6 +173,7 @@ def run_wayback(
     debug: bool,
     on_ready: Callable[[str], None],
     startup_timeout: float = STARTUP_TIMEOUT_SECONDS,
+    child_environment: dict[str, str] | None = None,
 ) -> int:
     """Run pywb until it exits or the parent is interrupted."""
 
@@ -189,6 +190,7 @@ def run_wayback(
         command,
         runtime_directory / "pywb.log",
         debug=debug,
+        environment=child_environment,
     )
 
     previous_term = _install_termination_handler()
@@ -222,6 +224,7 @@ def _start_wayback(
     log_path: Path,
     *,
     debug: bool,
+    environment: dict[str, str] | None = None,
 ) -> tuple[subprocess.Popen[bytes], _OutputCapture | None]:
     capture: _OutputCapture | None = None
     try:
@@ -233,6 +236,7 @@ def _start_wayback(
             stdout=None if debug else subprocess.PIPE,
             stderr=subprocess.STDOUT,
             start_new_session=True,
+            env=environment,
         )
     except OSError as error:
         if capture is not None:

@@ -9,7 +9,7 @@ from urllib.parse import unquote, urlsplit, urlunsplit
 from surt import surt
 
 from .models import CaptureIdentity
-from .policy import (
+from .protocol import (
     EMPTY_PAYLOAD_DIGEST,
     INVALID_URI_PAYLOAD_DIGEST,
     MISSING_CDX_PAYLOAD_DIGEST,

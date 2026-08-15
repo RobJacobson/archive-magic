@@ -1,250 +1,240 @@
-# Archive Magic Fetch architecture
+# Archive Magic Fetch Architecture
 
-Archive Magic Fetch builds immutable, portable WARC 1.1 collections and sorted
-CDXJ indexes from Internet Archive history for one domain pattern. The current
-CLI partitions captures by UTC calendar year, but collection publication is
-identified by a generic filesystem-safe collection ID.
+## Purpose and boundary
 
-## Module ownership
+Archive Magic Fetch turns Internet Archive capture history into portable WARC 1.1
+collections and CDXJ indexes. It is a standalone producer. It does not call or
+coordinate with Navigator; the two applications interact only by reading and
+writing the locations described by the same archive descriptor.
 
-Policy constants and data models are isolated in `policy.py` and `models.py`;
-capture normalization lives in `identity.py`. `cdx.py` owns CDX acquisition,
-while `playback.py` owns Wayback sessions and playback interpretation.
-`inventory.py` derives local and cross-collection reuse state, `workers.py`
-owns pacing and retries, and `resolution.py` applies chronological capture
-selection without mutating collection state. `warc.py` owns only WARC record
-construction, validation, salvage, and shard publication. `fetch.py` coordinates
-startup recovery and serial per-year publication on the main writer thread.
+One Fetch process on one machine owns an archive prefix. Concurrent writers,
+secondary updater machines, and manual bucket mutation are unsupported.
 
-## Command and output
+## Public interface
 
 ```text
-archive-magic-fetch URL_PATTERN [--start DATE] [--end DATE]
+archive-magic-fetch ARCHIVE [--start DATE] [--end DATE] [--reset-data]
 ```
 
-The default range is 1995 through the current UTC time. Expected capture-level
-failures do not fail the command; they are reported in the corresponding
-immutable run record. Unexpected exceptions return nonzero.
+`ARCHIVE` is either a file named `archive.toml` or its containing directory. There
+is no legacy URL-pattern, `--config`, or `--archives-root` interface.
+
+Normal CLI dates narrow a run without changing the descriptor. Without overrides,
+Fetch uses `[fetch].start` through `[fetch].end`; an omitted end is resolved to the
+current UTC timestamp when the run starts. Fetch therefore checks the complete
+configured history on daily or weekly runs. Identity-based deduplication makes
+unchanged older collections no-ops, so normally only the current year is
+republished.
+
+## Descriptor contract
+
+The descriptor is user-authored intent:
+
+```toml
+schema_version = 1
+
+[archive]
+id = "example.org"
+url_pattern = "*.example.org"
+
+[storage]
+authority = "remote" # "local" or "remote"
+workspace_directory = "workspace"
+
+[storage.remote]
+bucket = "archive-magic"
+prefix = "example.org"
+endpoint_url = "https://s3.example.invalid"
+region = "auto"
+
+[fetch]
+start = "1995-01-01"
+# end omitted means now
+warc_target_bytes = 250000000
+playback_workers = 4
+playback_starts_per_second = 20.0
+
+[playback]
+wayback_fallback = true
+```
+
+Rules:
+
+- `schema_version` must be exactly `1`; unknown keys are errors.
+- Archive IDs must be route-safe and cannot be `.`, `..`, or `static`.
+- Relative paths and `~` are resolved from the descriptor directory.
+- `workspace_directory` is the exact archive root. The archive ID is not appended.
+- `storage.remote` is required for remote authority and forbidden for local
+  authority.
+- Bucket credentials come exclusively from Boto3's standard credential chain.
+  No adjacent `.env` is loaded and no specific access-key variable is required.
+- The compressed WARC rollover target defaults to 250,000,000 bytes and remains
+  configurable per archive.
+
+Fetch validates the complete shared descriptor, including playback keys, so Fetch
+and Navigator reject the same malformed contract.
+
+## Workspace and publication layout
 
 ```text
-<archives-root>/example.org/
-├── collections/
-│   └── 2004/
-│       ├── example.org-2004-001.warc.gz
-│       ├── example.org-2004-001.warc.gz.partial
-│       └── example.org-2004-index.cdxj
-└── captures/
-    └── 2004/
-        └── runs/<UTC-run-id>/
-            ├── run.json
-            └── page-001.cdx.gz
+<workspace_directory>/
+  collections-manifest.json
+  collections/
+    2004/
+      example.org-2004-001.warc.gz
+      example.org-2004-002.warc.gz
+      example.org-2004-index.cdxj
+  captures/
+    2004/
+      runs/<run-id>/run.json
+      ... diagnostic acquisition state ...
 ```
 
-Only `collections/**` is required for replay or bucket publication.
-`captures/**` is acquisition provenance and operational diagnostics. Fetch does
-not publish a domain-wide merged index, catalog, mutable failure ledger, or
-collection manifest.
+`collections/` is portable playback data. `captures/` records local diagnostics,
+queries, and run state; it is deliberately not bucket-authoritative archive
+content. `collections-manifest.json` is generated publication state and retains its
+existing unversioned JSON shape. It must never be edited as configuration.
 
-Each CDXJ stores a WARC basename such as
-`example.org-2004-001.warc.gz`. The index and its WARCs can therefore be copied
-together to another directory and replayed by configuring that directory as
-pywb's archive path.
+Short-lived files use same-directory temporary names followed by atomic local
+replacement. A visible `.warc.gz.partial` represents an interrupted open shard and
+is salvaged on the next run when possible.
 
-## Collection processing
+## Acquisition pipeline
 
-Years are selected serially in ascending order. For each selected year Fetch:
+For each year in the selected range, Fetch:
 
-1. Creates `captures/<year>/runs/<run-id>/` and durably saves every raw CDX HTTP
-   entity as `page-NNN.cdx.gz` before parsing it.
-2. Parses, validates, de-duplicates exact CDX rows, orders them by timestamp,
-   and groups them by URL key.
-3. Inventories only finalized WARCs in `collections/<year>/`.
-4. Resolves URL groups through bounded playback workers. Fully represented
-   groups stay on the main thread so they do not occupy workers. Each group
-   remains chronological: represented identities are skipped, an earlier matched
-   response with the same URL key, valid CDX digest, and CDX status becomes a
-   revisit, HTTP 200 captures whose CDX digest is the empty payload are
-   materialized locally, and an eligible earlier-collection HTTP 200 payload is
-   copied into a new full response. A CDX 301/302 whose URL group already lists
-   this URL plus a trailing slash is stored as that slash redirect without
-   playback. Other captures use exact playback. When exact `id_` playback of a
-   CDX 301/302 is a Wayback `found capture at …` 302 whose Location is this URL
-   plus a trailing slash, Fetch stores a redirect with that `Location` instead
-   of following the nearby capture. Other `found capture at …` substitutions
-   are fetched once and stored under the CDX identity as inexact keeps.
-5. Finalizes the current shard in `collections/<year>/` (continuing the last
-   shard when it is under the 1 GB cap), rebuilds the collection CDXJ from every
-   finalized WARC, and atomically publishes it.
-6. Atomically publishes `run.json` last. Its presence marks normal completion
-   for that collection's slice of the invocation.
+1. Ensures the year's CDXJ. Local authority is a no-op; remote authority
+   downloads the committed CDXJ only if no local copy exists. Leftover local
+   WARCs from an interrupted run are reindexed before inventory.
+2. Queries Internet Archive CDX history for the configured URL pattern.
+3. Parses and deduplicates captures by canonical capture identity.
+4. Inventories existing captures from CDXJ identity metadata and skips those
+   already represented.
+5. If that year has captures not yet represented, remote authority downloads
+   only the manifest's final WARC for the year (or keeps a longer local tail).
+   Unchanged years never download a WARC.
+6. Resolves remaining captures through bounded, rate-limited playback workers.
+7. Appends response or revisit records through one serialized WARC writer.
+8. Reindexes changed/new WARCs, merges their lines into the stable CDXJ, and
+   validates the completed artifacts.
+9. Publishes only changed/new WARCs plus the CDXJ, writes an immutable local run
+   record, and evicts remote working copies after confirmed success.
 
-One invocation ID is shared by all selected yearly collections. A year with no
-playable records still gets its capture run record, but it does not get a
-`collections/<year>/` directory or empty replay index.
+A weekly run and a multi-year backfill are the same loop. New captures in the
+current year extend that year's last shard. Missed captures from an earlier year
+extend that earlier year's last shard. Earlier shards of a year are never
+downloaded or rewritten.
 
-`run.json` contains the archive and collection IDs, bounded dates, URL pattern,
-query/page metadata, outcome counts, operational timings, current-run failures,
-and a complete post-run WARC/index artifact snapshot with hashes and sizes.
-Run records are immutable history; Fetch does not carry failures forward.
+Acquisition can be parallel; WARC mutation and publication remain serialized.
+Failures for individual captures are recorded without corrupting already committed
+records. At the process boundary, exceptions produce a nonzero exit. The next run
+keeps any leftover local tail/CDXJ, rebuilds the index if needed, and republishes.
+`--reset-data` is the recovery tool when the workspace was lost or the prefix is
+confused.
 
-## Recovery, identity, and validation
+Payloads are never reused across collections: a capture missing from its current
+collection is downloaded from Internet Archive unless CDX metadata can synthesize
+an empty response or slash redirect. The `payload-reuses` metric counts only those
+CDX-synthesized outcomes.
 
-Finalized WARCs are the recovery source of truth. On a rerun, Fetch requeries
-CDX, inventories existing WARCs, skips represented identities, and retries
-missing captures. In-progress shards are written as visible
-`*.warc.gz.partial` siblings in `collections/<year>/`. Startup salvage truncates
-a torn last gzip member and promotes a usable partial to its finalized name.
-Ctrl-C and unexpected failures finalize the open shard and rebuild CDXJ, but
-they do not write `run.json`. A collection directory without a replay index is
-not playable; Navigator skips it.
+## Append-only WARC behavior
 
-The last shard is continued when it is under 1 GB compressed. A new sequence
-starts only when that cap is reached. Collection CDXJ is always rebuilt from
-the finalized WARCs; offsets are not preserved across publication.
+WARC files use gzip member concatenation. Existing records are immutable. The
+writer extends the last shard of a year, or creates the next sequence when that
+shard is at or beyond the target. A normal update therefore uploads one tail WARC
+plus its CDXJ, or one new WARC plus the CDXJ. Earlier WARC objects remain
+untouched.
 
-WARC shards target 1 GB compressed and use sequences `001` through `999`.
-A shard is written to `collections/<year>/<archive>-<year>-NNN.warc.gz.partial`,
-closed, validated, and atomically renamed into its portable collection name.
+The stable CDXJ contains the original CDX digest, status token, and URL key for
+every response and revisit. Fetch can therefore reconstruct exact capture
+inventory without rescanning WARCs. Incremental indexing removes prior lines for
+changed filenames, adds their replacement lines, sorts the result, and validates
+byte ranges against manifest sizes for shards that are not on disk. Archives
+created without the required identity fields must be reset and regenerated.
 
-Capture identity preserves URL key, original URL, raw timestamp, raw CDX status,
-and raw CDX digest. Revisit reuse is collection-local and same-URL only, keyed by
-`(urlkey, valid CDX digest, CDX status)`. Payload reuse across collections is
-keyed only by the valid IA digest, is limited to HTTP 200, and writes a new full
-response into the current collection. Revisits may cross WARC shards inside a
-collection but never cross collection boundaries or point forward in time.
+## Local authority
 
-Collection index validation requires every locator to be a basename naming one
-of that collection's immutable WARCs, every byte range to be in bounds, and
-every revisit to resolve to a same-collection full response at an equal or
-earlier timestamp.
+With `authority = "local"`, the workspace is authoritative. Fetch publishes WARC,
+CDXJ, and manifest files using local atomic replacement. Navigator may serve the
+same workspace directly. Normal publication preserves all previous collections;
+`--reset-data` retains selected-collection reset behavior.
 
-Legacy `archive/`, `sources/`, root `index.cdxj`, `collection.json`, or
-`failures.json` layouts are rejected with a regenerate-required error. There is
-no migration or dual-layout compatibility layer.
+## Remote authority and bounded materialization
 
-## Network policy
+With `authority = "remote"`, the bucket prefix and its manifest are authoritative.
+The workspace is a bounded working area. At startup Fetch reads the manifest.
+Missing manifest means an empty archive. For each selected year it then:
 
-Playback uses `PLAYBACK_WORKERS` persistent worker clients. One shared gate
-smoothly limits starts to `PLAYBACK_STARTS_PER_SECOND`; retries pass through the
-same gate. Transport failures and HTTP 5xx receive at most
-`MAX_PLAYBACK_ATTEMPTS`, using exponential retry delays.
+1. Downloads the committed CDXJ if no local copy is present.
+2. Queries IA and inventories the year.
+3. Downloads that year's final WARC only when the year has new captures, keeping
+   a local file that is already at least as large as the committed tail.
+4. Runs the same local append and incremental-index code used by local authority.
+5. Publishes changed/new artifacts and commits the manifest last.
+6. Writes the run record, then deletes that collection's finalized local
+   WARC/CDXJ files.
 
-HTTP 429 and refused TCP connections are both treated as IA backpressure. They
-pause all new starts: 429 honors `Retry-After` or defaults to
-`BACKPRESSURE_COOLDOWN_S`, while TCP refusal uses that default. Concurrent
-signals retain the largest observed delay and extend the shared monotonic
-deadline. Exact mismatches, blocked captures, unusable bodies, truncated stored
-payloads, and other permanent failures continue immediately.
+Partials, `captures/`, run diagnostics, and the small cached manifest remain local.
+A failed upload keeps the workspace; the next run continues from those files.
+Missing local artifacts are never interpreted as remote deletions. If the
+workspace was lost after a partial same-key publication, reset and regenerate.
 
-Workers return completed URL groups without printing or mutating collection
-state. URL groups that need no Wayback GET (fully represented, empty HTTP 200
-payloads, or slash-normalizing redirects already listed in the same CDX group)
-are resolved on the main thread and never queued on playback workers. After a
-download group finishes, those local-only groups are yielded and printed before
-the next Wayback GET is submitted, so skip tables are not held behind the
-following playback. The main thread writes each group to WARC and then prints
-one contiguous URL table with ISO-formatted capture timestamps linked to exact
-``id_`` Wayback playback and the final six characters of each CDX payload
-digest.
+## Remote publication
 
-Captures without a valid CDX digest download individually. An earlier
-digest-matched response with the same URL key, digest, and CDX status becomes a
-revisit, including empty-bodied 301/302 captures. A 301 does not stand in for a
-302 or a statusless row. Revisit records omit HTTP headers; pywb fills them from
-the referred response, so later redirects inherit that capture's `Location`.
-HTTP 200 captures whose CDX digest is the SHA-1 of zero bytes are materialized
-locally (`Content-Type` from CDX MIME, `Content-Length: 0`) without playback.
-Redirects with that digest still download once so `Location` is captured, unless
-the same URL group already lists this URL plus a trailing slash. In that case
-Fetch writes the slash redirect locally (`Location`, empty body) and does not
-ask Wayback. If exact playback of a CDX 301/302 cannot be played and Wayback
-instead returns a live 302 with `X-Archive-Redirect-Reason: found capture at …`
-pointing at this URL plus a trailing slash, Fetch reconstructs that redirect
-locally and does not store the nearby capture. Other `found capture at …` 302s
-are followed once: Fetch stores the nearby memento under the CDX identity
-(WARC-Date and WARC-Target-URI stay the requested capture; WARC-Source-URI is
-the memento actually fetched). URL, timestamp, status, or digest may disagree;
-digest mismatches do not seed revisits. Fetch uses original/raw playback and
-never follows historical redirects of an archived page.
-Cross-year payload reuse stays HTTP 200 only. Unusable playback means IA
-`Invalid URI` stubs and empty bodies that contradict a non-empty CDX digest.
+After local WARC and CDXJ validation, one changed collection is published in this
+order:
 
-## Digest domains and payload reuse
+1. Upload the extended tail or newly rolled WARC. Unchanged WARC objects are
+   skipped.
+2. Replace the live CDXJ. A single S3 key is atomic, so readers see
+   either all old bytes or all new bytes.
+3. Replace `collections-manifest.json` last. This is the commit point.
+4. Write the run record, then evict finalized local working files.
 
-Fetch deliberately uses two digest domains. The IA/CDX payload digest is source
-metadata used at acquisition edges: it remains part of capture identity and is
-the key for comparing captures against the cross-year payload cache. The WARC
-payload digest is recomputed from the exact bytes Fetch stores and is used for
-internal integrity, revisit references, and the standard CDXJ `digest` field.
-Generated CDXJ response entries retain both domains as `cdxDigest` and `digest`,
-plus `cdxDigestMatch` to identify responses eligible to seed payload reuse.
+There is intentionally a short window after CDXJ replacement and before manifest
+commit in which a fresh remote reader may reject the archive. Cached Navigator
+instances continue with their last validated index; the next Fetch run republishes
+if the workspace was retained. No versioned index keys or reader fallback protocol
+are added.
 
-Some early IA ARC indexes hashed `payload + "\n"` while playback returns
-`payload`. Fetch accepts this recognized discrepancy as a soft match, stores
-the playback bytes, and retains IA's original digest as the cache key. It does
-not create aliases between IA digests: identical bytes advertised under the
-correct and newline-adjusted hashes miss each other and may be downloaded more
-than once. This is a safe false negative. Other explicit digest mismatches are
-kept for capture fidelity but never seed revisits or payload reuse.
+## Destructive reset
 
-Same-URL revisits are a separate path from the payload cache. They may include
-redirects and other non-200 statuses because they stay on one URL and one CDX
-status. They inherit HTTP headers (including `Location`) from the representative
-via pywb. HTTP 200 captures whose CDX digest is the SHA-1 of zero bytes skip
-playback entirely: Fetch writes a full response with an empty body and
-synthesized `Content-Type` / `Content-Length`, then later same-key captures
-become revisits. A 301/302 whose URL group already contains this URL plus a
-trailing slash is the same kind of local materialization: Fetch writes
-`Location` and an empty body without asking Wayback.
+Remote `--reset-data` is explicit authorization for whole-archive maintenance. It:
 
-The payload cache is an in-memory, rebuildable acquisition accelerator derived
-from finalized CDXJ locators. Its keys intentionally omit URL. Reuse is limited
-to HTTP 200 captures because a payload digest says nothing about status-specific
-metadata such as `Location` or `Content-Range`. An empty-body digest therefore
-cannot attach another capture's redirect metadata to a different URL. A hit
-range-reads and validates the earlier full response, verifies that its WARC
-timestamp matches the CDXJ timestamp and is not later than the current capture,
-then writes a new full response with the current capture identity, status, and
-CDX MIME. Only `Content-Type` and a recomputed `Content-Length` are synthesized;
-headers from the representative capture are not copied across captures. This
-makes each yearly collection independently replayable without attributing another
-capture's cookies, security policy, or other HTTP metadata to the current one.
-Missing, corrupt, future, or invalid candidates are ordinary cache misses and
-fall back to exact playback. CDXJs without the explicit `cdxDigest` and
-`cdxDigestMatch` fields do not seed the cache; there is no compatibility or
-migration path.
+- rejects `--start` and `--end` overrides;
+- prints a prominent deletion/playback-downtime warning;
+- deletes only the descriptor's complete configured bucket prefix;
+- clears only the exact workspace archive root; and
+- rebuilds the descriptor's full configured range.
 
-## Fidelity: pass-through vs derived
+There is no interactive prompt. The old manifest is absent during the rebuild, so
+remote playback is unavailable until publication completes. Other prefixes in the
+same bucket are not touched.
 
-Fetch reconstructs portable WARC/CDXJ collections from IA CDX plus exact
-``id_`` playback. It does not download IA's internal WARCs, so output will not
-match those files byte-for-byte. The contract is: for each well-formed CDX row
-that exact playback can satisfy, store that capture's URL, time, status, and
-payload in a pywb-playable form—without collapsing URL aliases (scheme/www) or
-rewriting paths.
+## Module map
 
-| Field / concern | Treatment |
-|-----------------|-----------|
-| CDX row selection | **Pass-through** — every well-formed row is scheduled; no http/https or www alias filtering |
-| Original URL (`WARC-Target-URI`) | **Pass-through** — CDX original URL; only default ports (`:80` / `:443`) are stripped. Exact-playback URL checks treat percent-encoding variants as equal (IA may double-encode in `Link: rel="original"`) |
-| Capture timestamp | **Pass-through** — CDX timestamp → `WARC-Date` |
-| HTTP status | **Pass-through** — exact playback must match CDX status; retained as `CDX-Status` |
-| CDX urlkey / digest | **Pass-through** — stored on the WARC as `CDX-Urlkey` / `CDX-Payload-Digest` |
-| Payload body | **Pass-through** of exact `id_` entity bytes (after false-gzip repair when IA mis-labels encoding). HTTP 200 with the empty CDX digest is synthesized as zero bytes without playback. CDX 301/302 rows that Wayback will not play exactly, substituting a nearby trailing-slash capture, are stored as an empty redirect with reconstructed `Location` |
-| HTTP entity headers | **Modified** — drop representation headers (`Content-Encoding`, `Transfer-Encoding`, `ETag`, payload digests, etc.) and rewrite `Content-Length` so headers describe the stored body; keep `Content-Range` for HTTP 206 |
-| Status reason / protocol line | **Derived** — synthesized (`200 OK`, `HTTP/1.1`); not taken from the archived reason phrase |
-| Failed / unplayable CDX rows | **Omitted** — recorded in `run.json`; nothing written to WARC/CDXJ. Includes IA `Invalid URI` stubs and empty playback that contradicts a non-empty CDX digest |
-| Digest match | **Exact or soft** — exact body SHA-1, or early-IA quirk where CDX hashed `body + "\n"` while `id_` returns `body`; soft matches still store exact playback bytes and can seed revisits and payload reuse. HTTP 200 with the empty CDX digest is materialized locally without playback |
-| Digest mismatch | **Kept** — body stored; `WARC-Payload-Digest` is of actual bytes; IA digest preserved; `CDX-Digest-Match: false`; cannot seed revisits or payload reuse |
-| Same-urlkey revisits | **Derived** — collection-local identical-payload revisits keyed by URL key, CDX digest, and CDX status (including redirects); not IA's revisit graph. Revisit records omit HTTP headers, so pywb inherits `Location` from the representative |
-| Cross-year payload reuse | **Derived** — digest-only IA lookup for HTTP 200 captures; the cached body, current CDX MIME, and recomputed length become a new full response in the current year |
-| Year collections | **Derived** — calendar-year partition; revisits do not cross years and every year retains a full copy of reused payload data |
-| Collection CDXJ | **Derived** — indexed from finalized WARCs (`url`, `status`, `mime`, local/IA digests, offsets); not a copy of IA CDX |
-| Record types / order | **Derived** — `warcinfo` + `response`/`revisit` only; shard order is write order, not crawl order |
+- `config.py`: descriptor path resolution and strict schema validation.
+- `cli.py`: public argument contract and exit-code boundary.
+- `fetch.py`: configured-history orchestration and yearly lifecycle.
+- `console.py`: terminal progress, URL tables, colors, and Wayback links.
+- `collection.py`: exact workspace paths, atomic files, and run records.
+- `warc.py`: append-only WARC writer, rollover, and partial salvage.
+- `index.py`: deterministic full or incremental collection CDXJ generation.
+- `inventory.py`: CDXJ-driven identity inventory and within-collection revisits.
+- `storage.py`: local manifests plus remote index/tail materialization,
+  publication, and eviction.
+- `cdx.py`, `resolution.py`, `workers.py`, `playback.py`: capture discovery and
+  bounded playback acquisition.
 
-## Deferred capabilities
+## Verification
 
-Arbitrary grouping strategies, a public collection-ID CLI, remote publication,
-persistent catalogs, cross-collection revisits, and overlapping-collection
-precedence are intentionally deferred. The layout and publication APIs use
-generic IDs so those features do not require another storage-format redesign.
+The Fetch test suite is run independently from Navigator:
+
+```console
+uv run pytest -q
+```
+
+Coverage includes descriptor conformance, the 250 MB default and configurable
+rollover, deferred tail download (CDXJ for inventory, WARC only when a year has
+new work), incremental indexing, publication order, successful eviction, failure
+retention and retry, unchanged-artifact suppression, and reset prefix scope.
