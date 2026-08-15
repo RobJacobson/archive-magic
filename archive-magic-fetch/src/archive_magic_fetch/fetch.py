@@ -283,7 +283,15 @@ def _run_year(
         reset_collection_data(layout, collection_id)
         print(f"year {year}: reset existing collection data", flush=True)
     else:
-        publisher.materialize_collection(layout, collection_id)
+        publisher.materialize_index(layout, collection_id)
+        leftover = list_collection_warcs(layout, collection_id)
+        if leftover:
+            publish_collection_index(
+                layout,
+                collection_id,
+                changed_warcs=leftover,
+                warc_sizes=publisher.collection_warc_sizes(layout, collection_id),
+            )
     year_metrics = RunMetrics()
     year_failures: list[UnresolvedFailure] = []
     year_started = time.monotonic()
@@ -308,6 +316,8 @@ def _run_year(
     year_metrics.selected += len(selected)
 
     inventory = inventory_collection(layout, collection_id)
+    if any(capture.identity not in inventory.identities for capture in selected):
+        publisher.materialize_tail(layout, collection_id)
     writer = CollectionWarcWriter(
         layout,
         collection_id,

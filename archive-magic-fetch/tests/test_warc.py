@@ -758,28 +758,6 @@ def test_salvage_promotes_collection_partial_and_truncates_garbage(tmp_path):
     validate_warc(salvaged[0].path)
 
 
-def test_salvage_promotes_legacy_work_partial(tmp_path):
-    layout = ArchiveLayout(tmp_path, "example.org")
-    ensure_collection_dirs(layout)
-    capt = make_capt()
-    writer = CollectionWarcWriter(layout, "2004")
-    writer.write_playback(playback(capt))
-    writer.close()
-    warc = list_collection_warcs(layout, "2004")[0]
-    layout.work_root.mkdir(parents=True)
-    leftover = layout.work_root / ".tmp-abcd1234.example.org-2004-001.warc.gz.partial"
-    leftover.write_bytes(warc.read_bytes())
-    warc.unlink()
-
-    salvaged = salvage_collection_partials(layout)
-
-    assert salvaged[0].path == layout.collection_warc_path("2004", 1)
-    publish_collection_index(layout, "2004")
-    assert inventory_collection(layout, "2004").contains(capt)
-    assert not leftover.exists()
-    assert not layout.work_root.exists()
-
-
 def test_cleanup_temps_keeps_visible_warc_partials(tmp_path):
     layout = ArchiveLayout(tmp_path, "example.org")
     ensure_collection_dirs(layout)

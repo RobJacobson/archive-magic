@@ -165,7 +165,7 @@ def test_manifest_parser_rejects_version_dead_weight():
     manifest, _ = manifest_and_index(b"x")
     raw = json.loads(manifest)
     raw["schema_version"] = 1
-    with pytest.raises(Exception, match="shape"):
+    with pytest.raises(Exception, match="published_at and collections"):
         parse_manifest(json.dumps(raw).encode())
 
 

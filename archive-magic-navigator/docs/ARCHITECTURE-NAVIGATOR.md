@@ -253,7 +253,7 @@ multi-tenant hardening.
 - `cli.py`: public arguments, source selection, aggregate validation, and process
   lifecycle.
 - `collections.py`: local exact-root discovery and route-safe collection models.
-- `remote.py`: manifest validation, atomic cache adoption, polling, and S3 paths.
+- `remote.py`: shared manifest types, atomic cache adoption, polling, and S3 paths.
 - `validation.py`: playable archive/CDXJ checks.
 - `config.py`: per-archive pywb and fallback configuration generation.
 - `process.py`: child process readiness, loopback checks, and shutdown.

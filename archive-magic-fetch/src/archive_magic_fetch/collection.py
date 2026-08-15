@@ -47,10 +47,6 @@ class ArchiveLayout:
     def captures_root(self) -> Path:
         return self.root / "captures"
 
-    @property
-    def work_root(self) -> Path:
-        return self.captures_root / ".work"
-
     def validate_collection_id(self, collection_id: str) -> str:
         if not _COLLECTION_ID.fullmatch(collection_id) or collection_id in {".", ".."}:
             raise ValueError(f"unsafe collection ID: {collection_id!r}")
@@ -201,13 +197,6 @@ def cleanup_temps(layout: ArchiveLayout) -> None:
                 path.unlink()
             except OSError:
                 pass
-    if layout.work_root.is_dir():
-        try:
-            next(layout.work_root.iterdir())
-        except StopIteration:
-            shutil.rmtree(layout.work_root, ignore_errors=True)
-        except OSError:
-            pass
 
 
 def file_sha256(path: Path) -> str:
@@ -332,7 +321,7 @@ def parse_warc_partial_name(
 
     collection_id = layout.validate_collection_id(collection_id)
     pattern = re.compile(
-        rf"^(?:\.tmp-[^.]+\.)?{re.escape(layout.archive_id)}-"
+        rf"^{re.escape(layout.archive_id)}-"
         rf"{re.escape(collection_id)}-(?P<seq>\d{{3}})\.warc\.gz\.partial$"
     )
     match = pattern.fullmatch(name)

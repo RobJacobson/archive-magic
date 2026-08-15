@@ -48,7 +48,6 @@ class FakeS3:
         self.objects: dict[str, dict] = {}
         self.operations: list[tuple] = []
         self.fail_key_suffix: str | None = None
-        self.fail_after_write_suffix: str | None = None
 
     def seed(self, key, body, etag=None, metadata=None):
         self.objects[key] = {
@@ -76,8 +75,6 @@ class FakeS3:
         if self.fail_key_suffix and Key.endswith(self.fail_key_suffix):
             raise OSError("simulated upload failure")
         self.seed(Key, data, metadata=Metadata)
-        if self.fail_after_write_suffix and Key.endswith(self.fail_after_write_suffix):
-            raise OSError("simulated upload failure after write")
         return {"ETag": self.objects[Key]["etag"]}
 
     def delete_object(self, *, Bucket, Key):
@@ -165,7 +162,8 @@ def published_update(tmp_path, monkeypatch):
     manager.prepare(layout)
     manager.publish_collection(layout, "2004")
     manager.evict_collection(layout, "2004")
-    manager.materialize_collection(layout, "2004")
+    manager.materialize_index(layout, "2004")
+    manager.materialize_tail(layout, "2004")
     identity, _, _ = append_capture(layout)
     return fake, layout, manager, identity
 
@@ -205,7 +203,7 @@ def test_filesystem_publication_uses_synthetic_etags(tmp_path):
     assert not manager.publish_collection(layout, "2004")
 
 
-def test_prepare_does_not_mirror_and_materializes_only_index_and_tail(
+def test_prepare_does_not_mirror_and_index_download_skips_warcs(
     tmp_path, monkeypatch
 ):
     fake = FakeS3()
@@ -218,21 +216,23 @@ def test_prepare_does_not_mirror_and_materializes_only_index_and_tail(
     manager.prepare(layout)
     assert not layout.collections_root.exists()
     fake.operations.clear()
-    manager.materialize_collection(layout, "2004")
+    manager.materialize_index(layout, "2004")
 
     first, tail = manifest.collections["2004"].warcs
     assert not (layout.root / first.key).exists()
+    assert not (layout.root / tail.key).exists()
+    gets = {op[1] for op in fake.operations if op[0] == "get"}
+    assert gets == {"example.org/" + manifest.collections["2004"].index.key}
+
+    fake.operations.clear()
+    manager.materialize_tail(layout, "2004")
+    assert not (layout.root / first.key).exists()
     assert (layout.root / tail.key).is_file()
     gets = {op[1] for op in fake.operations if op[0] == "get"}
-    assert gets == {
-        "example.org/" + manifest.collections["2004"].index.key,
-        "example.org/" + tail.key,
-    }
+    assert gets == {"example.org/" + tail.key}
 
 
-def test_materialization_preserves_prefix_extension_and_reindexes(
-    tmp_path, monkeypatch
-):
+def test_materialize_tail_keeps_a_longer_local_file(tmp_path, monkeypatch):
     fake = FakeS3()
     local, _, _ = make_collection(tmp_path / "workspace")
     original_warc = local.collection_warc_path("2004", 1).read_bytes()
@@ -254,7 +254,8 @@ def test_materialization_preserves_prefix_extension_and_reindexes(
     manager = PublicationManager(remote_config(tmp_path))
     manager.prepare(local)
     fake.operations.clear()
-    manager.materialize_collection(local, "2004")
+    manager.materialize_index(local, "2004")
+    manager.materialize_tail(local, "2004")
 
     assert inventory_collection(local, "2004").contains(identity)
     assert not [
@@ -264,7 +265,7 @@ def test_materialization_preserves_prefix_extension_and_reindexes(
     ]
 
 
-def test_materialization_preserves_contiguous_rollover(tmp_path, monkeypatch):
+def test_materialize_tail_keeps_a_new_rollover_shard(tmp_path, monkeypatch):
     fake = FakeS3()
     local, _, _ = make_collection(tmp_path / "workspace")
     original_warc = local.collection_warc_path("2004", 1).read_bytes()
@@ -286,7 +287,8 @@ def test_materialization_preserves_contiguous_rollover(tmp_path, monkeypatch):
 
     manager = PublicationManager(remote_config(tmp_path))
     manager.prepare(local)
-    manager.materialize_collection(local, "2004")
+    manager.materialize_tail(local, "2004")
+    assert local.collection_warc_path("2004", 2).is_file()
     assert inventory_collection(local, "2004").contains(identity)
 
 
@@ -366,25 +368,59 @@ def test_remote_two_run_fetch_extends_same_tail_and_evicts_working_files(
     assert not list(collection_dir.glob("*.cdxj"))
 
 
-@pytest.mark.parametrize(
-    ("failure_mode", "suffix"),
-    [
-        ("before", ".warc.gz"),
-        ("after", ".warc.gz"),
-        ("before", ".cdxj"),
-        ("after", ".cdxj"),
-        ("before", MANIFEST_NAME),
-        ("after", MANIFEST_NAME),
-    ],
-)
-def test_failed_publication_recovers_from_retained_workspace(
-    tmp_path, monkeypatch, failure_mode, suffix
-):
+def test_noop_remote_year_downloads_index_not_tail(tmp_path, monkeypatch):
+    fake = FakeS3()
+    patch_s3(monkeypatch, fake)
+    body = b"already stored"
+    digest = payload_digest(body).split(":", 1)[1]
+    rows = [
+        [
+            "org,example)/",
+            "20040601000000",
+            "http://example.org/",
+            "text/html",
+            "200",
+            digest,
+            str(len(body)),
+        ]
+    ]
+    settings = FetchSettings(
+        url_pattern="http://example.org/",
+        date_start="20040101000000",
+        date_end="20041231235959",
+        archive_id="example.org",
+        storage=remote_config(tmp_path),
+    )
+    original, cdx_mod, fetch_mod = patch_cdx(cdx_json(rows))
+    try:
+        first = run_fetch(
+            settings,
+            client_factory=lambda: MagicMock(),
+            download_fn=lambda _client, identity: playback(identity, body=body),
+            sleep=lambda _seconds: None,
+        )
+        assert first.exit_code == 0
+        fake.operations.clear()
+        second = run_fetch(
+            settings,
+            client_factory=lambda: MagicMock(),
+            download_fn=lambda _client, identity: playback(identity, body=body),
+            sleep=lambda _seconds: None,
+        )
+        assert second.exit_code == 0
+    finally:
+        cdx_mod.fetch_year_cdx = original
+        fetch_mod.fetch_year_cdx = original
+
+    gets = [op[1] for op in fake.operations if op[0] == "get"]
+    assert any(key.endswith("index.cdxj") for key in gets)
+    assert not any(key.endswith(".warc.gz") for key in gets)
+    assert not any(op[0] == "put" for op in fake.operations)
+
+
+def test_failed_publication_retries_from_retained_workspace(tmp_path, monkeypatch):
     fake, layout, manager, identity = published_update(tmp_path, monkeypatch)
-    if failure_mode == "after":
-        fake.fail_after_write_suffix = suffix
-    else:
-        fake.fail_key_suffix = suffix
+    fake.fail_key_suffix = MANIFEST_NAME
 
     with pytest.raises(OSError, match="simulated"):
         manager.publish_collection(layout, "2004")
@@ -392,10 +428,10 @@ def test_failed_publication_recovers_from_retained_workspace(
     assert layout.collection_index("2004").is_file()
 
     fake.fail_key_suffix = None
-    fake.fail_after_write_suffix = None
     recovered = PublicationManager(remote_config(tmp_path))
     recovered.prepare(layout)
-    recovered.materialize_collection(layout, "2004")
+    recovered.materialize_index(layout, "2004")
+    recovered.materialize_tail(layout, "2004")
     recovered.publish_collection(layout, "2004")
     assert recovered.manifest.collections["2004"].index.sha256 == hashlib.sha256(
         layout.collection_index("2004").read_bytes()
@@ -403,42 +439,34 @@ def test_failed_publication_recovers_from_retained_workspace(
     assert inventory_collection(layout, "2004").contains(identity)
 
 
-def test_manifestless_partial_prefix_resumes_with_local_work(tmp_path, monkeypatch):
-    fake = FakeS3()
-    fake.seed("example.org/partial.warc.gz", b"partial")
-    patch_s3(monkeypatch, fake)
-    layout, _, _ = make_collection(tmp_path / "workspace")
-    manager = PublicationManager(remote_config(tmp_path))
-
-    manager.prepare(layout)
-    assert manager.publish_collection(layout, "2004")
-    assert "example.org/" + MANIFEST_NAME in fake.objects
-
-
-def test_manifestless_prefix_without_local_work_fails(tmp_path, monkeypatch):
+def test_missing_manifest_is_an_empty_archive(tmp_path, monkeypatch):
     fake = FakeS3()
     fake.seed("example.org/orphan.warc.gz", b"orphan")
     patch_s3(monkeypatch, fake)
     manager = PublicationManager(remote_config(tmp_path))
+    layout = ArchiveLayout(tmp_path / "workspace", "example.org")
 
-    with pytest.raises(RuntimeError, match="no recoverable collection"):
-        manager.prepare(ArchiveLayout(tmp_path / "workspace", "example.org"))
+    manager.prepare(layout)
+    assert manager.manifest.collections == {}
 
 
-def test_conflicting_local_tail_stops_without_remote_writes(tmp_path, monkeypatch):
+def test_shorter_local_tail_is_replaced_from_remote(tmp_path, monkeypatch):
     fake = FakeS3()
     source, _, _ = make_collection(tmp_path / "source")
     seed_manifest(fake, source)
     patch_s3(monkeypatch, fake)
     layout, _, _ = make_collection(tmp_path / "workspace")
-    layout.collection_warc_path("2004", 1).write_bytes(b"conflicting bytes")
+    tail = layout.collection_warc_path("2004", 1)
+    tail.write_bytes(b"short")
     manager = PublicationManager(remote_config(tmp_path))
     manager.prepare(layout)
     fake.operations.clear()
 
-    with pytest.raises(RuntimeError, match="conflicts"):
-        manager.materialize_collection(layout, "2004")
-    assert not [op for op in fake.operations if op[0] == "put"]
+    manager.materialize_tail(layout, "2004")
+    assert tail.stat().st_size > 5
+    assert any(
+        op[0] == "get" and op[1].endswith(".warc.gz") for op in fake.operations
+    )
 
 
 def test_reset_deletes_only_archive_prefix_and_workspace(tmp_path, monkeypatch):
@@ -468,7 +496,8 @@ def test_publish_retains_non_materialized_warcs_from_manifest(tmp_path, monkeypa
     manager.publish_collection(layout, "2004")
     first_body = fake.objects["example.org/" + first_key]["body"]
     manager.evict_collection(layout, "2004")
-    manager.materialize_collection(layout, "2004")
+    manager.materialize_index(layout, "2004")
+    manager.materialize_tail(layout, "2004")
     assert not (layout.root / first_key).exists()
 
     fake.operations.clear()
@@ -493,7 +522,8 @@ def test_remote_publish_skips_unchanged_artifacts(tmp_path, monkeypatch):
     manager.prepare(layout)
     assert manager.publish_collection(layout, "2004")
     manager.evict_collection(layout, "2004")
-    manager.materialize_collection(layout, "2004")
+    manager.materialize_index(layout, "2004")
+    manager.materialize_tail(layout, "2004")
     fake.operations.clear()
 
     assert not manager.publish_collection(layout, "2004")
@@ -514,7 +544,7 @@ def test_replaced_remote_cdxj_recovers_from_local_index(tmp_path, monkeypatch):
 
     recovered_manager = PublicationManager(remote_config(tmp_path))
     recovered_manager.prepare(layout)
-    recovered_manager.materialize_collection(layout, "2004")
+    recovered_manager.materialize_index(layout, "2004")
     assert index_path.read_bytes() == recovered
     fake.operations.clear()
     assert recovered_manager.publish_collection(layout, "2004")

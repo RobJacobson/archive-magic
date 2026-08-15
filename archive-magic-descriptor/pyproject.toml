@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "archive-magic-descriptor"
 version = "0.1.0"
-description = "Shared archive.toml descriptor parsing for Archive Magic"
+description = "Shared archive.toml and collections-manifest parsing for Archive Magic"
 requires-python = ">=3.12"
 license = { text = "MIT" }
 dependencies = []

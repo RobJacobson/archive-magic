@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import re
 import shutil
 from dataclasses import dataclass, field
 from http import HTTPStatus
@@ -147,91 +146,28 @@ def truncate_incomplete_gzip_warc(path: Path) -> int | None:
 
 
 def salvage_collection_partials(layout: ArchiveLayout) -> list[SalvagedWarc]:
-    """Promote visible and leftover hidden WARC partials into finalized shards."""
+    """Promote visible in-progress WARC partials into finalized shards."""
 
     salvaged: list[SalvagedWarc] = []
-    pending: list[tuple[str, int, Path]] = []
-
-    if layout.work_root.is_dir():
-        for path in layout.work_root.iterdir():
-            if not path.is_file():
-                continue
-            parsed = _parse_legacy_work_partial(layout, path.name)
-            if parsed is None:
-                continue
-            collection_id, sequence = parsed
-            pending.append((collection_id, sequence, path))
-
-    if layout.collections_root.is_dir():
-        for collection_dir in sorted(layout.collections_root.iterdir()):
-            if not collection_dir.is_dir():
-                continue
-            try:
-                collection_id = layout.validate_collection_id(collection_dir.name)
-            except ValueError:
-                continue
-            for path in list_collection_partials(layout, collection_id):
-                sequence = parse_warc_partial_name(
-                    layout, collection_id, path.name
-                )
-                if sequence is None:
-                    continue
-                pending.append((collection_id, sequence, path))
-
-    for collection_id, sequence, path in pending:
-        artifact = _publish_salvaged_partial(
-            layout, collection_id, sequence, path
-        )
-        if artifact is not None:
-            salvaged.append(artifact)
-
-    if layout.work_root.is_dir():
-        try:
-            remaining = list(layout.work_root.iterdir())
-        except OSError:
-            remaining = [layout.work_root]
-        if not remaining:
-            shutil.rmtree(layout.work_root, ignore_errors=True)
-
-    return salvaged
-
-
-def _parse_legacy_work_partial(
-    layout: ArchiveLayout, name: str
-) -> tuple[str, int] | None:
-    """Parse `.tmp-*.{archive}-{collection}-{seq}.warc.gz.partial` names."""
-
-    if not name.endswith(".warc.gz.partial"):
-        return None
     if not layout.collections_root.is_dir():
-        match = re.fullmatch(
-            rf"^(?:\.tmp-[^.]+\.)?{re.escape(layout.archive_id)}-"
-            rf"(?P<collection>[A-Za-z0-9][A-Za-z0-9._-]*)-"
-            rf"(?P<seq>\d{{3}})\.warc\.gz\.partial$",
-            name,
-        )
-        if match is None:
-            return None
-        return match.group("collection"), int(match.group("seq"))
-    for collection_dir in layout.collections_root.iterdir():
+        return salvaged
+    for collection_dir in sorted(layout.collections_root.iterdir()):
         if not collection_dir.is_dir():
             continue
         try:
             collection_id = layout.validate_collection_id(collection_dir.name)
         except ValueError:
             continue
-        sequence = parse_warc_partial_name(layout, collection_id, name)
-        if sequence is not None:
-            return collection_id, sequence
-    match = re.fullmatch(
-        rf"^(?:\.tmp-[^.]+\.)?{re.escape(layout.archive_id)}-"
-        rf"(?P<collection>[A-Za-z0-9][A-Za-z0-9._-]*)-"
-        rf"(?P<seq>\d{{3}})\.warc\.gz\.partial$",
-        name,
-    )
-    if match is None:
-        return None
-    return match.group("collection"), int(match.group("seq"))
+        for path in list_collection_partials(layout, collection_id):
+            sequence = parse_warc_partial_name(layout, collection_id, path.name)
+            if sequence is None:
+                continue
+            artifact = _publish_salvaged_partial(
+                layout, collection_id, sequence, path
+            )
+            if artifact is not None:
+                salvaged.append(artifact)
+    return salvaged
 
 
 def _publish_salvaged_partial(
@@ -425,11 +361,4 @@ def validate_warc(path: Path) -> int:
     count, first_type = _scan_warc(path, check_digests="raise")
     if first_type != "warcinfo":
         raise ValueError(f"WARC missing leading warcinfo: {path}")
-    return count
-
-
-def count_warc_records(path: Path) -> int:
-    """Return the number of records in a finalized WARC."""
-
-    count, _first_type = _scan_warc(path, check_digests=False)
     return count

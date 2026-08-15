@@ -103,13 +103,16 @@ is salvaged on the next run when possible.
 
 For each year in the selected range, Fetch:
 
-1. Materializes the collection. Local authority is a no-op; remote authority
-   downloads the stable CDXJ and only the manifest's final WARC.
-2. Reconciles interrupted local WARC/index work for that collection.
-3. Queries Internet Archive CDX history for the configured URL pattern.
-4. Parses and deduplicates captures by canonical capture identity.
-5. Inventories existing captures from CDXJ identity metadata and skips those
+1. Ensures the year's CDXJ. Local authority is a no-op; remote authority
+   downloads the committed CDXJ only if no local copy exists. Leftover local
+   WARCs from an interrupted run are reindexed before inventory.
+2. Queries Internet Archive CDX history for the configured URL pattern.
+3. Parses and deduplicates captures by canonical capture identity.
+4. Inventories existing captures from CDXJ identity metadata and skips those
    already represented.
+5. If that year has captures not yet represented, remote authority downloads
+   only the manifest's final WARC for the year (or keeps a longer local tail).
+   Unchanged years never download a WARC.
 6. Resolves remaining captures through bounded, rate-limited playback workers.
 7. Appends response or revisit records through one serialized WARC writer.
 8. Reindexes changed/new WARCs, merges their lines into the stable CDXJ, and
@@ -117,10 +120,17 @@ For each year in the selected range, Fetch:
 9. Publishes only changed/new WARCs plus the CDXJ, writes an immutable local run
    record, and evicts remote working copies after confirmed success.
 
+A weekly run and a multi-year backfill are the same loop. New captures in the
+current year extend that year's last shard. Missed captures from an earlier year
+extend that earlier year's last shard. Earlier shards of a year are never
+downloaded or rewritten.
+
 Acquisition can be parallel; WARC mutation and publication remain serialized.
 Failures for individual captures are recorded without corrupting already committed
-records. At the process boundary, exceptions produce a nonzero exit, and the next
-run reconciles recoverable partial work.
+records. At the process boundary, exceptions produce a nonzero exit. The next run
+keeps any leftover local tail/CDXJ, rebuilds the index if needed, and republishes.
+`--reset-data` is the recovery tool when the workspace was lost or the prefix is
+confused.
 
 Payloads are never reused across collections: a capture missing from its current
 collection is downloaded from Internet Archive unless CDX metadata can synthesize
@@ -129,24 +139,18 @@ CDX-synthesized outcomes.
 
 ## Append-only WARC behavior
 
-WARC files use gzip member concatenation. Existing records are immutable. A normal
-remote update may change at most the lexicographically final WARC already named by
-the manifest, its new length must be greater, and the SHA-256 of its old-length
-prefix must equal the manifest digest. Earlier WARC objects cannot change or
-disappear.
-
-When the final shard is at or beyond the target, the writer creates the next
-sequence. Consequently a normal update transfers one tail WARC plus its updated
-CDXJ, or creates one new WARC plus the CDXJ. All other WARC objects remain
+WARC files use gzip member concatenation. Existing records are immutable. The
+writer extends the last shard of a year, or creates the next sequence when that
+shard is at or beyond the target. A normal update therefore uploads one tail WARC
+plus its CDXJ, or one new WARC plus the CDXJ. Earlier WARC objects remain
 untouched.
 
 The stable CDXJ contains the original CDX digest, status token, and URL key for
 every response and revisit. Fetch can therefore reconstruct exact capture
 inventory without rescanning WARCs. Incremental indexing removes prior lines for
-changed filenames, adds their replacement lines, sorts the result, validates byte
-ranges against manifest sizes, and trusts the previously committed CDXJ's semantic
-relationships. Archives created without the required identity fields must be reset
-and regenerated.
+changed filenames, adds their replacement lines, sorts the result, and validates
+byte ranges against manifest sizes for shards that are not on disk. Archives
+created without the required identity fields must be reset and regenerated.
 
 ## Local authority
 
@@ -158,26 +162,24 @@ same workspace directly. Normal publication preserves all previous collections;
 ## Remote authority and bounded materialization
 
 With `authority = "remote"`, the bucket prefix and its manifest are authoritative.
-The workspace is a bounded working area and the recovery source for uncommitted
-work. At startup Fetch reads the manifest. For each selected collection it then:
+The workspace is a bounded working area. At startup Fetch reads the manifest.
+Missing manifest means an empty archive. For each selected year it then:
 
-1. Downloads the committed CDXJ unless a validated copy is present.
-2. Downloads only the manifest's final WARC, preserving a valid local exact-prefix
-   extension recovered from interrupted work.
-3. Runs the same local append and incremental-index code used by local authority.
-4. Publishes explicit changed/new artifacts and commits the manifest last.
-5. Writes the run record, then deletes that collection's finalized local
+1. Downloads the committed CDXJ if no local copy is present.
+2. Queries IA and inventories the year.
+3. Downloads that year's final WARC only when the year has new captures, keeping
+   a local file that is already at least as large as the committed tail.
+4. Runs the same local append and incremental-index code used by local authority.
+5. Publishes changed/new artifacts and commits the manifest last.
+6. Writes the run record, then deletes that collection's finalized local
    WARC/CDXJ files.
 
 Partials, `captures/`, run diagnostics, and the small cached manifest remain local.
-Any publication failure retains materialized WARC/CDXJ files for recovery. Missing
-local artifacts are never interpreted as remote deletions.
+A failed upload keeps the workspace; the next run continues from those files.
+Missing local artifacts are never interpreted as remote deletions. If the
+workspace was lost after a partial same-key publication, reset and regenerate.
 
-An archive prefix must either be empty, contain a valid manifest, or have valid
-local WARC/CDXJ work from an interrupted initial publication. A nonempty prefix
-without a manifest or matching local recovery files stops rather than guessing.
-
-## Remote publication and recovery
+## Remote publication
 
 After local WARC and CDXJ validation, one changed collection is published in this
 order:
@@ -186,20 +188,14 @@ order:
    skipped.
 2. Replace the live CDXJ. A single S3 key is atomic, so readers see
    either all old bytes or all new bytes.
-3. Replace `collections-manifest.json` last and re-read it for verification. This
-   is the commit point.
+3. Replace `collections-manifest.json` last. This is the commit point.
 4. Write the run record, then evict finalized local working files.
-
-If a write fails, Fetch stops and retains the workspace. On the next run it uses
-the committed manifest plus the retained exact-prefix tail/new rollovers and CDXJ
-to reconstruct the intended collection through the normal incremental-index and
-publication path. If the workspace was lost after a partial same-key publication,
-automatic recovery is impossible and the archive must be reset and regenerated.
 
 There is intentionally a short window after CDXJ replacement and before manifest
 commit in which a fresh remote reader may reject the archive. Cached Navigator
-instances continue with their last validated index; the next Fetch run completes
-forward recovery. No versioned index keys or reader fallback protocol are added.
+instances continue with their last validated index; the next Fetch run republishes
+if the workspace was retained. No versioned index keys or reader fallback protocol
+are added.
 
 ## Destructive reset
 
@@ -218,14 +214,15 @@ same bucket are not touched.
 ## Module map
 
 - `config.py`: descriptor path resolution and strict schema validation.
+- `manifest.py`: re-export of the shared collections-manifest parser.
 - `cli.py`: public argument contract and exit-code boundary.
 - `fetch.py`: configured-history orchestration and yearly lifecycle.
 - `collection.py`: exact workspace paths, atomic files, and run records.
 - `warc.py`: append-only WARC writer, rollover, and partial salvage.
 - `index.py`: deterministic full or incremental collection CDXJ generation.
 - `inventory.py`: CDXJ-driven identity inventory and within-collection revisits.
-- `storage.py`: local manifests plus remote materialization, publication,
-  workspace-backed recovery, and eviction.
+- `storage.py`: local manifests plus remote index/tail materialization,
+  publication, and eviction.
 - `cdx.py`, `resolution.py`, `workers.py`, `playback.py`: capture discovery and
   bounded playback acquisition.
 
@@ -238,7 +235,6 @@ uv run pytest -q
 ```
 
 Coverage includes descriptor conformance, the 250 MB default and configurable
-rollover, exact-prefix continuation, tail-only materialization, incremental
-indexing, publication order, workspace-backed recovery at each upload boundary,
-successful eviction, failure retention, unchanged-artifact suppression, and reset
-prefix scope.
+rollover, deferred tail download (CDXJ for inventory, WARC only when a year has
+new work), incremental indexing, publication order, successful eviction, failure
+retention and retry, unchanged-artifact suppression, and reset prefix scope.
