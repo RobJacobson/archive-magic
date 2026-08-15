@@ -985,7 +985,8 @@ def test_completed_run_reports_expected_failures(tmp_path):
     }
     assert len(record["failures"]) == 1
     assert record["failures"][0]["identity"]["timestamp"] == bad.timestamp
-    assert record["query"]["client"] == "wayback"
+    assert record["query"]["url_pattern"] == "http://example.org/"
+    assert record["query"]["match_type"] is None
     assert list_collection_warcs(layout, "2004")
     assert all(w["record_count"] > 0 for w in record["warcs"])
     assert record["index"]["filename"] == (
@@ -1137,10 +1138,8 @@ def test_multi_year_empty_run_shares_id_without_playback_collections(
     def empty_year(*, date_start, date_end, **_kwargs):
         return CdxResult(
             captures=(),
-            query={
-                "from": date_start,
-                "to": date_end,
-            },
+            search_url="http://example.org/",
+            match_type=None,
         )
 
     monkeypatch.setattr(fetch_mod, "fetch_cdx", empty_year)

@@ -11,7 +11,6 @@ from typing import Callable, Mapping, Optional, Sequence
 
 from .cdx import (
     fetch_cdx,
-    init_run_id,
     parse_date_bound,
     validate_date_range,
     year_ranges,
@@ -22,6 +21,7 @@ from .collection import (
     cleanup_temps,
     ensure_collection_dirs,
     index_artifact_from_path,
+    init_run_id,
     list_collection_warcs,
     normalize_archive_id,
     reject_legacy_layout,
@@ -125,7 +125,6 @@ def run_fetch(
 ) -> FetchResult:
     """Execute the annual fetch pipeline with bounded playback workers."""
 
-    validate_date_range(settings.date_start, settings.date_end)
     factory = client_factory or make_client
     workers = PlaybackWorkers(
         factory,
@@ -150,7 +149,6 @@ def _run_fetch(
 ) -> FetchResult:
     """Execute serial years with parallel playback and one WARC writer."""
 
-    validate_date_range(settings.date_start, settings.date_end)
     layout = ArchiveLayout(settings.storage.workspace_directory, settings.archive_id)
     publisher = PublicationManager(settings.storage)
     if settings.reset_data and settings.storage.authority == "remote":
@@ -290,9 +288,14 @@ def _run_year(
         collection_id=collection_id,
         run_id=run_id,
         url_pattern=settings.url_pattern,
-        date_start=str(year_cdx.query["from"]),
-        date_end=str(year_cdx.query["to"]),
-        query=year_cdx.query,
+        date_start=date_start,
+        date_end=date_end,
+        query={
+            "url_pattern": settings.url_pattern,
+            "search_url": year_cdx.search_url,
+            "match_type": year_cdx.match_type,
+            "result_count": len(year_cdx.captures),
+        },
         warcs=year_warcs,
         index=collection_index,
         metrics=year_metrics,

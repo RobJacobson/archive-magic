@@ -122,9 +122,12 @@ def patch_cdx(body: bytes):
     rows = json.loads(body)
 
     def fake_fetch_cdx(**kwargs):
-        kwargs = dict(kwargs)
-        kwargs["client"] = FakeCdxClient(rows)
-        return original(**kwargs)
+        previous = cdx_mod.WaybackClient
+        cdx_mod.WaybackClient = lambda *args, **kw: FakeCdxClient(rows)
+        try:
+            return original(**kwargs)
+        finally:
+            cdx_mod.WaybackClient = previous
 
     cdx_mod.fetch_cdx = fake_fetch_cdx
     fetch_mod.fetch_cdx = fake_fetch_cdx
@@ -138,11 +141,14 @@ def patch_cdx_by_year(bodies_by_year: dict[int, bytes]):
     original = cdx_mod.fetch_cdx
 
     def fake_fetch_cdx(**kwargs):
-        kwargs = dict(kwargs)
         year = int(str(kwargs["date_start"])[:4])
         rows = json.loads(bodies_by_year.get(year, b"[]"))
-        kwargs["client"] = FakeCdxClient(rows)
-        return original(**kwargs)
+        previous = cdx_mod.WaybackClient
+        cdx_mod.WaybackClient = lambda *args, **kw: FakeCdxClient(rows)
+        try:
+            return original(**kwargs)
+        finally:
+            cdx_mod.WaybackClient = previous
 
     cdx_mod.fetch_cdx = fake_fetch_cdx
     fetch_mod.fetch_cdx = fake_fetch_cdx

@@ -44,21 +44,26 @@ def record(**overrides):
     return CdxRecord(**values)
 
 
-def test_fetch_cdx_delegates_paging_and_parsing_to_wayback():
-    client = FakeClient([record()])
+def test_fetch_cdx_delegates_paging_and_parsing_to_wayback(monkeypatch):
+    fake = FakeClient([record()])
+    sessions = []
 
+    def fake_wayback(*, session):
+        sessions.append(session)
+        return fake
+
+    monkeypatch.setattr("archive_magic_fetch.cdx.WaybackClient", fake_wayback)
     result = fetch_cdx(
         url_pattern="*.example.org",
         date_start="20040101000000",
         date_end="20041231235959",
         retries=4,
-        client=client,
     )
 
     assert len(result.captures) == 1
     assert result.captures[0].identity.timestamp == "20040615000000"
     assert result.captures[0].identity.status_token == "200"
-    assert client.calls == [
+    assert fake.calls == [
         (
             "example.org",
             {
@@ -70,29 +75,10 @@ def test_fetch_cdx_delegates_paging_and_parsing_to_wayback():
             },
         )
     ]
-    assert not client.closed
-    assert result.query["client"] == "wayback"
-    assert result.query["result_count"] == 1
-
-
-def test_fetch_cdx_uses_configured_retries(monkeypatch):
-    observed = []
-    client = FakeClient()
-
-    def make_client(retries):
-        observed.append(retries)
-        return client
-
-    monkeypatch.setattr("archive_magic_fetch.cdx.make_cdx_client", make_client)
-    fetch_cdx(
-        url_pattern="http://example.org/",
-        date_start="20040101000000",
-        date_end="20041231235959",
-        retries=4,
-    )
-
-    assert observed == [4]
-    assert client.closed
+    assert sessions[0].retries == 4
+    assert fake.closed
+    assert result.search_url == "example.org"
+    assert result.match_type == "domain"
 
 
 def test_parse_date_bound_strips_hyphens_and_pads_precision():
