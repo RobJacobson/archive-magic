@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import errno
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -18,10 +17,11 @@ from .models import (
     UnresolvedFailure,
 )
 from .playback import classify_playback_error
-from .retry import parse_retry_after
-
-
-_BACKPRESSURE_COOLDOWN_SECONDS = 60.0
+from .retry import (
+    BACKPRESSURE_COOLDOWN_SECONDS,
+    backpressure_signal,
+    retry_after_from_error,
+)
 
 
 @dataclass(frozen=True)
@@ -75,7 +75,7 @@ class StartGate:
         retry_after: float | None,
         identity: CaptureIdentity,
     ) -> None:
-        requested = retry_after or _BACKPRESSURE_COOLDOWN_SECONDS
+        requested = retry_after or BACKPRESSURE_COOLDOWN_SECONDS
         with self._lock:
             now = self._clock()
             if now >= self._blocked_until:
@@ -218,61 +218,3 @@ class PlaybackWorkers:
         with self._owners_lock:
             self._owners.append(owner)
         return self._local.client
-
-
-def iter_error_chain(error: BaseException):
-    seen: set[int] = set()
-    current: BaseException | None = error
-    while current is not None and id(current) not in seen:
-        yield current
-        seen.add(id(current))
-        nested = getattr(current, "cause", None)
-        current = (
-            nested
-            if isinstance(nested, BaseException)
-            else current.__cause__ or current.__context__
-        )
-
-
-def retry_after_from_error(error: BaseException) -> float | None:
-    delays: list[float] = []
-    for candidate in iter_error_chain(error):
-        values = [getattr(candidate, "retry_after", None)]
-        response = getattr(candidate, "response", None)
-        headers = getattr(response, "headers", None) or {}
-        values.append(headers.get("Retry-After") or headers.get("retry-after"))
-        for value in values:
-            parsed = parse_retry_after(value)
-            if parsed is not None:
-                delays.append(parsed)
-    return max(delays, default=None)
-
-
-def backpressure_signal(error: BaseException) -> tuple[str, float | None] | None:
-    """Recognize HTTP 429 and refused TCP connections through wrapper chains."""
-
-    http = False
-    tcp = False
-    for candidate in iter_error_chain(error):
-        name = type(candidate).__name__
-        message = str(candidate).lower()
-        response = getattr(candidate, "response", None)
-        if (
-            "RateLimit" in name
-            or getattr(candidate, "status_code", None) == 429
-            or getattr(response, "status_code", None) == 429
-            or "rate limit" in message
-            or "too many requests" in message
-        ):
-            http = True
-        if (
-            isinstance(candidate, ConnectionRefusedError)
-            or getattr(candidate, "errno", None) == errno.ECONNREFUSED
-            or "connection refused" in message
-        ):
-            tcp = True
-    if http:
-        return "http", retry_after_from_error(error)
-    if tcp:
-        return "tcp", _BACKPRESSURE_COOLDOWN_SECONDS
-    return None

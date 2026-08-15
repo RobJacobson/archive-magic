@@ -4,16 +4,24 @@ from __future__ import annotations
 
 import calendar
 import re
-from collections.abc import Iterator
+import time
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import datetime
 
 from wayback import CdxRecord, WaybackClient
 
 from .collection import normalize_domain
+from .console import emit
 from .identity import make_identity
 from .models import ParsedCapture
-from .playback import ArchiveMagicWaybackSession
+from .playback import ArchiveMagicWaybackSession, classify_playback_error
+from .retry import (
+    BACKPRESSURE_COOLDOWN_SECONDS,
+    backpressure_signal,
+    iter_error_chain,
+    retry_after_from_error,
+)
 
 
 # Compact CDX timestamps at year, month, day, or full second precision.
@@ -132,28 +140,86 @@ def fetch_cdx(
     date_start: str,
     date_end: str,
     retries: int,
+    sleep: Callable[[float], None] = time.sleep,
+    report: Callable[[str], None] = emit,
 ) -> CdxResult:
-    """Fetch and parse a CDX range through ``WaybackClient.search``."""
+    """Fetch and parse a CDX range through ``WaybackClient.search``.
+
+    Fetch owns CDX retries. Wayback library retries stay disabled so a refused
+    TCP connection or HTTP 429 pauses for 60s (or ``Retry-After``) instead of
+    giving up after a few seconds of inner backoff. A failed query is retried
+    from the start of the year range so the result is never a partial listing.
+    """
 
     search_url, match_type = normalize_cdx_search(url_pattern)
-    client = WaybackClient(
-        session=ArchiveMagicWaybackSession(
-            user_agent="archive-magic-fetch",
-            retries=retries,
+    max_attempts = retries + 1
+    last_error: BaseException | None = None
+    for attempt in range(1, max_attempts + 1):
+        client = WaybackClient(
+            session=ArchiveMagicWaybackSession(
+                user_agent="archive-magic-fetch",
+                retries=0,
+            )
         )
-    )
-    try:
-        records = client.search(
-            search_url,
-            match_type=match_type,
-            from_date=date_start,
-            to_date=date_end,
-            resolve_revisits=False,
-            skip_malformed_results=True,
-        )
-        captures = tuple(
-            sorted(map(_parsed_capture, records), key=lambda item: item.identity.sort_key())
-        )
-    finally:
-        client.close()
-    return CdxResult(captures, search_url, match_type)
+        try:
+            records = client.search(
+                search_url,
+                match_type=match_type,
+                from_date=date_start,
+                to_date=date_end,
+                resolve_revisits=False,
+                skip_malformed_results=True,
+            )
+            captures = tuple(
+                sorted(
+                    map(_parsed_capture, records),
+                    key=lambda item: item.identity.sort_key(),
+                )
+            )
+            return CdxResult(captures, search_url, match_type)
+        except Exception as error:  # noqa: BLE001 - network boundary
+            last_error = error
+            _, retryable = classify_playback_error(error)
+            if retryable and attempt < max_attempts:
+                delay = _cdx_retry_delay(error, attempt)
+                report(_cdx_retry_message(error, delay, attempt, max_attempts))
+                sleep(delay)
+                continue
+            break
+        finally:
+            client.close()
+    assert last_error is not None
+    detail = _unwrap_wayback_retry(last_error)
+    raise RuntimeError(
+        f"CDX query failed after {attempt} attempts: {detail}"
+    ) from last_error
+
+
+def _cdx_retry_delay(error: BaseException, attempt: int) -> float:
+    backpressure = backpressure_signal(error)
+    if backpressure is not None:
+        _, retry_after = backpressure
+        return retry_after or BACKPRESSURE_COOLDOWN_SECONDS
+    return retry_after_from_error(error) or float(5 * (2 ** (attempt - 1)))
+
+
+def _cdx_retry_message(
+    error: BaseException,
+    delay: float,
+    attempt: int,
+    max_attempts: int,
+) -> str:
+    backpressure = backpressure_signal(error)
+    suffix = f"pausing {delay:g}s before attempt {attempt + 1}/{max_attempts}"
+    if backpressure is None:
+        return f"CDX query error during attempt {attempt}/{max_attempts}; {suffix} ({error})"
+    kind, _retry_after = backpressure
+    source = "HTTP 429" if kind == "http" else "TCP connection refused"
+    return f"rate limit: {source} during CDX query; {suffix}"
+
+
+def _unwrap_wayback_retry(error: BaseException) -> BaseException:
+    for candidate in iter_error_chain(error):
+        if "WaybackRetry" not in type(candidate).__name__:
+            return candidate
+    return error

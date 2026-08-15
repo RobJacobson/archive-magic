@@ -75,10 +75,118 @@ def test_fetch_cdx_delegates_paging_and_parsing_to_wayback(monkeypatch):
             },
         )
     ]
-    assert sessions[0].retries == 4
+    assert sessions[0].retries == 0
     assert fake.closed
     assert result.search_url == "example.org"
     assert result.match_type == "domain"
+
+
+def test_fetch_cdx_pauses_60s_on_connection_refused(monkeypatch):
+    from wayback.exceptions import WaybackRetryError
+
+    attempts = {"n": 0}
+    sleeps: list[float] = []
+    reports: list[str] = []
+
+    class FlakyClient:
+        def __init__(self):
+            self.closed = False
+
+        def search(self, *args, **kwargs):
+            attempts["n"] += 1
+            if attempts["n"] < 3:
+                cause = ConnectionError(
+                    "HTTPSConnectionPool(host='web.archive.org', port=443): "
+                    "Max retries exceeded with url: /cdx/search/cdx "
+                    "(Caused by NewConnectionError("
+                    "\"Failed to establish a new connection: "
+                    "[Errno 61] Connection refused\"))"
+                )
+                raise WaybackRetryError(4, 19.04, cause) from cause
+            return iter([record()])
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(
+        "archive_magic_fetch.cdx.WaybackClient",
+        lambda **_kwargs: FlakyClient(),
+    )
+    result = fetch_cdx(
+        url_pattern="*.example.org",
+        date_start="20040101000000",
+        date_end="20041231235959",
+        retries=4,
+        sleep=sleeps.append,
+        report=reports.append,
+    )
+
+    assert len(result.captures) == 1
+    assert attempts["n"] == 3
+    assert sleeps == [60.0, 60.0]
+    assert reports == [
+        "rate limit: TCP connection refused during CDX query; "
+        "pausing 60s before attempt 2/5",
+        "rate limit: TCP connection refused during CDX query; "
+        "pausing 60s before attempt 3/5",
+    ]
+
+
+def test_fetch_cdx_raises_after_exhausted_connection_refused_retries(monkeypatch):
+    sleeps: list[float] = []
+
+    class RefusedClient:
+        def search(self, *args, **kwargs):
+            raise ConnectionError(
+                "Max retries exceeded: [Errno 61] Connection refused"
+            )
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(
+        "archive_magic_fetch.cdx.WaybackClient",
+        lambda **_kwargs: RefusedClient(),
+    )
+    with pytest.raises(RuntimeError, match="CDX query failed after 3 attempts"):
+        fetch_cdx(
+            url_pattern="http://example.org/",
+            date_start="20040101000000",
+            date_end="20041231235959",
+            retries=2,
+            sleep=sleeps.append,
+            report=lambda _message: None,
+        )
+    assert sleeps == [60.0, 60.0]
+
+
+def test_fetch_cdx_does_not_retry_permanent_errors(monkeypatch):
+    sleeps: list[float] = []
+    attempts = {"n": 0}
+
+    class PermanentClient:
+        def search(self, *args, **kwargs):
+            attempts["n"] += 1
+            raise ValueError("malformed CDX")
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(
+        "archive_magic_fetch.cdx.WaybackClient",
+        lambda **_kwargs: PermanentClient(),
+    )
+    with pytest.raises(RuntimeError, match="CDX query failed after 1 attempts"):
+        fetch_cdx(
+            url_pattern="http://example.org/",
+            date_start="20040101000000",
+            date_end="20041231235959",
+            retries=4,
+            sleep=sleeps.append,
+            report=lambda _message: None,
+        )
+    assert attempts["n"] == 1
+    assert sleeps == []
 
 
 def test_parse_date_bound_strips_hyphens_and_pads_precision():
