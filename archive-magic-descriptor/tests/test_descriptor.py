@@ -20,7 +20,7 @@ id = "example.org"
 url_pattern = "*.example.org"
 [storage]
 authority = "local"
-workspace_directory = "workspace"
+data_directory = "data"
 """ + extra,
         encoding="utf-8",
     )
@@ -43,7 +43,7 @@ wayback_fallback = false
     assert config.source == path.resolve()
     assert config.archive_id == "example.org"
     assert config.url_pattern == "*.example.org"
-    assert config.storage.workspace_directory == (tmp_path / "workspace").resolve()
+    assert config.storage.data_directory == (tmp_path / "data").resolve()
     assert config.warc_target_bytes == DEFAULT_WARC_TARGET_BYTES
     assert config.playback_workers == 2
     assert config.retries == 5
@@ -60,7 +60,7 @@ id = "example.org"
 url_pattern = "example.org"
 [storage]
 authority = "remote"
-workspace_directory = "workspace"
+data_directory = "data"
 [storage.remote]
 bucket = "bucket"
 prefix = "/archives/example.org/"
@@ -119,10 +119,10 @@ def test_descriptor_validation(tmp_path, body, message):
 
 
 def test_storage_config_has_no_compatibility_aliases(tmp_path):
-    local = StorageConfig("local", tmp_path / "workspace")
+    local = StorageConfig("local", tmp_path / "data")
     remote = StorageConfig(
         "remote",
-        tmp_path / "workspace",
+        tmp_path / "data",
         RemoteConfig("bucket", "prefix", "https://example.invalid"),
     )
     assert local.authority == "local"

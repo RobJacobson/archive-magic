@@ -117,18 +117,6 @@ def _open_replay_index(
     archive_id: str,
 ) -> tuple[Path, TextIO]:
     index_path = collection.replay_index
-    other_indexes = sorted(
-        path.name
-        for path in collection.root.iterdir()
-        if path.is_file()
-        and path.suffix in {".cdx", ".cdxj"}
-        and path != index_path
-    )
-    if other_indexes:
-        raise ValidationError(
-            f"archive {archive_id!r}, collection {collection.collection_id!r} "
-            f"contains unexpected indexes: {', '.join(other_indexes)}"
-        )
     try:
         resolved = index_path.resolve(strict=True)
         resolved.relative_to(collection.root)

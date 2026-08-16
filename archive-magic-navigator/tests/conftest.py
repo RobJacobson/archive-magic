@@ -17,7 +17,7 @@ def collection_factory(tmp_path):
     ):
         root = tmp_path / "archives"
         archive = root / archive_id
-        collection = archive / "collections" / collection_id
+        collection = archive
         warc_name = f"{archive_id}-{collection_id}-001.warc.gz"
         warc = collection / warc_name
         warc.parent.mkdir(parents=True, exist_ok=True)

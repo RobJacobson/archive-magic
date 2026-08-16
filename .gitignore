@@ -6,5 +6,6 @@ __pycache__/
 .pytest_cache/
 archives/
 .env
-workspace/
+data/
+logs/
 navigator-cache/

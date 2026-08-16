@@ -45,7 +45,7 @@ id = "example.org"
 url_pattern = "*.example.org"
 [storage]
 authority = "{authority}"
-workspace_directory = "workspace"
+data_directory = "data"
 {remote}
 [fetch]
 start = "2000-01-01"
@@ -290,7 +290,7 @@ def test_cli_uses_descriptor_configured_history(tmp_path, monkeypatch):
     assert captured[0].archive_id == "example.org"
     assert captured[0].date_start == "20000101000000"
     assert captured[0].date_end == "20011231235959"
-    assert captured[0].storage.workspace_directory == (tmp_path / "workspace").resolve()
+    assert captured[0].storage.data_directory == (tmp_path / "data").resolve()
 
 
 def test_remote_reset_rejects_dates_and_warns_before_full_rebuild(

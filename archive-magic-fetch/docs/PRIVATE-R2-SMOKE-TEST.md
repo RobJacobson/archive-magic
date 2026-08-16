@@ -17,8 +17,8 @@ Use a disposable prefix: the reset step intentionally deletes it.
    ```
 
 3. Limit `[fetch]` to a small historical interval for the smoke test. Keep
-   `workspace_directory = "workspace"` so transient working files are visible beside the
-   descriptor.
+   `data_directory = "data"` so transient working files remain isolated from the
+   descriptor and logs.
 4. Configure credentials through the standard AWS/Boto3 chain (for example an AWS
    profile or process environment). Archive Magic does not load `.env`.
 
@@ -31,8 +31,8 @@ uv run archive-magic-fetch /absolute/path/to/example.org/archive.toml
 ```
 
 Confirm the prefix contains WARC/CDXJ objects and
-`collections-manifest.json`. Confirm `workspace/collections/<year>` contains no
-finalized WARC or CDXJ after success. Re-run Fetch without source changes and
+`collections-manifest.json`. Confirm `data/` contains no finalized WARC or CDXJ
+after success. Re-run Fetch without source changes and
 confirm it downloads only the active CDXJ/tail and performs no WARC/index uploads.
 
 From the Navigator project:
@@ -48,12 +48,12 @@ that replay produces authenticated WARC range reads from the bucket.
 
 Extend the selected source interval or wait for a new snapshot, then run Fetch
 again. The expected order is changed/new WARC, live CDXJ, manifest verification,
-run record, then local-working-file cleanup. Earlier WARC objects must be
+the run record, then local-working-file cleanup. Earlier WARC objects must be
 untouched; an existing tail must be an exact prefix extension.
 
 To exercise recovery, interrupt or fail one upload and confirm the finalized
-WARC/CDXJ remain in the workspace. The next run must finish through the normal
-materialize/index/publish path. Do not delete the workspace during an incomplete
+WARC/CDXJ remain in `data/`. The next run must finish through the normal
+materialize/index/publish path. Do not delete `data/` during an incomplete
 publication; without it, reset and regeneration are required.
 
 Keep Navigator running during the update. It should use the previous validated
@@ -68,5 +68,5 @@ uv run archive-magic-fetch /absolute/path/to/example.org --reset-data
 ```
 
 Remote reset rejects `--start`/`--end`, prints a downtime warning, deletes only the
-complete configured prefix, clears the workspace archive data, and rebuilds the
+complete configured prefix, clears the managed data directory, and rebuilds the
 full configured range. Confirm a neighboring prefix remains untouched.

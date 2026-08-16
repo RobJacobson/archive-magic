@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
 import threading
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Iterator, TextIO
 from .identity import is_invalid_uri_payload_digest, wayback_url
 from .models import CaptureIdentity
 from .resolution import CaptureKind, CaptureOutcome, UrlOutcome
@@ -19,6 +23,24 @@ _RESULT_STYLES = {
 _OSC = "\033]8;;"
 _ST = "\033\\"
 _LOCK = threading.Lock()
+_LOG_STREAM: TextIO | None = None
+_ESCAPE = re.compile(r"\x1b(?:\][^\x1b]*(?:\x1b\\|\x07)|\[[0-?]*[ -/]*[@-~])")
+
+
+@contextmanager
+def mirror_output(path: Path) -> Iterator[None]:
+    """Mirror emitted console output to a plain-text log."""
+
+    global _LOG_STREAM
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("x", encoding="utf-8", buffering=1) as stream:
+        with _LOCK:
+            _LOG_STREAM = stream
+        try:
+            yield
+        finally:
+            with _LOCK:
+                _LOG_STREAM = None
 
 
 def emit(text: str) -> None:
@@ -26,6 +48,8 @@ def emit(text: str) -> None:
 
     with _LOCK:
         print(text, flush=True)
+        if _LOG_STREAM is not None:
+            _LOG_STREAM.write(_ESCAPE.sub("", text) + "\n")
 
 
 def links_enabled() -> bool:

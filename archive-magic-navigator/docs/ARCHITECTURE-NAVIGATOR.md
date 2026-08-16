@@ -65,7 +65,7 @@ url_pattern = "*.example.org"
 
 [storage]
 authority = "remote"
-workspace_directory = "workspace"
+data_directory = "data"
 
 [storage.remote]
 bucket = "archive-magic"
@@ -81,13 +81,13 @@ warc_target_bytes = 250000000
 wayback_fallback = true
 ```
 
-`archive.toml` is user-authored intent. `collections-manifest.json` is generated
-publication state and deliberately keeps its existing JSON format.
+`archive.toml` is user-authored intent. `collections-manifest.json` is generated,
+versioned publication state.
 
 Unknown keys and unsupported schema versions fail startup. The archive ID is
 validated for safe use in pywb routes and local paths. Relative paths and `~` are
-resolved from the descriptor directory. `workspace_directory` is the exact archive
-root; Navigator never appends the archive ID. Remote authority requires
+resolved from the descriptor directory. `data_directory` is the exact archive
+data root; Navigator never appends the archive ID. Remote authority requires
 `[storage.remote]`, while local authority rejects it.
 
 Navigator validates the shared Fetch table even though it does not use acquisition
@@ -114,11 +114,11 @@ invalid entry or duplicate archive ID; it never silently serves a partial catalo
 
 `--source` applies to every selected descriptor:
 
-- `auto`: local authority uses the exact workspace; remote authority uses its
+- `auto`: local authority uses the exact data directory; remote authority uses its
   bucket.
-- `local`: use every descriptor's workspace. A remote-authoritative Fetch
-  workspace normally has no finalized WARC/CDXJ working copies after success, so
-  use `remote` or `auto` for those descriptors unless the workspace was populated
+- `local`: use every descriptor's data directory. A remote-authoritative Fetch
+  data directory normally has no finalized WARC/CDXJ working copies after success, so
+  use `remote` or `auto` for those descriptors unless the data directory was populated
   independently.
 - `remote`: require remote settings for every entry and use each bucket/prefix.
 
@@ -133,19 +133,17 @@ environment, and Archive Magic neither injects per-archive keys nor loads `.env`
 A local archive has this exact root:
 
 ```text
-<workspace_directory>/
+<data_directory>/
   collections-manifest.json
-  collections/
-    2004/
-      example.org-2004-001.warc.gz
-      example.org-2004-index.cdxj
-  captures/                 # ignored by playback
+  example.org-2004-001.warc.gz
+  example.org-2004-index.cdxj
+  example.org-2005-001.warc.gz
+  example.org-2005-index.cdxj
 ```
 
-Navigator discovers playable collection directories, validates safe names and
-expected index/WARC structure, and gives pywb local collection paths. The generated
-manifest may be checked by tooling but the local collection/index contents are what
-pywb serves. `captures/` remains Fetch diagnostics and is never exposed as archive
+Navigator discovers logical yearly collections from the strict index filenames,
+validates their index/WARC structure, and gives pywb the shared data path. Fetch
+run records live in the sibling `logs/` directory and are never exposed as archive
 content.
 
 ## Remote playback and visible cache
@@ -162,12 +160,11 @@ Within it, archive IDs remain separated:
 navigator-cache/
   example.org/
     collections-manifest.json
-    collections/
-      2004/example.org-2004-index.cdxj
+    example.org-2004-index.cdxj
 ```
 
 WARC objects are not downloaded into this cache. The generated pywb collection uses
-an authenticated `s3://bucket/prefix/collections/<id>/` archive path, allowing pywb
+an authenticated `s3://bucket/prefix/` archive path, allowing pywb
 to issue byte-range reads using the standard AWS credential chain. Only indexes and
 the last accepted manifest are cached locally.
 

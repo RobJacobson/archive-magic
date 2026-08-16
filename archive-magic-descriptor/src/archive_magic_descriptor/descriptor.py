@@ -24,7 +24,7 @@ class RemoteConfig:
 @dataclass(frozen=True)
 class StorageConfig:
     authority: str
-    workspace_directory: Path
+    data_directory: Path
     remote: RemoteConfig | None = None
 
 
@@ -82,7 +82,7 @@ def load_descriptor(value: Path | str) -> ArchiveDescriptor:
     _reject_unknown(archive, {"id", "url_pattern"}, "archive")
     _reject_unknown(
         storage_data,
-        {"authority", "workspace_directory", "remote"},
+        {"authority", "data_directory", "remote"},
         "storage",
     )
     _reject_unknown(
@@ -105,10 +105,10 @@ def load_descriptor(value: Path | str) -> ArchiveDescriptor:
     if authority not in {"local", "remote"}:
         raise ValueError("storage.authority must be 'local' or 'remote'")
     base = source.parent
-    workspace = _path(
+    data_directory = _path(
         base,
-        storage_data.get("workspace_directory", "workspace"),
-        "storage.workspace_directory",
+        storage_data.get("data_directory", "data"),
+        "storage.data_directory",
     )
 
     remote_value = storage_data.get("remote")
@@ -127,7 +127,7 @@ def load_descriptor(value: Path | str) -> ArchiveDescriptor:
     return ArchiveDescriptor(
         archive_id=archive_id,
         url_pattern=url_pattern,
-        storage=StorageConfig(authority, workspace, remote),
+        storage=StorageConfig(authority, data_directory, remote),
         warc_target_bytes=_positive_int(
             fetch.get("warc_target_bytes", DEFAULT_WARC_TARGET_BYTES),
             "fetch.warc_target_bytes",

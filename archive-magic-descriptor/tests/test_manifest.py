@@ -25,18 +25,18 @@ def test_manifest_round_trip_sorts_warcs_and_rejects_unknown_keys():
         {
             "2005": ManifestCollection(
                 timestamp,
-                artifact("collections/2005/example-2005-index.cdxj"),
+                artifact("example-2005-index.cdxj"),
                 (
-                    artifact("collections/2005/example-2005-002.warc.gz"),
-                    artifact("collections/2005/example-2005-001.warc.gz"),
+                    artifact("example-2005-002.warc.gz"),
+                    artifact("example-2005-001.warc.gz"),
                 ),
             )
         },
     )
     parsed = parse_manifest(manifest.to_bytes())
     assert [item.key for item in parsed.collections["2005"].warcs] == [
-        "collections/2005/example-2005-001.warc.gz",
-        "collections/2005/example-2005-002.warc.gz",
+        "example-2005-001.warc.gz",
+        "example-2005-002.warc.gz",
     ]
     extra = manifest.to_bytes().replace(
         b'"published_at"',

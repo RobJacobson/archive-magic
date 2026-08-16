@@ -230,12 +230,21 @@ def reconcile_missing_indexes(layout: ArchiveLayout) -> list[str]:
     """Rebuild missing indexes; incrementally replace lines for new or newer WARCs."""
 
     updated: list[str] = []
-    if not layout.collections_root.is_dir():
+    if not layout.root.is_dir():
         return updated
-    for collection_dir in sorted(layout.collections_root.iterdir()):
-        if not collection_dir.is_dir():
-            continue
-        collection_id = layout.validate_collection_id(collection_dir.name)
+    prefix = f"{layout.archive_id}-"
+    suffix = "-001.warc.gz"
+    collection_ids = sorted(
+        {
+            path.name[len(prefix) : -len(suffix)]
+            for path in layout.root.glob(f"{layout.archive_id}-*-001.warc.gz")
+            if path.is_file()
+            and path.name.startswith(prefix)
+            and path.name.endswith(suffix)
+        }
+    )
+    for collection_id in collection_ids:
+        layout.validate_collection_id(collection_id)
         warcs = list_collection_warcs(layout, collection_id)
         if not warcs:
             continue

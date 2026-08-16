@@ -1,4 +1,4 @@
-"""Domain archive layout, atomic publication, and immutable run records."""
+"""Flat archive-data layout, atomic publication, and immutable run records."""
 
 from __future__ import annotations
 
@@ -25,7 +25,15 @@ from .models import (
 _WWW_ALIAS_PREFIX = re.compile(r"^www\d*\.")
 _TEMP_NAME = re.compile(r"^\.tmp-|^.*\.tmp$")
 _COLLECTION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
-_LEGACY_NAMES = ("archive", "sources", "index.cdxj", "collection.json", "failures.json")
+_LEGACY_NAMES = (
+    "archive",
+    "sources",
+    "index.cdxj",
+    "collection.json",
+    "failures.json",
+    "collections",
+    "captures",
+)
 
 
 @dataclass(frozen=True)
@@ -39,12 +47,8 @@ class ArchiveLayout:
         object.__setattr__(self, "root", Path(self.root).expanduser().resolve())
 
     @property
-    def collections_root(self) -> Path:
-        return self.root / "collections"
-
-    @property
-    def captures_root(self) -> Path:
-        return self.root / "captures"
+    def logs_root(self) -> Path:
+        return self.root.parent / "logs"
 
     def validate_collection_id(self, collection_id: str) -> str:
         if not _COLLECTION_ID.fullmatch(collection_id) or collection_id in {".", ".."}:
@@ -57,16 +61,14 @@ class ArchiveLayout:
         return run_id
 
     def collection_dir(self, collection_id: str) -> Path:
-        return self.collections_root / self.validate_collection_id(collection_id)
+        self.validate_collection_id(collection_id)
+        return self.root
 
-    def capture_dir(self, collection_id: str) -> Path:
-        return self.captures_root / self.validate_collection_id(collection_id)
+    def run_record(self, run_id: str) -> Path:
+        return self.logs_root / f"{self.validate_run_id(run_id)}.json"
 
-    def run_dir(self, collection_id: str, run_id: str) -> Path:
-        return self.capture_dir(collection_id) / "runs" / self.validate_run_id(run_id)
-
-    def run_record(self, collection_id: str, run_id: str) -> Path:
-        return self.run_dir(collection_id, run_id) / "run.json"
+    def run_log(self, run_id: str) -> Path:
+        return self.logs_root / f"{self.validate_run_id(run_id)}.log"
 
     def index_filename(self, collection_id: str) -> str:
         collection_id = self.validate_collection_id(collection_id)
@@ -159,11 +161,10 @@ def reject_legacy_layout(layout: ArchiveLayout) -> None:
 
 
 def ensure_collection_dirs(layout: ArchiveLayout) -> None:
-    """Create permanent domain archive and capture-state directories."""
+    """Create the data and log directories."""
 
     layout.root.mkdir(parents=True, exist_ok=True)
-    layout.collections_root.mkdir(parents=True, exist_ok=True)
-    layout.captures_root.mkdir(parents=True, exist_ok=True)
+    layout.logs_root.mkdir(parents=True, exist_ok=True)
 
 
 def init_run_id(layout: ArchiveLayout) -> str:
@@ -172,9 +173,19 @@ def init_run_id(layout: ArchiveLayout) -> str:
     base = current_run_id()
     for attempt in range(1000):
         candidate = base if attempt == 0 else f"{base}-{attempt:02d}"
-        if not any(layout.captures_root.glob(f"*/runs/{candidate}")):
+        if not layout.run_record(candidate).exists() and not layout.run_log(candidate).exists():
             return candidate
     raise RuntimeError("unable to allocate a unique run source directory")
+
+
+def init_run_record(layout: ArchiveLayout, run_id: str) -> Path:
+    """Create the invocation's single structured log."""
+
+    destination = layout.run_record(run_id)
+    payload = {"run_id": run_id, "archive_id": layout.archive_id, "years": {}}
+    with destination.open("x", encoding="utf-8") as stream:
+        stream.write(json.dumps(payload) + "\n")
+    return destination
 
 
 def cleanup_temps(layout: ArchiveLayout) -> None:
@@ -259,7 +270,9 @@ def reset_collection_data(layout: ArchiveLayout, collection_id: str) -> None:
         path.unlink()
     collection_dir = layout.collection_dir(collection_id)
     if collection_dir.is_dir():
-        for path in collection_dir.glob("*.warc.gz.partial"):
+        for path in collection_dir.glob(
+            f"{layout.archive_id}-{collection_id}-*.warc.gz.partial"
+        ):
             path.unlink()
     index_path = layout.collection_index(collection_id)
     if index_path.is_file():
@@ -308,12 +321,12 @@ def warc_artifact_from_path(
     layout: ArchiveLayout,
     path: Path,
     *,
+    collection_id: str,
     record_count: int,
 ) -> WarcArtifact:
     """Build a WarcArtifact descriptor for a finalized WARC."""
 
     relative = path.relative_to(layout.root).as_posix()
-    collection_id = path.parent.name
     layout.validate_collection_id(collection_id)
     expected_parent = layout.collection_dir(collection_id)
     match = _collection_warc_name_pattern(layout, collection_id).fullmatch(
@@ -373,9 +386,7 @@ def write_run_record(
         failures,
         key=lambda item: (item.identity.sort_key(), item.category.value, item.message),
     )
-    payload = {
-        "run_id": run_id,
-        "archive_id": layout.archive_id,
+    year = {
         "collection_id": collection_id,
         "url_pattern": url_pattern,
         "date_start": date_start,
@@ -430,10 +441,12 @@ def write_run_record(
             for item in ordered_failures
         ],
     }
-    destination = layout.run_record(collection_id, run_id)
-    if destination.exists():
-        raise FileExistsError(f"run record already exists: {destination}")
+    destination = layout.run_record(run_id)
+    payload = json.loads(destination.read_text(encoding="utf-8"))
+    payload["years"][collection_id] = year
     tmp = exclusive_temp_path(destination.parent, suffix=".run.json.tmp")
-    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    tmp.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
     publish_file_atomically(tmp, destination)
     return destination

@@ -20,7 +20,7 @@ id = "example.org"
 url_pattern = "*.example.org"
 [storage]
 authority = "local"
-workspace_directory = "workspace"
+data_directory = "data"
 """ + extra,
         encoding="utf-8",
     )
@@ -65,7 +65,7 @@ id = "example.org"
 url_pattern = "example.org"
 [storage]
 authority = "remote"
-workspace_directory = "workspace"
+data_directory = "data"
 [storage.remote]
 bucket = "bucket"
 prefix = "/archives/example.org/"

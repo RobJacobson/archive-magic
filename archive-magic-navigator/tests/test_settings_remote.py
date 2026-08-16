@@ -20,7 +20,7 @@ id = "example.org"
 url_pattern = "example.org"
 [storage]
 authority = "local"
-workspace_directory = "workspace"
+data_directory = "data"
 [playback]
 wayback_fallback = false
 """,
@@ -28,7 +28,7 @@ wayback_fallback = false
     )
     settings = load_config(path)
     assert settings.archive_id == "example.org"
-    assert settings.storage.workspace_directory == (tmp_path / "workspace").resolve()
+    assert settings.storage.data_directory == (tmp_path / "data").resolve()
     assert settings.wayback_fallback is False
 
 
@@ -47,7 +47,7 @@ id = "example.org"
 url_pattern = "*.example.org"
 [storage]
 authority = "remote"
-workspace_directory = "workspace"
+data_directory = "data"
 [storage.remote]
 bucket = "bucket"
 prefix = "/archives/example.org/"
@@ -70,8 +70,8 @@ def remote_config(prefix="example.org"):
 
 
 def manifest_and_index(index_bytes):
-    warc_key = "collections/2004/example.org-2004-001.warc.gz"
-    index_key = "collections/2004/example.org-2004-index.cdxj"
+    warc_key = "example.org-2004-001.warc.gz"
+    index_key = "example.org-2004-index.cdxj"
     payload = {
         "published_at": "2026-08-13T20:15:00Z",
         "collections": {
@@ -137,9 +137,7 @@ def test_remote_store_caches_index_and_builds_s3_archive_path(tmp_path, monkeypa
 
     collection = archive.collections[0]
     assert collection.replay_index.read_bytes() == index
-    assert (
-        collection.archive_path == "s3://bucket/example.org/collections/2004/"
-    )
+    assert collection.archive_path == "s3://bucket/example.org/"
     environment = store.child_environment()
     assert environment["AWS_ENDPOINT_URL_S3"] == "https://endpoint"
     assert environment["AWS_DEFAULT_REGION"] == "auto"

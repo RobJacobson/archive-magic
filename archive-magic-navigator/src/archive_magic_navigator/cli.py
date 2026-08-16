@@ -67,7 +67,7 @@ def parse_args(argv: Sequence[str] | None = None) -> NavigatorRequest:
         "--source",
         choices=("auto", "local", "remote"),
         default="auto",
-        help="serve each archive from its authority, local workspace, or remote bucket",
+        help="serve each archive from its authority, local data, or remote bucket",
     )
     parser.add_argument("--cache", type=Path, metavar="PATH")
     parser.add_argument(
@@ -141,10 +141,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                     ).rstrip("/")
                 else:
                     archive = select_archive_root(
-                        item.storage.workspace_directory,
+                        item.storage.data_directory,
                         item.archive_id,
                     )
-                    label = str(item.storage.workspace_directory)
+                    label = str(item.storage.data_directory)
                 validate_archive(archive)
             except (NavigatorError, ValueError) as error:
                 archive_errors.append(f"{item.archive_id}: {error}")

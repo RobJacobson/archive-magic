@@ -18,7 +18,7 @@ uv run archive-magic-navigator ~/archives/example.org --open
 ```
 
 `--source auto` is the default: local-authoritative descriptors serve their exact
-`workspace_directory`, while remote-authoritative descriptors cache validated
+`data_directory`, while remote-authoritative descriptors cache validated
 indexes locally and serve WARC ranges from the bucket.
 
 Useful process options are:

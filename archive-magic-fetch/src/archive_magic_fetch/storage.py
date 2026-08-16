@@ -222,17 +222,12 @@ class PublicationManager:
 
         if self.config.authority != "remote":
             return
-        directory = layout.collection_dir(collection_id)
-        if not directory.is_dir():
-            return
-        for path in directory.iterdir():
-            if path.is_file() and (
-                path.name.endswith(".warc.gz") or path.name.endswith(".cdxj")
-            ):
-                path.unlink()
+        for path in list_collection_warcs(layout, collection_id):
+            path.unlink()
+        layout.collection_index(collection_id).unlink(missing_ok=True)
 
     def reset_archive(self, layout: ArchiveLayout) -> None:
-        """Delete exactly this archive prefix and clear its local workspace."""
+        """Delete exactly this archive prefix and clear its local data directory."""
 
         if self.config.authority != "remote":
             raise ValueError("remote archive reset requires remote authority")

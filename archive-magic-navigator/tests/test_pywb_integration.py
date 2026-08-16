@@ -32,7 +32,7 @@ FIXTURE = Path(__file__).parent / "fixtures" / "collection"
 
 
 def archive_for_root(archive_id: str, root: Path) -> Archive:
-    collection_root = root / "collections" / "2020"
+    collection_root = root
     replay_index = collection_root / f"{archive_id}-2020-index.cdxj"
     return Archive(
         archive_id,
@@ -44,7 +44,7 @@ def archive_for_root(archive_id: str, root: Path) -> Archive:
 def copy_fixture(archives: Path, archive_id: str) -> Archive:
     root = archives / archive_id
     shutil.copytree(FIXTURE, root)
-    collection_root = root / "collections" / "2020"
+    collection_root = root
     if archive_id != "fixture":
         old_index = collection_root / "fixture-2020-index.cdxj"
         text = old_index.read_text(encoding="utf-8").replace(
@@ -388,12 +388,12 @@ def test_real_pywb_replays_versions_revisit_and_subresources_read_only(
 
 @pytest.mark.integration
 def test_real_pywb_reads_private_s3_warc_byte_ranges(tmp_path):
-    collection_root = (FIXTURE / "collections" / "2020").resolve()
+    collection_root = FIXTURE.resolve()
     replay = ReplayCollection(
         "2020",
         collection_root,
         collection_root / "fixture-2020-index.cdxj",
-        "s3://bucket/collections/2020/",
+        "s3://bucket/",
     )
     archive = Archive("fixture", FIXTURE.resolve(), (replay,))
 
@@ -422,7 +422,7 @@ def test_real_pywb_reads_private_s3_warc_byte_ranges(tmp_path):
     assert b"Archived version one" in body
     assert handler.ranges
     assert all(
-        filename.startswith("collections/2020/")
+        "/" not in filename
         and byte_range is not None
         and byte_range.startswith("bytes=")
         and authorization is not None
@@ -582,7 +582,7 @@ def test_real_pywb_aggregates_flat_collections_and_replays_same_collection_revis
 
     archives = tmp_path / "archives"
     root = archives / "annual"
-    year_dir = root / "collections" / "2020"
+    year_dir = root
     year_dir.mkdir(parents=True)
 
     url = "http://example.org/"
@@ -664,8 +664,7 @@ def test_real_pywb_aggregates_flat_collections_and_replays_same_collection_revis
         encoding="utf-8",
     )
 
-    second_dir = root / "collections" / "2021"
-    second_dir.mkdir()
+    second_dir = root
     second_url = "http://second.example/"
     second_warc = second_dir / "annual-2021-001.warc.gz"
     with second_warc.open("wb") as stream:

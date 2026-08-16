@@ -53,7 +53,7 @@ def test_select_archive_root_resolves_portable_collections(collection_factory):
 
 def test_archive_discovery_ignores_capture_metadata(collection_factory):
     _, archive, _, _ = collection_factory()
-    run = archive / "captures" / "2020" / "runs" / "run-1"
+    run = archive.parent / "logs" / "run-1"
     run.mkdir(parents=True)
     (run / "run.json").write_text("{}\n", encoding="utf-8")
 
@@ -67,7 +67,7 @@ def test_select_archive_root_lists_multiple_portable_collections_sorted(
 ):
     _, archive, _, _ = collection_factory(collection_id="2020")
     collection_factory(collection_id="2008")
-    run = archive / "captures" / "2008" / "runs" / "run-noise"
+    run = archive.parent / "logs" / "run-noise"
     run.mkdir(parents=True)
     (run / "run.json").write_text("{}\n", encoding="utf-8")
 
@@ -78,9 +78,7 @@ def test_select_archive_root_lists_multiple_portable_collections_sorted(
 
 def test_unindexed_collection_dir_is_skipped(collection_factory):
     _, archive, _, _ = collection_factory()
-    incomplete = archive / "collections" / "2004"
-    incomplete.mkdir(parents=True)
-    (incomplete / "example.org-2004-001.warc.gz.partial").write_bytes(b"partial")
+    (archive / "example.org-2004-001.warc.gz.partial").write_bytes(b"partial")
 
     selected = select_archive_root(archive, "example.org")
 
@@ -89,24 +87,23 @@ def test_unindexed_collection_dir_is_skipped(collection_factory):
 
 def test_archive_with_only_unindexed_year_is_not_playable(tmp_path):
     archive = tmp_path / "example.org"
-    collection = archive / "collections" / "2004"
-    collection.mkdir(parents=True)
-    (collection / "example.org-2004-001.warc.gz.partial").write_bytes(b"partial")
+    archive.mkdir(parents=True)
+    (archive / "example.org-2004-001.warc.gz.partial").write_bytes(b"partial")
 
     with pytest.raises(ValidationError, match="no playable collections"):
         select_archive_root(archive, "example.org")
 
 
-def test_select_archive_root_rejects_escaping_directory_symlink(
+def test_select_archive_root_rejects_escaping_index_symlink(
     collection_factory,
     tmp_path,
 ):
     _, archive, _, _ = collection_factory()
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    (archive / "collections" / "escaped").symlink_to(outside, target_is_directory=True)
+    outside = tmp_path / "outside.cdxj"
+    outside.write_text("x\n", encoding="utf-8")
+    (archive / "example.org-escaped-index.cdxj").symlink_to(outside)
 
-    with pytest.raises(ValidationError, match="not a contained directory"):
+    with pytest.raises(ValidationError, match="not contained"):
         select_archive_root(archive, "example.org")
 
 

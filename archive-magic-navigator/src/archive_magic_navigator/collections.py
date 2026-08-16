@@ -49,48 +49,25 @@ def validate_collection_id(collection_id: str) -> str:
 
 
 def select_archive_root(root: Path, archive_id: str) -> Archive:
-    """Validate an exact archive workspace root from a descriptor."""
+    """Validate an exact archive data root from a descriptor."""
 
     archive_id = validate_archive_id(archive_id)
     try:
         resolved = Path(root).expanduser().resolve(strict=True)
     except (OSError, RuntimeError) as error:
-        raise ValidationError(f"archive workspace does not exist: {root}") from error
+        raise ValidationError(f"archive data does not exist: {root}") from error
     if not resolved.is_dir():
-        raise ValidationError(f"archive workspace is not a directory: {resolved}")
+        raise ValidationError(f"archive data is not a directory: {resolved}")
     return _validate_archive(archive_id, resolved)
 
 
 def _validate_archive(archive_id: str, root: Path) -> Archive:
     validate_archive_id(archive_id)
-    collections_root = root / "collections"
-    try:
-        resolved_collections = collections_root.resolve(strict=True)
-        resolved_collections.relative_to(root)
-    except (OSError, RuntimeError, ValueError) as error:
-        raise ValidationError(
-            f"archive {archive_id!r} has no safe collections directory: "
-            f"{collections_root}"
-        ) from error
-    if not resolved_collections.is_dir():
-        raise ValidationError(
-            f"archive {archive_id!r} collections path is not a directory: "
-            f"{resolved_collections}"
-        )
-
-    entries = sorted(
-        (entry for entry in resolved_collections.iterdir() if entry.is_dir()),
-        key=lambda entry: entry.name,
-    )
+    pattern = f"{archive_id}-*-index.cdxj"
     collections = tuple(
-        collection
-        for collection in (
-            _validate_replay_collection(
-                root, archive_id, resolved_collections, entry
-            )
-            for entry in entries
-        )
-        if collection is not None
+        _validate_replay_collection(root, archive_id, index)
+        for index in sorted(root.glob(pattern))
+        if index.is_file()
     )
     if not collections:
         raise ValidationError(f"archive {archive_id!r} has no playable collections")
@@ -98,28 +75,20 @@ def _validate_archive(archive_id: str, root: Path) -> Archive:
 
 
 def _validate_replay_collection(
-    archive_root: Path,
+    root: Path,
     archive_id: str,
-    collections_root: Path,
-    candidate: Path,
-) -> ReplayCollection | None:
-    collection_id = validate_collection_id(candidate.name)
-    root = _resolve_immediate_child(
-        collections_root,
-        candidate,
-        f"collection {collection_id!r} in archive {archive_id!r}",
+    replay_index: Path,
+) -> ReplayCollection:
+    prefix, suffix = f"{archive_id}-", "-index.cdxj"
+    collection_id = validate_collection_id(
+        replay_index.name[len(prefix) : -len(suffix)]
     )
-    replay_index = root / f"{archive_id}-{collection_id}-index.cdxj"
-    if not replay_index.is_file():
-        return None
-    return ReplayCollection(collection_id, root, replay_index)
-
-
-def _resolve_immediate_child(parent: Path, candidate: Path, label: str) -> Path:
     try:
-        resolved = candidate.resolve(strict=True)
+        resolved = replay_index.resolve(strict=True)
     except (OSError, RuntimeError) as error:
-        raise ValidationError(f"{label} cannot be resolved: {candidate}") from error
-    if resolved.parent != parent or not resolved.is_dir():
-        raise ValidationError(f"{label} is not a contained directory: {candidate}")
-    return resolved
+        raise ValidationError(
+            f"collection index cannot be resolved: {replay_index}"
+        ) from error
+    if resolved.parent != root:
+        raise ValidationError(f"collection index is not contained: {replay_index}")
+    return ReplayCollection(collection_id, root, resolved)
