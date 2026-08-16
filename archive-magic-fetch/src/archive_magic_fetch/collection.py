@@ -64,12 +64,11 @@ class ArchiveLayout:
         self.validate_collection_id(collection_id)
         return self.root
 
-    def run_dir(self, run_id: str) -> Path:
-        return self.logs_root / self.validate_run_id(run_id)
+    def run_record(self, run_id: str) -> Path:
+        return self.logs_root / f"{self.validate_run_id(run_id)}.json"
 
-    def run_record(self, collection_id: str, run_id: str) -> Path:
-        collection_id = self.validate_collection_id(collection_id)
-        return self.run_dir(run_id) / f"{collection_id}.json"
+    def run_log(self, run_id: str) -> Path:
+        return self.logs_root / f"{self.validate_run_id(run_id)}.log"
 
     def index_filename(self, collection_id: str) -> str:
         collection_id = self.validate_collection_id(collection_id)
@@ -174,9 +173,19 @@ def init_run_id(layout: ArchiveLayout) -> str:
     base = current_run_id()
     for attempt in range(1000):
         candidate = base if attempt == 0 else f"{base}-{attempt:02d}"
-        if not (layout.logs_root / candidate).exists():
+        if not layout.run_record(candidate).exists() and not layout.run_log(candidate).exists():
             return candidate
     raise RuntimeError("unable to allocate a unique run source directory")
+
+
+def init_run_record(layout: ArchiveLayout, run_id: str) -> Path:
+    """Create the invocation's single structured log."""
+
+    destination = layout.run_record(run_id)
+    payload = {"run_id": run_id, "archive_id": layout.archive_id, "years": {}}
+    with destination.open("x", encoding="utf-8") as stream:
+        stream.write(json.dumps(payload) + "\n")
+    return destination
 
 
 def cleanup_temps(layout: ArchiveLayout) -> None:
@@ -377,9 +386,7 @@ def write_run_record(
         failures,
         key=lambda item: (item.identity.sort_key(), item.category.value, item.message),
     )
-    payload = {
-        "run_id": run_id,
-        "archive_id": layout.archive_id,
+    year = {
         "collection_id": collection_id,
         "url_pattern": url_pattern,
         "date_start": date_start,
@@ -434,10 +441,12 @@ def write_run_record(
             for item in ordered_failures
         ],
     }
-    destination = layout.run_record(collection_id, run_id)
-    if destination.exists():
-        raise FileExistsError(f"run record already exists: {destination}")
+    destination = layout.run_record(run_id)
+    payload = json.loads(destination.read_text(encoding="utf-8"))
+    payload["years"][collection_id] = year
     tmp = exclusive_temp_path(destination.parent, suffix=".run.json.tmp")
-    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    tmp.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
     publish_file_atomically(tmp, destination)
     return destination

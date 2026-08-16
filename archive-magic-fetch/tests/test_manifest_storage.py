@@ -538,7 +538,7 @@ def test_remote_run_record_is_written_before_working_files_are_evicted(
     original_evict = PublicationManager.evict_collection
 
     def evict(self, layout, collection_id):
-        observed["run_record"] = any(layout.logs_root.glob(f"*/{collection_id}.json"))
+        observed["run_record"] = any(layout.logs_root.glob("*.json"))
         collection_dir = layout.collection_dir(collection_id)
         observed["working_files"] = bool(
             list(collection_dir.glob("*.warc.gz")) or list(collection_dir.glob("*.cdxj"))

@@ -22,6 +22,7 @@ from .collection import (
     ensure_collection_dirs,
     index_artifact_from_path,
     init_run_id,
+    init_run_record,
     list_collection_warcs,
     normalize_archive_id,
     reject_legacy_layout,
@@ -29,7 +30,7 @@ from .collection import (
     write_run_record,
 )
 from .config import DEFAULT_RETRIES, DEFAULT_WARC_TARGET_BYTES, StorageConfig
-from .console import emit, format_elapsed, log_url_outcome
+from .console import emit, format_elapsed, log_url_outcome, mirror_output
 from .index import (
     parse_cdxj_line,
     publish_collection_index,
@@ -126,6 +127,10 @@ def run_fetch(
 ) -> FetchResult:
     """Execute the annual fetch pipeline with bounded playback workers."""
 
+    layout = ArchiveLayout(settings.storage.data_directory, settings.archive_id)
+    layout.logs_root.mkdir(parents=True, exist_ok=True)
+    run_id = init_run_id(layout)
+    init_run_record(layout, run_id)
     factory = client_factory or make_client
     workers = PlaybackWorkers(
         factory,
@@ -138,7 +143,14 @@ def run_fetch(
         retries=settings.retries,
     )
     try:
-        return _run_fetch(settings, workers=workers, sleep=sleep)
+        with mirror_output(layout.run_log(run_id)):
+            return _run_fetch(
+                settings,
+                layout=layout,
+                run_id=run_id,
+                workers=workers,
+                sleep=sleep,
+            )
     finally:
         workers.close()
 
@@ -146,12 +158,13 @@ def run_fetch(
 def _run_fetch(
     settings: FetchSettings,
     *,
+    layout: ArchiveLayout,
+    run_id: str,
     workers: PlaybackWorkers,
     sleep,
 ) -> FetchResult:
     """Execute serial years with parallel playback and one WARC writer."""
 
-    layout = ArchiveLayout(settings.storage.data_directory, settings.archive_id)
     publisher = PublicationManager(settings.storage)
     if settings.reset_data and settings.storage.authority == "remote":
         publisher.reset_archive(layout)
@@ -163,7 +176,6 @@ def _run_fetch(
         reconcile_missing_indexes(layout)
 
     metrics = RunMetrics()
-    run_id = init_run_id(layout)
     all_failures: list[UnresolvedFailure] = []
     first_year = int(settings.date_start[:4])
     last_year = int(settings.date_end[:4])

@@ -29,8 +29,8 @@ archives/
       example.org-2004-001.warc.gz
       example.org-2004-index.cdxj
     logs/
-      <run-id>/
-        2004.json
+      <run-id>.json
+      <run-id>.log
     navigator-cache/       # created only for remote playback
 ```
 
@@ -76,8 +76,8 @@ The bucket prefix is the source of truth. Before fetching, Fetch validates or
 downloads the selected collection's CDXJ and final WARC into `data/`. It
 runs the same append/index pipeline as local authority, publishes changed
 WARC/index objects, and commits `collections-manifest.json` last. After a verified
-commit it removes the finalized local working copies. Fetch keeps successful
-per-year run records grouped by invocation under `logs/`.
+commit it removes the finalized local working copies. Fetch writes one JSON record
+and one console log per invocation under `logs/`.
 Navigator keeps indexes in the visible `navigator-cache/`, streams WARC ranges
 from the bucket, and continues using its last validated index during an incomplete
 publication or transient bucket error.

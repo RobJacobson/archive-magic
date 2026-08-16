@@ -966,13 +966,19 @@ def test_completed_run_reports_expected_failures(tmp_path):
         fetch_mod.fetch_cdx = original
 
     assert result.exit_code == 0
-    run_dirs = list(layout.logs_root.iterdir())
-    assert len(run_dirs) == 1
-    record = json.loads((run_dirs[0] / "2004.json").read_text())
+    records = list(layout.logs_root.glob("*.json"))
+    assert len(records) == 1
+    logs = list(layout.logs_root.glob("*.log"))
+    assert len(logs) == 1
+    assert logs[0].stem == records[0].stem
+    assert "done: downloads=1" in logs[0].read_text()
+    record = json.loads(records[0].read_text())
     assert "schema_version" not in record
     assert "warc_version" not in record
     assert "warc_target_bytes" not in record
     assert record["archive_id"] == "example.org"
+    assert set(record["years"]) == {"2004"}
+    record = record["years"]["2004"]
     assert record["collection_id"] == "2004"
     assert record["counts"]["payload_reused"] == 0
     assert set(record["metrics"]) == {
@@ -1041,8 +1047,8 @@ def test_scoped_rerun_keeps_prior_collection_and_records_only_current_failures(t
     assert result.exit_code == 0
     assert layout.collection_index("2004").read_bytes() == original_index
     assert layout.collection_index("2005").is_file()
-    run_dirs = list(layout.logs_root.iterdir())
-    record = json.loads((run_dirs[0] / "2005.json").read_text())
+    records = list(layout.logs_root.glob("*.json"))
+    record = json.loads(records[0].read_text())["years"]["2005"]
     assert record["collection_id"] == "2005"
     assert record["failures"] == []
 
@@ -1097,9 +1103,9 @@ def test_failed_capture_retries_successfully_on_rerun(tmp_path):
         assert first.exit_code == 0
         assert attempts["n"] == 1
         assert not list_collection_warcs(layout, "2004")
-        first_run_dirs = list(layout.logs_root.iterdir())
-        assert len(first_run_dirs) == 1
-        first_record = json.loads((first_run_dirs[0] / "2004.json").read_text())
+        records = list(layout.logs_root.glob("*.json"))
+        assert len(records) == 1
+        first_record = json.loads(records[0].read_text())["years"]["2004"]
         assert len(first_record["failures"]) == 1
         assert first_record["failures"][0]["identity"]["timestamp"] == capt.timestamp
 
@@ -1119,9 +1125,9 @@ def test_failed_capture_retries_successfully_on_rerun(tmp_path):
     inv = inventory_collection(layout, "2004")
     assert inv.contains(capt)
 
-    run_dirs = sorted(layout.logs_root.iterdir())
-    assert len(run_dirs) == 2
-    second_record = json.loads((run_dirs[1] / "2004.json").read_text())
+    records = sorted(layout.logs_root.glob("*.json"))
+    assert len(records) == 2
+    second_record = json.loads(records[1].read_text())["years"]["2004"]
     assert second_record["failures"] == []
     assert second_record["counts"]["downloaded"] == 1
     assert not (layout.root / "failures.json").exists()
@@ -1154,10 +1160,10 @@ def test_multi_year_empty_run_shares_id_without_playback_collections(
 
     assert result.exit_code == 0
     layout = result.layout
-    runs = list(layout.logs_root.iterdir())
-    assert len(runs) == 1
-    assert layout.run_record("2004", runs[0].name).is_file()
-    assert layout.run_record("2005", runs[0].name).is_file()
+    records = list(layout.logs_root.glob("*.json"))
+    assert len(records) == 1
+    record = json.loads(records[0].read_text())
+    assert set(record["years"]) == {"2004", "2005"}
 
 
 def test_cdx_year_failure_continues_with_later_years(tmp_path, monkeypatch, capsys):
@@ -1319,7 +1325,12 @@ def test_interrupt_finalizes_appended_records_without_run_json(tmp_path, monkeyp
     assert [path.name for path in warcs] == ["example.org-2004-001.warc.gz"]
     assert layout.collection_index("2004").is_file()
     assert inventory_collection(layout, "2004").contains(first)
-    assert not any(layout.logs_root.iterdir())
+    records = list(layout.logs_root.glob("*.json"))
+    assert len(records) == 1
+    assert json.loads(records[0].read_text())["years"] == {}
+    logs = list(layout.logs_root.glob("*.log"))
+    assert len(logs) == 1
+    assert "year 2004: CDX query" in logs[0].read_text()
     assert not list(layout.collection_dir("2004").glob("*.partial"))
 
     downloaded.clear()

@@ -91,15 +91,14 @@ and Navigator reject the same malformed contract.
   example.org-2004-index.cdxj
 
 <data-directory-parent>/logs/
-  <run-id>/
-    2004.json
-    2005.json
+  <run-id>.json
+  <run-id>.log
 ```
 
 The data directory is a flat portable namespace. Strict artifact filenames and
 the manifest retain the logical yearly collection boundary without year folders.
-Each successful year writes its existing JSON run record under the invocation's
-directory. Run records are local diagnostics rather than bucket-authoritative content.
+The JSON file combines the invocation's yearly run records; the text file mirrors
+its console output. Both are local diagnostics rather than bucket-authoritative content.
 `collections-manifest.json` is generated, versioned publication state and must
 never be edited as configuration.
 
