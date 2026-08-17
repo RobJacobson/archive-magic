@@ -143,10 +143,15 @@ boundary also produce a nonzero exit. The next run keeps any leftover local
 tail/CDXJ, rebuilds the index if needed, and republishes. `--reset-data` is the
 recovery tool when the data directory was lost or the prefix is confused.
 
-Payloads are never reused across collections: a capture missing from its current
-collection is downloaded from Internet Archive unless CDX metadata can synthesize
-an empty response or slash redirect. The `payload-reuses` metric counts only those
-CDX-synthesized outcomes.
+Identical payloads reuse the oldest digest-matched full response, including
+across years: a later capture with the same urlkey and digest becomes a
+WARC revisit rather than another Internet Archive download. Empty payloads
+still split on CDX status so a 301 and a 302 stay distinct. Years remain
+publication partitions; the archive prefix is the portable unit. The
+`payload-reuses` metric still counts only CDX-synthesized empty responses and
+slash redirects. Local `--reset-data` of a subset of years can leave later
+revisits referring to deleted records; remote `--reset-data` already wipes the
+whole prefix.
 
 ## Append-only WARC behavior
 
@@ -237,7 +242,7 @@ same bucket are not touched.
 - `warc.py`: record construction, pre-append validation, append-only writing, and
   rollover.
 - `index.py`: deterministic full or incremental collection CDXJ generation.
-- `inventory.py`: CDXJ-driven identity inventory and within-collection revisits.
+- `inventory.py`: CDXJ-driven identity inventory and identical-payload revisits.
 - `storage.py`: local manifests plus remote index/tail materialization,
   publication, and eviction.
 - `cdx.py`, `resolution.py`, `workers.py`, `playback.py`: capture discovery and

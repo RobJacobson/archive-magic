@@ -177,9 +177,21 @@ def is_redirect_status_token(token: str) -> bool:
 
 
 def revisit_group_key(identity: CaptureIdentity) -> tuple[str, str, str] | None:
+    """Return the representative-map key for an identical-payload revisit.
+
+    Missing digests cannot group. Empty payloads keep status in the key so a
+    301 and a 302 stay distinct. Any other digest already identifies the
+    bytes, so CDX status is ignored: IA ``warc/revisit`` rows use ``-``.
+    """
+
     if identity.payload_digest == MISSING_CDX_PAYLOAD_DIGEST:
         return None
-    return identity.urlkey, identity.payload_digest, identity.status_token
+    status = (
+        identity.status_token
+        if is_empty_payload_digest(identity.payload_digest)
+        else ""
+    )
+    return identity.urlkey, identity.payload_digest, status
 
 
 def make_identity(

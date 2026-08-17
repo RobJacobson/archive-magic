@@ -50,6 +50,7 @@ class UrlOutcome:
 def group_needs_playback(
     group: Sequence[ParsedCapture],
     existing_identities: frozenset[CaptureIdentity],
+    existing_representatives: dict[tuple[str, str, str], StoredResponse],
 ) -> bool:
     """Return whether any capture in a URL group requires Wayback playback."""
 
@@ -60,6 +61,13 @@ def group_needs_playback(
         and slash_redirect_from_cdx(
             capture.identity, group_urls=group_urls
         ) is None
+        and _find_representative(
+            capture.identity,
+            revisit_group_key(capture.identity),
+            {},
+            existing_representatives,
+        )
+        is None
         for capture in group
     )
 

@@ -15,7 +15,7 @@ _RESERVED_ARCHIVE_IDS = frozenset({"static"})
 
 @dataclass(frozen=True)
 class ReplayCollection:
-    """One independently portable WARC/CDXJ collection."""
+    """One yearly WARC/CDXJ partition in an archive."""
 
     collection_id: str
     root: Path
