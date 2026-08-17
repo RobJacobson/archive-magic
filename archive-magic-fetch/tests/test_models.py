@@ -8,7 +8,7 @@ from archive_magic_fetch.identity import (
     revisit_group_key,
     same_original_url,
 )
-from archive_magic_fetch.protocol import MISSING_CDX_PAYLOAD_DIGEST
+from archive_magic_fetch.protocol import EMPTY_PAYLOAD_DIGEST, MISSING_CDX_PAYLOAD_DIGEST
 
 def test_normalize_original_url_strips_default_ports():
     assert (
@@ -62,19 +62,31 @@ def test_same_original_url_accepts_ia_double_encoding():
     )
 
 
-def test_revisit_group_key_includes_status_and_skips_missing_digest():
+def test_revisit_group_key_splits_empty_payloads_on_status():
     digest = "sha1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    png_200 = make_identity(
+        original_url="http://example.org/logo.png",
+        timestamp="20040615000000",
+        status_token="200",
+        payload_digest=digest,
+    )
+    png_revisit = make_identity(
+        original_url="http://example.org/logo.png",
+        timestamp="20040616000000",
+        status_token="-",
+        payload_digest=digest,
+    )
     redirect_301 = make_identity(
         original_url="http://example.org/",
         timestamp="20040615000000",
         status_token="301",
-        payload_digest=digest,
+        payload_digest=EMPTY_PAYLOAD_DIGEST,
     )
     redirect_302 = make_identity(
         original_url="http://example.org/",
         timestamp="20040616000000",
         status_token="302",
-        payload_digest=digest,
+        payload_digest=EMPTY_PAYLOAD_DIGEST,
     )
     missing = make_identity(
         original_url="http://example.org/",
@@ -83,11 +95,17 @@ def test_revisit_group_key_includes_status_and_skips_missing_digest():
         payload_digest=MISSING_CDX_PAYLOAD_DIGEST,
     )
 
+    assert revisit_group_key(png_200) == revisit_group_key(png_revisit)
+    assert revisit_group_key(png_200) == (
+        png_200.urlkey,
+        png_200.payload_digest,
+        "",
+    )
     key_301 = revisit_group_key(redirect_301)
     key_302 = revisit_group_key(redirect_302)
     assert key_301 == (
         redirect_301.urlkey,
-        redirect_301.payload_digest,
+        EMPTY_PAYLOAD_DIGEST,
         "301",
     )
     assert key_302 is not None

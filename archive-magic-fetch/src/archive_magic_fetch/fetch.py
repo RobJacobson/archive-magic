@@ -187,6 +187,7 @@ def _run_fetch(
 
     run_skips_errors = 0
     failed_years: list[int] = []
+    representatives: dict[tuple[str, str, str], StoredResponse] = {}
     for year, year_start, year_end in year_ranges(
         settings.date_start, settings.date_end
     ):
@@ -200,6 +201,7 @@ def _run_fetch(
                 run_id=run_id,
                 workers=workers,
                 publisher=publisher,
+                representatives=representatives,
                 sleep=sleep,
             )
         except Exception as error:  # noqa: BLE001 - isolate years
@@ -239,6 +241,7 @@ def _run_year(
     run_id: str,
     workers: PlaybackWorkers,
     publisher: PublicationManager,
+    representatives: dict[tuple[str, str, str], StoredResponse],
     sleep,
 ) -> _YearResult:
     """Acquire, resolve, publish, and record one yearly collection."""
@@ -273,6 +276,8 @@ def _run_year(
     year_metrics.selected += len(selected)
 
     inventory = inventory_collection(layout, collection_id)
+    for stored in representatives.values():
+        inventory.remember_representative(stored)
     if any(capture.identity not in inventory.identities for capture in selected):
         publisher.materialize_tail(layout, collection_id)
     payloads = fetch_payload_data(selected, inventory=inventory, workers=workers)
@@ -338,6 +343,8 @@ def _run_year(
         f"skips/errors={year_skips_errors}"
     )
     emit(f"elapsed {format_elapsed(time.monotonic() - year_started)}")
+    representatives.clear()
+    representatives.update(inventory.by_url_digest)
 
     return _YearResult(
         metrics=year_metrics,
@@ -375,7 +382,10 @@ def fetch_payload_data(
         groups,
         process,
         workers,
-        tuple(not group_needs_playback(group, identities) for group in groups),
+        tuple(
+            not group_needs_playback(group, identities, representatives)
+            for group in groups
+        ),
     )
     return PayloadData(url_count=len(groups), outcomes=outcomes)
 

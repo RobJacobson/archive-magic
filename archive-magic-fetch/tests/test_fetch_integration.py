@@ -533,6 +533,65 @@ def test_same_year_representative_revisits_include_redirects(tmp_path):
     assert types.count("revisit") == 2
 
 
+def test_identical_digest_with_missing_cdx_status_is_a_revisit(tmp_path):
+    """IA warc/revisit rows use status '-'; they share the payload digest."""
+
+    layout = ArchiveLayout(tmp_path / "data", "example.org")
+    ensure_collection_dirs(layout)
+    body_bytes = b"logo-bytes"
+    dig = payload_digest(body_bytes).split(":")[1]
+    downloads: list[str] = []
+
+    def download_fn(_client, identity):
+        downloads.append(identity.status_token)
+        return playback(identity, body=body_bytes)
+
+    cdx_body = cdx_json(
+        [
+            [
+                "com,example)/logo.png",
+                "20080311181249",
+                "http://example.org/logo.png",
+                "image/png",
+                "200",
+                dig,
+                "80",
+            ],
+            [
+                "com,example)/logo.png",
+                "20080408192501",
+                "http://example.org/logo.png",
+                "warc/revisit",
+                "-",
+                dig,
+                "50",
+            ],
+        ]
+    )
+    original, cdx_mod, fetch_mod = patch_cdx(cdx_body)
+    try:
+        result = run_fetch(
+            FetchSettings(
+                url_pattern="http://example.org/",
+                date_start="20080311181249",
+                date_end="20080408192501",
+                archive_id="example.org",
+                storage=StorageConfig("local", tmp_path / "data"),
+            ),
+            client_factory=lambda: MagicMock(),
+            download_fn=download_fn,
+            sleep=lambda _s: None,
+        )
+    finally:
+        cdx_mod.fetch_cdx = original
+        fetch_mod.fetch_cdx = original
+
+    assert result.exit_code == 0
+    assert downloads == ["200"]
+    assert result.metrics.downloads == 1
+    assert result.metrics.revisits == 1
+
+
 def test_empty_http_200_skips_playback_and_revisits(tmp_path):
     layout = ArchiveLayout(tmp_path / "data", "example.org")
     ensure_collection_dirs(layout)
@@ -613,7 +672,7 @@ def test_empty_http_200_skips_playback_and_revisits(tmp_path):
     assert empty_responses == 2
 
 
-def test_matching_payloads_in_different_years_are_downloaded_from_ia(tmp_path):
+def test_matching_payloads_in_later_years_become_revisits(tmp_path):
     layout = ArchiveLayout(tmp_path / "data", "example.org")
     ensure_collection_dirs(layout)
     body = b"logo"
@@ -671,10 +730,10 @@ def test_matching_payloads_in_different_years_are_downloaded_from_ia(tmp_path):
         fetch_mod.fetch_cdx = original
 
     assert result.exit_code == 0
-    assert downloads == ["20040601000000", "20050601000000"]
-    assert result.metrics.downloads == 2
+    assert downloads == ["20040601000000"]
+    assert result.metrics.downloads == 1
     assert result.metrics.payload_reuses == 0
-    assert result.metrics.revisits == 0
+    assert result.metrics.revisits == 1
 
     types_2004 = []
     with list_collection_warcs(layout, "2004")[0].open("rb") as stream:
@@ -685,22 +744,28 @@ def test_matching_payloads_in_different_years_are_downloaded_from_ia(tmp_path):
     assert types_2004.count("revisit") == 0
 
     types_2005 = []
+    refers_to_date = None
     with list_collection_warcs(layout, "2005")[0].open("rb") as stream:
         for record in ArchiveIterator(stream):
             types_2005.append(record.rec_type)
+            if record.rec_type == "revisit":
+                refers_to_date = record.rec_headers.get_header("WARC-Refers-To-Date")
             record.raw_stream.read()
-    assert types_2005.count("response") == 1
-    assert types_2005.count("revisit") == 0
+    assert types_2005.count("response") == 0
+    assert types_2005.count("revisit") == 1
+    assert refers_to_date == "2004-06-01T00:00:00Z"
 
     inv = inventory_collection(layout, "2005")
-    stored = inv.lookup_representative(
-        "com,example)/",
-        payload_digest(body),
-        "200",
-        not_after_timestamp="20050601000000",
+    assert inv.contains(
+        make_identity(
+            original_url="http://example.org/",
+            timestamp="20050601000000",
+            status_token="200",
+            payload_digest=payload_digest(body),
+            urlkey="com,example)/",
+        )
     )
-    assert stored is not None
-    assert stored.identity.timestamp == "20050601000000"
+
 
 
 def test_different_ia_digest_downloads_twice(tmp_path):

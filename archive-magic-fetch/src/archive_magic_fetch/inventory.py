@@ -1,4 +1,4 @@
-"""CDXJ-backed collection inventory and within-collection revisits."""
+"""CDXJ-backed capture inventory and identical-payload revisits."""
 
 from __future__ import annotations
 
@@ -40,11 +40,12 @@ class StoredResponse:
 
 @dataclass
 class CollectionInventory:
-    """Exact captures and reusable responses from one portable collection.
+    """Exact captures for one year and reusable responses for revisits.
 
-    ``by_url_digest`` maps ``(urlkey, IA/CDX payload digest, CDX status)`` to
-    the oldest matched full response with that key. Entries store compact
-    locator metadata only (never payloads), rebuilt from the stable CDXJ.
+    ``identities`` are this year's captures. ``by_url_digest`` maps a
+    revisit group key to the oldest matched full response. Fetch may seed
+    earlier years' representatives. Entries store compact locator metadata
+    only (never payloads).
     """
 
     identities: set[CaptureIdentity] = field(default_factory=set)
@@ -66,12 +67,21 @@ class CollectionInventory:
         """Return a prior successful response usable for a capture timestamp.
 
         Reject representatives after the capture timestamp so revisits never
-        point forward within the year.
+        point forward.
         """
 
-        if ia_digest == MISSING_CDX_PAYLOAD_DIGEST:
+        key = revisit_group_key(
+            CaptureIdentity(
+                urlkey=urlkey,
+                original_url="",
+                timestamp=not_after_timestamp,
+                status_token=status_token,
+                payload_digest=ia_digest,
+            )
+        )
+        if key is None:
             return None
-        stored = self.by_url_digest.get((urlkey, ia_digest, status_token))
+        stored = self.by_url_digest.get(key)
         if stored is None:
             return None
         if stored.identity.timestamp > not_after_timestamp:
@@ -81,10 +91,9 @@ class CollectionInventory:
     def remember_representative(self, stored: StoredResponse) -> None:
         """Record a successful full response for later revisit short-circuits.
 
-        Keeps the oldest representative for each
-        ``(urlkey, IA digest, CDX status)``. Callers must pass only
-        successfully written, digest-matched responses. Missing IA digests
-        cannot group.
+        Keeps the oldest representative for each revisit group key.
+        Callers must pass only successfully written, digest-matched
+        responses. Missing IA digests cannot group.
         """
 
         key = revisit_group_key(stored.identity)

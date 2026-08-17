@@ -573,7 +573,7 @@ def test_run_wayback_accepts_its_private_readiness_marker(tmp_path):
 def test_real_pywb_aggregates_flat_collections_and_replays_same_collection_revisit(
     tmp_path,
 ):
-    """Full response in 001 and revisit in 002 of the same year must replay."""
+    """Same-year shard revisits and a later-year revisit of that URL must replay."""
 
     from io import BytesIO
 
@@ -667,6 +667,7 @@ def test_real_pywb_aggregates_flat_collections_and_replays_same_collection_revis
     second_dir = root
     second_url = "http://second.example/"
     second_warc = second_dir / "annual-2021-001.warc.gz"
+    second_entries = []
     with second_warc.open("wb") as stream:
         writer = WARCWriter(stream, gzip=True, warc_version="1.1")
         second = writer.create_warc_record(
@@ -679,27 +680,58 @@ def test_real_pywb_aggregates_flat_collections_and_replays_same_collection_revis
         start = stream.tell()
         writer.write_record(second)
         length = stream.tell() - start
-    (second_dir / "annual-2021-index.cdxj").write_text(
-        "example,second)/ 20210101000000 "
-        + json.dumps(
-            {
-                "url": second_url,
-                "mime": "text/html",
-                "status": "200",
-                "digest": second.rec_headers.get_header("WARC-Payload-Digest"),
-                "filename": second_warc.name,
-                "offset": str(start),
-                "length": str(length),
-            },
-            separators=(",", ":"),
-            sort_keys=True,
+        second_entries.append(
+            (
+                "example,second)/",
+                "20210101000000",
+                {
+                    "url": second_url,
+                    "mime": "text/html",
+                    "status": "200",
+                    "digest": second.rec_headers.get_header("WARC-Payload-Digest"),
+                    "filename": second_warc.name,
+                    "offset": str(start),
+                    "length": str(length),
+                },
+            )
         )
-        + "\n",
+        later = writer.create_revisit_record(
+            url,
+            digest,
+            url,
+            "2020-06-01T00:00:00Z",
+            http_headers=headers,
+            warc_headers_dict={"WARC-Date": "2021-06-01T00:00:00Z"},
+        )
+        start = stream.tell()
+        writer.write_record(later)
+        length = stream.tell() - start
+        second_entries.append(
+            (
+                "org,example)/",
+                "20210601000000",
+                {
+                    "url": url,
+                    "mime": "warc/revisit",
+                    "status": "200",
+                    "digest": digest,
+                    "filename": second_warc.name,
+                    "offset": str(start),
+                    "length": str(length),
+                },
+            )
+        )
+    second_entries.sort(key=lambda item: (item[0], item[1]))
+    (second_dir / "annual-2021-index.cdxj").write_text(
+        "".join(
+            f"{key} {ts} {json.dumps(meta, separators=(',', ':'), sort_keys=True)}\n"
+            for key, ts, meta in second_entries
+        ),
         encoding="utf-8",
     )
 
     collection = select_archive_root(archives / "annual", "annual")
-    assert validate_archive(collection).record_count == 3
+    assert validate_archive(collection).record_count == 4
     assert [item.collection_id for item in collection.collections] == ["2020", "2021"]
     before = snapshot_tree(archives)
 
@@ -708,6 +740,8 @@ def test_real_pywb_aggregates_flat_collections_and_replays_same_collection_revis
         _, revisited, _ = get(base + "/annual/20200701000000id_/http://example.org/")
         assert b"Annual shard body" in original
         assert revisited == original
+        _, later_body, _ = get(base + "/annual/20210601000000id_/http://example.org/")
+        assert later_body == original
         _, second_body, _ = get(
             base + "/annual/20210101000000id_/http://second.example/"
         )
