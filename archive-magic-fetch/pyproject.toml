@@ -9,7 +9,7 @@ description = "Build portable WARC 1.1 and CDXJ collections from Internet Archiv
 requires-python = ">=3.12"
 license = { text = "MIT" }
 dependencies = [
-    "archive-magic-descriptor",
+    "archive-magic-format",
     "boto3>=1.35,<2",
     "cdxj-indexer==1.4.6",
     "surt==0.3.1",

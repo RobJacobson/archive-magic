@@ -13,12 +13,12 @@ package = false
 
 [tool.uv.workspace]
 members = [
-    "archive-magic-descriptor",
+    "archive-magic-format",
     "archive-magic-fetch",
     "archive-magic-navigator",
 ]
 
 [tool.uv.sources]
-archive-magic-descriptor = { workspace = true }
+archive-magic-format = { workspace = true }
 archive-magic-fetch = { workspace = true }
 archive-magic-navigator = { workspace = true }

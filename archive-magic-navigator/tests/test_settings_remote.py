@@ -6,57 +6,97 @@ import json
 
 import pytest
 from archive_magic_navigator.remote import RemoteArchiveStore, parse_manifest
-from archive_magic_navigator.settings import RemoteConfig, load_config
+from archive_magic_navigator.settings import (
+    CONFIG_NAME,
+    LocalSource,
+    RemoteSource,
+    discover_configs,
+    load_config,
+)
 from botocore.exceptions import ClientError
 
 
-def test_navigator_toml_defaults_and_relative_paths(tmp_path):
-    path = tmp_path / "archive.toml"
-    path.write_text(
+def write_navigator_toml(directory, body, name=CONFIG_NAME):
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / name
+    path.write_text(body, encoding="utf-8")
+    return path
+
+
+def test_directory_shorthand_and_relative_paths(tmp_path):
+    path = write_navigator_toml(
+        tmp_path,
         """
-schema_version = 1
 [archive]
 id = "example.org"
-url_pattern = "example.org"
-[storage]
-authority = "local"
-data_directory = "data"
+[source]
+type = "local"
+directory = "data"
 [playback]
 wayback_fallback = false
 """,
-        encoding="utf-8",
     )
-    settings = load_config(path)
+    settings = load_config(tmp_path)
+    assert settings.config_path == path.resolve()
     assert settings.archive_id == "example.org"
-    assert settings.storage.data_directory == (tmp_path / "data").resolve()
+    assert settings.source == LocalSource((tmp_path / "data").resolve())
     assert settings.wayback_fallback is False
 
 
-def test_remote_descriptor_uses_standard_credentials_without_loading_dotenv(
-    tmp_path,
-    monkeypatch,
-):
-    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "process-key")
-    (tmp_path / ".env").write_text("AWS_ACCESS_KEY_ID=file-key\n")
-    path = tmp_path / "archive.toml"
-    path.write_text(
+def test_explicit_arbitrary_filename(tmp_path):
+    path = write_navigator_toml(
+        tmp_path,
         """
-schema_version = 1
 [archive]
 id = "example.org"
-url_pattern = "*.example.org"
-[storage]
-authority = "remote"
-data_directory = "data"
-[storage.remote]
+[source]
+type = "local"
+""",
+        name="other.toml",
+    )
+    settings = load_config(path)
+    assert settings.config_path == path.resolve()
+    assert settings.source == LocalSource((tmp_path / "data").resolve())
+
+
+def test_missing_canonical_file(tmp_path):
+    with pytest.raises(ValueError, match="navigator configuration does not exist"):
+        load_config(tmp_path)
+
+
+def test_defaults_when_playback_omitted(tmp_path):
+    write_navigator_toml(
+        tmp_path,
+        """
+[archive]
+id = "example.org"
+[source]
+type = "local"
+""",
+    )
+    settings = load_config(tmp_path)
+    assert settings.wayback_fallback is True
+    assert settings.source.directory == (tmp_path / "data").resolve()
+
+
+def test_remote_source_parses_prefix_and_flattened_fields(tmp_path, monkeypatch):
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "process-key")
+    (tmp_path / ".env").write_text("AWS_ACCESS_KEY_ID=file-key\n")
+    path = write_navigator_toml(
+        tmp_path,
+        """
+[archive]
+id = "example.org"
+[source]
+type = "remote"
 bucket = "bucket"
 prefix = "/archives/example.org/"
 endpoint_url = "https://endpoint"
 region = "auto"
-"""
+""",
     )
     settings = load_config(path)
-    assert settings.storage.remote == RemoteConfig(
+    assert settings.source == RemoteSource(
         "bucket",
         "archives/example.org",
         "https://endpoint",
@@ -65,8 +105,63 @@ region = "auto"
     assert __import__("os").environ["AWS_ACCESS_KEY_ID"] == "process-key"
 
 
+@pytest.mark.parametrize(
+    "body, message",
+    [
+        (
+            "[archive]\nid='bad/id'\n[source]\ntype='local'\n",
+            "invalid archive ID",
+        ),
+        (
+            "[archive]\nid='x'\nurl_pattern='x'\n[source]\ntype='local'\n",
+            "unexpected keyword",
+        ),
+        (
+            "[archive]\nid='x'\n[source]\ntype='remote'\n",
+            "bucket",
+        ),
+        (
+            "[archive]\nid='x'\n[source]\ntype='remote'\nbucket='x'\nprefix='../bad'\n",
+            "must not contain",
+        ),
+        (
+            "[archive]\nid='x'\n[source]\ntype='local'\n[playback]\nwayback_fallback='yes'\n",
+            "must be a boolean",
+        ),
+    ],
+)
+def test_configuration_validation(tmp_path, body, message):
+    write_navigator_toml(tmp_path, body)
+    with pytest.raises(ValueError, match=message):
+        load_config(tmp_path)
+
+
+def test_catalog_discovers_navigator_toml_only(tmp_path):
+    write_navigator_toml(
+        tmp_path / "b",
+        "[archive]\nid='b.example'\n[source]\ntype='local'\n",
+    )
+    write_navigator_toml(
+        tmp_path / "a",
+        "[archive]\nid='a.example'\n[source]\ntype='local'\n",
+    )
+    (tmp_path / ".hidden").mkdir()
+    (tmp_path / ".hidden" / CONFIG_NAME).write_text(
+        "[archive]\nid='hidden'\n[source]\ntype='local'\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "ignored.toml").write_text("id='root'\n", encoding="utf-8")
+    (tmp_path / "c").mkdir()
+    (tmp_path / "c" / "fetch.toml").write_text(
+        "[archive]\nid='old'\n",
+        encoding="utf-8",
+    )
+    paths = discover_configs(tmp_path)
+    assert [path.parent.name for path in paths] == ["a", "b"]
+
+
 def remote_config(prefix="example.org"):
-    return RemoteConfig("bucket", prefix, "https://endpoint", "auto")
+    return RemoteSource("bucket", prefix, "https://endpoint", "auto")
 
 
 def manifest_and_index(index_bytes):

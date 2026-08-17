@@ -12,16 +12,16 @@ import threading
 from pathlib import Path, PurePosixPath
 
 import boto3
-from botocore.exceptions import ClientError
-
-from archive_magic_descriptor import (
+from archive_magic_format import (
     MANIFEST_NAME,
     CollectionsManifest,
     ManifestArtifact,
     ManifestCollection,
-    RemoteConfig,
     parse_manifest as parse_collections_manifest,
 )
+from botocore.exceptions import ClientError
+
+from .settings import RemoteSource
 
 from .collections import (
     Archive,
@@ -37,7 +37,7 @@ class RemoteArchiveStore:
     """Own validated cached indexes for one Navigator process."""
 
     def __init__(
-        self, config: RemoteConfig, cache_directory: Path, poll_seconds: float
+        self, config: RemoteSource, cache_directory: Path, poll_seconds: float
     ) -> None:
         self.config = config
         self.cache_directory = cache_directory

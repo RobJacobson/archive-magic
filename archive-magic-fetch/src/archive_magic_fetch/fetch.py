@@ -29,7 +29,11 @@ from .collection import (
     reset_collection_data,
     write_run_record,
 )
-from .config import DEFAULT_RETRIES, DEFAULT_WARC_TARGET_BYTES, StorageConfig
+from .config import (
+    DEFAULT_RETRIES,
+    DEFAULT_WARC_TARGET_BYTES,
+    FetchOutput,
+)
 from .console import emit, format_elapsed, log_url_outcome, mirror_output
 from .index import (
     parse_cdxj_line,
@@ -73,7 +77,7 @@ class FetchSettings:
     date_start: str
     date_end: str
     archive_id: str
-    storage: StorageConfig
+    output: FetchOutput
     reset_data: bool = False
     warc_target_bytes: int = DEFAULT_WARC_TARGET_BYTES
     playback_workers: int = 4
@@ -127,7 +131,7 @@ def run_fetch(
 ) -> FetchResult:
     """Execute the annual fetch pipeline with bounded playback workers."""
 
-    layout = ArchiveLayout(settings.storage.data_directory, settings.archive_id)
+    layout = ArchiveLayout(settings.output.data_directory, settings.archive_id)
     layout.logs_root.mkdir(parents=True, exist_ok=True)
     run_id = init_run_id(layout)
     init_run_record(layout, run_id)
@@ -165,14 +169,14 @@ def _run_fetch(
 ) -> FetchResult:
     """Execute serial years with parallel playback and one WARC writer."""
 
-    publisher = PublicationManager(settings.storage)
-    if settings.reset_data and settings.storage.authority == "remote":
+    publisher = PublicationManager(settings.output)
+    if settings.reset_data and settings.output.type == "remote":
         publisher.reset_archive(layout)
     publisher.prepare(layout)
     reject_legacy_layout(layout)
     ensure_collection_dirs(layout)
     cleanup_temps(layout)
-    if settings.storage.authority == "local":
+    if settings.output.type == "local":
         reconcile_missing_indexes(layout)
 
     metrics = RunMetrics()
@@ -634,7 +638,7 @@ def build_settings(
     date_end: Optional[str] = None,
     *,
     reset_data: bool = False,
-    storage: StorageConfig,
+    output: FetchOutput,
     warc_target_bytes: int = DEFAULT_WARC_TARGET_BYTES,
     playback_workers: int = 4,
     playback_starts_per_second: float = 20.0,
@@ -659,7 +663,7 @@ def build_settings(
         date_start=start,
         date_end=end,
         reset_data=reset_data,
-        storage=storage,
+        output=output,
         warc_target_bytes=warc_target_bytes,
         playback_workers=playback_workers,
         playback_starts_per_second=playback_starts_per_second,

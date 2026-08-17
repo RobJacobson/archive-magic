@@ -7,14 +7,14 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
-from archive_magic_descriptor import (
+from archive_magic_format import (
     CollectionsManifest,
     ManifestArtifact,
     ManifestCollection,
     parse_manifest,
 )
 from archive_magic_fetch.collection import ArchiveLayout, ensure_collection_dirs
-from archive_magic_fetch.config import RemoteConfig, StorageConfig
+from archive_magic_fetch.config import FetchOutput
 from archive_magic_fetch.fetch import FetchSettings, run_fetch
 from archive_magic_fetch.index import parse_cdxj_line, publish_collection_index
 from archive_magic_fetch.inventory import inventory_collection
@@ -30,10 +30,13 @@ def artifact(key, body=b"data", etag='"etag"'):
 
 
 def remote_config(tmp_path, prefix="example.org"):
-    return StorageConfig(
+    return FetchOutput(
         "remote",
         tmp_path / "data",
-        RemoteConfig("bucket", prefix, "https://example.invalid", "auto"),
+        "bucket",
+        prefix,
+        "https://example.invalid",
+        "auto",
     )
 
 
@@ -170,7 +173,7 @@ def published_update(tmp_path, monkeypatch):
 
 def test_filesystem_publication_uses_synthetic_etags(tmp_path):
     layout, _, _ = make_collection(tmp_path / "data")
-    manager = PublicationManager(StorageConfig("local", layout.root))
+    manager = PublicationManager(FetchOutput("local", layout.root))
     manager.prepare(layout)
     assert manager.publish_collection(layout, "2004")
     collection = parse_manifest((layout.root / MANIFEST_NAME).read_bytes()).collections[
@@ -305,7 +308,7 @@ def test_remote_two_run_fetch_extends_same_tail_and_evicts_working_files(
         date_start="20040101000000",
         date_end="20041231235959",
         archive_id="example.org",
-        storage=remote_config(tmp_path),
+        output=remote_config(tmp_path),
     )
 
     def download_fn(_client, identity):
@@ -340,7 +343,7 @@ def test_remote_two_run_fetch_extends_same_tail_and_evicts_working_files(
     assert warc_keys == ["example.org/example.org-2004-001.warc.gz"]
     index_body = fake.objects["example.org/example.org-2004-index.cdxj"]["body"]
     assert len(index_body.splitlines()) == 2
-    collection_dir = settings.storage.data_directory
+    collection_dir = settings.output.data_directory
     assert not list(collection_dir.glob("*.warc.gz"))
     assert not list(collection_dir.glob("*.cdxj"))
 
@@ -366,7 +369,7 @@ def test_noop_remote_year_downloads_index_not_tail(tmp_path, monkeypatch):
         date_start="20040101000000",
         date_end="20041231235959",
         archive_id="example.org",
-        storage=remote_config(tmp_path),
+        output=remote_config(tmp_path),
     )
     original, cdx_mod, fetch_mod = patch_cdx(cdx_json(rows))
     try:
@@ -569,7 +572,7 @@ def test_remote_run_record_is_written_before_working_files_are_evicted(
                 date_start="20040615000000",
                 date_end="20040615000000",
                 archive_id="example.org",
-                storage=remote_config(tmp_path),
+                output=remote_config(tmp_path),
             ),
             client_factory=lambda: MagicMock(),
             download_fn=lambda _client, identity: playback(identity, body=body),

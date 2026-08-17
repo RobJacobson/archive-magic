@@ -1,4 +1,4 @@
-"""Read and write the per-archive collection publication manifest."""
+"""Read and write the Archive Magic collection publication manifest."""
 
 from __future__ import annotations
 

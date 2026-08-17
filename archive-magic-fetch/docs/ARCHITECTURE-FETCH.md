@@ -4,8 +4,8 @@
 
 Archive Magic Fetch turns Internet Archive capture history into portable WARC 1.1
 collections and CDXJ indexes. It is a standalone producer. It does not call or
-coordinate with Navigator; the two applications interact only by reading and
-writing the locations described by the same archive descriptor.
+coordinate with Navigator; the two applications interact only through the archived
+WARC/CDXJ layout and `collections-manifest.json`.
 
 One Fetch process on one machine owns an archive prefix. Concurrent writers,
 secondary updater machines, and manual bucket mutation are unsupported.
@@ -16,32 +16,29 @@ secondary updater machines, and manual bucket mutation are unsupported.
 archive-magic-fetch ARCHIVE [--start DATE] [--end DATE] [--reset-data]
 ```
 
-`ARCHIVE` is either a file named `archive.toml` or its containing directory. There
-is no legacy URL-pattern, `--config`, or `--archives-root` interface.
+`ARCHIVE` is either a Fetch TOML file of any name or a directory containing
+`fetch.toml`. There is no legacy URL-pattern, `--config`, or `--archives-root`
+interface.
 
-Normal CLI dates narrow a run without changing the descriptor. Without overrides,
+Normal CLI dates narrow a run without changing the configuration. Without overrides,
 Fetch uses `[fetch].start` through `[fetch].end`; an omitted end is resolved to the
 current UTC timestamp when the run starts. Fetch therefore checks the complete
 configured history on daily or weekly runs. Identity-based deduplication makes
 unchanged older collections no-ops, so normally only the current year is
 republished.
 
-## Descriptor contract
+## Configuration contract
 
-The descriptor is user-authored intent:
+The Fetch configuration is user-authored intent:
 
 ```toml
-schema_version = 1
-
 [archive]
 id = "example.org"
 url_pattern = "*.example.org"
 
-[storage]
-authority = "remote" # "local" or "remote"
+[output]
+type = "remote" # "local" or "remote"
 data_directory = "data"
-
-[storage.remote]
 bucket = "archive-magic"
 prefix = "example.org"
 endpoint_url = "https://s3.example.invalid"
@@ -54,20 +51,19 @@ warc_target_bytes = 250000000
 playback_workers = 4
 playback_starts_per_second = 20.0
 retries = 4 # four retries after the initial request
-
-[playback]
-wayback_fallback = true
 ```
 
 Rules:
 
-- `schema_version` must be exactly `1`; unknown keys are errors.
+- The format is unversioned but strict: unknown tables and keys are errors.
 - Archive IDs must be route-safe and cannot be `.`, `..`, or `static`.
-- Relative paths and `~` are resolved from the descriptor directory.
+- Relative paths and `~` are resolved from the containing TOML file.
 - `data_directory` is the exact managed artifact root. The archive ID is not appended.
+  For remote output it remains the local working directory.
 - Run records are written to `logs/` beside `data_directory`.
-- `storage.remote` is required for remote authority and forbidden for local
-  authority.
+- Remote-only fields (`bucket`, `prefix`, `endpoint_url`, `region`) are required or
+  optional as documented and are forbidden for local output. They are flattened
+  into `[output]`, not nested.
 - Bucket credentials come exclusively from Boto3's standard credential chain.
   No adjacent `.env` is loaded and no specific access-key variable is required.
 - The compressed WARC rollover target defaults to 250,000,000 bytes and remains
@@ -78,8 +74,7 @@ Rules:
   attempt, matching playback backpressure. A CDX failure skips that year, continues
   with later years, and makes the process exit nonzero.
 
-Fetch validates the complete shared descriptor, including playback keys, so Fetch
-and Navigator reject the same malformed contract.
+Fetch does not read Navigator configuration. Playback policy lives in `navigator.toml`.
 
 ## Data, logging, and publication layout
 
@@ -110,7 +105,7 @@ appended to a shard.
 
 For each year in the selected range, Fetch:
 
-1. Ensures the year's CDXJ. Local authority is a no-op; remote authority
+1. Ensures the year's CDXJ. Local output is a no-op; remote output
    downloads the committed CDXJ only if no local copy exists. Leftover local
    WARCs from an interrupted run are reindexed before inventory.
 2. Queries Internet Archive CDX history through `WaybackClient.search()`, which
@@ -120,7 +115,7 @@ For each year in the selected range, Fetch:
 3. Parses and deduplicates captures by canonical capture identity.
 4. Inventories existing captures from CDXJ identity metadata and skips those
    already represented.
-5. If that year has captures not yet represented, remote authority downloads
+5. If that year has captures not yet represented, remote output downloads
    only the manifest's final WARC for the year (or keeps a longer local tail).
    Unchanged years never download a WARC.
 6. Resolves remaining captures through bounded, rate-limited playback workers.
@@ -174,16 +169,16 @@ changed filenames, adds their replacement lines, sorts the result, and validates
 byte ranges against manifest sizes for shards that are not on disk. Archives
 created without the required identity fields must be reset and regenerated.
 
-## Local authority
+## Local output
 
-With `authority = "local"`, the data directory is authoritative. Fetch appends
+With `output.type = "local"`, the data directory is authoritative. Fetch appends
 validated WARC members and atomically replaces CDXJ and manifest files. Navigator
 may serve the same data directly. Normal publication preserves all previous
 collections; `--reset-data` retains selected-collection reset behavior.
 
-## Remote authority and bounded materialization
+## Remote output and bounded materialization
 
-With `authority = "remote"`, the bucket prefix and its manifest are authoritative.
+With `output.type = "remote"`, the bucket prefix and its manifest are authoritative.
 The data directory is a bounded working area. At startup Fetch reads the manifest.
 Missing manifest means an empty archive. For each selected year it then:
 
@@ -191,7 +186,7 @@ Missing manifest means an empty archive. For each selected year it then:
 2. Queries IA and inventories the year.
 3. Downloads that year's final WARC only when the year has new captures, keeping
    a local file that is already at least as large as the committed tail.
-4. Runs the same local append and incremental-index code used by local authority.
+4. Runs the same local append and incremental-index code used by local output.
 5. Publishes changed/new artifacts and commits the manifest last.
 6. Deletes that collection's finalized local WARC/CDXJ files after commit.
 
@@ -224,9 +219,9 @@ Remote `--reset-data` is explicit authorization for whole-archive maintenance. I
 
 - rejects `--start` and `--end` overrides;
 - prints a prominent deletion/playback-downtime warning;
-- deletes only the descriptor's complete configured bucket prefix;
+- deletes only the configuration's complete configured bucket prefix;
 - clears only the exact managed data directory; and
-- rebuilds the descriptor's full configured range.
+- rebuilds the configuration's full configured range.
 
 There is no interactive prompt. The old manifest is absent during the rebuild, so
 remote playback is unavailable until publication completes. Other prefixes in the
@@ -234,7 +229,9 @@ same bucket are not touched.
 
 ## Module map
 
-- `config.py`: descriptor path resolution and strict schema validation.
+- `config.py`: Fetch-local TOML loading, path resolution, and safety checks.
+- `archive-magic-format`: dependency-free `collections-manifest.json` content
+  protocol shared with Navigator; it contains no application configuration.
 - `cli.py`: public argument contract and exit-code boundary.
 - `fetch.py`: configured-history orchestration and yearly lifecycle.
 - `console.py`: terminal progress, URL tables, colors, and Wayback links.
@@ -256,7 +253,7 @@ The Fetch test suite is run independently from Navigator:
 uv run pytest -q
 ```
 
-Coverage includes descriptor conformance, the 250 MB default and configurable
+Coverage includes configuration conformance, the 250 MB default and configurable
 rollover, deferred tail download (CDXJ for inventory, WARC only when a year has
 new work), incremental indexing, publication order, successful eviction, failure
 retention and retry, unchanged-artifact suppression, and reset prefix scope.

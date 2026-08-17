@@ -14,7 +14,7 @@ from archive_magic_fetch.collection import (
     ensure_collection_dirs,
     list_collection_warcs,
 )
-from archive_magic_fetch.config import StorageConfig
+from archive_magic_fetch.config import FetchOutput
 from archive_magic_fetch.fetch import FetchSettings, run_fetch
 from archive_magic_fetch.index import publish_collection_index
 from archive_magic_fetch.models import FailureCategory, PlaybackResult
@@ -378,7 +378,7 @@ def test_trailing_newline_soft_match_seeds_revisit_and_survives_inventory(
                 date_start="20040601000000",
                 date_end="20040602000000",
                 archive_id="example.org",
-                    storage=StorageConfig("local", tmp_path / "data"),
+                    output=FetchOutput("local", tmp_path / "data"),
             ),
             client_factory=lambda: MagicMock(),
             download_fn=download_fn,
@@ -558,7 +558,7 @@ def test_digest_mismatch_is_kept_but_never_seeds_revisit(tmp_path):
                 date_start="20040601000000",
                 date_end="20040602000000",
                 archive_id="example.org",
-                    storage=StorageConfig("local", tmp_path / "data"),
+                    output=FetchOutput("local", tmp_path / "data"),
             ),
             client_factory=lambda: MagicMock(),
             download_fn=download_fn,

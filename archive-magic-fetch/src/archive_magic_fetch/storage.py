@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import boto3
-from archive_magic_descriptor import (
+from archive_magic_format import (
     MANIFEST_NAME,
     CollectionsManifest,
     ManifestArtifact,
@@ -25,7 +25,7 @@ from .collection import (
     list_collection_warcs,
     publish_file_atomically,
 )
-from .config import StorageConfig
+from .config import FetchOutput
 
 
 @dataclass(frozen=True)
@@ -39,24 +39,21 @@ class LocalArtifact:
 class PublicationManager:
     """Materialize remote work and publish completed local transformations."""
 
-    def __init__(self, config: StorageConfig) -> None:
+    def __init__(self, config: FetchOutput) -> None:
         self.config = config
         self.manifest = CollectionsManifest("", {})
         self.client = None
-        if config.authority == "remote":
-            remote = config.remote
-            if remote is None:
-                raise ValueError("remote authority requires storage.remote")
+        if config.type == "remote":
             self.client = boto3.client(
                 "s3",
-                endpoint_url=remote.endpoint_url,
-                region_name=remote.region,
+                endpoint_url=config.endpoint_url,
+                region_name=config.region,
             )
 
     def prepare(self, layout: ArchiveLayout) -> None:
         """Load committed publication state without mirroring its artifacts."""
 
-        if self.config.authority == "local":
+        if self.config.type == "local":
             path = layout.root / MANIFEST_NAME
             if path.is_file():
                 self.manifest = parse_manifest(path.read_bytes())
@@ -85,7 +82,7 @@ class PublicationManager:
         """Download the committed CDXJ when no local copy exists."""
 
         collection_id = layout.validate_collection_id(collection_id)
-        if self.config.authority == "local":
+        if self.config.type == "local":
             return
         previous = self.manifest.collections.get(collection_id)
         if previous is None:
@@ -100,7 +97,7 @@ class PublicationManager:
         """Download the committed final WARC when no usable local tail exists."""
 
         collection_id = layout.validate_collection_id(collection_id)
-        if self.config.authority == "local":
+        if self.config.type == "local":
             return
         previous = self.manifest.collections.get(collection_id)
         if previous is None:
@@ -166,7 +163,7 @@ class PublicationManager:
             return False
 
         published = {} if reset else dict(previous_by_key)
-        if self.config.authority == "local":
+        if self.config.type == "local":
             for item in changed:
                 published[item.key] = _manifest_artifact(
                     item, _local_etag(item.sha256)
@@ -201,7 +198,7 @@ class PublicationManager:
         )
         next_manifest = self._manifest_with(collection_id, collection)
 
-        if self.config.authority == "local":
+        if self.config.type == "local":
             self.manifest = next_manifest
             self._write_manifest(layout)
             return True
@@ -218,9 +215,9 @@ class PublicationManager:
         return True
 
     def evict_collection(self, layout: ArchiveLayout, collection_id: str) -> None:
-        """Remove remote-authority working copies after a confirmed commit."""
+        """Remove remote-output working copies after a confirmed commit."""
 
-        if self.config.authority != "remote":
+        if self.config.type != "remote":
             return
         for path in list_collection_warcs(layout, collection_id):
             path.unlink()
@@ -229,8 +226,8 @@ class PublicationManager:
     def reset_archive(self, layout: ArchiveLayout) -> None:
         """Delete exactly this archive prefix and clear its local data directory."""
 
-        if self.config.authority != "remote":
-            raise ValueError("remote archive reset requires remote authority")
+        if self.config.type != "remote":
+            raise ValueError("remote archive reset requires remote output")
         for key in self._iter_keys():
             self.client.delete_object(Bucket=self._remote().bucket, Key=key)
         if layout.root.exists():
@@ -330,9 +327,9 @@ class PublicationManager:
         return relative_key
 
     def _remote(self):
-        remote = self.config.remote
-        assert remote is not None
-        return remote
+        assert self.config.type == "remote"
+        assert self.config.bucket is not None
+        return self.config
 
 
 def _local_artifact(layout: ArchiveLayout, path: Path) -> LocalArtifact:

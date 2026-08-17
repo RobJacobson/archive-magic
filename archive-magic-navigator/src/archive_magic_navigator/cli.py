@@ -15,7 +15,13 @@ from .config import build_config, write_config
 from .errors import NavigatorError, ValidationError
 from .process import is_loopback_bind, run_wayback
 from .remote import RemoteArchiveStore
-from .settings import NavigatorConfig, discover_descriptors, load_config
+from .settings import (
+    LocalSource,
+    NavigatorConfig,
+    RemoteSource,
+    discover_configs,
+    load_config,
+)
 from .validation import validate_archive
 
 
@@ -23,7 +29,6 @@ from .validation import validate_archive
 class NavigatorRequest:
     archive: Path | None
     catalog: Path | None
-    source: str
     cache: Path | None
     poll_interval_seconds: float
     bind: str
@@ -63,12 +68,6 @@ def parse_args(argv: Sequence[str] | None = None) -> NavigatorRequest:
     parser = argparse.ArgumentParser(prog="archive-magic-navigator")
     parser.add_argument("archive", nargs="?", type=Path, metavar="ARCHIVE")
     parser.add_argument("--catalog", type=Path, metavar="PATH")
-    parser.add_argument(
-        "--source",
-        choices=("auto", "local", "remote"),
-        default="auto",
-        help="serve each archive from its authority, local data, or remote bucket",
-    )
     parser.add_argument("--cache", type=Path, metavar="PATH")
     parser.add_argument(
         "--poll-interval",
@@ -87,7 +86,6 @@ def parse_args(argv: Sequence[str] | None = None) -> NavigatorRequest:
     return NavigatorRequest(
         args.archive,
         args.catalog,
-        args.source,
         args.cache,
         args.poll_interval,
         args.bind,
@@ -102,15 +100,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     request = parse_args(argv)
     remotes: list[RemoteArchiveStore] = []
     try:
-        descriptors = (
-            discover_descriptors(request.catalog)
+        configs = (
+            discover_configs(request.catalog)
             if request.catalog is not None
             else (request.archive,)
         )
-        settings = _load_settings(descriptors)
+        settings = _load_settings(configs)
         _validate_unique_ids(settings)
         cache = _cache_directory(request, settings)
-        _validate_remote_environment(settings, request.source)
+        _validate_remote_environment(settings)
 
         archives: list[Archive] = []
         fallbacks: dict[str, bool] = {}
@@ -119,32 +117,26 @@ def main(argv: Sequence[str] | None = None) -> int:
         archive_errors: list[str] = []
         for item in settings:
             try:
-                use_remote = request.source == "remote" or (
-                    request.source == "auto"
-                    and item.storage.authority == "remote"
-                )
+                use_remote = isinstance(item.source, RemoteSource)
                 remote = None
                 if use_remote:
-                    if item.storage.remote is None:
-                        raise ValidationError(
-                            f"archive {item.archive_id!r} has no remote storage"
-                        )
                     remote = RemoteArchiveStore(
-                        item.storage.remote,
+                        item.source,
                         cache,
                         request.poll_interval_seconds,
                     )
                     archive = remote.load_archive(item.archive_id)
-                    remote_cfg = item.storage.remote
+                    remote_cfg = item.source
                     label = (
                         f"s3://{remote_cfg.bucket}/{remote_cfg.prefix}"
                     ).rstrip("/")
                 else:
+                    assert isinstance(item.source, LocalSource)
                     archive = select_archive_root(
-                        item.storage.data_directory,
+                        item.source.directory,
                         item.archive_id,
                     )
-                    label = str(item.storage.data_directory)
+                    label = str(item.source.directory)
                 validate_archive(archive)
             except (NavigatorError, ValueError) as error:
                 archive_errors.append(f"{item.archive_id}: {error}")
@@ -231,7 +223,7 @@ def _cache_directory(
     base = (
         request.catalog.expanduser().resolve()
         if request.catalog is not None
-        else settings[0].source.parent
+        else settings[0].config_path.parent
     )
     return (base / "navigator-cache").resolve()
 
@@ -249,10 +241,10 @@ def _validate_unique_ids(settings: tuple[NavigatorConfig, ...]) -> None:
         )
 
 
-def _load_settings(descriptors: tuple[Path | None, ...]) -> tuple[NavigatorConfig, ...]:
+def _load_settings(configs: tuple[Path | None, ...]) -> tuple[NavigatorConfig, ...]:
     settings: list[NavigatorConfig] = []
     errors: list[str] = []
-    for path in descriptors:
+    for path in configs:
         if path is None:
             continue
         try:
@@ -261,20 +253,16 @@ def _load_settings(descriptors: tuple[Path | None, ...]) -> tuple[NavigatorConfi
             errors.append(f"{path}: {error}")
     if errors:
         raise ValidationError(
-            "invalid archive descriptor(s):\n  - " + "\n  - ".join(errors)
+            "invalid navigator configuration(s):\n  - " + "\n  - ".join(errors)
         )
     return tuple(settings)
 
 
-def _validate_remote_environment(
-    settings: tuple[NavigatorConfig, ...],
-    source: str,
-) -> None:
+def _validate_remote_environment(settings: tuple[NavigatorConfig, ...]) -> None:
     signatures = {
-        (item.storage.remote.endpoint_url, item.storage.remote.region)
+        (item.source.endpoint_url, item.source.region)
         for item in settings
-        if item.storage.remote is not None
-        and (source == "remote" or (source == "auto" and item.storage.authority == "remote"))
+        if isinstance(item.source, RemoteSource)
     }
     if len(signatures) > 1:
         raise ValidationError(

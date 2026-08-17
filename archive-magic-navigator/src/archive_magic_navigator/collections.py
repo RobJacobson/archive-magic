@@ -49,7 +49,7 @@ def validate_collection_id(collection_id: str) -> str:
 
 
 def select_archive_root(root: Path, archive_id: str) -> Archive:
-    """Validate an exact archive data root from a descriptor."""
+    """Validate an exact archive data root from a configuration."""
 
     archive_id = validate_archive_id(archive_id)
     try:

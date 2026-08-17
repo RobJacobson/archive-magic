@@ -1,25 +1,27 @@
 # Private S3-compatible bucket smoke test
 
-This procedure exercises a remote-authoritative archive against a private bucket.
+This procedure exercises a remote archive against a private bucket.
 Use a disposable prefix: the reset step intentionally deletes it.
 
 ## Configure
 
-1. Copy `examples/example.org/archive.toml` outside either implementation directory.
-2. Set `storage.authority = "remote"` and add:
+1. Copy `examples/example.org/fetch.toml` and
+   `examples/example.org/navigator.toml` outside either implementation directory.
+2. In `fetch.toml`, set `output.type = "remote"` and add:
 
    ```toml
-   [storage.remote]
    bucket = "your-private-bucket"
    prefix = "archive-magic-smoke/example.org"
    endpoint_url = "https://your-s3-compatible-endpoint"
    region = "auto"
    ```
 
-3. Limit `[fetch]` to a small historical interval for the smoke test. Keep
+3. In `navigator.toml`, set `source.type = "remote"` with the same bucket fields
+   (no `directory` on a remote source).
+4. Limit `[fetch]` to a small historical interval for the smoke test. Keep
    `data_directory = "data"` so transient working files remain isolated from the
-   descriptor and logs.
-4. Configure credentials through the standard AWS/Boto3 chain (for example an AWS
+   configuration and logs.
+5. Configure credentials through the standard AWS/Boto3 chain (for example an AWS
    profile or process environment). Archive Magic does not load `.env`.
 
 ## Publish and play
@@ -27,7 +29,7 @@ Use a disposable prefix: the reset step intentionally deletes it.
 From the Fetch project:
 
 ```console
-uv run archive-magic-fetch /absolute/path/to/example.org/archive.toml
+uv run archive-magic-fetch /absolute/path/to/example.org/fetch.toml
 ```
 
 Confirm the prefix contains WARC/CDXJ objects and
@@ -38,7 +40,7 @@ confirm it downloads only the active CDXJ/tail and performs no WARC/index upload
 From the Navigator project:
 
 ```console
-uv run archive-magic-navigator /absolute/path/to/example.org --source remote --open
+uv run archive-magic-navigator /absolute/path/to/example.org --open
 ```
 
 Confirm that `navigator-cache/` contains manifest/index files, no WARC copies, and

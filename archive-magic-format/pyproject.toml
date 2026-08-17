@@ -3,9 +3,9 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "archive-magic-descriptor"
+name = "archive-magic-format"
 version = "0.1.0"
-description = "Shared archive.toml and collections-manifest parsing for Archive Magic"
+description = "Shared Archive Magic publication manifest format"
 requires-python = ">=3.12"
 license = { text = "MIT" }
 dependencies = []

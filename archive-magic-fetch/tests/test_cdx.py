@@ -12,7 +12,7 @@ from archive_magic_fetch.cdx import (
     parse_date_bound,
     year_ranges,
 )
-from archive_magic_fetch.config import StorageConfig
+from archive_magic_fetch.config import FetchOutput
 from archive_magic_fetch.fetch import build_settings
 
 
@@ -213,7 +213,7 @@ def test_parse_date_bound_strips_hyphens_and_pads_precision():
         "http://example.org/",
         date_start="2004-06",
         date_end="2004-12-31",
-        storage=StorageConfig("local", Path("/tmp/workspace")),
+        output=FetchOutput("local", Path("/tmp/workspace")),
     )
     assert settings.date_start == "20040601000000"
     assert settings.date_end == "20041231235959"

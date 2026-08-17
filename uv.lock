@@ -5,8 +5,8 @@ requires-python = "==3.12.*"
 [manifest]
 members = [
     "archive-magic",
-    "archive-magic-descriptor",
     "archive-magic-fetch",
+    "archive-magic-format",
     "archive-magic-navigator",
 ]
 
@@ -26,26 +26,11 @@ requires-dist = [
 ]
 
 [[package]]
-name = "archive-magic-descriptor"
-version = "0.1.0"
-source = { editable = "archive-magic-descriptor" }
-
-[package.dev-dependencies]
-dev = [
-    { name = "pytest" },
-]
-
-[package.metadata]
-
-[package.metadata.requires-dev]
-dev = [{ name = "pytest", specifier = ">=8" }]
-
-[[package]]
 name = "archive-magic-fetch"
 version = "0.1.0"
 source = { editable = "archive-magic-fetch" }
 dependencies = [
-    { name = "archive-magic-descriptor" },
+    { name = "archive-magic-format" },
     { name = "boto3" },
     { name = "cdxj-indexer" },
     { name = "surt" },
@@ -60,7 +45,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "archive-magic-descriptor", editable = "archive-magic-descriptor" },
+    { name = "archive-magic-format", editable = "archive-magic-format" },
     { name = "boto3", specifier = ">=1.35,<2" },
     { name = "cdxj-indexer", specifier = "==1.4.6" },
     { name = "surt", specifier = "==0.3.1" },
@@ -72,11 +57,26 @@ requires-dist = [
 dev = [{ name = "pytest", specifier = ">=8" }]
 
 [[package]]
+name = "archive-magic-format"
+version = "0.1.0"
+source = { editable = "archive-magic-format" }
+
+[package.dev-dependencies]
+dev = [
+    { name = "pytest" },
+]
+
+[package.metadata]
+
+[package.metadata.requires-dev]
+dev = [{ name = "pytest", specifier = ">=8" }]
+
+[[package]]
 name = "archive-magic-navigator"
 version = "0.1.0"
 source = { editable = "archive-magic-navigator" }
 dependencies = [
-    { name = "archive-magic-descriptor" },
+    { name = "archive-magic-format" },
     { name = "boto3" },
     { name = "pywb" },
     { name = "pyyaml" },
@@ -90,7 +90,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "archive-magic-descriptor", editable = "archive-magic-descriptor" },
+    { name = "archive-magic-format", editable = "archive-magic-format" },
     { name = "boto3", specifier = ">=1.35,<2" },
     { name = "pywb", specifier = "==2.9.1" },
     { name = "pyyaml", specifier = ">=6,<7" },
