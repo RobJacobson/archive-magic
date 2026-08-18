@@ -26,7 +26,6 @@ from .settings import RemoteSource
 
 _CDX_TIMESTAMP = re.compile(r"^\d{14}$")
 _INDEX_SUFFIX = "-index.cdxj"
-_IGNORED_OBJECT_NAMES = frozenset({"collections-manifest.json"})
 
 
 @dataclass(frozen=True)
@@ -329,10 +328,7 @@ class RemoteArchiveStore:
             response = self.client.list_objects_v2(**kwargs)
             for entry in response.get("Contents", []):
                 relative = _relative_key(prefix, entry["Key"])
-                if (
-                    relative is None
-                    or PurePosixPath(relative).name in _IGNORED_OBJECT_NAMES
-                ):
+                if relative is None or not _is_archive_object(relative):
                     continue
                 inventory[relative] = RemoteObject(
                     key=relative,
@@ -404,6 +400,13 @@ def _validate_index(
                     raise ValidationError(
                         f"{path}, line {number}: WARC range out of bounds"
                     )
+
+
+def _is_archive_object(relative: str) -> bool:
+    name = PurePosixPath(relative).name
+    return relative == name and (
+        name.endswith(".warc.gz") or name.endswith(".cdxj")
+    )
 
 
 def _relative_key(prefix: str, key: str) -> str | None:
