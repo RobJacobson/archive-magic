@@ -6,10 +6,10 @@ Archive Magic Navigator is a standalone playback process. It validates published
 Archive Magic collections, generates an isolated pywb runtime configuration, and
 serves replay UI/routes. It never asks Fetch to acquire data and has no control
 channel with Fetch. The two applications interact only through the archived
-WARC/CDXJ layout and `collections-manifest.json`.
+WARC/CDXJ layout in a flat directory.
 
 Navigator does not mutate WARC or user-authored archive configuration. For remote
-playback it writes only validated CDXJ/manifest cache files.
+playback it writes only validated CDXJ cache files.
 
 ## Public interface
 
@@ -78,8 +78,7 @@ endpoint_url = "https://s3.example.invalid"
 region = "auto"
 ```
 
-`navigator.toml` is user-authored intent. `collections-manifest.json` is generated
-publication state.
+`navigator.toml` is user-authored intent.
 
 The format is unversioned but strict: unknown tables and keys fail startup. The
 archive ID is validated for safe use in pywb routes and local paths. Relative
@@ -119,7 +118,6 @@ A local archive has this exact root:
 
 ```text
 <source.directory>/
-  collections-manifest.json
   example.org-2004-001.warc.gz
   example.org-2004-index.cdxj
   example.org-2005-001.warc.gz
@@ -145,46 +143,39 @@ Within it, archive IDs remain separated:
 ```text
 navigator-cache/
   example.org/
-    collections-manifest.json
     example.org-2004-index.cdxj
 ```
 
 WARC objects are not downloaded into this cache. The generated pywb collection uses
 an authenticated `s3://bucket/prefix/` archive path, allowing pywb
-to issue byte-range reads using the standard AWS credential chain. Only indexes and
-the last accepted manifest are cached locally.
+to issue byte-range reads using the standard AWS credential chain. Only indexes
+are cached locally.
 
 At startup the remote store:
 
-1. Reads `collections-manifest.json` and records its ETag.
-2. Strictly validates its shape, timestamps, IDs, keys, ETags, SHA-256 values, and
-   sizes.
-3. Downloads each CDXJ with the index artifact ETag as `If-Match`.
-4. Verifies size and SHA-256 and validates every CDXJ WARC filename/range against
-   the manifest's WARC inventory.
-5. Stages all required index files beside their destinations and atomically replaces
+1. Lists the bucket prefix and discovers collections from strict index filenames.
+2. Downloads each CDXJ with the listed object ETag as `If-Match`.
+3. Verifies size and optional object metadata SHA-256 and validates every CDXJ WARC
+   filename/range against listed WARC sizes.
+4. Stages all required index files beside their destinations and atomically replaces
    them only after validation.
-6. Atomically caches the accepted manifest.
 
-If remote startup fails, Navigator may use the previous cache only when its
-manifest and every cached index still pass the same validation. Otherwise startup
-fails.
+If remote startup fails, Navigator may use the previous cache only when every cached
+index still passes structural validation. Otherwise startup fails.
 
 ## Polling and publication continuity
 
-Each remote store polls the manifest ETag at the configured interval. An unchanged
-ETag is a no-op. For a changed manifest, Navigator stages and validates changed
-indexes before atomically replacing each cached index and advancing its accepted
-manifest state.
+Each remote store polls index object ETags at the configured interval by relisting
+the prefix. An unchanged index ETag is a no-op. For a changed index ETag, Navigator
+stages and validates the new CDXJ before atomically replacing the cached index.
 
-Fetch publishes WARC objects, then the index, then the manifest. This order makes
-the manifest the visibility boundary:
+Fetch publishes WARC objects first and replaces the CDXJ last. This order makes
+the CDXJ the visibility boundary:
 
-- Before manifest commit, Navigator sees the old manifest and keeps the old index.
-- After commit, all referenced artifacts should be complete.
-- If the new manifest/index read is temporarily inconsistent, preconditioned,
-  corrupt, or unavailable, polling logs a warning, retains the previous validated
-  cache/state, and retries later.
+- Before CDXJ replacement, Navigator keeps the old index.
+- After replacement, all referenced WARC byte ranges should exist.
+- If listing, downloading, or validation fails, polling logs a warning, retains
+  the previous validated cache, and retries later.
 - An extended WARC is safe with an old index because all old byte ranges are
   unchanged.
 
@@ -198,8 +189,8 @@ The generated pywb configuration assigns each route its effective policy. A cata
 can therefore contain both fallback-enabled and fallback-disabled archives. The CLI
 override forces all routes on or off for one process invocation.
 
-Fallback behavior is a playback policy only. It does not alter stored WARC data,
-the Navigator configuration, or the publication manifest.
+Fallback behavior is a playback policy only. It does not alter stored WARC data
+or the Navigator configuration.
 
 ## Generated pywb runtime
 
@@ -216,13 +207,13 @@ child cleanly.
 
 ## Failure and trust model
 
-Navigator trusts only configuration-validated paths plus manifest-validated artifact
-metadata. It rejects traversal, reserved route names, duplicate IDs, malformed CDXJ
-rows, unknown manifest keys, out-of-bounds WARC ranges, and changed artifacts that
-do not match their declared digest.
+Navigator trusts only configuration-validated paths plus CDXJ structure and, when
+a prefix listing is available, WARC range bounds derived from listed object sizes.
+It rejects traversal, reserved route names, duplicate IDs, malformed CDXJ rows,
+unknown WARC filenames, and out-of-bounds ranges.
 
 Expected transient conditions—an in-progress publication, conditional read
-failure, provider outage, or malformed new manifest—do not destroy the last known
+failure, provider outage, or malformed new index—do not destroy the last known
 good cache. Unexpected startup conditions without a valid cache are fatal and
 produce a nonzero exit.
 
@@ -234,8 +225,6 @@ multi-tenant hardening.
 
 - `settings.py`: Navigator-local TOML loading, path resolution, safety checks, and
   catalog discovery.
-- `archive-magic-format`: dependency-free `collections-manifest.json` content
-  protocol shared with Fetch; it contains no application configuration.
 - `cli.py`: public arguments, source dispatch, aggregate validation, and process
   lifecycle.
 - `collections.py`: local exact-root discovery and route-safe collection models.
@@ -263,5 +252,5 @@ uv run pytest -q -m integration
 
 Tests cover configuration and CLI cutover, deterministic catalogs, remote
 environment compatibility, per-archive fallback generation, cached playback
-during manifest/index mismatch, atomic polling adoption, authenticated S3 archive
+during index mismatch, atomic polling adoption, authenticated S3 archive
 paths, and local pywb startup.

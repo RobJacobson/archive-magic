@@ -6,13 +6,9 @@ Archive Magic consists of two independent applications:
 - `archive-magic-navigator` plays one or more collections through pywb.
 
 They do not communicate with each other. Each application has its own configuration
-file. The generated `collections-manifest.json` describes published artifacts; it
-is state, not configuration. Configuration files may be colocated for convenience
-but are not archive content and need not exist on the same host.
-
-Both applications depend on the small, dependency-free `archive-magic-format`
-package for this manifest protocol. It shares the archive format, not application
-configuration or runtime behavior.
+file. The archive protocol is the flat directory of WARC and CDXJ files. Configuration
+files may be colocated for convenience but are not archive content and need not exist
+on the same host.
 
 ## Configuration
 
@@ -31,7 +27,6 @@ archives/
     fetch.toml
     navigator.toml
     data/
-      collections-manifest.json
       example.org-2004-001.warc.gz
       example.org-2004-index.cdxj
     logs/
@@ -82,9 +77,9 @@ archive-magic-navigator ~/archives/example.org --poll-interval 60
 The bucket prefix is the source of truth. Before fetching, Fetch validates or
 downloads the selected collection's CDXJ and final WARC into `data/`. It
 runs the same append/index pipeline as local output, publishes changed
-WARC/index objects, and commits `collections-manifest.json` last. After a verified
-commit it removes the finalized local working copies. Fetch writes one JSON record
-and one console log per invocation under `logs/`.
+WARC objects, and replaces the CDXJ last. After a verified commit it removes the
+finalized local working copies. Fetch writes one JSON record and one console log
+per invocation under `logs/`.
 Navigator keeps indexes in the visible `navigator-cache/`, streams WARC ranges
 from the bucket, and continues using its last validated index during an incomplete
 publication or transient bucket error.
@@ -108,8 +103,8 @@ archive-magic-fetch ~/archives/example.org --start 2026-01-01 --end 2026-12-31
 
 `--reset-data` is exceptional maintenance. With remote output it rejects date
 overrides, deletes the complete configured prefix, clears `data/`, and
-rebuilds the full configured range. Playback is unavailable until the new manifest
-is published. With local output it preserves the existing selected-collection
+rebuilds the full configured range. Playback is unavailable until the new indexes
+are published. With local output it preserves the existing selected-collection
 reset behavior.
 
 ## Catalog playback

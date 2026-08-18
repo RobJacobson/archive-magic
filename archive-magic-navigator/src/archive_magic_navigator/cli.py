@@ -137,7 +137,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         item.archive_id,
                     )
                     label = str(item.source.directory)
-                validate_archive(archive)
+                    validate_archive(archive)
             except (NavigatorError, ValueError) as error:
                 archive_errors.append(f"{item.archive_id}: {error}")
                 continue

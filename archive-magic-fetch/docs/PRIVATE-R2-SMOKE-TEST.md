@@ -32,9 +32,8 @@ From the Fetch project:
 uv run archive-magic-fetch /absolute/path/to/example.org/fetch.toml
 ```
 
-Confirm the prefix contains WARC/CDXJ objects and
-`collections-manifest.json`. Confirm `data/` contains no finalized WARC or CDXJ
-after success. Re-run Fetch without source changes and
+Confirm the prefix contains WARC and CDXJ objects. Confirm `data/` contains no
+finalized WARC or CDXJ after success. Re-run Fetch without source changes and
 confirm it downloads only the active CDXJ/tail and performs no WARC/index uploads.
 
 From the Navigator project:
@@ -43,15 +42,15 @@ From the Navigator project:
 uv run archive-magic-navigator /absolute/path/to/example.org --open
 ```
 
-Confirm that `navigator-cache/` contains manifest/index files, no WARC copies, and
+Confirm that `navigator-cache/` contains index files, no WARC copies, and
 that replay produces authenticated WARC range reads from the bucket.
 
 ## Update and continuity
 
 Extend the selected source interval or wait for a new snapshot, then run Fetch
-again. The expected order is changed/new WARC, live CDXJ, manifest verification,
-the run record, then local-working-file cleanup. Earlier WARC objects must be
-untouched; an existing tail must be an exact prefix extension.
+again. The expected order is changed/new WARC, live CDXJ, the run record, then
+local-working-file cleanup. Earlier WARC objects must be untouched; an existing
+tail must be an exact prefix extension.
 
 To exercise recovery, interrupt or fail one upload and confirm the finalized
 WARC/CDXJ remain in `data/`. The next run must finish through the normal
@@ -59,7 +58,7 @@ materialize/index/publish path. Do not delete `data/` during an incomplete
 publication; without it, reset and regeneration are required.
 
 Keep Navigator running during the update. It should use the previous validated
-index until the new manifest is committed, then adopt the new index on a later poll.
+index until the new CDXJ is committed, then adopt the new index on a later poll.
 
 ## Destructive reset
 

@@ -7,26 +7,16 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
-from archive_magic_format import (
-    CollectionsManifest,
-    ManifestArtifact,
-    ManifestCollection,
-    parse_manifest,
-)
 from archive_magic_fetch.collection import ArchiveLayout, ensure_collection_dirs
 from archive_magic_fetch.config import FetchOutput
 from archive_magic_fetch.fetch import FetchSettings, run_fetch
 from archive_magic_fetch.index import parse_cdxj_line, publish_collection_index
 from archive_magic_fetch.inventory import inventory_collection
 from archive_magic_fetch.playback import payload_digest
-from archive_magic_fetch.storage import MANIFEST_NAME, PublicationManager
+from archive_magic_fetch.storage import PublicationManager
 from archive_magic_fetch.warc import CollectionWarcWriter
 from botocore.exceptions import ClientError
 from helpers import cdx_json, make_capt, patch_cdx, playback
-
-
-def artifact(key, body=b"data", etag='"etag"'):
-    return ManifestArtifact(key, etag, hashlib.sha256(body).hexdigest(), len(body))
 
 
 def remote_config(tmp_path, prefix="example.org"):
@@ -53,16 +43,26 @@ class FakeS3:
         self.fail_key_suffix: str | None = None
 
     def seed(self, key, body, etag=None, metadata=None):
+        digest = hashlib.sha256(body).hexdigest()
         self.objects[key] = {
             "body": body,
             "etag": etag or f'"{hashlib.md5(body).hexdigest()}"',  # noqa: S324
-            "metadata": metadata or {"sha256": hashlib.sha256(body).hexdigest()},
+            "metadata": metadata or {"sha256": digest},
         }
 
-    def get_object(self, *, Bucket, Key):
-        self.operations.append(("get", Key))
+    def get_object(self, *, Bucket, Key, **kwargs):
+        self.operations.append(("get", Key, kwargs))
         item = self._item(Key, "GetObject")
-        return {"Body": io.BytesIO(item["body"]), "ETag": item["etag"]}
+        return {
+            "Body": io.BytesIO(item["body"]),
+            "ETag": item["etag"],
+            "Metadata": item["metadata"],
+        }
+
+    def head_object(self, *, Bucket, Key):
+        self.operations.append(("head", Key))
+        item = self._item(Key, "HeadObject")
+        return {"ETag": item["etag"], "Metadata": item["metadata"]}
 
     def list_objects_v2(self, **kwargs):
         prefix = kwargs["Prefix"]
@@ -70,7 +70,17 @@ class FakeS3:
         keys = sorted(key for key in self.objects if key.startswith(prefix))
         if "MaxKeys" in kwargs:
             keys = keys[: kwargs["MaxKeys"]]
-        return {"KeyCount": len(keys), "Contents": [{"Key": key} for key in keys]}
+        return {
+            "KeyCount": len(keys),
+            "Contents": [
+                {
+                    "Key": key,
+                    "Size": len(self.objects[key]["body"]),
+                    "ETag": self.objects[key]["etag"],
+                }
+                for key in keys
+            ],
+        }
 
     def put_object(self, *, Bucket, Key, Body, Metadata=None, **kwargs):
         self.operations.append(("put", Key))
@@ -105,24 +115,15 @@ def make_collection(workspace: Path, *, captures: int = 1, target_bytes=250_000_
     return layout, warcs, index
 
 
-def seed_manifest(fake: FakeS3, layout: ArchiveLayout, etag='"manifest"'):
-    warcs = []
-    for path in sorted(layout.collection_dir("2004").glob("*.warc.gz")):
+def seed_remote(fake: FakeS3, layout: ArchiveLayout, *, prefix="example.org"):
+    for path in sorted(layout.root.glob("*.warc.gz")):
         body = path.read_bytes()
-        item = artifact(path.relative_to(layout.root).as_posix(), body)
-        fake.seed("example.org/" + item.key, body, item.etag)
-        warcs.append(item)
+        key = path.relative_to(layout.root).as_posix()
+        fake.seed(f"{prefix}/{key}", body)
     index_path = layout.collection_index("2004")
-    index_body = index_path.read_bytes()
-    index = artifact(index_path.relative_to(layout.root).as_posix(), index_body)
-    fake.seed("example.org/" + index.key, index_body, index.etag)
-    timestamp = "2026-08-13T20:15:00Z"
-    manifest = CollectionsManifest(
-        timestamp,
-        {"2004": ManifestCollection(timestamp, index, tuple(warcs))},
-    )
-    fake.seed("example.org/" + MANIFEST_NAME, manifest.to_bytes(), etag)
-    return manifest
+    if index_path.is_file():
+        key = index_path.relative_to(layout.root).as_posix()
+        fake.seed(f"{prefix}/{key}", index_path.read_bytes())
 
 
 def append_capture(
@@ -171,17 +172,12 @@ def published_update(tmp_path, monkeypatch):
     return fake, layout, manager, identity
 
 
-def test_filesystem_publication_uses_synthetic_etags(tmp_path):
+def test_local_publication_does_not_write_manifest(tmp_path):
     layout, _, _ = make_collection(tmp_path / "data")
     manager = PublicationManager(FetchOutput("local", layout.root))
     manager.prepare(layout)
-    assert manager.publish_collection(layout, "2004")
-    collection = parse_manifest((layout.root / MANIFEST_NAME).read_bytes()).collections[
-        "2004"
-    ]
-    assert collection.index.etag.startswith('"sha256:')
-    assert all(item.etag.startswith('"sha256:') for item in collection.warcs)
     assert not manager.publish_collection(layout, "2004")
+    assert not (layout.root / "collections-manifest.json").exists()
 
 
 def test_prepare_does_not_mirror_and_index_download_skips_warcs(
@@ -189,7 +185,7 @@ def test_prepare_does_not_mirror_and_index_download_skips_warcs(
 ):
     fake = FakeS3()
     source, _, _ = make_collection(tmp_path / "source", captures=2, target_bytes=1)
-    manifest = seed_manifest(fake, source)
+    seed_remote(fake, source)
     patch_s3(monkeypatch, fake)
     layout = ArchiveLayout(tmp_path / "data", "example.org")
     manager = PublicationManager(remote_config(tmp_path))
@@ -200,18 +196,19 @@ def test_prepare_does_not_mirror_and_index_download_skips_warcs(
     fake.operations.clear()
     manager.materialize_index(layout, "2004")
 
-    first, tail = manifest.collections["2004"].warcs
-    assert not (layout.root / first.key).exists()
-    assert not (layout.root / tail.key).exists()
+    first_key = "example.org-2004-001.warc.gz"
+    tail_key = "example.org-2004-002.warc.gz"
+    assert not (layout.root / first_key).exists()
+    assert not (layout.root / tail_key).exists()
     gets = {op[1] for op in fake.operations if op[0] == "get"}
-    assert gets == {"example.org/" + manifest.collections["2004"].index.key}
+    assert gets == {"example.org/example.org-2004-index.cdxj"}
 
     fake.operations.clear()
     manager.materialize_tail(layout, "2004")
-    assert not (layout.root / first.key).exists()
-    assert (layout.root / tail.key).is_file()
+    assert not (layout.root / first_key).exists()
+    assert (layout.root / tail_key).is_file()
     gets = {op[1] for op in fake.operations if op[0] == "get"}
-    assert gets == {"example.org/" + tail.key}
+    assert gets == {"example.org/" + tail_key}
 
 
 def test_materialize_tail_keeps_a_longer_local_file(tmp_path, monkeypatch):
@@ -221,16 +218,8 @@ def test_materialize_tail_keeps_a_longer_local_file(tmp_path, monkeypatch):
     original_index = local.collection_index("2004").read_bytes()
     identity, _, _ = append_capture(local)
 
-    warc = artifact("example.org-2004-001.warc.gz", original_warc)
-    index = artifact("example.org-2004-index.cdxj", original_index)
-    timestamp = "2026-08-13T20:15:00Z"
-    manifest = CollectionsManifest(
-        timestamp,
-        {"2004": ManifestCollection(timestamp, index, (warc,))},
-    )
-    fake.seed("example.org/" + warc.key, original_warc, warc.etag)
-    fake.seed("example.org/" + index.key, original_index, index.etag)
-    fake.seed("example.org/" + MANIFEST_NAME, manifest.to_bytes(), '"manifest"')
+    fake.seed("example.org/example.org-2004-001.warc.gz", original_warc)
+    fake.seed("example.org/example.org-2004-index.cdxj", original_index)
     patch_s3(monkeypatch, fake)
 
     manager = PublicationManager(remote_config(tmp_path))
@@ -255,16 +244,8 @@ def test_materialize_tail_keeps_a_new_rollover_shard(tmp_path, monkeypatch):
     identity, changed, _ = append_capture(local, target_bytes=1)
     assert changed[0].sequence == 2
 
-    warc = artifact("example.org-2004-001.warc.gz", original_warc)
-    index = artifact("example.org-2004-index.cdxj", original_index)
-    timestamp = "2026-08-13T20:15:00Z"
-    manifest = CollectionsManifest(
-        timestamp,
-        {"2004": ManifestCollection(timestamp, index, (warc,))},
-    )
-    fake.seed("example.org/" + warc.key, original_warc, warc.etag)
-    fake.seed("example.org/" + index.key, original_index, index.etag)
-    fake.seed("example.org/" + MANIFEST_NAME, manifest.to_bytes(), '"manifest"')
+    fake.seed("example.org/example.org-2004-001.warc.gz", original_warc)
+    fake.seed("example.org/example.org-2004-index.cdxj", original_index)
     patch_s3(monkeypatch, fake)
 
     manager = PublicationManager(remote_config(tmp_path))
@@ -274,7 +255,7 @@ def test_materialize_tail_keeps_a_new_rollover_shard(tmp_path, monkeypatch):
     assert inventory_collection(local, "2004").contains(identity)
 
 
-def test_remote_publication_is_warc_index_manifest_and_evicts(tmp_path, monkeypatch):
+def test_remote_publication_is_warc_then_index_and_evicts(tmp_path, monkeypatch):
     fake = FakeS3()
     patch_s3(monkeypatch, fake)
     layout, warcs, index = make_collection(tmp_path / "data")
@@ -286,7 +267,6 @@ def test_remote_publication_is_warc_index_manifest_and_evicts(tmp_path, monkeypa
     assert puts == [
         "example.org/" + warcs[0].relative_key,
         "example.org/" + index.relative_key,
-        "example.org/" + MANIFEST_NAME,
     ]
     manager.evict_collection(layout, "2004")
     assert not list(layout.collection_dir("2004").glob("*.warc.gz"))
@@ -400,7 +380,7 @@ def test_noop_remote_year_downloads_index_not_tail(tmp_path, monkeypatch):
 
 def test_failed_publication_retries_from_retained_workspace(tmp_path, monkeypatch):
     fake, layout, manager, identity = published_update(tmp_path, monkeypatch)
-    fake.fail_key_suffix = MANIFEST_NAME
+    fake.fail_key_suffix = "index.cdxj"
 
     with pytest.raises(OSError, match="simulated"):
         manager.publish_collection(layout, "2004")
@@ -413,13 +393,15 @@ def test_failed_publication_retries_from_retained_workspace(tmp_path, monkeypatc
     recovered.materialize_index(layout, "2004")
     recovered.materialize_tail(layout, "2004")
     recovered.publish_collection(layout, "2004")
-    assert recovered.manifest.collections["2004"].index.sha256 == hashlib.sha256(
+    assert hashlib.sha256(
         layout.collection_index("2004").read_bytes()
-    ).hexdigest()
+    ).hexdigest() == fake.objects["example.org/example.org-2004-index.cdxj"]["metadata"][
+        "sha256"
+    ]
     assert inventory_collection(layout, "2004").contains(identity)
 
 
-def test_missing_manifest_is_an_empty_archive(tmp_path, monkeypatch):
+def test_orphan_warc_without_index_is_ignored(tmp_path, monkeypatch):
     fake = FakeS3()
     fake.seed("example.org/orphan.warc.gz", b"orphan")
     patch_s3(monkeypatch, fake)
@@ -427,13 +409,15 @@ def test_missing_manifest_is_an_empty_archive(tmp_path, monkeypatch):
     layout = ArchiveLayout(tmp_path / "data", "example.org")
 
     manager.prepare(layout)
-    assert manager.manifest.collections == {}
+    assert "orphan.warc.gz" in manager.inventory
+    manager.materialize_index(layout, "2004")
+    assert not layout.collection_index("2004").exists()
 
 
 def test_shorter_local_tail_is_replaced_from_remote(tmp_path, monkeypatch):
     fake = FakeS3()
     source, _, _ = make_collection(tmp_path / "source")
-    seed_manifest(fake, source)
+    seed_remote(fake, source)
     patch_s3(monkeypatch, fake)
     layout, _, _ = make_collection(tmp_path / "data")
     tail = layout.collection_warc_path("2004", 1)
@@ -463,7 +447,7 @@ def test_reset_deletes_only_archive_prefix_and_workspace(tmp_path, monkeypatch):
     assert not list(layout.root.iterdir())
 
 
-def test_publish_retains_non_materialized_warcs_from_manifest(tmp_path, monkeypatch):
+def test_publish_skips_reupload_of_non_materialized_warcs(tmp_path, monkeypatch):
     fake = FakeS3()
     patch_s3(monkeypatch, fake)
     layout, warcs, _ = make_collection(
@@ -490,8 +474,7 @@ def test_publish_retains_non_materialized_warcs_from_manifest(tmp_path, monkeypa
     puts = [op[1] for op in fake.operations if op[0] == "put"]
     assert "example.org/" + first_key not in puts
     assert fake.objects["example.org/" + first_key]["body"] == first_body
-    published = parse_manifest(fake.objects["example.org/" + MANIFEST_NAME]["body"])
-    assert first_key in [item.key for item in published.collections["2004"].warcs]
+    assert first_key in manager.inventory
 
 
 def test_remote_publish_skips_unchanged_artifacts(tmp_path, monkeypatch):
@@ -519,17 +502,31 @@ def test_replaced_remote_cdxj_recovers_from_local_index(tmp_path, monkeypatch):
     manager.publish_collection(layout, "2004")
     index_path = layout.collection_index("2004")
     index_key = "example.org/" + index_path.relative_to(layout.root).as_posix()
-    recovered = _mark_cdxj_recovered(index_path)
-    fake.seed(index_key, recovered)
+    original_remote = fake.objects[index_key]["body"]
+    _mark_cdxj_recovered(index_path)
+    fake.seed(index_key, original_remote)
 
     recovered_manager = PublicationManager(remote_config(tmp_path))
     recovered_manager.prepare(layout)
     recovered_manager.materialize_index(layout, "2004")
-    assert index_path.read_bytes() == recovered
+    assert index_path.read_text(encoding="utf-8").count("recovered") == 1
     fake.operations.clear()
     assert recovered_manager.publish_collection(layout, "2004")
     puts = [op[1] for op in fake.operations if op[0] == "put"]
-    assert puts == [index_key, "example.org/" + MANIFEST_NAME]
+    assert puts == [index_key]
+
+
+def test_leftover_manifest_is_ignored(tmp_path, monkeypatch):
+    fake = FakeS3()
+    layout, _, _ = make_collection(tmp_path / "source")
+    seed_remote(fake, layout)
+    fake.seed("example.org/collections-manifest.json", b'{"ignored": true}')
+    patch_s3(monkeypatch, fake)
+    manager = PublicationManager(remote_config(tmp_path))
+    target = ArchiveLayout(tmp_path / "data", "example.org")
+
+    manager.prepare(target)
+    assert "collections-manifest.json" not in manager.inventory
 
 
 def test_remote_run_record_is_written_before_working_files_are_evicted(
