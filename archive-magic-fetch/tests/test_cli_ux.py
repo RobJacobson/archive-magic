@@ -21,30 +21,28 @@ from archive_magic_fetch.retry import backpressure_signal
 from helpers import make_capt, playback
 
 
-def write_cli_descriptor(
+def write_cli_config(
     directory: Path,
     *,
-    authority: str = "local",
+    output_type: str = "local",
 ) -> Path:
     directory.mkdir(parents=True, exist_ok=True)
     remote = ""
-    if authority == "remote":
+    if output_type == "remote":
         remote = """
-[storage.remote]
 bucket = "bucket"
 prefix = "example.org"
 endpoint_url = "https://s3.example.invalid"
 region = "auto"
 """
-    path = directory / "archive.toml"
+    path = directory / "fetch.toml"
     path.write_text(
         f"""
-schema_version = 1
 [archive]
 id = "example.org"
 url_pattern = "*.example.org"
-[storage]
-authority = "{authority}"
+[output]
+type = "{output_type}"
 data_directory = "data"
 {remote}
 [fetch]
@@ -262,10 +260,10 @@ def test_skip_groups_yield_before_next_download_starts():
 def test_cli_rejects_reversed_range(tmp_path):
     from archive_magic_fetch.cli import main
 
-    descriptor = write_cli_descriptor(tmp_path)
+    config = write_cli_config(tmp_path)
     code = main(
         [
-            str(descriptor),
+            str(config),
             "--start",
             "20050101",
             "--end",
@@ -275,10 +273,10 @@ def test_cli_rejects_reversed_range(tmp_path):
     assert code == 2
 
 
-def test_cli_uses_descriptor_configured_history(tmp_path, monkeypatch):
+def test_cli_uses_configured_history(tmp_path, monkeypatch):
     from archive_magic_fetch import cli
 
-    descriptor = write_cli_descriptor(tmp_path)
+    config = write_cli_config(tmp_path)
     captured = []
 
     def run(settings):
@@ -286,11 +284,11 @@ def test_cli_uses_descriptor_configured_history(tmp_path, monkeypatch):
         return SimpleNamespace(exit_code=0)
 
     monkeypatch.setattr(cli, "run_fetch", run)
-    assert cli.main([str(descriptor.parent)]) == 0
+    assert cli.main([str(config.parent)]) == 0
     assert captured[0].archive_id == "example.org"
     assert captured[0].date_start == "20000101000000"
     assert captured[0].date_end == "20011231235959"
-    assert captured[0].storage.data_directory == (tmp_path / "data").resolve()
+    assert captured[0].output.data_directory == (tmp_path / "data").resolve()
 
 
 def test_remote_reset_rejects_dates_and_warns_before_full_rebuild(
@@ -300,8 +298,8 @@ def test_remote_reset_rejects_dates_and_warns_before_full_rebuild(
 ):
     from archive_magic_fetch import cli
 
-    descriptor = write_cli_descriptor(tmp_path, authority="remote")
-    assert cli.main([str(descriptor), "--reset-data", "--start", "2001"]) == 2
+    config = write_cli_config(tmp_path, output_type="remote")
+    assert cli.main([str(config), "--reset-data", "--start", "2001"]) == 2
     assert "complete configured date range" in capsys.readouterr().err
 
     monkeypatch.setattr(
@@ -309,7 +307,7 @@ def test_remote_reset_rejects_dates_and_warns_before_full_rebuild(
         "run_fetch",
         lambda settings: SimpleNamespace(exit_code=0),
     )
-    assert cli.main([str(descriptor), "--reset-data"]) == 0
+    assert cli.main([str(config), "--reset-data"]) == 0
     warning = capsys.readouterr().err
     assert "delete and rebuild the entire remote archive prefix" in warning
     assert "playback will be unavailable" in warning

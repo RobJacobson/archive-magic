@@ -20,6 +20,7 @@ from .collection import (
     ArchiveLayout,
     cleanup_temps,
     ensure_collection_dirs,
+    file_sha256,
     index_artifact_from_path,
     init_run_id,
     init_run_record,
@@ -29,7 +30,11 @@ from .collection import (
     reset_collection_data,
     write_run_record,
 )
-from .config import DEFAULT_RETRIES, DEFAULT_WARC_TARGET_BYTES, StorageConfig
+from .config import (
+    DEFAULT_RETRIES,
+    DEFAULT_WARC_TARGET_BYTES,
+    FetchOutput,
+)
 from .console import emit, format_elapsed, log_url_outcome, mirror_output
 from .index import (
     parse_cdxj_line,
@@ -73,7 +78,7 @@ class FetchSettings:
     date_start: str
     date_end: str
     archive_id: str
-    storage: StorageConfig
+    output: FetchOutput
     reset_data: bool = False
     warc_target_bytes: int = DEFAULT_WARC_TARGET_BYTES
     playback_workers: int = 4
@@ -127,7 +132,7 @@ def run_fetch(
 ) -> FetchResult:
     """Execute the annual fetch pipeline with bounded playback workers."""
 
-    layout = ArchiveLayout(settings.storage.data_directory, settings.archive_id)
+    layout = ArchiveLayout(settings.output.data_directory, settings.archive_id)
     layout.logs_root.mkdir(parents=True, exist_ok=True)
     run_id = init_run_id(layout)
     init_run_record(layout, run_id)
@@ -165,14 +170,14 @@ def _run_fetch(
 ) -> FetchResult:
     """Execute serial years with parallel playback and one WARC writer."""
 
-    publisher = PublicationManager(settings.storage)
-    if settings.reset_data and settings.storage.authority == "remote":
+    publisher = PublicationManager(settings.output)
+    if settings.reset_data and settings.output.type == "remote":
         publisher.reset_archive(layout)
     publisher.prepare(layout)
     reject_legacy_layout(layout)
     ensure_collection_dirs(layout)
     cleanup_temps(layout)
-    if settings.storage.authority == "local":
+    if settings.output.type == "local":
         reconcile_missing_indexes(layout)
 
     metrics = RunMetrics()
@@ -315,7 +320,7 @@ def _run_year(
         collection_id,
         reset=settings.reset_data,
     )
-    year_warcs = _manifest_warc_artifacts(layout, collection_id, publisher)
+    year_warcs = _published_warc_artifacts(layout, collection_id, publisher)
     write_run_record(
         layout,
         collection_id=collection_id,
@@ -565,18 +570,18 @@ def _dedupe_captures(
     return result
 
 
-def _manifest_warc_artifacts(
+def _published_warc_artifacts(
     layout: ArchiveLayout,
     collection_id: str,
     publisher: PublicationManager,
 ) -> list[WarcArtifact]:
-    """Summarize committed WARCs from manifest metadata and CDXJ counts."""
+    """Summarize committed WARCs from the CDXJ and size inventory."""
 
-    collection = publisher.manifest.collections.get(collection_id)
     index_path = layout.collection_index(collection_id)
-    if collection is None or not index_path.is_file():
+    if not index_path.is_file():
         return []
     capture_counts: dict[str, int] = defaultdict(int)
+    warc_names: set[str] = set()
     for line in index_path.read_text(encoding="utf-8").splitlines():
         if not line:
             continue
@@ -585,21 +590,31 @@ def _manifest_warc_artifacts(
         except (KeyError, TypeError, ValueError):
             continue
         if isinstance(filename, str):
+            warc_names.add(filename)
             capture_counts[filename] += 1
-    return [
-        WarcArtifact(
-            relative_key=item.key,
-            collection_id=collection_id,
-            sequence=int(
-                Path(item.key).name.removesuffix(".warc.gz").rsplit("-", 1)[1]
-            ),
-            path=layout.root / item.key,
-            size_bytes=item.size_bytes,
-            sha256=item.sha256,
-            record_count=capture_counts[Path(item.key).name] + 1,
+    sizes = publisher.collection_warc_sizes(layout, collection_id)
+    artifacts: list[WarcArtifact] = []
+    for filename in sorted(warc_names):
+        path = layout.root / filename
+        size_bytes = sizes.get(filename, path.stat().st_size if path.is_file() else 0)
+        sha256 = file_sha256(path) if path.is_file() else ""
+        remote = publisher.inventory.get(filename)
+        if not sha256 and remote is not None and remote.sha256 is not None:
+            sha256 = remote.sha256
+        artifacts.append(
+            WarcArtifact(
+                relative_key=filename,
+                collection_id=collection_id,
+                sequence=int(
+                    Path(filename).name.removesuffix(".warc.gz").rsplit("-", 1)[1]
+                ),
+                path=path,
+                size_bytes=size_bytes,
+                sha256=sha256,
+                record_count=capture_counts[filename] + 1,
+            )
         )
-        for item in collection.warcs
-    ]
+    return artifacts
 
 
 def _accumulate_metrics(total: RunMetrics, current: RunMetrics) -> None:
@@ -634,7 +649,7 @@ def build_settings(
     date_end: Optional[str] = None,
     *,
     reset_data: bool = False,
-    storage: StorageConfig,
+    output: FetchOutput,
     warc_target_bytes: int = DEFAULT_WARC_TARGET_BYTES,
     playback_workers: int = 4,
     playback_starts_per_second: float = 20.0,
@@ -659,7 +674,7 @@ def build_settings(
         date_start=start,
         date_end=end,
         reset_data=reset_data,
-        storage=storage,
+        output=output,
         warc_target_bytes=warc_target_bytes,
         playback_workers=playback_workers,
         playback_starts_per_second=playback_starts_per_second,

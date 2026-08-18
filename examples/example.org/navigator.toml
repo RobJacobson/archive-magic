@@ -1,0 +1,9 @@
+[archive]
+id = "example.org"
+
+[source]
+type = "local"
+directory = "data"
+
+[playback]
+wayback_fallback = true

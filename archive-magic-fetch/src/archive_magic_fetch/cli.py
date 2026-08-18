@@ -23,7 +23,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         action="store_true",
         help=(
             "rebuild selected local collections, or delete and rebuild the complete "
-            "configured archive prefix when remote authority is selected"
+            "configured archive prefix when remote output is selected"
         ),
     )
     return parser.parse_args(argv)
@@ -35,10 +35,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
     try:
         config = load_config(args.archive)
-        if config.storage.authority == "remote" and args.reset_data:
+        if config.output.type == "remote" and args.reset_data:
             if args.start is not None or args.end is not None:
                 raise ValueError(
-                    "remote --reset-data requires the descriptor's complete configured date range"
+                    "remote --reset-data requires the configuration's complete configured date range"
                 )
             print(
                 "WARNING: --reset-data will delete and rebuild the entire remote archive prefix; "
@@ -51,7 +51,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             date_start=args.start,
             date_end=args.end,
             reset_data=args.reset_data,
-            storage=config.storage,
+            output=config.output,
             warc_target_bytes=config.warc_target_bytes,
             playback_workers=config.playback_workers,
             playback_starts_per_second=config.playback_starts_per_second,

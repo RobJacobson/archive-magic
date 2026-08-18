@@ -1,7 +1,7 @@
 # Archive Magic Navigator
 
 Navigator serves Archive Magic WARC collections through a local pywb viewer. It is
-independent from Archive Magic Fetch and reads the same per-archive `archive.toml`.
+independent from Archive Magic Fetch and reads its own per-archive `navigator.toml`.
 
 ## Install
 
@@ -11,20 +11,19 @@ uv sync
 
 ## Serve one archive
 
-Pass a descriptor or its containing directory:
+Pass a configuration file or its containing directory:
 
 ```console
 uv run archive-magic-navigator ~/archives/example.org --open
 ```
 
-`--source auto` is the default: local-authoritative descriptors serve their exact
-`data_directory`, while remote-authoritative descriptors cache validated
-indexes locally and serve WARC ranges from the bucket.
+Each `navigator.toml` selects exactly one source. A local source serves its exact
+`directory`. A remote source caches validated indexes locally and serves WARC
+ranges from the bucket.
 
 Useful process options are:
 
 ```text
---source {auto,local,remote}
 --cache PATH
 --poll-interval SECONDS
 --bind ADDRESS
@@ -34,7 +33,7 @@ Useful process options are:
 --debug
 ```
 
-The default remote cache is the visible `navigator-cache/` beside `archive.toml`.
+The default remote cache is the visible `navigator-cache/` beside `navigator.toml`.
 It retains the last validated index if polling observes an incomplete publication
 or transient bucket failure.
 
@@ -44,11 +43,11 @@ or transient bucket failure.
 uv run archive-magic-navigator --catalog ~/archives
 ```
 
-Catalog discovery includes only immediate, non-hidden `*/archive.toml` entries.
-Entries are sorted deterministically, and any invalid descriptor or duplicate ID
-fails startup. Mixed local/remote entries are supported. Remote-selected entries
-must share endpoint and region because pywb receives one S3 environment; their
-buckets and prefixes may differ.
+Catalog discovery includes only immediate, non-hidden `*/navigator.toml` entries.
+Entries are sorted deterministically, and any invalid configuration or duplicate ID
+fails startup. Mixed local/remote entries are supported. Remote entries must share
+endpoint and region because pywb receives one S3 environment; their buckets and
+prefixes may differ.
 
 ## Playback policy
 
@@ -66,7 +65,7 @@ development archive server and prints a warning; the application does not provid
 TLS or hostile-content hardening.
 
 See [the repository README](../README.md), the
-[example descriptor](../examples/example.org/archive.toml), and the
+[example configuration](../examples/example.org/navigator.toml), and the
 [architecture document](docs/ARCHITECTURE-NAVIGATOR.md) for complete details.
 
 ## Tests

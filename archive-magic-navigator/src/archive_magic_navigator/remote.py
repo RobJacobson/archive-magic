@@ -1,4 +1,4 @@
-"""Private S3 manifest synchronization and local CDXJ caching."""
+"""Private S3 index synchronization and local CDXJ caching."""
 
 from __future__ import annotations
 
@@ -9,35 +9,44 @@ import re
 import sys
 import tempfile
 import threading
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 import boto3
 from botocore.exceptions import ClientError
 
-from archive_magic_descriptor import (
-    MANIFEST_NAME,
-    CollectionsManifest,
-    ManifestArtifact,
-    ManifestCollection,
-    RemoteConfig,
-    parse_manifest as parse_collections_manifest,
-)
-
 from .collections import (
     Archive,
     ReplayCollection,
     validate_archive_id,
+    validate_collection_id,
 )
 from .errors import ValidationError
+from .settings import RemoteSource
 
 _CDX_TIMESTAMP = re.compile(r"^\d{14}$")
+_INDEX_SUFFIX = "-index.cdxj"
+_IGNORED_OBJECT_NAMES = frozenset({"collections-manifest.json"})
+
+
+@dataclass(frozen=True)
+class RemoteObject:
+    key: str
+    size_bytes: int
+    etag: str
+
+
+@dataclass(frozen=True)
+class RemoteCollection:
+    collection_id: str
+    index: RemoteObject
 
 
 class RemoteArchiveStore:
     """Own validated cached indexes for one Navigator process."""
 
     def __init__(
-        self, config: RemoteConfig, cache_directory: Path, poll_seconds: float
+        self, config: RemoteSource, cache_directory: Path, poll_seconds: float
     ) -> None:
         self.config = config
         self.cache_directory = cache_directory
@@ -45,20 +54,20 @@ class RemoteArchiveStore:
         self.client = boto3.client(
             "s3", endpoint_url=config.endpoint_url, region_name=config.region
         )
-        self._states: dict[str, tuple[CollectionsManifest, str]] = {}
+        self._states: dict[str, dict[str, RemoteCollection]] = {}
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
     def load_archive(self, archive_id: str) -> Archive:
         archive_id = validate_archive_id(archive_id)
         try:
-            manifest, etag = self._get_manifest()
-            archive = self._accept_manifest(archive_id, manifest)
-            self._states[archive_id] = (manifest, etag)
-            self._write_cached_manifest(archive_id, manifest)
+            inventory = self._list_inventory()
+            collections = self._discover_collections(archive_id, inventory)
+            archive = self._accept_collections(archive_id, collections, inventory)
+            self._states[archive_id] = collections
             return archive
         except Exception as error:
-            cached = self._read_cached_manifest(archive_id)
+            cached = self._read_cached_indexes(archive_id)
             if cached is None:
                 if isinstance(error, ValidationError):
                     raise
@@ -69,9 +78,9 @@ class RemoteArchiveStore:
                 f"WARNING: using cached index for {archive_id}: {error}",
                 file=sys.stderr,
             )
-            archive = self._archive_from_manifest(archive_id, cached)
+            archive = self._archive_from_cached(archive_id, cached)
             self._validate_cached_indexes(archive_id, cached)
-            self._states[archive_id] = (cached, "")
+            self._states[archive_id] = cached
             return archive
 
     def start_polling(self) -> None:
@@ -107,18 +116,11 @@ class RemoteArchiveStore:
                     )
 
     def _poll_archive(self, archive_id: str) -> None:
-        current, etag = self._states[archive_id]
-        try:
-            manifest, new_etag = self._get_manifest(if_none_match=etag or None)
-        except ClientError as error:
-            if str(error.response.get("Error", {}).get("Code", "")) in {
-                "304",
-                "NotModified",
-            }:
-                return
-            raise
-        old_ids = set(current.collections)
-        new_ids = set(manifest.collections)
+        current = self._states[archive_id]
+        inventory = self._list_inventory()
+        discovered = self._discover_collections(archive_id, inventory)
+        old_ids = set(current)
+        new_ids = set(discovered)
         if old_ids != new_ids:
             print(
                 f"WARNING: collection membership changed for {archive_id}; "
@@ -126,41 +128,38 @@ class RemoteArchiveStore:
                 file=sys.stderr,
             )
         for collection_id in sorted(old_ids & new_ids):
-            old = current.collections[collection_id]
-            new = manifest.collections[collection_id]
-            if old.index != new.index:
-                self._sync_index(archive_id, collection_id, new)
-        accepted = CollectionsManifest(
-            manifest.published_at,
-            {
-                collection_id: manifest.collections[collection_id]
-                for collection_id in current.collections
-                if collection_id in manifest.collections
-            }
-            | {
-                collection_id: current.collections[collection_id]
-                for collection_id in current.collections
-                if collection_id not in manifest.collections
-            },
-        )
-        self._states[archive_id] = (accepted, new_etag)
-        self._write_cached_manifest(archive_id, accepted)
+            if current[collection_id].index.etag != discovered[collection_id].index.etag:
+                self._sync_index(
+                    archive_id,
+                    collection_id,
+                    discovered[collection_id],
+                    inventory,
+                )
+        self._states[archive_id] = {
+            collection_id: discovered[collection_id]
+            for collection_id in current
+            if collection_id in discovered
+        } | {
+            collection_id: current[collection_id]
+            for collection_id in current
+            if collection_id not in discovered
+        }
 
-    def _get_manifest(self, *, if_none_match: str | None = None):
-        params = {"Bucket": self.config.bucket, "Key": self._object_key(MANIFEST_NAME)}
-        if if_none_match:
-            params["IfNoneMatch"] = if_none_match
-        response = self.client.get_object(**params)
-        try:
-            return parse_manifest(response["Body"].read()), response["ETag"]
-        finally:
-            response["Body"].close()
-
-    def _accept_manifest(self, archive_id: str, manifest: CollectionsManifest) -> Archive:
+    def _accept_collections(
+        self,
+        archive_id: str,
+        collections: dict[str, RemoteCollection],
+        inventory: dict[str, RemoteObject],
+    ) -> Archive:
         staged: list[tuple[Path, Path]] = []
         try:
-            for collection_id, collection in manifest.collections.items():
-                item = self._stage_index(archive_id, collection_id, collection)
+            for collection_id, collection in collections.items():
+                item = self._stage_index(
+                    archive_id,
+                    collection_id,
+                    collection,
+                    inventory,
+                )
                 if item is not None:
                     staged.append(item)
             for destination, temporary in staged:
@@ -168,12 +167,22 @@ class RemoteArchiveStore:
         finally:
             for _, temporary in staged:
                 temporary.unlink(missing_ok=True)
-        return self._archive_from_manifest(archive_id, manifest)
+        return self._archive_from_collections(archive_id, collections)
 
     def _sync_index(
-        self, archive_id: str, collection_id: str, collection: ManifestCollection
+        self,
+        archive_id: str,
+        collection_id: str,
+        collection: RemoteCollection,
+        inventory: dict[str, RemoteObject],
     ) -> None:
-        staged = self._stage_index(archive_id, collection_id, collection)
+        staged = self._stage_index(
+            archive_id,
+            collection_id,
+            collection,
+            inventory,
+            refresh=True,
+        )
         if staged is not None:
             destination, temporary = staged
             try:
@@ -185,15 +194,18 @@ class RemoteArchiveStore:
         self,
         archive_id: str,
         collection_id: str,
-        collection: ManifestCollection,
+        collection: RemoteCollection,
+        inventory: dict[str, RemoteObject],
+        *,
+        refresh: bool = False,
     ) -> tuple[Path, Path] | None:
-        destination = self._index_path(archive_id, collection_id, collection.index)
+        destination = self._index_path(archive_id, collection_id, collection.index.key)
         if (
-            destination.is_file()
+            not refresh
+            and destination.is_file()
             and destination.stat().st_size == collection.index.size_bytes
-            and _sha256(destination) == collection.index.sha256
         ):
-            _validate_index(destination, collection)
+            _validate_index(destination, inventory)
             return None
         response = self.client.get_object(
             Bucket=self.config.bucket,
@@ -206,15 +218,21 @@ class RemoteArchiveStore:
         tmp = Path(name)
         try:
             data = response["Body"].read()
+            metadata = response.get("Metadata", {})
+            metadata = {key.lower(): value for key, value in metadata.items()}
             tmp.write_bytes(data)
-            if (
-                len(data) != collection.index.size_bytes
-                or hashlib.sha256(data).hexdigest() != collection.index.sha256
-            ):
+            if len(data) != collection.index.size_bytes:
                 raise ValidationError(
-                    f"downloaded index does not match manifest: {collection.index.key}"
+                    f"downloaded index size mismatch: {collection.index.key}"
                 )
-            _validate_index(tmp, collection)
+            declared = metadata.get("sha256")
+            if declared is not None:
+                digest = hashlib.sha256(data).hexdigest()
+                if digest != declared:
+                    raise ValidationError(
+                        f"downloaded index does not match metadata: {collection.index.key}"
+                    )
+            _validate_index(tmp, inventory)
             return destination, tmp
         except Exception:
             tmp.unlink(missing_ok=True)
@@ -222,63 +240,113 @@ class RemoteArchiveStore:
         finally:
             response["Body"].close()
 
-    def _archive_from_manifest(
-        self, archive_id: str, manifest: CollectionsManifest
+    def _archive_from_collections(
+        self, archive_id: str, collections: dict[str, RemoteCollection]
     ) -> Archive:
         root = (self.cache_directory / archive_id).resolve()
-        collections = tuple(
+        replay_collections = tuple(
             ReplayCollection(
                 collection_id,
                 root,
-                self._index_path(archive_id, collection_id, collection.index).resolve(),
+                self._index_path(
+                    archive_id, collection_id, collection.index.key
+                ).resolve(),
                 self._archive_path(),
             )
-            for collection_id, collection in sorted(manifest.collections.items())
+            for collection_id, collection in sorted(collections.items())
         )
-        if not collections:
+        if not replay_collections:
             raise ValidationError(
                 f"remote archive {archive_id!r} has no playable collections"
             )
-        return Archive(archive_id, root, collections)
+        return Archive(archive_id, root, replay_collections)
+
+    def _archive_from_cached(
+        self, archive_id: str, collections: dict[str, RemoteCollection]
+    ) -> Archive:
+        return self._archive_from_collections(archive_id, collections)
 
     def _validate_cached_indexes(
-        self, archive_id: str, manifest: CollectionsManifest
+        self, archive_id: str, collections: dict[str, RemoteCollection]
     ) -> None:
-        for collection_id, collection in manifest.collections.items():
-            path = self._index_path(archive_id, collection_id, collection.index)
+        for collection_id, collection in collections.items():
+            path = self._index_path(archive_id, collection_id, collection.index.key)
             if (
                 not path.is_file()
                 or path.stat().st_size != collection.index.size_bytes
-                or _sha256(path) != collection.index.sha256
             ):
                 raise ValidationError(f"cached index is missing or invalid: {path}")
-            _validate_index(path, collection)
+            _validate_index(path)
 
-    def _write_cached_manifest(self, archive_id: str, manifest: CollectionsManifest) -> None:
-        path = self.cache_directory / archive_id / MANIFEST_NAME
-        path.parent.mkdir(parents=True, exist_ok=True)
-        data = manifest.to_bytes()
-        fd, name = tempfile.mkstemp(prefix=".tmp-manifest-", dir=path.parent)
-        os.close(fd)
-        tmp = Path(name)
-        try:
-            tmp.write_bytes(data)
-            os.replace(tmp, path)
-        finally:
-            tmp.unlink(missing_ok=True)
+    def _read_cached_indexes(
+        self, archive_id: str
+    ) -> dict[str, RemoteCollection] | None:
+        root = self.cache_directory / archive_id
+        if not root.is_dir():
+            return None
+        collections: dict[str, RemoteCollection] = {}
+        pattern = f"{archive_id}-*{_INDEX_SUFFIX}"
+        for path in sorted(root.glob(pattern)):
+            if not path.is_file():
+                continue
+            prefix, suffix = f"{archive_id}-", _INDEX_SUFFIX
+            collection_id = validate_collection_id(
+                path.name[len(prefix) : -len(suffix)]
+            )
+            collections[collection_id] = RemoteCollection(
+                collection_id,
+                RemoteObject(
+                    key=path.name,
+                    size_bytes=path.stat().st_size,
+                    etag="",
+                ),
+            )
+        return collections or None
 
-    def _read_cached_manifest(self, archive_id: str) -> CollectionsManifest | None:
-        path = self.cache_directory / archive_id / MANIFEST_NAME
-        return parse_manifest(path.read_bytes()) if path.is_file() else None
+    def _discover_collections(
+        self, archive_id: str, inventory: dict[str, RemoteObject]
+    ) -> dict[str, RemoteCollection]:
+        collections: dict[str, RemoteCollection] = {}
+        prefix = f"{archive_id}-"
+        for key, item in inventory.items():
+            name = PurePosixPath(key).name
+            if not name.endswith(_INDEX_SUFFIX) or not name.startswith(prefix):
+                continue
+            collection_id = validate_collection_id(
+                name[len(prefix) : -len(_INDEX_SUFFIX)]
+            )
+            collections[collection_id] = RemoteCollection(collection_id, item)
+        return collections
+
+    def _list_inventory(self) -> dict[str, RemoteObject]:
+        inventory: dict[str, RemoteObject] = {}
+        prefix = self._object_key("")
+        token = None
+        while True:
+            kwargs = {"Bucket": self.config.bucket, "Prefix": prefix}
+            if token is not None:
+                kwargs["ContinuationToken"] = token
+            response = self.client.list_objects_v2(**kwargs)
+            for entry in response.get("Contents", []):
+                relative = _relative_key(prefix, entry["Key"])
+                if (
+                    relative is None
+                    or PurePosixPath(relative).name in _IGNORED_OBJECT_NAMES
+                ):
+                    continue
+                inventory[relative] = RemoteObject(
+                    key=relative,
+                    size_bytes=int(entry["Size"]),
+                    etag=entry["ETag"],
+                )
+            if not response.get("IsTruncated"):
+                return inventory
+            token = response["NextContinuationToken"]
 
     def _index_path(
-        self, archive_id: str, collection_id: str, artifact: ManifestArtifact
+        self, archive_id: str, collection_id: str, index_key: str
     ) -> Path:
-        return (
-            self.cache_directory
-            / archive_id
-            / PurePosixPath(artifact.key).name
-        )
+        return self.cache_directory / archive_id / PurePosixPath(index_key).name
 
     def _archive_path(self) -> str:
         key = self._object_key("").rstrip("/")
@@ -288,15 +356,17 @@ class RemoteArchiveStore:
         return "/".join(part for part in (self.config.prefix, relative) if part)
 
 
-def parse_manifest(data: bytes) -> CollectionsManifest:
-    try:
-        return parse_collections_manifest(data)
-    except ValueError as error:
-        raise ValidationError(str(error)) from error
-
-
-def _validate_index(path: Path, collection: ManifestCollection) -> None:
-    sizes = {PurePosixPath(item.key).name: item.size_bytes for item in collection.warcs}
+def _validate_index(
+    path: Path,
+    inventory: dict[str, RemoteObject] | None = None,
+) -> None:
+    warc_sizes: dict[str, int] = {}
+    if inventory is not None:
+        warc_sizes = {
+            PurePosixPath(item.key).name: item.size_bytes
+            for item in inventory.values()
+            if item.key.endswith(".warc.gz")
+        }
     with path.open("r", encoding="utf-8") as stream:
         for number, line in enumerate(stream, 1):
             if not line.strip():
@@ -320,20 +390,26 @@ def _validate_index(path: Path, collection: ManifestCollection) -> None:
             if (
                 not isinstance(filename, str)
                 or PurePosixPath(filename).name != filename
-                or filename not in sizes
             ):
                 raise ValidationError(
                     f"{path}, line {number}: unknown WARC {filename!r}"
                 )
-            if offset < 0 or length <= 0 or offset + length > sizes[filename]:
-                raise ValidationError(
-                    f"{path}, line {number}: WARC range out of bounds"
-                )
+            if inventory is not None:
+                size = warc_sizes.get(filename)
+                if size is None:
+                    raise ValidationError(
+                        f"{path}, line {number}: unknown WARC {filename!r}"
+                    )
+                if offset < 0 or length <= 0 or offset + length > size:
+                    raise ValidationError(
+                        f"{path}, line {number}: WARC range out of bounds"
+                    )
 
 
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        while chunk := stream.read(1024 * 1024):
-            digest.update(chunk)
-    return digest.hexdigest()
+def _relative_key(prefix: str, key: str) -> str | None:
+    normalized = prefix.rstrip("/")
+    if normalized and not key.startswith(normalized + "/") and key != normalized:
+        return None
+    if normalized:
+        return key[len(normalized) + 1 :]
+    return key
