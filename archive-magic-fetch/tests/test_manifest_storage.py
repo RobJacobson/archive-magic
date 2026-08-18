@@ -172,12 +172,12 @@ def published_update(tmp_path, monkeypatch):
     return fake, layout, manager, identity
 
 
-def test_local_publication_does_not_write_manifest(tmp_path):
+def test_local_publication_does_not_write_sidecar(tmp_path):
     layout, _, _ = make_collection(tmp_path / "data")
     manager = PublicationManager(FetchOutput("local", layout.root))
     manager.prepare(layout)
     assert not manager.publish_collection(layout, "2004")
-    assert not (layout.root / "collections-manifest.json").exists()
+    assert list(layout.root.glob("*.json")) == []
 
 
 def test_prepare_does_not_mirror_and_index_download_skips_warcs(
@@ -516,17 +516,23 @@ def test_replaced_remote_cdxj_recovers_from_local_index(tmp_path, monkeypatch):
     assert puts == [index_key]
 
 
-def test_leftover_manifest_is_ignored(tmp_path, monkeypatch):
+def test_inventory_includes_only_flat_warc_and_cdxj_objects(tmp_path, monkeypatch):
     fake = FakeS3()
     layout, _, _ = make_collection(tmp_path / "source")
     seed_remote(fake, layout)
-    fake.seed("example.org/collections-manifest.json", b'{"ignored": true}')
+    fake.seed("example.org/notes.json", b'{"ignored": true}')
+    fake.seed("example.org/nested/example.org-2004-001.warc.gz", b"nested")
     patch_s3(monkeypatch, fake)
     manager = PublicationManager(remote_config(tmp_path))
     target = ArchiveLayout(tmp_path / "data", "example.org")
 
     manager.prepare(target)
-    assert "collections-manifest.json" not in manager.inventory
+    assert all(
+        key.endswith(".warc.gz") or key.endswith(".cdxj")
+        for key in manager.inventory
+    )
+    assert "notes.json" not in manager.inventory
+    assert "nested/example.org-2004-001.warc.gz" not in manager.inventory
 
 
 def test_remote_run_record_is_written_before_working_files_are_evicted(

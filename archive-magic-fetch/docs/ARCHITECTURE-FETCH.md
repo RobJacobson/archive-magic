@@ -91,8 +91,8 @@ Fetch does not read Navigator configuration. Playback policy lives in `navigator
 
 The data directory is a flat portable namespace. Strict artifact filenames retain
 the logical yearly collection boundary without year folders. A collection exists
-when `{archive_id}-{collection_id}-index.cdxj` is present. Leftover
-`collections-manifest.json` files from older releases are ignored.
+when `{archive_id}-{collection_id}-index.cdxj` is present. Prefix listings include
+only those CDXJ and `.warc.gz` objects.
 
 The JSON file under `logs/` combines the invocation's yearly run records; the text
 file mirrors its console output. Both are local diagnostics rather than

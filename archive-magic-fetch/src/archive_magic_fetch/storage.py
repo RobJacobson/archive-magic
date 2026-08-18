@@ -22,8 +22,6 @@ from .collection import (
 from .config import FetchOutput
 from .index import parse_cdxj_line
 
-_IGNORED_OBJECT_NAMES = frozenset({"collections-manifest.json"})
-
 
 @dataclass(frozen=True)
 class LocalArtifact:
@@ -219,7 +217,7 @@ class PublicationManager:
             response = self.client.list_objects_v2(**kwargs)
             for entry in response.get("Contents", []):
                 relative = _relative_key(prefix, entry["Key"])
-                if relative is None or PurePosixPath(relative).name in _IGNORED_OBJECT_NAMES:
+                if relative is None or not _is_archive_object(relative):
                     continue
                 metadata = self._head_metadata(relative)
                 inventory[relative] = RemoteObject(
@@ -386,6 +384,13 @@ def _cdxj_tail_filename(
             max_sequence = sequence
             tail = name
     return tail
+
+
+def _is_archive_object(relative: str) -> bool:
+    name = PurePosixPath(relative).name
+    return relative == name and (
+        name.endswith(".warc.gz") or name.endswith(".cdxj")
+    )
 
 
 def _relative_key(prefix: str, key: str) -> str | None:
