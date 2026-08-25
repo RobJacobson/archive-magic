@@ -28,17 +28,11 @@ class NavigatorConfig:
     archive_id: str
     source: LocalSource | RemoteSource
     config_path: Path
-    wayback_fallback: bool = True
 
 
 @dataclass(frozen=True)
 class _Archive:
     id: str
-
-
-@dataclass(frozen=True)
-class _Playback:
-    wayback_fallback: bool = True
 
 
 def config_path(value: Path | str) -> Path:
@@ -72,26 +66,27 @@ def load_config(value: Path | str) -> NavigatorConfig:
             source = RemoteSource(**source_data)
         else:
             raise ValueError("source.type must be 'local' or 'remote'")
-        playback = _Playback(**_section(document, "playback", required=False))
         if document:
             raise TypeError(f"unexpected table(s): {', '.join(sorted(document))}")
         archive_id = _safe_id(archive.id)
-        if not isinstance(playback.wayback_fallback, bool):
-            raise ValueError("playback.wayback_fallback must be a boolean")
     except (
         OSError,
         tomllib.TOMLDecodeError,
         KeyError,
         TypeError,
         AttributeError,
+        ValueError,
     ) as error:
+        if isinstance(error, ValueError) and str(error).startswith(
+            "navigator configuration does not exist:"
+        ):
+            raise
         raise ValueError(f"invalid navigator configuration {path}: {error}") from error
 
     return NavigatorConfig(
         archive_id=archive_id,
         source=source,
         config_path=path,
-        wayback_fallback=playback.wayback_fallback,
     )
 
 

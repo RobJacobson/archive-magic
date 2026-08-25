@@ -51,9 +51,8 @@ prefixes may differ.
 
 ## Playback policy
 
-Without a CLI override, every archive uses its own
-`[playback].wayback_fallback` setting. A catalog may therefore have mixed policy.
-`--wayback-fallback on` or `off` overrides all selected archives for that process.
+`--wayback-fallback` defaults to `on` for the whole process. Pass `off` to disable
+it for every selected archive in that invocation.
 
 ## Credentials and exposure
 

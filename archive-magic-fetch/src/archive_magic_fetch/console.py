@@ -97,10 +97,7 @@ def playback_timing(outcome: CaptureOutcome) -> str:
 def log_url_outcome(number: int, total: int, outcome: UrlOutcome) -> None:
     links = links_enabled()
     color = color_enabled()
-    lines = [
-        f"{number}/{total} {_safe(outcome.url)}",
-        "  Capture              Digest  Result",
-    ]
+    lines = [f"{number}/{total} {_safe(outcome.url)}"]
     for capture in outcome.captures:
         detail, style = _capture_line(capture)
         lines.append(

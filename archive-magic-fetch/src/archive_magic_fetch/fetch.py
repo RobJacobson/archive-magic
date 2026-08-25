@@ -31,7 +31,6 @@ from .collection import (
     write_run_record,
 )
 from .config import (
-    DEFAULT_RETRIES,
     DEFAULT_WARC_TARGET_BYTES,
     FetchOutput,
 )
@@ -68,6 +67,8 @@ from .inventory import (
 )
 from .warc import CollectionWarcWriter
 from .storage import PublicationManager
+
+DEFAULT_RETRIES = 4
 
 
 @dataclass(frozen=True)
@@ -186,7 +187,7 @@ def _run_fetch(
     last_year = int(settings.date_end[:4])
     emit(f"archive {layout.archive_id}: collections {first_year}-{last_year}")
     emit(
-        f"playback policy: workers={settings.playback_workers}, "
+        f"download: workers={settings.playback_workers}, "
         f"starts/second={settings.playback_starts_per_second:g}"
     )
 
@@ -659,14 +660,23 @@ def build_settings(
 ) -> FetchSettings:
     """Validate CLI-facing inputs into settings."""
 
-    start = parse_date_bound(
-        date_start, default=default_start, bound="start"
-    )
-    end = parse_date_bound(
-        date_end,
+    project_start = parse_date_bound(None, default=default_start, bound="start")
+    project_end = parse_date_bound(
+        None,
         default=default_end or current_utc_cdx_timestamp(),
         bound="end",
     )
+    validate_date_range(project_start, project_end)
+    start = parse_date_bound(date_start, default=project_start, bound="start")
+    end = parse_date_bound(date_end, default=project_end, bound="end")
+    if start < project_start:
+        raise ValueError(
+            f"CLI start {start} is before the project start {project_start}"
+        )
+    if end > project_end:
+        raise ValueError(
+            f"CLI end {end} is after the project end {project_end}"
+        )
     validate_date_range(start, end)
     return FetchSettings(
         url_pattern=url_pattern.strip(),

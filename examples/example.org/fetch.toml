@@ -15,7 +15,4 @@ data_directory = "data"
 [fetch]
 start = "1995-01-01"
 # end omitted means now
-warc_target_bytes = 250000000
-playback_workers = 4
-playback_starts_per_second = 20.0
-retries = 4
+# warc_target_bytes = 250000000

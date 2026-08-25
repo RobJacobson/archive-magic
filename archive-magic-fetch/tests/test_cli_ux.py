@@ -311,3 +311,45 @@ def test_remote_reset_rejects_dates_and_warns_before_full_rebuild(
     warning = capsys.readouterr().err
     assert "delete and rebuild the entire remote archive prefix" in warning
     assert "playback will be unavailable" in warning
+
+
+def test_cli_runtime_flags_override_defaults(tmp_path, monkeypatch):
+    from archive_magic_fetch import cli
+
+    config = write_cli_config(tmp_path)
+    captured = []
+    monkeypatch.setattr(
+        cli,
+        "run_fetch",
+        lambda item: captured.append(item) or SimpleNamespace(exit_code=0),
+    )
+    assert cli.main([str(config)]) == 0
+    assert captured[0].playback_workers == 4
+    assert captured[0].playback_starts_per_second == 20.0
+    assert captured[0].retries == 4
+    captured.clear()
+    assert (
+        cli.main(
+            [
+                str(config),
+                "--workers",
+                "2",
+                "--starts-per-second",
+                "1.5",
+                "--retries",
+                "0",
+            ]
+        )
+        == 0
+    )
+    assert captured[0].playback_workers == 2
+    assert captured[0].playback_starts_per_second == 1.5
+    assert captured[0].retries == 0
+
+
+def test_cli_rejects_start_before_project_range(tmp_path):
+    from archive_magic_fetch.cli import main
+
+    config = write_cli_config(tmp_path)
+    assert main([str(config), "--start", "1999-01-01"]) == 2
+
