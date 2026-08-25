@@ -17,9 +17,9 @@ from .identity import make_identity
 from .models import ParsedCapture
 from .playback import ArchiveMagicWaybackSession, classify_playback_error
 from .retry import (
-    BACKPRESSURE_COOLDOWN_SECONDS,
     backpressure_signal,
     iter_error_chain,
+    linear_backpressure_delay,
     retry_after_from_error,
 )
 
@@ -146,9 +146,10 @@ def fetch_cdx(
     """Fetch and parse a CDX range through ``WaybackClient.search``.
 
     Fetch owns CDX retries. Wayback library retries stay disabled so a refused
-    TCP connection or HTTP 429 pauses for 60s (or ``Retry-After``) instead of
-    giving up after a few seconds of inner backoff. A failed query is retried
-    from the start of the year range so the result is never a partial listing.
+    TCP connection or HTTP 429 uses a linear 60s, 120s, 180s, ... pause (or a
+    longer ``Retry-After``) instead of giving up after a few seconds of inner
+    backoff. A failed query is retried from the start of the year range so the
+    result is never a partial listing.
     """
 
     search_url, match_type = normalize_cdx_search(url_pattern)
@@ -199,7 +200,7 @@ def _cdx_retry_delay(error: BaseException, attempt: int) -> float:
     backpressure = backpressure_signal(error)
     if backpressure is not None:
         _, retry_after = backpressure
-        return retry_after or BACKPRESSURE_COOLDOWN_SECONDS
+        return linear_backpressure_delay(attempt, retry_after)
     return retry_after_from_error(error) or float(5 * (2 ** (attempt - 1)))
 
 

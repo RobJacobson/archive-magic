@@ -73,9 +73,9 @@ Rules:
   configurable per archive.
 - `--retries` applies to both CDX and playback requests and defaults to four
   retries after the initial request. CDX retries are owned by Fetch: HTTP 429 and
-  TCP connection refused pause for 60 seconds (or `Retry-After`) before the next
-  attempt, matching playback backpressure. A CDX failure skips that year, continues
-  with later years, and makes the process exit nonzero.
+  TCP connection refused pause with a linear 60s, 120s, 180s, ... backoff, never
+  shorter than `Retry-After`. A CDX failure skips that year, continues with later
+  years, and makes the process exit nonzero.
 
 Fetch does not read Navigator configuration. Wayback fallback is a Navigator CLI
 flag.
@@ -115,8 +115,9 @@ For each year in the selected range, Fetch:
    WARCs from an interrupted run are reindexed before inventory.
 2. Queries Internet Archive CDX history through `WaybackClient.search()`, which
    owns parsing and resume-key pagination. Fetch owns CDX retries and treats
-   connection refused like HTTP 429: pause 60s (or `Retry-After`) and retry the
-   whole year query. Giving up on a year does not abort later years.
+   connection refused like HTTP 429: pause 60s, 120s, 180s, ... (or a longer
+   `Retry-After`) and retry the whole year query. Giving up on a year does not
+   abort later years.
 3. Parses and deduplicates captures by canonical capture identity.
 4. Inventories existing captures from CDXJ identity metadata and skips those
    already represented.

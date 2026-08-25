@@ -81,7 +81,7 @@ def test_fetch_cdx_delegates_paging_and_parsing_to_wayback(monkeypatch):
     assert result.match_type == "domain"
 
 
-def test_fetch_cdx_pauses_60s_on_connection_refused(monkeypatch):
+def test_fetch_cdx_uses_linear_backoff_on_connection_refused(monkeypatch):
     from wayback.exceptions import WaybackRetryError
 
     attempts = {"n": 0}
@@ -123,12 +123,55 @@ def test_fetch_cdx_pauses_60s_on_connection_refused(monkeypatch):
 
     assert len(result.captures) == 1
     assert attempts["n"] == 3
-    assert sleeps == [60.0, 60.0]
+    assert sleeps == [60.0, 120.0]
     assert reports == [
         "rate limit: TCP connection refused during CDX query; "
         "pausing 60s before attempt 2/5",
         "rate limit: TCP connection refused during CDX query; "
-        "pausing 60s before attempt 3/5",
+        "pausing 120s before attempt 3/5",
+    ]
+
+
+def test_fetch_cdx_escalates_past_retry_after_on_http_429(monkeypatch):
+    attempts = {"n": 0}
+    sleeps: list[float] = []
+    reports: list[str] = []
+
+    class RateLimitedClient:
+        def search(self, *args, **kwargs):
+            attempts["n"] += 1
+            if attempts["n"] < 4:
+                error = RuntimeError(
+                    "Wayback rate limit exceeded, retry after 60 s"
+                )
+                error.retry_after = 60
+                error.status_code = 429
+                raise error
+            return iter([record()])
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(
+        "archive_magic_fetch.cdx.WaybackClient",
+        lambda **_kwargs: RateLimitedClient(),
+    )
+    result = fetch_cdx(
+        url_pattern="*.example.org",
+        date_start="20040101000000",
+        date_end="20041231235959",
+        retries=4,
+        sleep=sleeps.append,
+        report=reports.append,
+    )
+
+    assert len(result.captures) == 1
+    assert attempts["n"] == 4
+    assert sleeps == [60.0, 120.0, 180.0]
+    assert reports == [
+        "rate limit: HTTP 429 during CDX query; pausing 60s before attempt 2/5",
+        "rate limit: HTTP 429 during CDX query; pausing 120s before attempt 3/5",
+        "rate limit: HTTP 429 during CDX query; pausing 180s before attempt 4/5",
     ]
 
 
@@ -157,7 +200,7 @@ def test_fetch_cdx_raises_after_exhausted_connection_refused_retries(monkeypatch
             sleep=sleeps.append,
             report=lambda _message: None,
         )
-    assert sleeps == [60.0, 60.0]
+    assert sleeps == [60.0, 120.0]
 
 
 def test_fetch_cdx_does_not_retry_permanent_errors(monkeypatch):
