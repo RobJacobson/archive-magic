@@ -5,7 +5,7 @@ import pytest
 from archive_magic_navigator import cli
 
 
-def write_config(directory: Path, archive_id: str, workspace: Path, *, fallback=True):
+def write_config(directory: Path, archive_id: str, workspace: Path):
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / "navigator.toml"
     path.write_text(
@@ -15,8 +15,6 @@ id = "{archive_id}"
 [source]
 type = "local"
 directory = "{workspace}"
-[playback]
-wayback_fallback = {str(fallback).lower()}
 """,
         encoding="utf-8",
     )
@@ -55,6 +53,7 @@ def test_parse_args_defaults_and_modes(tmp_path):
     assert request.bind == "127.0.0.1"
     assert request.port == 8080
     assert request.poll_interval_seconds == 60
+    assert request.wayback_fallback is True
     assert not hasattr(request, "source")
     assert cli.parse_args(["--catalog", str(tmp_path)]).catalog == tmp_path
     assert cli.parse_args([str(tmp_path), "--wayback-fallback", "off"]).wayback_fallback is False
@@ -85,6 +84,7 @@ def test_help_documents_catalog_and_overrides(capsys):
     assert "--wayback-fallback {on,off}" in output
     assert "--cache" in output
     assert "--poll-interval" in output
+    assert "--settings" not in output
 
 
 def test_main_validates_configuration_and_opens_after_ready(collection_factory, tmp_path, monkeypatch, capsys):
@@ -104,9 +104,9 @@ def test_main_validates_configuration_and_opens_after_ready(collection_factory, 
     assert "Serving 1 domain archive with 1 portable collection" in capsys.readouterr().out
 
 
-def test_fallback_and_cli_override_are_passed_per_archive(collection_factory, tmp_path, monkeypatch):
+def test_wayback_fallback_flag_is_process_wide(collection_factory, tmp_path, monkeypatch):
     _, archive, _, _ = collection_factory()
-    config = write_config(tmp_path / "config", "example.org", archive, fallback=False)
+    config = write_config(tmp_path / "config", "example.org", archive)
     generated = []
     real = cli.build_config
 
@@ -117,10 +117,10 @@ def test_fallback_and_cli_override_are_passed_per_archive(collection_factory, tm
     monkeypatch.setattr(cli, "build_config", capture)
     monkeypatch.setattr(cli, "run_wayback", lambda *a, **k: 0)
     assert cli.main([str(config)]) == 0
-    assert generated == [{"example.org": False}]
+    assert generated == [True]
     generated.clear()
-    assert cli.main([str(config), "--wayback-fallback", "on"]) == 0
-    assert generated == [{"example.org": True}]
+    assert cli.main([str(config), "--wayback-fallback", "off"]) == 0
+    assert generated == [False]
 
 
 def test_catalog_is_sorted_and_rejects_duplicate_ids(collection_factory, tmp_path, monkeypatch):

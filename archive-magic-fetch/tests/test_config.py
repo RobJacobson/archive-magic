@@ -36,8 +36,6 @@ def test_local_config_resolves_directory_and_defaults(tmp_path):
             """
 [fetch]
 start = "2000-01-01"
-playback_workers = 2
-retries = 5
 """
         ),
     )
@@ -46,8 +44,6 @@ retries = 5
     assert config.url_pattern == "*.example.org"
     assert config.output == FetchOutput("local", (tmp_path / "data").resolve())
     assert config.warc_target_bytes == DEFAULT_WARC_TARGET_BYTES
-    assert config.playback_workers == 2
-    assert config.retries == 5
     assert config.start == "2000-01-01"
     assert config.end is None
 
@@ -112,6 +108,10 @@ region = "auto"
             "[archive]\nid='x'\nurl_pattern='x'\n[output]\ntype='remote'\nbucket='x'\nprefix='../bad'\n",
             "must not contain",
         ),
+        (
+            "[archive]\nid='x'\nurl_pattern='x'\n[output]\ntype='local'\n[fetch]\nwarc_target_bytes=0\n",
+            "must be positive",
+        ),
     ],
 )
 def test_config_rejects_unsafe_or_unknown_values(tmp_path, body, message):
@@ -123,3 +123,35 @@ def test_config_rejects_unsafe_or_unknown_values(tmp_path, body, message):
 def test_directory_requires_fetch_toml(tmp_path):
     with pytest.raises(ValueError, match="fetch configuration does not exist"):
         load_config(tmp_path)
+
+
+def test_narrowing_rejects_out_of_range_cli_dates(tmp_path):
+    write_config(
+        tmp_path,
+        local_config(
+            """
+[fetch]
+start = "2000-01-01"
+end = "2001-12-31"
+"""
+        ),
+    )
+    config = load_config(tmp_path)
+    with pytest.raises(ValueError, match="before the project start"):
+        build_settings(
+            config.url_pattern,
+            archive_id=config.archive_id,
+            date_start="1999-01-01",
+            output=config.output,
+            default_start=config.start,
+            default_end=config.end,
+        )
+    with pytest.raises(ValueError, match="after the project end"):
+        build_settings(
+            config.url_pattern,
+            archive_id=config.archive_id,
+            date_end="2002",
+            output=config.output,
+            default_start=config.start,
+            default_end=config.end,
+        )

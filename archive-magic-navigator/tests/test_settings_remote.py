@@ -31,15 +31,12 @@ id = "example.org"
 [source]
 type = "local"
 directory = "data"
-[playback]
-wayback_fallback = false
 """,
     )
     settings = load_config(tmp_path)
     assert settings.config_path == path.resolve()
     assert settings.archive_id == "example.org"
     assert settings.source == LocalSource((tmp_path / "data").resolve())
-    assert settings.wayback_fallback is False
 
 
 def test_explicit_arbitrary_filename(tmp_path):
@@ -63,7 +60,7 @@ def test_missing_canonical_file(tmp_path):
         load_config(tmp_path)
 
 
-def test_defaults_when_playback_omitted(tmp_path):
+def test_local_source_defaults_directory(tmp_path):
     write_navigator_toml(
         tmp_path,
         """
@@ -74,7 +71,6 @@ type = "local"
 """,
     )
     settings = load_config(tmp_path)
-    assert settings.wayback_fallback is True
     assert settings.source.directory == (tmp_path / "data").resolve()
 
 
@@ -124,8 +120,8 @@ region = "auto"
             "must not contain",
         ),
         (
-            "[archive]\nid='x'\n[source]\ntype='local'\n[playback]\nwayback_fallback='yes'\n",
-            "must be a boolean",
+            "[archive]\nid='x'\n[source]\ntype='local'\n[playback]\nwayback_fallback=true\n",
+            "unexpected table",
         ),
     ],
 )

@@ -36,3 +36,4 @@ testpaths = ["tests"]
 markers = [
     "integration: starts the real pinned pywb executable",
 ]
+

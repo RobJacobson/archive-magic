@@ -9,7 +9,7 @@ from pathlib import Path
 
 CONFIG_NAME = "fetch.toml"
 DEFAULT_WARC_TARGET_BYTES = 250_000_000
-DEFAULT_RETRIES = 4
+DEFAULT_START = "1995-01-01"
 
 
 @dataclass(frozen=True)
@@ -28,10 +28,7 @@ class FetchConfig:
     url_pattern: str
     output: FetchOutput
     warc_target_bytes: int = DEFAULT_WARC_TARGET_BYTES
-    playback_workers: int = 4
-    playback_starts_per_second: float = 20.0
-    retries: int = DEFAULT_RETRIES
-    start: str = "1995-01-01"
+    start: str = DEFAULT_START
     end: str | None = None
 
 
@@ -44,10 +41,7 @@ class _Archive:
 @dataclass(frozen=True)
 class _FetchOptions:
     warc_target_bytes: int = DEFAULT_WARC_TARGET_BYTES
-    playback_workers: int = 4
-    playback_starts_per_second: float = 20.0
-    retries: int = DEFAULT_RETRIES
-    start: str = "1995-01-01"
+    start: str = DEFAULT_START
     end: str | None = None
 
 
@@ -83,6 +77,8 @@ def load_config(value: Path | str) -> FetchConfig:
         if output.type == "remote" and not output.bucket:
             raise ValueError("output.bucket is required for remote output")
         options = _FetchOptions(**_section(document, "fetch", required=False))
+        if options.warc_target_bytes <= 0:
+            raise ValueError("fetch.warc_target_bytes must be positive")
         if document:
             raise TypeError(f"unexpected table(s): {', '.join(sorted(document))}")
         archive_id = _safe_id(archive.id)
@@ -92,7 +88,12 @@ def load_config(value: Path | str) -> FetchConfig:
         KeyError,
         TypeError,
         AttributeError,
+        ValueError,
     ) as error:
+        if isinstance(error, ValueError) and str(error).startswith(
+            "fetch configuration does not exist:"
+        ):
+            raise
         raise ValueError(f"invalid fetch configuration {source}: {error}") from error
 
     return FetchConfig(
@@ -100,9 +101,6 @@ def load_config(value: Path | str) -> FetchConfig:
         url_pattern=archive.url_pattern,
         output=output,
         warc_target_bytes=options.warc_target_bytes,
-        playback_workers=options.playback_workers,
-        playback_starts_per_second=options.playback_starts_per_second,
-        retries=options.retries,
         start=options.start,
         end=options.end,
     )

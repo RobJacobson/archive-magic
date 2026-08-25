@@ -49,6 +49,17 @@ archive-magic-navigator /data/archives/example.org
 
 `~` is expanded, so `~/archives/example.org` works as expected.
 
+Process policy is CLI flags with code defaults, not a settings file:
+
+```text
+archive-magic-fetch ARCHIVE [--workers N] [--starts-per-second N] [--retries N]
+archive-magic-navigator ARCHIVE [--bind ADDRESS] [--port PORT]
+  [--poll-interval SECONDS] [--cache PATH] [--wayback-fallback {on,off}]
+```
+
+Fetch defaults are 4 workers, 20 starts/second, and 4 retries. Navigator defaults
+are `127.0.0.1:8080`, a 60-second poll interval, and Wayback fallback on.
+
 ## Local archive
 
 Use `output.type = "local"` in Fetch and `source.type = "local"` in Navigator.
@@ -95,7 +106,8 @@ Fetch configuration. An update may extend only the current collection's final WA
 as an exact byte prefix; rollover creates a new WARC and leaves earlier objects
 alone.
 
-CLI dates temporarily narrow a normal run:
+CLI dates may only narrow the project range. A start before `fetch.start`, an end
+after the configured or resolved project end, or a reversed range is rejected:
 
 ```console
 archive-magic-fetch ~/archives/example.org --start 2026-01-01 --end 2026-12-31

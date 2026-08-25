@@ -33,7 +33,7 @@ class NavigatorRequest:
     poll_interval_seconds: float
     bind: str
     port: int
-    wayback_fallback: bool | None
+    wayback_fallback: bool
     open_browser: bool
     debug: bool
 
@@ -77,7 +77,7 @@ def parse_args(argv: Sequence[str] | None = None) -> NavigatorRequest:
     )
     parser.add_argument("--bind", type=_bind, default="127.0.0.1", metavar="ADDRESS")
     parser.add_argument("--port", type=_port, default=8080, metavar="PORT")
-    parser.add_argument("--wayback-fallback", choices=("on", "off"), default=None)
+    parser.add_argument("--wayback-fallback", choices=("on", "off"), default="on")
     parser.add_argument("--open", action="store_true", dest="open_browser")
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args(argv)
@@ -90,7 +90,7 @@ def parse_args(argv: Sequence[str] | None = None) -> NavigatorRequest:
         args.poll_interval,
         args.bind,
         args.port,
-        None if args.wayback_fallback is None else args.wayback_fallback == "on",
+        args.wayback_fallback == "on",
         args.open_browser,
         args.debug,
     )
@@ -111,7 +111,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         _validate_remote_environment(settings)
 
         archives: list[Archive] = []
-        fallbacks: dict[str, bool] = {}
         labels: list[str] = []
         child_environment = None
         archive_errors: list[str] = []
@@ -146,11 +145,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 child_environment = remote.child_environment()
             labels.append(label)
             archives.append(archive)
-            fallbacks[item.archive_id] = (
-                item.wayback_fallback
-                if request.wayback_fallback is None
-                else request.wayback_fallback
-            )
         if archive_errors:
             raise ValidationError(
                 "invalid archive data:\n  - " + "\n  - ".join(archive_errors)
@@ -165,7 +159,13 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         with tempfile.TemporaryDirectory(prefix="archive-magic-navigator-") as name:
             runtime = Path(name).resolve()
-            write_config(runtime, build_config(tuple(archives), wayback_fallback=fallbacks))
+            write_config(
+                runtime,
+                build_config(
+                    tuple(archives),
+                    wayback_fallback=request.wayback_fallback,
+                ),
+            )
 
             def ready(url: str) -> None:
                 collection_count = sum(len(item.collections) for item in archives)
@@ -178,8 +178,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     f"from {', '.join(labels)}",
                     flush=True,
                 )
-                values = set(fallbacks.values())
-                label = "mixed" if len(values) > 1 else ("on" if values.pop() else "off")
+                label = "on" if request.wayback_fallback else "off"
                 print(f"Wayback fallback: {label}", flush=True)
                 print(f"Open {url}", flush=True)
                 print("Press Ctrl-C to stop.", flush=True)

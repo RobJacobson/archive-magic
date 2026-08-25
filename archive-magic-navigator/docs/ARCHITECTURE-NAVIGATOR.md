@@ -44,8 +44,7 @@ Process settings remain on the CLI:
 - `--poll-interval` defaults to 60 seconds and must be positive.
 - `--open` opens a browser only after pywb is ready.
 - `--debug` is passed to pywb.
-- `--wayback-fallback` globally overrides playback policy. Without it, each
-  archive keeps its own `[playback].wayback_fallback` value.
+- `--wayback-fallback` defaults to `on` for the whole process, including catalogs.
 
 Non-loopback binds print a warning because this is an unauthenticated development
 replay server, not a hardened public hosting layer.
@@ -62,9 +61,6 @@ id = "example.org"
 [source]
 type = "local"
 directory = "data"
-
-[playback]
-wayback_fallback = true
 ```
 
 Remote source fields are flattened into `[source]`:
@@ -183,14 +179,10 @@ Collection membership changes require a Navigator restart. Polling warns and kee
 the currently configured route set; it hot-adopts index changes for collections
 that already exist.
 
-## Per-archive Wayback fallback
+## Wayback fallback
 
-The generated pywb configuration assigns each route its effective policy. A catalog
-can therefore contain both fallback-enabled and fallback-disabled archives. The CLI
-override forces all routes on or off for one process invocation.
-
-Fallback behavior is a playback policy only. It does not alter stored WARC data
-or the Navigator configuration.
+`--wayback-fallback on` or `off` applies to every selected archive for that
+process. It does not alter stored WARC data or `navigator.toml`.
 
 ## Generated pywb runtime
 
@@ -251,6 +243,6 @@ uv run pytest -q -m integration
 ```
 
 Tests cover configuration and CLI cutover, deterministic catalogs, remote
-environment compatibility, per-archive fallback generation, cached playback
+environment compatibility, process-wide fallback generation, cached playback
 during index mismatch, atomic polling adoption, authenticated S3 archive
 paths, and local pywb startup.

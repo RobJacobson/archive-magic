@@ -14,18 +14,24 @@ secondary updater machines, and manual bucket mutation are unsupported.
 
 ```text
 archive-magic-fetch ARCHIVE [--start DATE] [--end DATE] [--reset-data]
+  [--workers N] [--starts-per-second N] [--retries N]
 ```
 
 `ARCHIVE` is either a Fetch TOML file of any name or a directory containing
 `fetch.toml`. There is no legacy URL-pattern, `--config`, or `--archives-root`
 interface.
 
-Normal CLI dates narrow a run without changing the configuration. Without overrides,
-Fetch uses `[fetch].start` through `[fetch].end`; an omitted end is resolved to the
-current UTC timestamp when the run starts. Fetch therefore checks the complete
-configured history on daily or weekly runs. Identity-based deduplication makes
-unchanged older collections no-ops, so normally only the current year is
+Normal CLI dates may only narrow a run without changing the configuration. Without
+overrides, Fetch uses `[fetch].start` through `[fetch].end`; an omitted start
+defaults to `1995-01-01` and an omitted end is resolved to the current UTC timestamp
+when the run starts. A CLI start before the project start, a CLI end after the
+resolved project end, or a reversed range is rejected. Fetch therefore checks the
+complete configured history on daily or weekly runs. Identity-based deduplication
+makes unchanged older collections no-ops, so normally only the current year is
 republished.
+
+Workers, start rate, and retries are process policy from CLI flags (defaults 4,
+20.0, and 4). They are not stored in `fetch.toml`.
 
 ## Configuration contract
 
@@ -48,9 +54,6 @@ region = "auto"
 start = "1995-01-01"
 # end omitted means now
 warc_target_bytes = 250000000
-playback_workers = 4
-playback_starts_per_second = 20.0
-retries = 4 # four retries after the initial request
 ```
 
 Rules:
@@ -68,13 +71,14 @@ Rules:
   No adjacent `.env` is loaded and no specific access-key variable is required.
 - The compressed WARC rollover target defaults to 250,000,000 bytes and remains
   configurable per archive.
-- `[fetch].retries` applies to both CDX and playback requests and defaults to four
+- `--retries` applies to both CDX and playback requests and defaults to four
   retries after the initial request. CDX retries are owned by Fetch: HTTP 429 and
   TCP connection refused pause for 60 seconds (or `Retry-After`) before the next
   attempt, matching playback backpressure. A CDX failure skips that year, continues
   with later years, and makes the process exit nonzero.
 
-Fetch does not read Navigator configuration. Playback policy lives in `navigator.toml`.
+Fetch does not read Navigator configuration. Wayback fallback is a Navigator CLI
+flag.
 
 ## Data, logging, and publication layout
 

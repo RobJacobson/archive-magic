@@ -10,9 +10,43 @@ from typing import Optional, Sequence
 from .config import load_config
 from .fetch import build_settings, run_fetch
 
+DEFAULT_WORKERS = 4
+DEFAULT_STARTS_PER_SECOND = 20.0
+DEFAULT_RETRIES = 4
+
+
+def _positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("must be an integer") from error
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be positive")
+    return parsed
+
+
+def _nonnegative_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("must be an integer") from error
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be nonnegative")
+    return parsed
+
+
+def _positive_float(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("must be a number") from error
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be positive")
+    return parsed
+
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
-    """Parse the minimal fetch command line."""
+    """Parse the fetch command line."""
 
     parser = argparse.ArgumentParser(prog="archive-magic-fetch")
     parser.add_argument("archive", type=Path, metavar="ARCHIVE")
@@ -25,6 +59,24 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
             "rebuild selected local collections, or delete and rebuild the complete "
             "configured archive prefix when remote output is selected"
         ),
+    )
+    parser.add_argument(
+        "--workers",
+        type=_positive_int,
+        default=DEFAULT_WORKERS,
+        metavar="N",
+    )
+    parser.add_argument(
+        "--starts-per-second",
+        type=_positive_float,
+        default=DEFAULT_STARTS_PER_SECOND,
+        metavar="N",
+    )
+    parser.add_argument(
+        "--retries",
+        type=_nonnegative_int,
+        default=DEFAULT_RETRIES,
+        metavar="N",
     )
     return parser.parse_args(argv)
 
@@ -53,9 +105,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             reset_data=args.reset_data,
             output=config.output,
             warc_target_bytes=config.warc_target_bytes,
-            playback_workers=config.playback_workers,
-            playback_starts_per_second=config.playback_starts_per_second,
-            retries=config.retries,
+            playback_workers=args.workers,
+            playback_starts_per_second=args.starts_per_second,
+            retries=args.retries,
             default_start=config.start,
             default_end=config.end,
         )
