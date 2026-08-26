@@ -97,14 +97,72 @@ def test_rate_gate_keeps_maximum_retry_after(capsys):
         clock=lambda: clock["now"],
         sleep=sleep,
     )
+    # Same wave: level 1 floor is 60s; a longer Retry-After still wins.
     gate.pause("http", 30, identity)
-    gate.pause("http", 40, identity)
+    gate.pause("http", 90, identity)
     gate.pause("http", 20, identity)
     gate.wait()
 
-    assert sleeps == [40.0]
+    assert sleeps == [90.0]
     output = capsys.readouterr().out
-    assert "Retry-After=20s, applied=20s, maximum=40s" in output
+    assert "Retry-After=20s, applied=60s, level=1, maximum=90s" in output
+
+
+def test_rate_gate_escalates_across_waves(capsys):
+    clock = {"now": 100.0}
+    sleeps: list[float] = []
+    identity = make_capt()
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        clock["now"] += seconds
+
+    gate = StartGate(
+        0,
+        clock=lambda: clock["now"],
+        sleep=sleep,
+    )
+    gate.pause("http", 60, identity)
+    gate.wait()
+    gate.pause("http", 60, identity)
+    gate.wait()
+    gate.pause("http", 60, identity)
+    gate.wait()
+
+    assert sleeps == [60.0, 120.0, 180.0]
+    output = capsys.readouterr().out
+    assert "level=1, maximum=60s" in output
+    assert "level=2, maximum=120s" in output
+    assert "applied=120s, level=2, maximum=120s" in output
+    assert "level=3, maximum=180s" in output
+
+
+def test_rate_gate_resets_escalation_after_success(capsys):
+    clock = {"now": 100.0}
+    sleeps: list[float] = []
+    identity = make_capt()
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        clock["now"] += seconds
+
+    gate = StartGate(
+        0,
+        clock=lambda: clock["now"],
+        sleep=sleep,
+    )
+    gate.pause("http", 60, identity)
+    gate.wait()
+    gate.pause("http", 60, identity)
+    gate.wait()
+    gate.note_success()
+    gate.pause("http", 60, identity)
+    gate.wait()
+
+    assert sleeps == [60.0, 120.0, 60.0]
+    output = capsys.readouterr().out
+    assert output.count("level=1,") == 2
+    assert "level=2, maximum=120s" in output
 
 
 def test_permanent_failure_does_not_retry():

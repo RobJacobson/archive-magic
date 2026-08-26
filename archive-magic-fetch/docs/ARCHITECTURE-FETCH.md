@@ -82,12 +82,14 @@ Rules:
 - `--retries` applies to both CDX and playback requests and defaults to four
   retries after the initial request. CDX retries are owned by Fetch: HTTP 429,
   TCP connection refused, timeouts/504, and mid-request disconnects pause with a
-  linear 60s, 120s, 180s, ... backoff, never shorter than `Retry-After`. After
-  year-query retries are exhausted for timeout/504-class errors, Fetch falls back
-  to date windows. A failed fallback window continues with later windows; if any
-  window fails the year is marked incomplete and the process exits nonzero after
-  publishing what was collected. Total CDX failure for a year skips that year,
-  continues with later years, and also exits nonzero.
+  linear 60s, 120s, 180s, ... backoff, never shorter than `Retry-After`. Playback
+  workers share the same linear backpressure ladder across successive 429 waves
+  (reset after a successful download). After year-query retries are exhausted for
+  timeout/504-class errors, Fetch falls back to date windows. A failed fallback
+  window continues with later windows; if any window fails the year is marked
+  incomplete and the process exits nonzero after publishing what was collected.
+  Total CDX failure for a year skips that year, continues with later years, and
+  also exits nonzero.
 
 Fetch does not read Navigator configuration. Wayback fallback is a Navigator CLI
 flag.
@@ -144,6 +146,8 @@ For each year in the selected range, Fetch:
    only the CDXJ-referenced final WARC for the year (or keeps a longer local tail).
    Unchanged years never download a WARC.
 6. Resolves remaining captures through bounded, rate-limited playback workers.
+   Shared backpressure pauses new starts on HTTP 429 / refused / timeout-class
+   errors with a linear 60s, 120s, 180s, ... cooldown across successive waves.
 7. Appends response or revisit records through one serialized WARC writer.
 8. Reindexes changed/new WARCs, merges their lines into the stable CDXJ, and
    validates the completed artifacts.

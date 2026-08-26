@@ -18,9 +18,9 @@ from .models import (
 )
 from .playback import classify_playback_error
 from .retry import (
-    BACKPRESSURE_COOLDOWN_SECONDS,
     backpressure_signal,
     backpressure_source,
+    linear_backpressure_delay,
     retry_after_from_error,
 )
 
@@ -39,7 +39,13 @@ def _default_report(message: str) -> None:
 
 
 class StartGate:
-    """Smooth request starts and pause every worker on IA backpressure."""
+    """Smooth request starts and pause every worker on IA backpressure.
+
+    Successive backpressure waves escalate with a linear 60s, 120s, 180s, ...
+    cooldown (never shorter than ``Retry-After``). Concurrent 429s in the same
+    pause window share one level. A successful download after the pause clears
+    resets the escalation.
+    """
 
     def __init__(
         self,
@@ -57,6 +63,7 @@ class StartGate:
         self._next_start = 0.0
         self._blocked_until = 0.0
         self._max_retry_after = 0.0
+        self._level = 0
 
     def wait(self) -> None:
         while True:
@@ -64,11 +71,17 @@ class StartGate:
                 now = self._clock()
                 deadline = max(self._next_start, self._blocked_until)
                 if now >= deadline:
-                    if now >= self._blocked_until:
-                        self._max_retry_after = 0.0
                     self._next_start = now + self._interval
                     return
             self._sleep(deadline - now)
+
+    def note_success(self) -> None:
+        """Reset escalation after a successful download past the pause window."""
+
+        with self._lock:
+            if self._clock() >= self._blocked_until:
+                self._level = 0
+                self._max_retry_after = 0.0
 
     def pause(
         self,
@@ -76,31 +89,27 @@ class StartGate:
         retry_after: float | None,
         identity: CaptureIdentity,
     ) -> None:
-        requested = retry_after or BACKPRESSURE_COOLDOWN_SECONDS
         with self._lock:
             now = self._clock()
             if now >= self._blocked_until:
+                self._level += 1
                 self._max_retry_after = 0.0
-            self._max_retry_after = max(self._max_retry_after, requested)
-            self._blocked_until = max(
-                self._blocked_until,
-                now + self._max_retry_after,
-            )
+            delay = linear_backpressure_delay(self._level, retry_after)
+            self._max_retry_after = max(self._max_retry_after, delay)
+            self._blocked_until = max(self._blocked_until, now + delay)
             maximum = self._max_retry_after
             remaining = self._blocked_until - now
+            level = self._level
         source = backpressure_source(kind)
-        policy = (
-            f"Retry-After={retry_after:g}s, applied={requested:g}s"
-            if retry_after is not None and kind == "http"
-            else (
-                f"Retry-After=absent, applied={requested:g}s"
-                if kind == "http"
-                else f"cooldown={requested:g}s"
-            )
-        )
+        if retry_after is not None and kind == "http":
+            policy = f"Retry-After={retry_after:g}s, applied={delay:g}s"
+        elif kind == "http":
+            policy = f"Retry-After=absent, applied={delay:g}s"
+        else:
+            policy = f"cooldown={delay:g}s"
         self._report(
             f"rate limit: {source} at {identity.timestamp}; "
-            f"{policy}, maximum={maximum:g}s; "
+            f"{policy}, level={level}, maximum={maximum:g}s; "
             f"new starts paused for {remaining:g}s"
         )
 
@@ -199,6 +208,7 @@ class PlaybackWorkers:
                     elapsed_s=time.monotonic() - started,
                     categories=tuple(categories),
                 )
+            self._gate.note_success()
             return DownloadOutcome(
                 result=result,
                 failure=None,
