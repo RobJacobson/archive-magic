@@ -6,23 +6,29 @@ import calendar
 import re
 import time
 from collections.abc import Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from wayback import CdxRecord, WaybackClient
 
 from .collection import normalize_domain
+from .config import DEFAULT_CDX_PAGE_LIMIT
 from .console import emit
 from .identity import make_identity
 from .models import ParsedCapture
 from .playback import ArchiveMagicWaybackSession, classify_playback_error
 from .retry import (
     backpressure_signal,
+    backpressure_source,
     iter_error_chain,
     linear_backpressure_delay,
     retry_after_from_error,
 )
 
+
+DEFAULT_CDX_TIMEOUT_SECONDS = 300.0
 
 # Compact CDX timestamps at year, month, day, or full second precision.
 _CDX_FORMATS = {
@@ -112,6 +118,41 @@ def year_ranges(date_start: str, date_end: str) -> Iterator[tuple[int, str, str]
         )
 
 
+def date_windows(
+    date_start: str,
+    date_end: str,
+    days: int,
+) -> Iterator[tuple[str, str]]:
+    """Yield inclusive CDX timestamp windows of up to ``days`` calendar days.
+
+    Windows never cross a calendar-year boundary. The final window in a year
+    (or overall) may be shorter than ``days``. Both bounds are 14-digit CDX
+    timestamps. ``days`` must be at least 1.
+    """
+
+    if days < 1:
+        raise ValueError(f"cdx window days must be positive, got {days}")
+    validate_date_range(date_start, date_end)
+    for _year, year_start, year_end in year_ranges(date_start, date_end):
+        cursor = datetime.strptime(year_start[:8], "%Y%m%d")
+        end_day = datetime.strptime(year_end[:8], "%Y%m%d")
+        while cursor <= end_day:
+            window_end_day = min(cursor + timedelta(days=days - 1), end_day)
+            window_start = max(year_start, cursor.strftime("%Y%m%d") + "000000")
+            window_end = min(year_end, window_end_day.strftime("%Y%m%d") + "235959")
+            yield window_start, window_end
+            cursor = window_end_day + timedelta(days=1)
+
+
+def format_cdx_window_label(date_start: str, date_end: str) -> str:
+    """Render a CDX window as YYYY-MM-DD..YYYY-MM-DD for console logs."""
+
+    def _day(value: str) -> str:
+        return f"{value[:4]}-{value[4:6]}-{value[6:8]}"
+
+    return f"{_day(date_start)}..{_day(date_end)}"
+
+
 @dataclass(frozen=True)
 class CdxResult:
     """Parsed captures and the CDX search that produced them."""
@@ -134,49 +175,89 @@ def _parsed_capture(record: CdxRecord) -> ParsedCapture:
     )
 
 
+def _materialize_cdx_search(
+    client: WaybackClient,
+    *,
+    search_url: str,
+    match_type: str | None,
+    date_start: str,
+    date_end: str,
+    limit: int,
+) -> tuple[ParsedCapture, ...]:
+    records = client.search(
+        search_url,
+        match_type=match_type,
+        from_date=date_start,
+        to_date=date_end,
+        limit=limit,
+        resolve_revisits=False,
+        skip_malformed_results=True,
+    )
+    return tuple(
+        sorted(
+            map(_parsed_capture, records),
+            key=lambda item: item.identity.sort_key(),
+        )
+    )
+
+
 def fetch_cdx(
     *,
     url_pattern: str,
     date_start: str,
     date_end: str,
     retries: int,
+    limit: int = DEFAULT_CDX_PAGE_LIMIT,
     sleep: Callable[[float], None] = time.sleep,
     report: Callable[[str], None] = emit,
 ) -> CdxResult:
     """Fetch and parse a CDX range through ``WaybackClient.search``.
 
-    Fetch owns CDX retries. Wayback library retries stay disabled so a refused
-    TCP connection or HTTP 429 uses a linear 60s, 120s, 180s, ... pause (or a
-    longer ``Retry-After``) instead of giving up after a few seconds of inner
-    backoff. A failed query is retried from the start of the year range so the
-    result is never a partial listing.
+    Fetch owns CDX retries. Wayback library retries stay disabled so HTTP 429,
+    TCP connection refused, timeouts/504, and mid-request disconnects use a
+    linear 60s, 120s, 180s, ... pause (or a longer ``Retry-After``) instead of
+    giving up after a few seconds of inner backoff. ``limit`` is the resumeKey
+    page size per HTTP request. A failed query is retried from the start of the
+    requested ``from``/``to`` window so the result is never a partial listing.
+
+    Each attempt has a wall-clock budget of ``DEFAULT_CDX_TIMEOUT_SECONDS``
+    covering every resumeKey page. Socket read timeouts alone are not enough:
+    IA can trickle bytes forever and reset the per-read timer.
     """
 
+    if limit <= 0:
+        raise ValueError(f"cdx page limit must be positive, got {limit}")
     search_url, match_type = normalize_cdx_search(url_pattern)
     max_attempts = retries + 1
     last_error: BaseException | None = None
     for attempt in range(1, max_attempts + 1):
+        report(f"CDX query attempt {attempt}/{max_attempts}")
         client = WaybackClient(
             session=ArchiveMagicWaybackSession(
                 user_agent="archive-magic-fetch",
                 retries=0,
+                timeout=DEFAULT_CDX_TIMEOUT_SECONDS,
             )
         )
+        pool = ThreadPoolExecutor(max_workers=1)
         try:
-            records = client.search(
-                search_url,
+            future = pool.submit(
+                _materialize_cdx_search,
+                client,
+                search_url=search_url,
                 match_type=match_type,
-                from_date=date_start,
-                to_date=date_end,
-                resolve_revisits=False,
-                skip_malformed_results=True,
+                date_start=date_start,
+                date_end=date_end,
+                limit=limit,
             )
-            captures = tuple(
-                sorted(
-                    map(_parsed_capture, records),
-                    key=lambda item: item.identity.sort_key(),
-                )
-            )
+            try:
+                captures = future.result(timeout=DEFAULT_CDX_TIMEOUT_SECONDS)
+            except FuturesTimeoutError as error:
+                client.close()
+                raise TimeoutError(
+                    f"CDX query exceeded {DEFAULT_CDX_TIMEOUT_SECONDS:g}s "
+                    "wall-clock budget"
+                ) from error
             return CdxResult(captures, search_url, match_type)
         except Exception as error:  # noqa: BLE001 - network boundary
             last_error = error
@@ -188,12 +269,20 @@ def fetch_cdx(
                 continue
             break
         finally:
+            pool.shutdown(wait=False, cancel_futures=True)
             client.close()
     assert last_error is not None
     detail = _unwrap_wayback_retry(last_error)
     raise RuntimeError(
         f"CDX query failed after {attempt} attempts: {detail}"
     ) from last_error
+
+
+def cdx_should_split(error: BaseException) -> bool:
+    """True when a failed year query should fall back to date windows."""
+
+    signal = backpressure_signal(error)
+    return signal is not None and signal[0] == "timeout"
 
 
 def _cdx_retry_delay(error: BaseException, attempt: int) -> float:
@@ -213,10 +302,14 @@ def _cdx_retry_message(
     backpressure = backpressure_signal(error)
     suffix = f"pausing {delay:g}s before attempt {attempt + 1}/{max_attempts}"
     if backpressure is None:
-        return f"CDX query error during attempt {attempt}/{max_attempts}; {suffix} ({error})"
+        return (
+            f"CDX query error during attempt {attempt}/{max_attempts}; "
+            f"{suffix} ({error})"
+        )
     kind, _retry_after = backpressure
-    source = "HTTP 429" if kind == "http" else "TCP connection refused"
-    return f"rate limit: {source} during CDX query; {suffix}"
+    return (
+        f"rate limit: {backpressure_source(kind)} during CDX query; {suffix}"
+    )
 
 
 def _unwrap_wayback_retry(error: BaseException) -> BaseException:

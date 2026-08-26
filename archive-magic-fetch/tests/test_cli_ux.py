@@ -97,14 +97,72 @@ def test_rate_gate_keeps_maximum_retry_after(capsys):
         clock=lambda: clock["now"],
         sleep=sleep,
     )
+    # Same wave: level 1 floor is 60s; a longer Retry-After still wins.
     gate.pause("http", 30, identity)
-    gate.pause("http", 40, identity)
+    gate.pause("http", 90, identity)
     gate.pause("http", 20, identity)
     gate.wait()
 
-    assert sleeps == [40.0]
+    assert sleeps == [90.0]
     output = capsys.readouterr().out
-    assert "Retry-After=20s, applied=20s, maximum=40s" in output
+    assert "Retry-After=20s, applied=60s, level=1, maximum=90s" in output
+
+
+def test_rate_gate_escalates_across_waves(capsys):
+    clock = {"now": 100.0}
+    sleeps: list[float] = []
+    identity = make_capt()
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        clock["now"] += seconds
+
+    gate = StartGate(
+        0,
+        clock=lambda: clock["now"],
+        sleep=sleep,
+    )
+    gate.pause("http", 60, identity)
+    gate.wait()
+    gate.pause("http", 60, identity)
+    gate.wait()
+    gate.pause("http", 60, identity)
+    gate.wait()
+
+    assert sleeps == [60.0, 120.0, 180.0]
+    output = capsys.readouterr().out
+    assert "level=1, maximum=60s" in output
+    assert "level=2, maximum=120s" in output
+    assert "applied=120s, level=2, maximum=120s" in output
+    assert "level=3, maximum=180s" in output
+
+
+def test_rate_gate_resets_escalation_after_success(capsys):
+    clock = {"now": 100.0}
+    sleeps: list[float] = []
+    identity = make_capt()
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        clock["now"] += seconds
+
+    gate = StartGate(
+        0,
+        clock=lambda: clock["now"],
+        sleep=sleep,
+    )
+    gate.pause("http", 60, identity)
+    gate.wait()
+    gate.pause("http", 60, identity)
+    gate.wait()
+    gate.note_success()
+    gate.pause("http", 60, identity)
+    gate.wait()
+
+    assert sleeps == [60.0, 120.0, 60.0]
+    output = capsys.readouterr().out
+    assert output.count("level=1,") == 2
+    assert "level=2, maximum=120s" in output
 
 
 def test_permanent_failure_does_not_retry():
@@ -154,6 +212,21 @@ def test_connection_refused_is_tcp_backpressure():
         "tcp",
         60.0,
     )
+
+
+def test_read_timeout_is_timeout_backpressure():
+    error = TimeoutError(
+        "HTTPSConnectionPool(host='web.archive.org', port=443): Read timed out."
+    )
+    assert backpressure_signal(error) == ("timeout", None)
+
+
+def test_remote_disconnected_is_timeout_backpressure():
+    error = ConnectionError(
+        "('Connection aborted.', RemoteDisconnected("
+        "'Remote end closed connection without response'))"
+    )
+    assert backpressure_signal(error) == ("timeout", None)
 
 
 def test_playback_workers_run_url_groups_in_parallel():
@@ -327,6 +400,8 @@ def test_cli_runtime_flags_override_defaults(tmp_path, monkeypatch):
     assert captured[0].playback_workers == 4
     assert captured[0].playback_starts_per_second == 20.0
     assert captured[0].retries == 4
+    assert captured[0].cdx_window_days == 10
+    assert captured[0].cdx_page_limit == 5000
     captured.clear()
     assert (
         cli.main(
@@ -345,6 +420,39 @@ def test_cli_runtime_flags_override_defaults(tmp_path, monkeypatch):
     assert captured[0].playback_workers == 2
     assert captured[0].playback_starts_per_second == 1.5
     assert captured[0].retries == 0
+    assert captured[0].cdx_window_days == 10
+    assert captured[0].cdx_page_limit == 5000
+
+
+def test_cli_uses_cdx_settings_from_toml(tmp_path, monkeypatch):
+    from archive_magic_fetch import cli
+
+    path = tmp_path / "fetch.toml"
+    path.write_text(
+        """
+[archive]
+id = "example.org"
+url_pattern = "*.example.org"
+[output]
+type = "local"
+data_directory = "data"
+[fetch]
+start = "2000-01-01"
+end = "2004-12-31"
+cdx_window_days = 3
+cdx_page_limit = 2500
+""",
+        encoding="utf-8",
+    )
+    captured = []
+    monkeypatch.setattr(
+        cli,
+        "run_fetch",
+        lambda item: captured.append(item) or SimpleNamespace(exit_code=0),
+    )
+    assert cli.main([str(path)]) == 0
+    assert captured[0].cdx_window_days == 3
+    assert captured[0].cdx_page_limit == 2500
 
 
 def test_cli_rejects_start_before_project_range(tmp_path):

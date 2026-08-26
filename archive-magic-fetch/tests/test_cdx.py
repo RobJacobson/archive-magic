@@ -7,7 +7,9 @@ import pytest
 from wayback import CdxRecord
 
 from archive_magic_fetch.cdx import (
+    date_windows,
     fetch_cdx,
+    format_cdx_window_label,
     normalize_cdx_search,
     parse_date_bound,
     year_ranges,
@@ -70,15 +72,145 @@ def test_fetch_cdx_delegates_paging_and_parsing_to_wayback(monkeypatch):
                 "match_type": "domain",
                 "from_date": "20040101000000",
                 "to_date": "20041231235959",
+                "limit": 5000,
                 "resolve_revisits": False,
                 "skip_malformed_results": True,
             },
         )
     ]
     assert sessions[0].retries == 0
+    assert sessions[0].timeout == 300.0
     assert fake.closed
     assert result.search_url == "example.org"
     assert result.match_type == "domain"
+
+
+def test_fetch_cdx_respects_custom_page_limit(monkeypatch):
+    fake = FakeClient([record()])
+
+    monkeypatch.setattr(
+        "archive_magic_fetch.cdx.WaybackClient",
+        lambda **_kwargs: fake,
+    )
+    fetch_cdx(
+        url_pattern="http://example.org/",
+        date_start="20040101000000",
+        date_end="20041231235959",
+        retries=0,
+        limit=1000,
+    )
+    assert fake.calls[0][1]["limit"] == 1000
+
+
+def test_cdx_should_split_detects_timeout_and_504():
+    from archive_magic_fetch.cdx import cdx_should_split
+
+    assert cdx_should_split(TimeoutError("read timed out"))
+    assert cdx_should_split(
+        RuntimeError(
+            "HTTPSConnectionPool(host='web.archive.org', port=443): "
+            "Read timed out. (read timeout=60)"
+        )
+    )
+    assert cdx_should_split(
+        ConnectionError(
+            "('Connection aborted.', RemoteDisconnected("
+            "'Remote end closed connection without response'))"
+        )
+    )
+    gateway = RuntimeError("504 Gateway Timeout")
+    gateway.status_code = 504
+    assert cdx_should_split(gateway)
+    refused = ConnectionError("Connection refused")
+    assert not cdx_should_split(refused)
+    rate = RuntimeError("Wayback rate limit exceeded, retry after 60 s")
+    rate.status_code = 429
+    assert not cdx_should_split(rate)
+
+
+def test_fetch_cdx_uses_linear_backoff_on_read_timeout(monkeypatch):
+    attempts = {"n": 0}
+    sleeps: list[float] = []
+    reports: list[str] = []
+
+    class TimeoutClient:
+        def search(self, *args, **kwargs):
+            attempts["n"] += 1
+            if attempts["n"] < 3:
+                raise TimeoutError(
+                    "HTTPSConnectionPool(host='web.archive.org', port=443): "
+                    "Read timed out."
+                )
+            return iter([record()])
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(
+        "archive_magic_fetch.cdx.WaybackClient",
+        lambda **_kwargs: TimeoutClient(),
+    )
+    result = fetch_cdx(
+        url_pattern="*.example.org",
+        date_start="20040101000000",
+        date_end="20041231235959",
+        retries=4,
+        sleep=sleeps.append,
+        report=reports.append,
+    )
+
+    assert len(result.captures) == 1
+    assert attempts["n"] == 3
+    assert sleeps == [60.0, 120.0]
+    assert reports == [
+        "CDX query attempt 1/5",
+        "rate limit: timeout/504 during CDX query; "
+        "pausing 60s before attempt 2/5",
+        "CDX query attempt 2/5",
+        "rate limit: timeout/504 during CDX query; "
+        "pausing 120s before attempt 3/5",
+        "CDX query attempt 3/5",
+    ]
+
+
+def test_fetch_cdx_enforces_wall_clock_budget(monkeypatch):
+    import time as time_module
+
+    sleeps: list[float] = []
+    reports: list[str] = []
+    closed = {"n": 0}
+
+    class SlowClient:
+        def search(self, *args, **kwargs):
+            def gen():
+                time_module.sleep(2.0)
+                yield record()
+
+            return gen()
+
+        def close(self):
+            closed["n"] += 1
+
+    monkeypatch.setattr(
+        "archive_magic_fetch.cdx.DEFAULT_CDX_TIMEOUT_SECONDS",
+        0.2,
+    )
+    monkeypatch.setattr(
+        "archive_magic_fetch.cdx.WaybackClient",
+        lambda **_kwargs: SlowClient(),
+    )
+    with pytest.raises(RuntimeError, match="wall-clock budget"):
+        fetch_cdx(
+            url_pattern="http://example.org/",
+            date_start="20040101000000",
+            date_end="20041231235959",
+            retries=0,
+            sleep=sleeps.append,
+            report=reports.append,
+        )
+    assert sleeps == []
+    assert reports == ["CDX query attempt 1/1"]
+    assert closed["n"] >= 1
 
 
 def test_fetch_cdx_uses_linear_backoff_on_connection_refused(monkeypatch):
@@ -125,10 +257,13 @@ def test_fetch_cdx_uses_linear_backoff_on_connection_refused(monkeypatch):
     assert attempts["n"] == 3
     assert sleeps == [60.0, 120.0]
     assert reports == [
+        "CDX query attempt 1/5",
         "rate limit: TCP connection refused during CDX query; "
         "pausing 60s before attempt 2/5",
+        "CDX query attempt 2/5",
         "rate limit: TCP connection refused during CDX query; "
         "pausing 120s before attempt 3/5",
+        "CDX query attempt 3/5",
     ]
 
 
@@ -169,9 +304,13 @@ def test_fetch_cdx_escalates_past_retry_after_on_http_429(monkeypatch):
     assert attempts["n"] == 4
     assert sleeps == [60.0, 120.0, 180.0]
     assert reports == [
+        "CDX query attempt 1/5",
         "rate limit: HTTP 429 during CDX query; pausing 60s before attempt 2/5",
+        "CDX query attempt 2/5",
         "rate limit: HTTP 429 during CDX query; pausing 120s before attempt 3/5",
+        "CDX query attempt 3/5",
         "rate limit: HTTP 429 during CDX query; pausing 180s before attempt 4/5",
+        "CDX query attempt 4/5",
     ]
 
 
@@ -268,6 +407,48 @@ def test_year_ranges_clips_first_and_last_years():
         (2004, "20040101000000", "20041231235959"),
         (2005, "20050101000000", "20050301120000"),
     ]
+
+
+def test_date_windows_splits_into_inclusive_n_day_chunks():
+    assert list(date_windows("20040101000000", "20040131235959", 10)) == [
+        ("20040101000000", "20040110235959"),
+        ("20040111000000", "20040120235959"),
+        ("20040121000000", "20040130235959"),
+        ("20040131000000", "20040131235959"),
+    ]
+
+
+def test_date_windows_never_cross_year_boundary():
+    windows = list(date_windows("20031225000000", "20040105000000", 10))
+    assert windows == [
+        ("20031225000000", "20031231235959"),
+        ("20040101000000", "20040105000000"),
+    ]
+    assert all(start[:4] == end[:4] for start, end in windows)
+
+
+def test_date_windows_handles_leap_day_and_short_range():
+    assert list(date_windows("20040220000000", "20040305000000", 10)) == [
+        ("20040220000000", "20040229235959"),
+        ("20040301000000", "20040305000000"),
+    ]
+    assert list(date_windows("20040615000000", "20040617000000", 10)) == [
+        ("20040615000000", "20040617000000"),
+    ]
+    assert list(date_windows("20040615000000", "20040615000000", 1)) == [
+        ("20040615000000", "20040615000000"),
+    ]
+
+
+def test_date_windows_rejects_non_positive_days():
+    with pytest.raises(ValueError, match="must be positive"):
+        list(date_windows("20040101000000", "20040110235959", 0))
+
+
+def test_format_cdx_window_label():
+    assert format_cdx_window_label("20040101000000", "20040110235959") == (
+        "2004-01-01..2004-01-10"
+    )
 
 
 def test_normalize_cdx_search_rewrites_wildcard_and_prefix():

@@ -53,7 +53,7 @@ class ArchiveMagicWaybackSession(WaybackSession):
     Playback clients leave library retries disabled because Fetch owns their
     synchronous retry loop. CDX clients also leave library retries disabled;
     `fetch_cdx` owns CDX retries, including a linear 60s, 120s, 180s, ...
-    pause for HTTP 429 and TCP connection refused.
+    pause for HTTP 429, TCP connection refused, timeouts, and HTTP 504.
 
     Wayback treats any response with ``Memento-Datetime`` as a successful
     memento, which can let HTTP 429 slip through as a playback error with no
@@ -75,8 +75,13 @@ class ArchiveMagicWaybackSession(WaybackSession):
     def send(self, request, **kwargs):
         # requests.Session.send() eagerly reads ``response.content`` unless
         # stream=True. That triggers ContentDecodingError on IA's false gzip
-        # claims before we can inspect the raw body, so always defer loading.
-        kwargs["stream"] = True
+        # claims before we can inspect the raw body, so defer loading for
+        # memento URLs only. CDX responses are not mementos; leave them
+        # non-streaming so the body download stays under the session timeout.
+        raw_url = getattr(request, "url", None)
+        path = urlsplit(raw_url if isinstance(raw_url, str) else "").path
+        if path.startswith("/web/"):
+            kwargs["stream"] = True
         response = super().send(request, **kwargs)
         if getattr(response, "status_code", None) == 429:
             delay = parse_retry_after(response.headers.get("Retry-After"))
