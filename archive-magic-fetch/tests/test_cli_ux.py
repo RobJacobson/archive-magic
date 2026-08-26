@@ -461,3 +461,33 @@ def test_cli_rejects_start_before_project_range(tmp_path):
     config = write_cli_config(tmp_path)
     assert main([str(config), "--start", "1999-01-01"]) == 2
 
+
+def test_log_url_outcome_omits_already_represented_lines(capsys):
+    from archive_magic_fetch.console import log_url_outcome
+    from archive_magic_fetch.resolution import CaptureKind, CaptureOutcome, UrlOutcome
+
+    existing = make_capt(ts="19990117001820")
+    downloaded = make_capt(ts="19990117071312", digest="sha1:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB")
+    outcome = UrlOutcome(
+        url="http://www.nclr.org/special/award.html",
+        captures=(
+            CaptureOutcome(identity=existing, kind=CaptureKind.EXISTING),
+            CaptureOutcome(
+                identity=downloaded,
+                kind=CaptureKind.DOWNLOADED,
+                playback=playback(downloaded),
+                attempts=1,
+                elapsed_s=0.4,
+            ),
+        ),
+        attempts=1,
+        playback_bytes=5,
+        categories=(),
+    )
+
+    log_url_outcome(1, 397, outcome)
+    text = capsys.readouterr().out
+    assert "1/397 http://www.nclr.org/special/award.html" in text
+    assert "already represented" not in text
+    assert "Downloaded" in text
+

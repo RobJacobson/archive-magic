@@ -99,6 +99,10 @@ def log_url_outcome(number: int, total: int, outcome: UrlOutcome) -> None:
     color = color_enabled()
     lines = [f"{number}/{total} {_safe(outcome.url)}"]
     for capture in outcome.captures:
+        # Skip already-represented captures: backfills otherwise drown the
+        # console in dim noise while URL progress lines remain useful.
+        if capture.kind is CaptureKind.EXISTING:
+            continue
         detail, style = _capture_line(capture)
         lines.append(
             f"  {timestamp_link(capture.identity, enabled=links)}  "
