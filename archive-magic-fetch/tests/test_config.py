@@ -3,6 +3,8 @@ from pathlib import Path
 import pytest
 from archive_magic_fetch.config import (
     CONFIG_NAME,
+    DEFAULT_CDX_PAGE_LIMIT,
+    DEFAULT_CDX_WINDOW_DAYS,
     DEFAULT_WARC_TARGET_BYTES,
     FetchOutput,
     load_config,
@@ -44,6 +46,8 @@ start = "2000-01-01"
     assert config.url_pattern == "*.example.org"
     assert config.output == FetchOutput("local", (tmp_path / "data").resolve())
     assert config.warc_target_bytes == DEFAULT_WARC_TARGET_BYTES
+    assert config.cdx_window_days == DEFAULT_CDX_WINDOW_DAYS
+    assert config.cdx_page_limit == DEFAULT_CDX_PAGE_LIMIT
     assert config.start == "2000-01-01"
     assert config.end is None
 
@@ -56,6 +60,56 @@ start = "2000-01-01"
     )
     assert settings.date_start == "20000101000000"
     assert settings.date_end == "20041231235959"
+    assert settings.cdx_window_days == DEFAULT_CDX_WINDOW_DAYS
+    assert settings.cdx_page_limit == DEFAULT_CDX_PAGE_LIMIT
+
+
+def test_cdx_window_days_override_from_toml(tmp_path):
+    write_config(
+        tmp_path,
+        local_config(
+            """
+[fetch]
+start = "2000-01-01"
+cdx_window_days = 7
+"""
+        ),
+    )
+    config = load_config(tmp_path)
+    assert config.cdx_window_days == 7
+    settings = build_settings(
+        config.url_pattern,
+        archive_id=config.archive_id,
+        output=config.output,
+        cdx_window_days=config.cdx_window_days,
+        default_start=config.start,
+        date_end="2000",
+    )
+    assert settings.cdx_window_days == 7
+
+
+def test_cdx_page_limit_override_from_toml(tmp_path):
+    write_config(
+        tmp_path,
+        local_config(
+            """
+[fetch]
+start = "2000-01-01"
+cdx_page_limit = 10000
+"""
+        ),
+    )
+    config = load_config(tmp_path)
+    assert config.cdx_page_limit == 10000
+    settings = build_settings(
+        config.url_pattern,
+        archive_id=config.archive_id,
+        output=config.output,
+        cdx_page_limit=config.cdx_page_limit,
+        default_start=config.start,
+        date_end="2000",
+    )
+    assert settings.cdx_page_limit == 10000
 
 
 def test_explicit_arbitrary_filename(tmp_path):
@@ -110,6 +164,14 @@ region = "auto"
         ),
         (
             "[archive]\nid='x'\nurl_pattern='x'\n[output]\ntype='local'\n[fetch]\nwarc_target_bytes=0\n",
+            "must be positive",
+        ),
+        (
+            "[archive]\nid='x'\nurl_pattern='x'\n[output]\ntype='local'\n[fetch]\ncdx_window_days=0\n",
+            "must be positive",
+        ),
+        (
+            "[archive]\nid='x'\nurl_pattern='x'\n[output]\ntype='local'\n[fetch]\ncdx_page_limit=0\n",
             "must be positive",
         ),
     ],

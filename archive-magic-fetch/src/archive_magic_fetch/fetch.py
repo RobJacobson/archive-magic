@@ -10,7 +10,10 @@ from pathlib import Path
 from typing import Callable, Mapping, Optional, Sequence
 
 from .cdx import (
+    cdx_should_split,
+    date_windows,
     fetch_cdx,
+    format_cdx_window_label,
     parse_date_bound,
     validate_date_range,
     year_ranges,
@@ -31,6 +34,8 @@ from .collection import (
     write_run_record,
 )
 from .config import (
+    DEFAULT_CDX_PAGE_LIMIT,
+    DEFAULT_CDX_WINDOW_DAYS,
     DEFAULT_WARC_TARGET_BYTES,
     FetchOutput,
 )
@@ -82,6 +87,8 @@ class FetchSettings:
     output: FetchOutput
     reset_data: bool = False
     warc_target_bytes: int = DEFAULT_WARC_TARGET_BYTES
+    cdx_window_days: int = DEFAULT_CDX_WINDOW_DAYS
+    cdx_page_limit: int = DEFAULT_CDX_PAGE_LIMIT
     playback_workers: int = 4
     playback_starts_per_second: float = 20.0
     retries: int = DEFAULT_RETRIES
@@ -105,6 +112,7 @@ class _YearResult:
     warcs: tuple[WarcArtifact, ...]
     index: IndexArtifact | None
     skip_errors: int
+    incomplete: bool = False
 
 
 @dataclass(frozen=True)
@@ -219,6 +227,8 @@ def _run_fetch(
         _accumulate_metrics(metrics, result.metrics)
         all_failures.extend(result.failures)
         run_skips_errors += result.skip_errors
+        if result.incomplete:
+            failed_years.append(year)
 
     emit(
         f"done: downloads={metrics.downloads} revisits={metrics.revisits} "
@@ -269,16 +279,76 @@ def _run_year(
     year_metrics = RunMetrics()
     year_started = time.monotonic()
     emit(f"year {year}: CDX query")
+    captures: list[ParsedCapture] = []
+    failed_windows: list[dict[str, str]] = []
+    search_url = ""
+    match_type: str | None = None
+    cdx_fallback: str | None = None
+    windows: list[tuple[str, str]] = []
     cdx_started = time.monotonic()
-    year_cdx = fetch_cdx(
-        url_pattern=settings.url_pattern,
-        date_start=date_start,
-        date_end=date_end,
-        retries=settings.retries,
-        sleep=sleep,
-    )
-    year_metrics.cdx_duration_s += time.monotonic() - cdx_started
-    selected = _dedupe_captures(year_cdx.captures)
+    try:
+        year_cdx = fetch_cdx(
+            url_pattern=settings.url_pattern,
+            date_start=date_start,
+            date_end=date_end,
+            retries=settings.retries,
+            limit=settings.cdx_page_limit,
+            sleep=sleep,
+        )
+    except Exception as error:  # noqa: BLE001 - year CDX boundary
+        year_metrics.cdx_duration_s += time.monotonic() - cdx_started
+        if not cdx_should_split(error):
+            raise
+        cdx_fallback = "date_windows"
+        windows = list(
+            date_windows(date_start, date_end, settings.cdx_window_days)
+        )
+        emit(
+            f"year {year}: CDX year query failed ({error}); "
+            f"falling back to {settings.cdx_window_days}d windows "
+            f"({len(windows)} windows)"
+        )
+        for window_start, window_end in windows:
+            label = format_cdx_window_label(window_start, window_end)
+            emit(f"year {year}: CDX {label}")
+            window_started = time.monotonic()
+            try:
+                window_cdx = fetch_cdx(
+                    url_pattern=settings.url_pattern,
+                    date_start=window_start,
+                    date_end=window_end,
+                    retries=settings.retries,
+                    limit=settings.cdx_page_limit,
+                    sleep=sleep,
+                )
+            except Exception as window_error:  # noqa: BLE001 - isolate windows
+                year_metrics.cdx_duration_s += time.monotonic() - window_started
+                emit(
+                    f"year {year}: CDX {label} failed ({window_error}); continuing"
+                )
+                failed_windows.append(
+                    {
+                        "date_start": window_start,
+                        "date_end": window_end,
+                        "message": str(window_error),
+                    }
+                )
+                continue
+            year_metrics.cdx_duration_s += time.monotonic() - window_started
+            captures.extend(window_cdx.captures)
+            search_url = window_cdx.search_url
+            match_type = window_cdx.match_type
+        if failed_windows and not captures and len(failed_windows) == len(windows):
+            raise RuntimeError(
+                f"CDX query failed for all {len(windows)} windows"
+            ) from error
+    else:
+        year_metrics.cdx_duration_s += time.monotonic() - cdx_started
+        captures = list(year_cdx.captures)
+        search_url = year_cdx.search_url
+        match_type = year_cdx.match_type
+
+    selected = _dedupe_captures(captures)
     year_metrics.selected += len(selected)
 
     inventory = inventory_collection(layout, collection_id)
@@ -322,6 +392,18 @@ def _run_year(
         reset=settings.reset_data,
     )
     year_warcs = _published_warc_artifacts(layout, collection_id, publisher)
+    query: dict[str, object] = {
+        "url_pattern": settings.url_pattern,
+        "search_url": search_url,
+        "match_type": match_type,
+        "result_count": len(captures),
+        "cdx_page_limit": settings.cdx_page_limit,
+    }
+    if cdx_fallback is not None:
+        query["cdx_fallback"] = cdx_fallback
+        query["cdx_window_days"] = settings.cdx_window_days
+        query["window_count"] = len(windows)
+        query["failed_windows"] = failed_windows
     write_run_record(
         layout,
         collection_id=collection_id,
@@ -329,12 +411,7 @@ def _run_year(
         url_pattern=settings.url_pattern,
         date_start=date_start,
         date_end=date_end,
-        query={
-            "url_pattern": settings.url_pattern,
-            "search_url": year_cdx.search_url,
-            "match_type": year_cdx.match_type,
-            "result_count": len(year_cdx.captures),
-        },
+        query=query,
         warcs=year_warcs,
         index=collection_index,
         metrics=year_metrics,
@@ -358,6 +435,7 @@ def _run_year(
         warcs=tuple(year_warcs),
         index=collection_index,
         skip_errors=year_skips_errors,
+        incomplete=bool(failed_windows),
     )
 
 
@@ -652,6 +730,8 @@ def build_settings(
     reset_data: bool = False,
     output: FetchOutput,
     warc_target_bytes: int = DEFAULT_WARC_TARGET_BYTES,
+    cdx_window_days: int = DEFAULT_CDX_WINDOW_DAYS,
+    cdx_page_limit: int = DEFAULT_CDX_PAGE_LIMIT,
     playback_workers: int = 4,
     playback_starts_per_second: float = 20.0,
     retries: int = DEFAULT_RETRIES,
@@ -660,6 +740,10 @@ def build_settings(
 ) -> FetchSettings:
     """Validate CLI-facing inputs into settings."""
 
+    if cdx_window_days <= 0:
+        raise ValueError("cdx_window_days must be positive")
+    if cdx_page_limit <= 0:
+        raise ValueError("cdx_page_limit must be positive")
     project_start = parse_date_bound(None, default=default_start, bound="start")
     project_end = parse_date_bound(
         None,
@@ -686,6 +770,8 @@ def build_settings(
         reset_data=reset_data,
         output=output,
         warc_target_bytes=warc_target_bytes,
+        cdx_window_days=cdx_window_days,
+        cdx_page_limit=cdx_page_limit,
         playback_workers=playback_workers,
         playback_starts_per_second=playback_starts_per_second,
         retries=retries,

@@ -94,10 +94,16 @@ class FakeCdxClient:
         self.closed = False
 
     def search(self, *args, **kwargs):
+        from_date = kwargs.get("from_date")
+        to_date = kwargs.get("to_date")
         for row in self.rows:
             if not isinstance(row, list) or len(row) < 7:
                 continue
             urlkey, timestamp, original, mimetype, status, digest, length = row[:7]
+            if from_date is not None and str(timestamp) < str(from_date):
+                continue
+            if to_date is not None and str(timestamp) > str(to_date):
+                continue
             yield CdxRecord(
                 urlkey=urlkey,
                 timestamp=datetime.strptime(timestamp, "%Y%m%d%H%M%S").replace(

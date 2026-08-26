@@ -156,6 +156,21 @@ def test_connection_refused_is_tcp_backpressure():
     )
 
 
+def test_read_timeout_is_timeout_backpressure():
+    error = TimeoutError(
+        "HTTPSConnectionPool(host='web.archive.org', port=443): Read timed out."
+    )
+    assert backpressure_signal(error) == ("timeout", None)
+
+
+def test_remote_disconnected_is_timeout_backpressure():
+    error = ConnectionError(
+        "('Connection aborted.', RemoteDisconnected("
+        "'Remote end closed connection without response'))"
+    )
+    assert backpressure_signal(error) == ("timeout", None)
+
+
 def test_playback_workers_run_url_groups_in_parallel():
     barrier = threading.Barrier(4)
     threads: set[str] = set()
@@ -327,6 +342,8 @@ def test_cli_runtime_flags_override_defaults(tmp_path, monkeypatch):
     assert captured[0].playback_workers == 4
     assert captured[0].playback_starts_per_second == 20.0
     assert captured[0].retries == 4
+    assert captured[0].cdx_window_days == 10
+    assert captured[0].cdx_page_limit == 5000
     captured.clear()
     assert (
         cli.main(
@@ -345,6 +362,39 @@ def test_cli_runtime_flags_override_defaults(tmp_path, monkeypatch):
     assert captured[0].playback_workers == 2
     assert captured[0].playback_starts_per_second == 1.5
     assert captured[0].retries == 0
+    assert captured[0].cdx_window_days == 10
+    assert captured[0].cdx_page_limit == 5000
+
+
+def test_cli_uses_cdx_settings_from_toml(tmp_path, monkeypatch):
+    from archive_magic_fetch import cli
+
+    path = tmp_path / "fetch.toml"
+    path.write_text(
+        """
+[archive]
+id = "example.org"
+url_pattern = "*.example.org"
+[output]
+type = "local"
+data_directory = "data"
+[fetch]
+start = "2000-01-01"
+end = "2004-12-31"
+cdx_window_days = 3
+cdx_page_limit = 2500
+""",
+        encoding="utf-8",
+    )
+    captured = []
+    monkeypatch.setattr(
+        cli,
+        "run_fetch",
+        lambda item: captured.append(item) or SimpleNamespace(exit_code=0),
+    )
+    assert cli.main([str(path)]) == 0
+    assert captured[0].cdx_window_days == 3
+    assert captured[0].cdx_page_limit == 2500
 
 
 def test_cli_rejects_start_before_project_range(tmp_path):

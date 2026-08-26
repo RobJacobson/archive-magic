@@ -20,6 +20,7 @@ from .playback import classify_playback_error
 from .retry import (
     BACKPRESSURE_COOLDOWN_SECONDS,
     backpressure_signal,
+    backpressure_source,
     retry_after_from_error,
 )
 
@@ -87,7 +88,7 @@ class StartGate:
             )
             maximum = self._max_retry_after
             remaining = self._blocked_until - now
-        source = "HTTP 429" if kind == "http" else "TCP connection refused"
+        source = backpressure_source(kind)
         policy = (
             f"Retry-After={retry_after:g}s, applied={requested:g}s"
             if retry_after is not None and kind == "http"

@@ -16,3 +16,5 @@ data_directory = "data"
 start = "1995-01-01"
 # end omitted means now
 # warc_target_bytes = 250000000
+# cdx_page_limit = 5000
+# cdx_window_days = 10

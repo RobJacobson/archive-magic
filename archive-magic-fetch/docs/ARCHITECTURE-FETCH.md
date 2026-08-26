@@ -54,6 +54,8 @@ region = "auto"
 start = "1995-01-01"
 # end omitted means now
 warc_target_bytes = 250000000
+# cdx_page_limit = 5000
+# cdx_window_days = 10
 ```
 
 Rules:
@@ -71,11 +73,21 @@ Rules:
   No adjacent `.env` is loaded and no specific access-key variable is required.
 - The compressed WARC rollover target defaults to 250,000,000 bytes and remains
   configurable per archive.
+- `cdx_page_limit` defaults to 5000 and is the resumeKey page size for each CDX
+  HTTP request within a year query. Each CDX attempt has a 300-second wall-clock
+  budget covering all resumeKey pages for that attempt.
+- `cdx_window_days` defaults to 10 and is used only when a whole-year CDX query
+  fails with a timeout/504-class error. Fetch then retries that year as N-day
+  windows.
 - `--retries` applies to both CDX and playback requests and defaults to four
-  retries after the initial request. CDX retries are owned by Fetch: HTTP 429 and
-  TCP connection refused pause with a linear 60s, 120s, 180s, ... backoff, never
-  shorter than `Retry-After`. A CDX failure skips that year, continues with later
-  years, and makes the process exit nonzero.
+  retries after the initial request. CDX retries are owned by Fetch: HTTP 429,
+  TCP connection refused, timeouts/504, and mid-request disconnects pause with a
+  linear 60s, 120s, 180s, ... backoff, never shorter than `Retry-After`. After
+  year-query retries are exhausted for timeout/504-class errors, Fetch falls back
+  to date windows. A failed fallback window continues with later windows; if any
+  window fails the year is marked incomplete and the process exits nonzero after
+  publishing what was collected. Total CDX failure for a year skips that year,
+  continues with later years, and also exits nonzero.
 
 Fetch does not read Navigator configuration. Wayback fallback is a Navigator CLI
 flag.
@@ -113,11 +125,18 @@ For each year in the selected range, Fetch:
 1. Ensures the year's CDXJ. Local output is a no-op; remote output
    downloads the committed CDXJ only if no local copy exists. Leftover local
    WARCs from an interrupted run are reindexed before inventory.
-2. Queries Internet Archive CDX history through `WaybackClient.search()`, which
-   owns parsing and resume-key pagination. Fetch owns CDX retries and treats
-   connection refused like HTTP 429: pause 60s, 120s, 180s, ... (or a longer
-   `Retry-After`) and retry the whole year query. Giving up on a year does not
-   abort later years.
+2. Queries Internet Archive CDX history through `WaybackClient.search()` for the
+   whole year, with resume-key pages of `cdx_page_limit` rows (default 5000) and a
+   300-second wall-clock budget per attempt. Fetch owns CDX retries and treats
+   HTTP 429, connection refused, timeouts/504, and mid-request disconnects as
+   backpressure: pause 60s, 120s, 180s, ... (or a longer `Retry-After`) and retry
+   the year query. If the year query still fails with a timeout/504-class error,
+   Fetch falls back to fixed N-day windows (default 10, from `cdx_window_days`),
+   which never cross a calendar year. Captures from successful windows are
+   concatenated, then one yearly playback pass runs so URL grouping and console
+   logs stay year-scoped. A failed fallback window does not abort later windows;
+   a year with any failed window is marked incomplete after publishing what was
+   collected. Giving up on a year does not abort later years.
 3. Parses and deduplicates captures by canonical capture identity.
 4. Inventories existing captures from CDXJ identity metadata and skips those
    already represented.
@@ -138,8 +157,10 @@ downloaded or rewritten.
 
 Acquisition can be parallel; WARC mutation and publication remain serialized.
 Failures for individual captures are recorded without corrupting already committed
-records. A year-level failure (including CDX) skips that year, continues with the
-rest of the range, and produces a nonzero exit. Uncaught exceptions at the process
+records. A year-level failure (including total CDX failure) skips that year,
+continues with the rest of the range, and produces a nonzero exit. A partial CDX
+window failure still publishes collected captures for that year, then marks the
+year incomplete and exits nonzero. Uncaught exceptions at the process
 boundary also produce a nonzero exit. The next run keeps any leftover local
 tail/CDXJ, rebuilds the index if needed, and republishes. `--reset-data` is the
 recovery tool when the data directory was lost or the prefix is confused.

@@ -66,18 +66,27 @@ def retry_after_from_error(error: BaseException) -> float | None:
 
 
 def backpressure_signal(error: BaseException) -> tuple[str, float | None] | None:
-    """Recognize HTTP 429 and refused TCP connections through wrapper chains."""
+    """Recognize IA backpressure through wrapper chains.
+
+    HTTP 429 and TCP connection refused are explicit signals. Timeouts, HTTP
+    504, and mid-request disconnects are treated the same: IA often throttles
+    at the transport layer by stalling, dropping, or gateway-timing-out
+    instead of returning 429.
+    """
 
     http = False
     tcp = False
+    timeout = False
     for candidate in iter_error_chain(error):
         name = type(candidate).__name__
         message = str(candidate).lower()
         response = getattr(candidate, "response", None)
+        status = getattr(candidate, "status_code", None)
+        response_status = getattr(response, "status_code", None)
         if (
             "RateLimit" in name
-            or getattr(candidate, "status_code", None) == 429
-            or getattr(response, "status_code", None) == 429
+            or status == 429
+            or response_status == 429
             or "rate limit" in message
             or "too many requests" in message
         ):
@@ -88,8 +97,36 @@ def backpressure_signal(error: BaseException) -> tuple[str, float | None] | None
             or "connection refused" in message
         ):
             tcp = True
+        if (
+            status == 504
+            or response_status == 504
+            or "Timeout" in name
+            or "RemoteDisconnected" in name
+            or "timed out" in message
+            or "read timeout" in message
+            or "gateway timeout" in message
+            or "wall-clock" in message
+            or "connection aborted" in message
+            or "remote end closed connection" in message
+            or "504" in message
+        ):
+            timeout = True
     if http:
         return "http", retry_after_from_error(error)
     if tcp:
         return "tcp", BACKPRESSURE_COOLDOWN_SECONDS
+    if timeout:
+        return "timeout", retry_after_from_error(error)
     return None
+
+
+def backpressure_source(kind: str) -> str:
+    """Human-readable label for a ``backpressure_signal`` kind."""
+
+    if kind == "http":
+        return "HTTP 429"
+    if kind == "tcp":
+        return "TCP connection refused"
+    if kind == "timeout":
+        return "timeout/504"
+    return kind
