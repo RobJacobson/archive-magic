@@ -7,17 +7,18 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+from archive_magic_fetch.models import FailureCategory
 from archive_magic_fetch.protocol import (
     INVALID_URI_PAYLOAD_DIGEST,
 )
 from archive_magic_fetch.resolution import (
     iter_url_outcomes,
 )
+from archive_magic_fetch.retry import backpressure_signal, pauses_playback_pool
 from archive_magic_fetch.workers import (
     PlaybackWorkers,
     StartGate,
 )
-from archive_magic_fetch.retry import backpressure_signal
 from helpers import make_capt, playback
 
 
@@ -105,13 +106,16 @@ def test_rate_gate_keeps_maximum_retry_after(capsys):
 
     assert sleeps == [90.0]
     output = capsys.readouterr().out
+    assert output.startswith("HTTP 429 at ")
     assert "Retry-After=20s, applied=60s, level=1, maximum=90s" in output
 
 
 def test_rate_gate_escalates_across_waves(capsys):
     clock = {"now": 100.0}
     sleeps: list[float] = []
-    identity = make_capt()
+    first = make_capt(ts="20040615000001")
+    second = make_capt(ts="20040615000002")
+    third = make_capt(ts="20040615000003")
 
     def sleep(seconds):
         sleeps.append(seconds)
@@ -122,11 +126,11 @@ def test_rate_gate_escalates_across_waves(capsys):
         clock=lambda: clock["now"],
         sleep=sleep,
     )
-    gate.pause("http", 60, identity)
+    gate.pause("http", 60, first)
     gate.wait()
-    gate.pause("http", 60, identity)
+    gate.pause("http", 60, second)
     gate.wait()
-    gate.pause("http", 60, identity)
+    gate.pause("http", 60, third)
     gate.wait()
 
     assert sleeps == [60.0, 120.0, 180.0]
@@ -137,7 +141,7 @@ def test_rate_gate_escalates_across_waves(capsys):
     assert "level=3, maximum=180s" in output
 
 
-def test_rate_gate_resets_escalation_after_success(capsys):
+def test_rate_gate_same_identity_does_not_escalate(capsys):
     clock = {"now": 100.0}
     sleeps: list[float] = []
     identity = make_capt()
@@ -155,8 +159,63 @@ def test_rate_gate_resets_escalation_after_success(capsys):
     gate.wait()
     gate.pause("http", 60, identity)
     gate.wait()
-    gate.note_success()
     gate.pause("http", 60, identity)
+    gate.wait()
+
+    assert sleeps == [60.0, 60.0, 60.0]
+    output = capsys.readouterr().out
+    assert output.count("level=1,") == 3
+    assert "level=2" not in output
+
+
+def test_rate_gate_wave_retries_do_not_escalate(capsys):
+    clock = {"now": 100.0}
+    sleeps: list[float] = []
+    first = make_capt(ts="20040615000001")
+    second = make_capt(ts="20040615000002")
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        clock["now"] += seconds
+
+    gate = StartGate(
+        0,
+        clock=lambda: clock["now"],
+        sleep=sleep,
+    )
+    gate.pause("http", 60, first)
+    gate.pause("http", 60, second)
+    gate.wait()
+    gate.pause("http", 60, first)
+    gate.wait()
+
+    assert sleeps == [60.0, 60.0]
+    output = capsys.readouterr().out
+    assert "level=2" not in output
+
+
+def test_rate_gate_resets_escalation_after_success(capsys):
+    clock = {"now": 100.0}
+    sleeps: list[float] = []
+    first = make_capt(ts="20040615000001")
+    second = make_capt(ts="20040615000002")
+    third = make_capt(ts="20040615000003")
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        clock["now"] += seconds
+
+    gate = StartGate(
+        0,
+        clock=lambda: clock["now"],
+        sleep=sleep,
+    )
+    gate.pause("http", 60, first)
+    gate.wait()
+    gate.pause("http", 60, second)
+    gate.wait()
+    gate.note_success()
+    gate.pause("http", 60, third)
     gate.wait()
 
     assert sleeps == [60.0, 120.0, 60.0]
@@ -227,6 +286,139 @@ def test_remote_disconnected_is_timeout_backpressure():
         "'Remote end closed connection without response'))"
     )
     assert backpressure_signal(error) == ("timeout", None)
+
+
+def test_only_http_and_tcp_pause_the_playback_pool():
+    assert pauses_playback_pool("http") is True
+    assert pauses_playback_pool("tcp") is True
+    assert pauses_playback_pool("timeout") is False
+    assert pauses_playback_pool(None) is False
+
+
+def test_playback_timeout_retries_once_without_pausing_pool(capsys):
+    identity = make_capt()
+    attempts = 0
+    sleeps: list[float] = []
+
+    def download(_client, capture):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise TimeoutError("Read timed out.")
+        return playback(capture)
+
+    workers = PlaybackWorkers(
+        lambda: MagicMock(),
+        download,
+        sleep=sleeps.append,
+        pace=False,
+    )
+    try:
+        outcome = workers.download(identity)
+    finally:
+        workers.close()
+
+    assert outcome.result is not None
+    assert outcome.failure is None
+    assert attempts == 2
+    assert sleeps == [5.0]
+    assert "new starts paused" not in capsys.readouterr().out
+
+
+def test_second_playback_timeout_is_terminal(capsys):
+    download = MagicMock(side_effect=TimeoutError("Read timed out."))
+    sleeps: list[float] = []
+    workers = PlaybackWorkers(
+        lambda: MagicMock(),
+        download,
+        sleep=sleeps.append,
+        pace=False,
+    )
+    try:
+        outcome = workers.download(make_capt())
+    finally:
+        workers.close()
+
+    assert outcome.result is None
+    assert outcome.failure is not None
+    assert outcome.failure.category is FailureCategory.RETRY_EXHAUSTED
+    assert outcome.attempts == 2
+    assert download.call_count == 2
+    assert sleeps == [5.0]
+    assert "new starts paused" not in capsys.readouterr().out
+
+
+def test_http_504_retries_once_without_pausing_pool(capsys):
+    attempts = 0
+
+    def download(_client, _capture):
+        nonlocal attempts
+        attempts += 1
+        error = RuntimeError("504 Gateway Timeout")
+        error.status_code = 504
+        raise error
+
+    sleeps: list[float] = []
+    workers = PlaybackWorkers(
+        lambda: MagicMock(),
+        download,
+        sleep=sleeps.append,
+        pace=False,
+    )
+    try:
+        outcome = workers.download(make_capt())
+    finally:
+        workers.close()
+
+    assert attempts == 2
+    assert outcome.failure is not None
+    assert sleeps == [5.0]
+    assert "new starts paused" not in capsys.readouterr().out
+
+
+def test_unavailable_failure_resets_rate_gate():
+    workers = PlaybackWorkers(
+        lambda: MagicMock(),
+        MagicMock(side_effect=RuntimeError("permanent")),
+        sleep=lambda _seconds: None,
+        pace=False,
+        retries=0,
+    )
+    workers._gate.note_success = MagicMock(wraps=workers._gate.note_success)
+    workers._gate.pause = MagicMock(wraps=workers._gate.pause)
+    try:
+        outcome = workers.download(make_capt())
+    finally:
+        workers.close()
+
+    assert outcome.failure is not None
+    workers._gate.pause.assert_not_called()
+    workers._gate.note_success.assert_called_once()
+
+
+def test_http_429_pauses_pool_without_reset():
+    def download(_client, _capture):
+        error = RuntimeError("429 Too Many Requests")
+        error.status_code = 429
+        raise error
+
+    workers = PlaybackWorkers(
+        lambda: MagicMock(),
+        download,
+        sleep=lambda _seconds: None,
+        pace=False,
+        retries=0,
+    )
+    workers._gate.note_success = MagicMock()
+    workers._gate.pause = MagicMock(wraps=workers._gate.pause)
+    try:
+        outcome = workers.download(make_capt())
+    finally:
+        workers.close()
+
+    assert outcome.failure is not None
+    workers._gate.pause.assert_called_once()
+    workers._gate.note_success.assert_not_called()
 
 
 def test_playback_workers_run_url_groups_in_parallel():
@@ -398,7 +590,7 @@ def test_cli_runtime_flags_override_defaults(tmp_path, monkeypatch):
     )
     assert cli.main([str(config)]) == 0
     assert captured[0].playback_workers == 4
-    assert captured[0].playback_starts_per_second == 20.0
+    assert captured[0].playback_starts_per_second == 16.0
     assert captured[0].retries == 4
     assert captured[0].cdx_window_days == 10
     assert captured[0].cdx_page_limit == 5000

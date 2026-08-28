@@ -164,10 +164,10 @@ def test_fetch_cdx_uses_linear_backoff_on_read_timeout(monkeypatch):
     assert sleeps == [60.0, 120.0]
     assert reports == [
         "CDX query attempt 1/5",
-        "rate limit: timeout/504 during CDX query; "
+        "timeout/504 during CDX query; "
         "pausing 60s before attempt 2/5",
         "CDX query attempt 2/5",
-        "rate limit: timeout/504 during CDX query; "
+        "timeout/504 during CDX query; "
         "pausing 120s before attempt 3/5",
         "CDX query attempt 3/5",
     ]
@@ -258,10 +258,10 @@ def test_fetch_cdx_uses_linear_backoff_on_connection_refused(monkeypatch):
     assert sleeps == [60.0, 120.0]
     assert reports == [
         "CDX query attempt 1/5",
-        "rate limit: TCP connection refused during CDX query; "
+        "TCP connection refused during CDX query; "
         "pausing 60s before attempt 2/5",
         "CDX query attempt 2/5",
-        "rate limit: TCP connection refused during CDX query; "
+        "TCP connection refused during CDX query; "
         "pausing 120s before attempt 3/5",
         "CDX query attempt 3/5",
     ]
@@ -305,11 +305,11 @@ def test_fetch_cdx_escalates_past_retry_after_on_http_429(monkeypatch):
     assert sleeps == [60.0, 120.0, 180.0]
     assert reports == [
         "CDX query attempt 1/5",
-        "rate limit: HTTP 429 during CDX query; pausing 60s before attempt 2/5",
+        "HTTP 429 during CDX query; pausing 60s before attempt 2/5",
         "CDX query attempt 2/5",
-        "rate limit: HTTP 429 during CDX query; pausing 120s before attempt 3/5",
+        "HTTP 429 during CDX query; pausing 120s before attempt 3/5",
         "CDX query attempt 3/5",
-        "rate limit: HTTP 429 during CDX query; pausing 180s before attempt 4/5",
+        "HTTP 429 during CDX query; pausing 180s before attempt 4/5",
         "CDX query attempt 4/5",
     ]
 

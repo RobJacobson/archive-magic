@@ -31,7 +31,7 @@ makes unchanged older collections no-ops, so normally only the current year is
 republished.
 
 Workers, start rate, and retries are process policy from CLI flags (defaults 4,
-20.0, and 4). They are not stored in `fetch.toml`.
+16.0, and 4). They are not stored in `fetch.toml`.
 
 ## Configuration contract
 
@@ -83,11 +83,16 @@ Rules:
   retries after the initial request. CDX retries are owned by Fetch: HTTP 429,
   TCP connection refused, timeouts/504, and mid-request disconnects pause with a
   linear 60s, 120s, 180s, ... backoff, never shorter than `Retry-After`. Playback
-  workers share the same linear backpressure ladder across successive 429 waves
-  (reset after a successful download). After year-query retries are exhausted for
-  timeout/504-class errors, Fetch falls back to date windows. A failed fallback
-  window continues with later windows; if any window fails the year is marked
-  incomplete and the process exits nonzero after publishing what was collected.
+  workers share that ladder only for HTTP 429 and TCP connection refused, across
+  successive waves from different captures, and reset it after any
+  non-backpressure completion (including unavailable and truncated). Retries of
+  a capture that already paused the current wave stay at the current level.
+  Timeout/504 and mid-request disconnects retry that capture once without pausing
+  the pool; a second timeout fails the capture. After year-query retries are
+  exhausted for timeout/504-class errors, Fetch falls back to date windows. A
+  failed fallback window continues with later windows; if any window fails the
+  year is marked incomplete and the process exits nonzero after publishing what
+  was collected.
   Total CDX failure for a year skips that year, continues with later years, and
   also exits nonzero.
 
@@ -146,8 +151,10 @@ For each year in the selected range, Fetch:
    only the CDXJ-referenced final WARC for the year (or keeps a longer local tail).
    Unchanged years never download a WARC.
 6. Resolves remaining captures through bounded, rate-limited playback workers.
-   Shared backpressure pauses new starts on HTTP 429 / refused / timeout-class
-   errors with a linear 60s, 120s, 180s, ... cooldown across successive waves.
+   Shared backpressure pauses new starts on HTTP 429 and TCP connection refused
+   with a linear 60s, 120s, 180s, ... cooldown across successive waves from
+   different captures. Timeout/504 fails the capture after one retry without
+   pausing other workers.
 7. Appends response or revisit records through one serialized WARC writer.
 8. Reindexes changed/new WARCs, merges their lines into the stable CDXJ, and
    validates the completed artifacts.
