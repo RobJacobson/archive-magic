@@ -21,8 +21,11 @@ from .retry import (
     backpressure_signal,
     backpressure_source,
     linear_backpressure_delay,
+    pauses_playback_pool,
     retry_after_from_error,
 )
+
+_MAX_CAPTURE_TIMEOUTS = 2
 
 
 @dataclass(frozen=True)
@@ -39,12 +42,13 @@ def _default_report(message: str) -> None:
 
 
 class StartGate:
-    """Smooth request starts and pause every worker on IA backpressure.
+    """Smooth request starts and pause every worker on IA 429/refused.
 
-    Successive backpressure waves escalate with a linear 60s, 120s, 180s, ...
-    cooldown (never shorter than ``Retry-After``). Concurrent 429s in the same
-    pause window share one level. A successful download after the pause clears
-    resets the escalation.
+    Successive waves from different captures escalate with a linear 60s, 120s,
+    180s, ... cooldown (never shorter than ``Retry-After``). Concurrent 429s in
+    the same pause window share one level. Retries of a capture that already
+    paused this wave stay at the current level. A non-backpressure completion
+    after the pause clears resets the escalation.
     """
 
     def __init__(
@@ -64,6 +68,7 @@ class StartGate:
         self._blocked_until = 0.0
         self._max_retry_after = 0.0
         self._level = 0
+        self._wave_identities: set[CaptureIdentity] = set()
 
     def wait(self) -> None:
         while True:
@@ -76,12 +81,13 @@ class StartGate:
             self._sleep(deadline - now)
 
     def note_success(self) -> None:
-        """Reset escalation after a successful download past the pause window."""
+        """Reset escalation after a non-backpressure completion past the pause."""
 
         with self._lock:
             if self._clock() >= self._blocked_until:
                 self._level = 0
                 self._max_retry_after = 0.0
+                self._wave_identities.clear()
 
     def pause(
         self,
@@ -92,8 +98,14 @@ class StartGate:
         with self._lock:
             now = self._clock()
             if now >= self._blocked_until:
-                self._level += 1
-                self._max_retry_after = 0.0
+                retry_from_wave = (
+                    identity in self._wave_identities and self._level > 0
+                )
+                if not retry_from_wave:
+                    self._level += 1
+                    self._max_retry_after = 0.0
+                    self._wave_identities = set()
+            self._wave_identities.add(identity)
             delay = linear_backpressure_delay(self._level, retry_after)
             self._max_retry_after = max(self._max_retry_after, delay)
             self._blocked_until = max(self._blocked_until, now + delay)
@@ -108,7 +120,7 @@ class StartGate:
         else:
             policy = f"cooldown={delay:g}s"
         self._report(
-            f"rate limit: {source} at {identity.timestamp}; "
+            f"{source} at {identity.timestamp}; "
             f"{policy}, level={level}, maximum={maximum:g}s; "
             f"new starts paused for {remaining:g}s"
         )
@@ -125,7 +137,7 @@ class PlaybackWorkers:
         sleep: Callable[[float], None],
         pace: bool,
         max_workers: int = 4,
-        starts_per_second: float = 20.0,
+        starts_per_second: float = 16.0,
         report: Callable[[str], None] = _default_report,
         retries: int = 4,
     ) -> None:
@@ -180,6 +192,7 @@ class PlaybackWorkers:
 
         started = time.monotonic()
         categories: list[str] = []
+        timeout_failures = 0
         for attempt in range(1, self.max_attempts + 1):
             self._gate.wait()
             try:
@@ -188,10 +201,17 @@ class PlaybackWorkers:
                 category, retryable = classify_playback_error(error)
                 categories.append(category.value)
                 backpressure = backpressure_signal(error)
-                if backpressure is not None:
+                kind = backpressure[0] if backpressure is not None else None
+                if backpressure is not None and pauses_playback_pool(kind):
                     self._gate.pause(*backpressure, identity)
+                elif kind == "timeout":
+                    timeout_failures += 1
+                    if timeout_failures >= _MAX_CAPTURE_TIMEOUTS:
+                        retryable = False
+                else:
+                    self._gate.note_success()
                 if retryable and attempt < self.max_attempts:
-                    if backpressure is None:
+                    if not pauses_playback_pool(kind):
                         self._sleep(
                             retry_after_from_error(error)
                             or float(5 * (2 ** (attempt - 1)))

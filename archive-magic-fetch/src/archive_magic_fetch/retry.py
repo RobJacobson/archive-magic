@@ -65,13 +65,19 @@ def retry_after_from_error(error: BaseException) -> float | None:
     return max(delays, default=None)
 
 
+def pauses_playback_pool(kind: str | None) -> bool:
+    """HTTP 429 and TCP refused pause all playback workers; timeouts do not."""
+
+    return kind in ("http", "tcp")
+
+
 def backpressure_signal(error: BaseException) -> tuple[str, float | None] | None:
     """Recognize IA backpressure through wrapper chains.
 
     HTTP 429 and TCP connection refused are explicit signals. Timeouts, HTTP
-    504, and mid-request disconnects are treated the same: IA often throttles
-    at the transport layer by stalling, dropping, or gateway-timing-out
-    instead of returning 429.
+    504, and mid-request disconnects are classified as ``timeout`` so CDX can
+    pause, but playback treats those as per-capture failures rather than a
+    pool-wide rate limit.
     """
 
     http = False

@@ -308,7 +308,7 @@ def _cdx_retry_message(
         )
     kind, _retry_after = backpressure
     return (
-        f"rate limit: {backpressure_source(kind)} during CDX query; {suffix}"
+        f"{backpressure_source(kind)} during CDX query; {suffix}"
     )
 
 

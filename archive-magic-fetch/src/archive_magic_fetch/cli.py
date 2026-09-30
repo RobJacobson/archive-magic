@@ -11,7 +11,7 @@ from .config import load_config
 from .fetch import build_settings, run_fetch
 
 DEFAULT_WORKERS = 4
-DEFAULT_STARTS_PER_SECOND = 20.0
+DEFAULT_STARTS_PER_SECOND = 16.0
 DEFAULT_RETRIES = 4
 
 

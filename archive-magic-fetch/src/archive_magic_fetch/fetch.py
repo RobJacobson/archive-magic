@@ -90,7 +90,7 @@ class FetchSettings:
     cdx_window_days: int = DEFAULT_CDX_WINDOW_DAYS
     cdx_page_limit: int = DEFAULT_CDX_PAGE_LIMIT
     playback_workers: int = 4
-    playback_starts_per_second: float = 20.0
+    playback_starts_per_second: float = 16.0
     retries: int = DEFAULT_RETRIES
 
 
@@ -733,7 +733,7 @@ def build_settings(
     cdx_window_days: int = DEFAULT_CDX_WINDOW_DAYS,
     cdx_page_limit: int = DEFAULT_CDX_PAGE_LIMIT,
     playback_workers: int = 4,
-    playback_starts_per_second: float = 20.0,
+    playback_starts_per_second: float = 16.0,
     retries: int = DEFAULT_RETRIES,
     default_start: str = "1995-01-01",
     default_end: str | None = None,
