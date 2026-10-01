@@ -35,9 +35,9 @@ archives/
     navigator-cache/       # created only for remote playback
 ```
 
-For remote Fetch output, finalized WARC/CDXJ working copies under `data/` are
-removed after each successful publication; the bucket remains their source of
-truth.
+For both Fetch output modes, the finalized WARC/CDXJ files under `data/` are
+the source of truth. Remote output mirrors those files to the configured bucket
+with rclone; Fetch never downloads its working archive from the bucket.
 
 An explicit TOML path may use any filename. Passing a directory resolves
 `<directory>/fetch.toml` or `<directory>/navigator.toml`:
@@ -53,6 +53,7 @@ Process policy is CLI flags with code defaults, not a settings file:
 
 ```text
 archive-magic-fetch ARCHIVE [--workers N] [--starts-per-second N] [--retries N]
+archive-magic-fetch ARCHIVE --sync-only
 archive-magic-navigator ARCHIVE [--bind ADDRESS] [--port PORT]
   [--poll-interval SECONDS] [--cache PATH] [--wayback-fallback {on,off}]
 ```
@@ -78,26 +79,34 @@ unchanged when the source has no newly discovered captures.
 
 Use `output.type = "remote"` in Fetch and `source.type = "remote"` in Navigator,
 with bucket fields in each file. Credentials are read through Boto3's standard
-credential chain; Archive Magic does not load an adjacent `.env` file.
+credential chain in Navigator and by rclone from the AWS environment or profile
+in Fetch. Archive Magic does not load an adjacent `.env` file.
 
 ```console
 archive-magic-fetch ~/archives/example.org
 archive-magic-navigator ~/archives/example.org --poll-interval 60
 ```
 
-The bucket prefix is the source of truth. Before fetching, Fetch validates or
-downloads the selected collection's CDXJ and final WARC into `data/`. It
-runs the same append/index pipeline as local output, publishes changed
-WARC objects, and replaces the CDXJ last. After a verified commit it removes the
-finalized local working copies. Fetch writes one JSON record and one console log
-per invocation under `logs/`.
+The local `data/` directory is the source of truth. Fetch builds each year in
+`data/.staging/`, promotes validated WARC files and their CDXJ to `data/`,
+then waits for rclone to mirror that year before starting the next. It copies
+WARCs first, updates the CDXJ, and only then removes obsolete bucket WARCs.
+Fetch writes one JSON record and one console log per invocation under `logs/`.
 Navigator keeps indexes in the visible `navigator-cache/`, streams WARC ranges
 from the bucket, and continues using its last validated index during an incomplete
 publication or transient bucket error.
 
-One Fetch process on one machine owns an archive prefix. Failed publications keep
-their local WARC/CDXJ working files for the next run; losing that data during
-an incomplete update requires reset and regeneration.
+Install rclone on the Fetch host. The existing bucket, prefix, endpoint, and
+region fields in `fetch.toml` configure it; AWS environment credentials or an
+AWS profile supply authentication. After an upload failure, rerun
+`archive-magic-fetch ARCHIVE --sync-only` to reconcile the complete local
+archive without contacting Wayback. Sync refuses a missing or empty local
+archive. One Fetch or sync process at a time owns the archive.
+
+Before upgrading an existing remote archive, finish any pending old-style
+publication, restore all bucket WARC/CDXJ files to the local `data/` directory
+once with rclone, and compare the local and remote file sets. Future syncs treat
+missing local managed files as deletions from the bucket.
 
 ## Dates, rollover, and reset
 

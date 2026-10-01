@@ -1,41 +1,21 @@
 # Archive Magic Fetch Architecture
 
-## Purpose and boundary
+## Purpose and interface
 
-Archive Magic Fetch turns Internet Archive capture history into portable WARC 1.1
-collections and CDXJ indexes. It is a standalone producer. It does not call or
-coordinate with Navigator; the two applications interact only through the archived
-WARC/CDXJ layout in a flat directory.
-
-One Fetch process on one machine owns an archive prefix. Concurrent writers,
-secondary updater machines, and manual bucket mutation are unsupported.
-
-## Public interface
+Fetch turns Internet Archive capture history into annual WARC 1.1 collections
+and CDXJ indexes. Navigator reads that flat file format independently.
 
 ```text
 archive-magic-fetch ARCHIVE [--start DATE] [--end DATE] [--reset-data]
   [--workers N] [--starts-per-second N] [--retries N]
+archive-magic-fetch ARCHIVE --sync-only
 ```
 
-`ARCHIVE` is either a Fetch TOML file of any name or a directory containing
-`fetch.toml`. There is no legacy URL-pattern, `--config`, or `--archives-root`
-interface.
+`ARCHIVE` is a TOML path or a directory containing `fetch.toml`. The
+`--sync-only` form requires remote output and does not query Wayback. It cannot
+be combined with dates or `--reset-data`.
 
-Normal CLI dates may only narrow a run without changing the configuration. Without
-overrides, Fetch uses `[fetch].start` through `[fetch].end`; an omitted start
-defaults to `1995-01-01` and an omitted end is resolved to the current UTC timestamp
-when the run starts. A CLI start before the project start, a CLI end after the
-resolved project end, or a reversed range is rejected. Fetch therefore checks the
-complete configured history on daily or weekly runs. Identity-based deduplication
-makes unchanged older collections no-ops, so normally only the current year is
-republished.
-
-Workers, start rate, and retries are process policy from CLI flags (defaults 4,
-16.0, and 4). They are not stored in `fetch.toml`.
-
-## Configuration contract
-
-The Fetch configuration is user-authored intent:
+The existing TOML fields stay in place:
 
 ```toml
 [archive]
@@ -43,7 +23,7 @@ id = "example.org"
 url_pattern = "*.example.org"
 
 [output]
-type = "remote" # "local" or "remote"
+type = "remote" # or "local"
 data_directory = "data"
 bucket = "archive-magic"
 prefix = "example.org"
@@ -53,242 +33,96 @@ region = "auto"
 [fetch]
 start = "1995-01-01"
 # end omitted means now
-warc_target_bytes = 250000000
+# warc_target_bytes = 250000000
 # cdx_page_limit = 5000
 # cdx_window_days = 10
 ```
 
-Rules:
+Remote output now means **local-authoritative with a bucket mirror**. The
+`data_directory` contains every finalized WARC and CDXJ. Fetch never downloads
+these artifacts from the bucket and never evicts them. The bucket, prefix,
+endpoint, and region configure a temporary rclone S3 backend; rclone obtains
+credentials from the AWS environment or profile. Rclone must be installed on
+the Fetch host.
 
-- The format is unversioned but strict: unknown tables and keys are errors.
-- Archive IDs must be route-safe and cannot be `.`, `..`, or `static`.
-- Relative paths and `~` are resolved from the containing TOML file.
-- `data_directory` is the exact managed artifact root. The archive ID is not appended.
-  For remote output it remains the local working directory.
-- Run records are written to `logs/` beside `data_directory`.
-- Remote-only fields (`bucket`, `prefix`, `endpoint_url`, `region`) are required or
-  optional as documented and are forbidden for local output. They are flattened
-  into `[output]`, not nested.
-- Bucket credentials come exclusively from Boto3's standard credential chain.
-  No adjacent `.env` is loaded and no specific access-key variable is required.
-- The compressed WARC rollover target defaults to 250,000,000 bytes and remains
-  configurable per archive.
-- `cdx_page_limit` defaults to 5000 and is the resumeKey page size for each CDX
-  HTTP request within a year query. Each CDX attempt has a 300-second wall-clock
-  budget covering all resumeKey pages for that attempt.
-- `cdx_window_days` defaults to 10 and is used only when a whole-year CDX query
-  fails with a timeout/504-class error. Fetch then retries that year as N-day
-  windows.
-- `--retries` applies to both CDX and playback requests and defaults to four
-  retries after the initial request. CDX retries are owned by Fetch: HTTP 429,
-  TCP connection refused, timeouts/504, and mid-request disconnects pause with a
-  linear 60s, 120s, 180s, ... backoff, never shorter than `Retry-After`. Playback
-  workers share that ladder only for HTTP 429 and TCP connection refused, across
-  successive waves from different captures, and reset it after any
-  non-backpressure completion (including unavailable and truncated). Retries of
-  a capture that already paused the current wave stay at the current level.
-  Timeout/504 and mid-request disconnects retry that capture once without pausing
-  the pool; a second timeout fails the capture. After year-query retries are
-  exhausted for timeout/504-class errors, Fetch falls back to date windows. A
-  failed fallback window continues with later windows; if any window fails the
-  year is marked incomplete and the process exits nonzero after publishing what
-  was collected.
-  Total CDX failure for a year skips that year, continues with later years, and
-  also exits nonzero.
-
-Fetch does not read Navigator configuration. Wayback fallback is a Navigator CLI
-flag.
-
-## Data, logging, and publication layout
+Run records and the process lock live in `logs/` beside `data_directory`.
+The hidden `data/.staging/` directory holds one year's unfinished work and is
+excluded from publication. The public archive format remains a flat directory:
 
 ```text
-<data_directory>/
+data/
   example.org-2004-001.warc.gz
   example.org-2004-002.warc.gz
   example.org-2004-index.cdxj
-
-<data-directory-parent>/logs/
-  <run-id>.json
-  <run-id>.log
 ```
 
-The data directory is a flat portable namespace. Strict artifact filenames retain
-the logical yearly collection boundary without year folders. A collection exists
-when `{archive_id}-{collection_id}-index.cdxj` is present. Prefix listings include
-only those CDXJ and `.warc.gz` objects.
+## Annual acquisition
 
-The JSON file under `logs/` combines the invocation's yearly run records; the text
-file mirrors its console output. Both are local diagnostics rather than
-bucket-authoritative content.
+Fetch visits years in order. It queries the whole-year CDX through the existing
+`wayback` client, falling back to configurable date windows after timeout/504
+exhaustion. A failed CDX window makes that year incomplete: Fetch skips its
+memento work and publication and proceeds to the next year. A complete CDX
+listing is deduplicated by capture identity. The existing URL-owned playback
+workers, chronological ordering within each URL, retry policy, and cross-year
+digest representatives remain in use. Individual unresolved mementos retain
+the existing skip-and-record policy.
 
-CDXJ files use same-directory temporary names followed by atomic local replacement.
-WARC records are validated as independent gzip members before being appended to a
-shard.
+For each year, Fetch creates a same-filesystem stage. Unchanged WARC shards
+are hard-linked into it; the final shard is copied only if new captures need to
+append to it, and the CDXJ is copied. The
+existing serialized WARC writer appends validated gzip members to that stage,
+and the CDXJ indexer validates the resulting byte ranges. On failure or Ctrl-C,
+Fetch discards unfinished staged work, leaving finalized local files unchanged.
 
-## Acquisition pipeline
+After validation, Fetch writes a small ready record in the stage, promotes
+changed WARCs, then promotes the CDXJ. A later fetch or manual sync completes
+a promotion interrupted between these steps before touching the bucket.
+Unchanged years do not replace their canonical files. Successful years update
+the cross-year representative map only after promotion.
 
-For each year in the selected range, Fetch:
+The default compressed WARC target is 250,000,000 bytes. Normal updates only
+extend a year's final shard or create a new shard; the previous byte prefix and
+CDXJ offsets remain valid. Older yearly shards are not rewritten.
 
-1. Ensures the year's CDXJ. Local output is a no-op; remote output
-   downloads the committed CDXJ only if no local copy exists. Leftover local
-   WARCs from an interrupted run are reindexed before inventory.
-2. Queries Internet Archive CDX history through `WaybackClient.search()` for the
-   whole year, with resume-key pages of `cdx_page_limit` rows (default 5000) and a
-   300-second wall-clock budget per attempt. Fetch owns CDX retries and treats
-   HTTP 429, connection refused, timeouts/504, and mid-request disconnects as
-   backpressure: pause 60s, 120s, 180s, ... (or a longer `Retry-After`) and retry
-   the year query. If the year query still fails with a timeout/504-class error,
-   Fetch falls back to fixed N-day windows (default 10, from `cdx_window_days`),
-   which never cross a calendar year. Captures from successful windows are
-   concatenated, then one yearly playback pass runs so URL grouping and console
-   logs stay year-scoped. A failed fallback window does not abort later windows;
-   a year with any failed window is marked incomplete after publishing what was
-   collected. Giving up on a year does not abort later years.
-3. Parses and deduplicates captures by canonical capture identity.
-4. Inventories existing captures from CDXJ identity metadata and skips those
-   already represented.
-5. If that year has captures not yet represented, remote output downloads
-   only the CDXJ-referenced final WARC for the year (or keeps a longer local tail).
-   Unchanged years never download a WARC.
-6. Resolves remaining captures through bounded, rate-limited playback workers.
-   Shared backpressure pauses new starts on HTTP 429 and TCP connection refused
-   with a linear 60s, 120s, 180s, ... cooldown across successive waves from
-   different captures. Timeout/504 fails the capture after one retry without
-   pausing other workers.
-7. Appends response or revisit records through one serialized WARC writer.
-8. Reindexes changed/new WARCs, merges their lines into the stable CDXJ, and
-   validates the completed artifacts.
-9. Publishes only changed/new WARCs plus the CDXJ, writes an immutable local run
-   record, and evicts remote working copies after confirmed success.
+## Publication
 
-A weekly run and a multi-year backfill are the same loop. New captures in the
-current year extend that year's last shard. Missed captures from an earlier year
-extend that earlier year's last shard. Earlier shards of a year are never
-downloaded or rewritten.
+Fetch waits for the completed year's rclone reconciliation before starting the
+next year. Automatic reconciliation is limited to that year's managed filenames;
+`--sync-only` reconciles every annual WARC/CDXJ in the local archive. Both use
+the same three ordered passes:
 
-Acquisition can be parallel; WARC mutation and publication remain serialized.
-Failures for individual captures are recorded without corrupting already committed
-records. A year-level failure (including total CDX failure) skips that year,
-continues with the rest of the range, and produces a nonzero exit. A partial CDX
-window failure still publishes collected captures for that year, then marks the
-year incomplete and exits nonzero. Uncaught exceptions at the process
-boundary also produce a nonzero exit. The next run keeps any leftover local
-tail/CDXJ, rebuilds the index if needed, and republishes. `--reset-data` is the
-recovery tool when the data directory was lost or the prefix is confused.
+1. Copy WARCs to the bucket without deleting remote files.
+2. Sync CDXJ files, which makes the newly uploaded records visible.
+3. Sync WARCs, deleting obsolete remote WARC files only after index publication.
 
-Identical payloads reuse the oldest digest-matched full response, including
-across years: a later capture with the same urlkey and digest becomes a
-WARC revisit rather than another Internet Archive download. Empty payloads
-still split on CDX status so a 301 and a 302 stay distinct. Years remain
-publication partitions; the archive prefix is the portable unit. The
-`payload-reuses` metric still counts only CDX-synthesized empty responses and
-slash redirects. Local `--reset-data` of a subset of years can leave later
-revisits referring to deleted records; remote `--reset-data` already wipes the
-whole prefix.
+Only root-level files for the configured archive are eligible. Logs, staging,
+and unrelated bucket keys are excluded. A missing or empty local archive
+causes sync to fail rather than delete the bucket. Sync validates local CDXJ
+ranges against local WARC sizes before publication. A fetch and a manual sync
+cannot run concurrently on the same archive.
 
-## Append-only WARC behavior
+An acquisition failure skips the affected year and allows later years to run.
+An rclone failure stops the run immediately. Local completed files stay
+available; `archive-magic-fetch ARCHIVE --sync-only` retries publication
+without contacting Wayback.
 
-WARC files use gzip member concatenation. Existing records are immutable. The
-writer extends the last shard of a year, or creates the next sequence when that
-shard is at or beyond the target. A normal update therefore uploads one tail WARC
-plus its CDXJ, or one new WARC plus the CDXJ. Earlier WARC objects remain
-untouched.
+## Reset and migration
 
-Each response or revisit is first serialized and digest-validated in memory as a
-complete gzip member. Only those validated bytes are appended. If the filesystem
-reports an append failure, the writer truncates back to the prior byte length.
-Closing a changed shard validates the complete WARC before indexing it. This
-preserves the original byte prefix without copying the old WARC into a partial.
+Local `--reset-data` rebuilds selected years through staging. Remote
+`--reset-data` remains a destructive full-range operation: it rejects date
+overrides, warns of playback downtime, purges the configured bucket prefix,
+clears the local data directory, and rebuilds and publishes years in order.
 
-The stable CDXJ contains the original CDX digest, status token, and URL key for
-every response and revisit. Fetch can therefore reconstruct exact capture
-inventory without rescanning WARCs. Incremental indexing removes prior lines for
-changed filenames, adds their replacement lines, sorts the result, and validates
-byte ranges against listed WARC sizes for shards that are not on disk. Archives
-created without the required identity fields must be reset and regenerated.
+Before switching an existing bucket-authoritative archive, finish pending
+publication with the old Fetch version. Restore its WARC/CDXJ objects into a
+fresh local `data_directory` once using rclone, and compare the local and
+remote file sets. Fetch performs no bucket download during normal operation.
 
-## Local output
+## Modules
 
-With `output.type = "local"`, the data directory is authoritative. Fetch appends
-validated WARC members and atomically replaces CDXJ files. Navigator may serve the
-same data directly. Normal publication preserves all previous collections;
-`--reset-data` retains selected-collection reset behavior.
-
-## Remote output and bounded materialization
-
-With `output.type = "remote"`, the bucket prefix is authoritative.
-The data directory is a bounded working area. At startup Fetch lists the prefix.
-For each selected year it then:
-
-1. Downloads the committed CDXJ if no local copy is present.
-2. Queries IA and inventories the year.
-3. Downloads that year's CDXJ-referenced final WARC only when the year has new
-   captures, keeping a local file that is already at least as large as the
-   committed tail.
-4. Runs the same local append and incremental-index code used by local output.
-5. Publishes changed/new WARC objects and replaces the CDXJ last.
-6. Deletes that collection's finalized local WARC/CDXJ files after commit.
-
-Run records remain local. A failed upload keeps the data directory; the next run
-continues from those files. Missing local artifacts are never interpreted as remote
-deletions. If the data directory was lost after a partial same-key publication,
-reset and regenerate.
-
-## Remote publication
-
-After local WARC and CDXJ validation, one changed collection is published in this
-order:
-
-1. Upload the extended tail or newly rolled WARC. Unchanged WARC objects are
-   skipped via listed size and object metadata SHA-256.
-2. Replace the live CDXJ. A single S3 key is atomic, so readers see
-   either all old bytes or all new bytes. This CDXJ replacement is the collection
-   commit point.
-3. Write the year's run record, then evict finalized local working files.
-
-An extended WARC is safe with an old index because all old byte ranges are
-unchanged. Cached Navigator instances continue with their last validated index
-until a changed index ETag is observed. No versioned index keys or reader fallback
-protocol are added.
-
-## Destructive reset
-
-Remote `--reset-data` is explicit authorization for whole-archive maintenance. It:
-
-- rejects `--start` and `--end` overrides;
-- prints a prominent deletion/playback-downtime warning;
-- deletes only the configuration's complete configured bucket prefix;
-- clears only the exact managed data directory; and
-- rebuilds the configuration's full configured range.
-
-There is no interactive prompt. Remote playback is unavailable until publication
-completes. Other prefixes in the same bucket are not touched.
-
-## Module map
-
-- `config.py`: Fetch-local TOML loading, path resolution, and safety checks.
-- `cli.py`: public argument contract and exit-code boundary.
-- `fetch.py`: configured-history orchestration and yearly lifecycle.
-- `console.py`: terminal progress, URL tables, colors, and Wayback links.
-- `collection.py`: flat managed-data paths and atomic artifact files.
-- `warc.py`: record construction, pre-append validation, append-only writing, and
-  rollover.
-- `index.py`: deterministic full or incremental collection CDXJ generation.
-- `inventory.py`: CDXJ-driven identity inventory and identical-payload revisits.
-- `storage.py`: remote prefix inventory plus index/tail materialization,
-  publication, and eviction.
-- `cdx.py`, `resolution.py`, `workers.py`, `playback.py`: capture discovery and
-  bounded playback acquisition.
-
-## Verification
-
-The Fetch test suite is run independently from Navigator:
-
-```console
-uv run pytest -q
-```
-
-Coverage includes configuration conformance, the 250 MB default and configurable
-rollover, deferred tail download (CDXJ for inventory, WARC only when a year has
-new work), incremental indexing, publication order, successful eviction, failure
-retention and retry, unchanged-artifact suppression, and reset prefix scope.
+- `fetch.py`: annual CDX, playback, deduplication, and promotion orchestration.
+- `staging.py`: annual copy-on-write staging and interrupted-commit recovery.
+- `storage.py`: archive lock, local preflight, and ordered rclone commands.
+- `warc.py` and `index.py`: portable WARC and CDXJ construction.
+- `cdx.py`, `resolution.py`, `workers.py`, and `playback.py`: unchanged
+  Wayback acquisition behavior.

@@ -19,10 +19,10 @@ Use a disposable prefix: the reset step intentionally deletes it.
 3. In `navigator.toml`, set `source.type = "remote"` with the same bucket fields
    (no `directory` on a remote source).
 4. Limit `[fetch]` to a small historical interval for the smoke test. Keep
-   `data_directory = "data"` so transient working files remain isolated from the
-   configuration and logs.
-5. Configure credentials through the standard AWS/Boto3 chain (for example an AWS
-   profile or process environment). Archive Magic does not load `.env`.
+   `data_directory = "data"` as the permanent local archive.
+5. Install rclone and configure credentials through AWS environment variables
+   or an AWS profile. Fetch derives rclone's bucket settings from `fetch.toml`;
+   it does not load `.env`.
 
 ## Publish and play
 
@@ -32,9 +32,9 @@ From the Fetch project:
 uv run archive-magic-fetch /absolute/path/to/example.org/fetch.toml
 ```
 
-Confirm the prefix contains WARC and CDXJ objects. Confirm `data/` contains no
-finalized WARC or CDXJ after success. Re-run Fetch without source changes and
-confirm it downloads only the active CDXJ/tail and performs no WARC/index uploads.
+Confirm the prefix contains WARC and CDXJ objects and `data/` retains identical
+finalized files. Re-run Fetch without source changes and confirm it does not
+download archive files from the bucket.
 
 From the Navigator project:
 
@@ -48,14 +48,14 @@ that replay produces authenticated WARC range reads from the bucket.
 ## Update and continuity
 
 Extend the selected source interval or wait for a new snapshot, then run Fetch
-again. The expected order is changed/new WARC, live CDXJ, the run record, then
-local-working-file cleanup. Earlier WARC objects must be untouched; an existing
-tail must be an exact prefix extension.
+again. The expected order is local annual promotion, bucket WARC copy, bucket
+CDXJ sync, then bucket WARC pruning. Earlier WARC objects must be untouched;
+an existing tail must be an exact prefix extension.
 
 To exercise recovery, interrupt or fail one upload and confirm the finalized
-WARC/CDXJ remain in `data/`. The next run must finish through the normal
-materialize/index/publish path. Do not delete `data/` during an incomplete
-publication; without it, reset and regeneration are required.
+WARC/CDXJ remain in `data/`. Then run
+`archive-magic-fetch /absolute/path/to/example.org --sync-only` and confirm
+it completes publication without contacting Wayback.
 
 Keep Navigator running during the update. It should use the previous validated
 index until the new CDXJ is committed, then adopt the new index on a later poll.

@@ -1367,10 +1367,10 @@ def test_cdx_year_timeout_falls_back_to_date_windows(tmp_path, monkeypatch, caps
     assert len(calls) > 1
     assert result.exit_code == 1
     assert result.failed_years == (2004,)
-    assert downloads == [january.timestamp, march.timestamp]
+    assert downloads == []
     layout = result.layout
-    assert inventory_collection(layout, "2004").contains(january)
-    assert inventory_collection(layout, "2004").contains(march)
+    assert not list_collection_warcs(layout, "2004")
+    assert not layout.collection_index("2004").exists()
     year_record = json.loads(layout.logs_root.glob("*.json").__iter__().__next__().read_text())[
         "years"
     ]["2004"]
@@ -1450,7 +1450,7 @@ def test_legacy_layout_rejects_all_artifacts(tmp_path, legacy_name):
         )
 
 
-def test_interrupt_finalizes_appended_records_without_run_json(tmp_path, monkeypatch):
+def test_interrupt_discards_staged_year_without_run_json(tmp_path, monkeypatch):
     import archive_magic_fetch.fetch as fetch_mod
     layout = ArchiveLayout(tmp_path / "data", "example.org")
     ensure_collection_dirs(layout)
@@ -1522,9 +1522,8 @@ def test_interrupt_finalizes_appended_records_without_run_json(tmp_path, monkeyp
 
     assert downloaded == [first.original_url]
     warcs = list_collection_warcs(layout, "2004")
-    assert [path.name for path in warcs] == ["example.org-2004-001.warc.gz"]
-    assert layout.collection_index("2004").is_file()
-    assert inventory_collection(layout, "2004").contains(first)
+    assert warcs == []
+    assert not layout.collection_index("2004").exists()
     records = list(layout.logs_root.glob("*.json"))
     assert len(records) == 1
     assert json.loads(records[0].read_text())["years"] == {}
@@ -1553,7 +1552,7 @@ def test_interrupt_finalizes_appended_records_without_run_json(tmp_path, monkeyp
         fetch_mod_patched.fetch_cdx = original
 
     assert result.exit_code == 0
-    assert downloaded == [second.original_url]
+    assert downloaded == [first.original_url, second.original_url]
     assert [path.name for path in list_collection_warcs(layout, "2004")] == [
         "example.org-2004-001.warc.gz"
     ]

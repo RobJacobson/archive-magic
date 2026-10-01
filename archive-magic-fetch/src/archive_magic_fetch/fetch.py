@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+import shutil
 from collections import defaultdict
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -30,7 +31,6 @@ from .collection import (
     list_collection_warcs,
     normalize_archive_id,
     reject_legacy_layout,
-    reset_collection_data,
     write_run_record,
 )
 from .config import (
@@ -71,7 +71,8 @@ from .inventory import (
     stored_from_playback,
 )
 from .warc import CollectionWarcWriter
-from .storage import PublicationManager
+from .staging import YearStage, recover_stages
+from .storage import archive_lock, purge_remote, sync_archive
 
 DEFAULT_RETRIES = 4
 
@@ -113,6 +114,8 @@ class _YearResult:
     index: IndexArtifact | None
     skip_errors: int
     incomplete: bool = False
+    query: dict[str, object] | None = None
+    representatives: dict[tuple[str, str, str], StoredResponse] | None = None
 
 
 @dataclass(frozen=True)
@@ -158,13 +161,15 @@ def run_fetch(
     )
     try:
         with mirror_output(layout.run_log(run_id)):
-            return _run_fetch(
-                settings,
-                layout=layout,
-                run_id=run_id,
-                workers=workers,
-                sleep=sleep,
-            )
+            with archive_lock(layout):
+                recover_stages(layout)
+                return _run_fetch(
+                    settings,
+                    layout=layout,
+                    run_id=run_id,
+                    workers=workers,
+                    sleep=sleep,
+                )
     finally:
         workers.close()
 
@@ -179,15 +184,14 @@ def _run_fetch(
 ) -> FetchResult:
     """Execute serial years with parallel playback and one WARC writer."""
 
-    publisher = PublicationManager(settings.output)
     if settings.reset_data and settings.output.type == "remote":
-        publisher.reset_archive(layout)
-    publisher.prepare(layout)
+        purge_remote(settings.output)
+        if layout.root.exists():
+            shutil.rmtree(layout.root)
     reject_legacy_layout(layout)
     ensure_collection_dirs(layout)
     cleanup_temps(layout)
-    if settings.output.type == "local":
-        reconcile_missing_indexes(layout)
+    reconcile_missing_indexes(layout)
 
     metrics = RunMetrics()
     all_failures: list[UnresolvedFailure] = []
@@ -205,30 +209,96 @@ def _run_fetch(
     for year, year_start, year_end in year_ranges(
         settings.date_start, settings.date_end
     ):
+        year_started = time.monotonic()
+        stage = YearStage(
+            layout,
+            f"{year:04d}",
+            reset=settings.reset_data and settings.output.type == "local",
+        )
         try:
             result = _run_year(
                 settings,
-                layout=layout,
+                layout=stage.layout,
+                stage=stage,
                 year=year,
                 date_start=year_start,
                 date_end=year_end,
-                run_id=run_id,
                 workers=workers,
-                publisher=publisher,
                 representatives=representatives,
                 sleep=sleep,
             )
+            if result.incomplete:
+                stage.abort()
+                failed_years.append(year)
+                write_run_record(
+                    layout,
+                    collection_id=f"{year:04d}",
+                    run_id=run_id,
+                    url_pattern=settings.url_pattern,
+                    date_start=year_start,
+                    date_end=year_end,
+                    query=result.query or {},
+                    warcs=[],
+                    index=None,
+                    metrics=result.metrics,
+                    failures=[],
+                )
+                continue
+            stage.commit(
+                result.warcs,
+                index_changed=bool(result.warcs) or (
+                    result.index is not None
+                    and not layout.collection_index(f"{year:04d}").is_file()
+                ),
+            )
         except Exception as error:  # noqa: BLE001 - isolate years
+            if (stage.path / "ready.json").is_file():
+                raise
+            stage.abort()
             emit(
                 f"year {year}: failed ({error}); continuing with remaining years"
             )
             failed_years.append(year)
             continue
+        except BaseException:
+            stage.abort()
+            raise
+        if settings.output.type == "remote" and list_collection_warcs(
+            layout, f"{year:04d}"
+        ):
+            sync_archive(layout, settings.output, year=f"{year:04d}")
+        year_warcs = _published_warc_artifacts(layout, f"{year:04d}")
+        index_path = layout.collection_index(f"{year:04d}")
+        collection_index = (
+            index_artifact_from_path(layout, index_path)
+            if index_path.is_file() else None
+        )
+        write_run_record(
+            layout,
+            collection_id=f"{year:04d}",
+            run_id=run_id,
+            url_pattern=settings.url_pattern,
+            date_start=year_start,
+            date_end=year_end,
+            query=result.query or {},
+            warcs=year_warcs,
+            index=collection_index,
+            metrics=result.metrics,
+            failures=result.failures,
+        )
+        representatives.clear()
+        representatives.update(result.representatives or {})
         _accumulate_metrics(metrics, result.metrics)
         all_failures.extend(result.failures)
         run_skips_errors += result.skip_errors
-        if result.incomplete:
-            failed_years.append(year)
+        emit(
+            f"year {year} done: downloads={result.metrics.downloads} "
+            f"payload-reuses={result.metrics.payload_reuses} "
+            f"revisits={result.metrics.revisits} "
+            f"already-represented={result.metrics.local_reuses} "
+            f"skips/errors={result.skip_errors}"
+        )
+        emit(f"elapsed {format_elapsed(time.monotonic() - year_started)}")
 
     emit(
         f"done: downloads={metrics.downloads} revisits={metrics.revisits} "
@@ -251,33 +321,18 @@ def _run_year(
     settings: FetchSettings,
     *,
     layout: ArchiveLayout,
+    stage: YearStage,
     year: int,
     date_start: str,
     date_end: str,
-    run_id: str,
     workers: PlaybackWorkers,
-    publisher: PublicationManager,
     representatives: dict[tuple[str, str, str], StoredResponse],
     sleep,
 ) -> _YearResult:
-    """Acquire, resolve, publish, and record one yearly collection."""
+    """Acquire captures and build one yearly collection in staging."""
 
     collection_id = f"{year:04d}"
-    if settings.reset_data:
-        reset_collection_data(layout, collection_id)
-        emit(f"year {year}: reset existing collection data")
-    else:
-        publisher.materialize_index(layout, collection_id)
-        leftover = list_collection_warcs(layout, collection_id)
-        if leftover:
-            publish_collection_index(
-                layout,
-                collection_id,
-                changed_warcs=leftover,
-                warc_sizes=publisher.collection_warc_sizes(layout, collection_id),
-            )
     year_metrics = RunMetrics()
-    year_started = time.monotonic()
     emit(f"year {year}: CDX query")
     captures: list[ParsedCapture] = []
     failed_windows: list[dict[str, str]] = []
@@ -351,47 +406,6 @@ def _run_year(
     selected = _dedupe_captures(captures)
     year_metrics.selected += len(selected)
 
-    inventory = inventory_collection(layout, collection_id)
-    for stored in representatives.values():
-        inventory.remember_representative(stored)
-    if any(capture.identity not in inventory.identities for capture in selected):
-        publisher.materialize_tail(layout, collection_id)
-    payloads = fetch_payload_data(selected, inventory=inventory, workers=workers)
-    emit(
-        f"year {year}: {len(selected)} captures across {payloads.url_count} URLs"
-    )
-    built = append_to_warc(
-        payloads,
-        layout=layout,
-        collection_id=collection_id,
-        target_bytes=settings.warc_target_bytes,
-        inventory=inventory,
-        warc_sizes=publisher.collection_warc_sizes(layout, collection_id),
-    )
-    _accumulate_metrics(year_metrics, built.metrics)
-    year_failures = list(built.failures)
-    year_skips_errors = len(year_failures)
-    new_warcs = list(built.warcs)
-
-    for artifact in new_warcs:
-        emit(f"  published {artifact.relative_key}")
-
-    idx_started = time.monotonic()
-    collection_index = build_cdxj(
-        layout,
-        collection_id,
-        new_warcs,
-        warc_sizes=publisher.collection_warc_sizes(layout, collection_id),
-    )
-    year_metrics.index_s += time.monotonic() - idx_started
-
-    year_metrics.unresolved = len(year_failures)
-    publisher.publish_collection(
-        layout,
-        collection_id,
-        reset=settings.reset_data,
-    )
-    year_warcs = _published_warc_artifacts(layout, collection_id, publisher)
     query: dict[str, object] = {
         "url_pattern": settings.url_pattern,
         "search_url": search_url,
@@ -404,38 +418,54 @@ def _run_year(
         query["cdx_window_days"] = settings.cdx_window_days
         query["window_count"] = len(windows)
         query["failed_windows"] = failed_windows
-    write_run_record(
-        layout,
-        collection_id=collection_id,
-        run_id=run_id,
-        url_pattern=settings.url_pattern,
-        date_start=date_start,
-        date_end=date_end,
-        query=query,
-        warcs=year_warcs,
-        index=collection_index,
-        metrics=year_metrics,
-        failures=year_failures,
-    )
-    publisher.evict_collection(layout, collection_id)
-    emit(
-        f"year {year} done: downloads={year_metrics.downloads} "
-        f"payload-reuses={year_metrics.payload_reuses} "
-        f"revisits={year_metrics.revisits} "
-        f"already-represented={year_metrics.local_reuses} "
-        f"skips/errors={year_skips_errors}"
-    )
-    emit(f"elapsed {format_elapsed(time.monotonic() - year_started)}")
-    representatives.clear()
-    representatives.update(inventory.by_url_digest)
+    if failed_windows:
+        emit(f"year {year}: incomplete CDX coverage; skipping playback and publication")
+        return _YearResult(
+            metrics=year_metrics, failures=(), warcs=(), index=None,
+            skip_errors=0, incomplete=True, query=query,
+        )
 
+    inventory = inventory_collection(layout, collection_id)
+    for stored in representatives.values():
+        inventory.remember_representative(stored)
+    if any(capture.identity not in inventory.identities for capture in selected):
+        stage.prepare_mutable_tail(settings.warc_target_bytes)
+    payloads = fetch_payload_data(selected, inventory=inventory, workers=workers)
+    emit(
+        f"year {year}: {len(selected)} captures across {payloads.url_count} URLs"
+    )
+    built = append_to_warc(
+        payloads,
+        layout=layout,
+        collection_id=collection_id,
+        target_bytes=settings.warc_target_bytes,
+        inventory=inventory,
+    )
+    _accumulate_metrics(year_metrics, built.metrics)
+    year_failures = list(built.failures)
+    year_skips_errors = len(year_failures)
+    new_warcs = list(built.warcs)
+
+    for artifact in new_warcs:
+        emit(f"  staged {artifact.relative_key}")
+
+    idx_started = time.monotonic()
+    collection_index = build_cdxj(
+        layout,
+        collection_id,
+        new_warcs,
+    )
+    year_metrics.index_s += time.monotonic() - idx_started
+
+    year_metrics.unresolved = len(year_failures)
     return _YearResult(
         metrics=year_metrics,
         failures=tuple(year_failures),
-        warcs=tuple(year_warcs),
+        warcs=tuple(new_warcs),
         index=collection_index,
         skip_errors=year_skips_errors,
-        incomplete=bool(failed_windows),
+        query=query,
+        representatives=dict(inventory.by_url_digest),
     )
 
 
@@ -481,40 +511,30 @@ def append_to_warc(
     collection_id: str,
     target_bytes: int,
     inventory: CollectionInventory,
-    warc_sizes: Mapping[str, int] | None = None,
 ) -> WarcBuild:
     """Append resolved payloads, validating each member before it reaches disk."""
 
     writer = CollectionWarcWriter(layout, collection_id, target_bytes=target_bytes)
     metrics = RunMetrics()
     failures: list[UnresolvedFailure] = []
-    try:
-        for number, outcome in enumerate(payloads.outcomes, start=1):
-            metrics.playback_attempts += outcome.attempts
-            metrics.playback_bytes += outcome.playback_bytes
-            for category in outcome.categories:
-                metrics.bump_attempt(category)
-            for capture in outcome.captures:
-                failure = _commit_capture_outcome(
-                    capture,
-                    inventory=inventory,
-                    writer=writer,
-                    metrics=metrics,
-                )
-                if failure is not None:
-                    failures.append(failure)
-            log_url_outcome(number, payloads.url_count, outcome)
-        started = time.monotonic()
-        warcs = writer.close()
-        metrics.warc_write_s += time.monotonic() - started
-    except BaseException:
-        _finalize_interrupted_year(
-            layout,
-            collection_id,
-            writer,
-            warc_sizes=warc_sizes,
-        )
-        raise
+    for number, outcome in enumerate(payloads.outcomes, start=1):
+        metrics.playback_attempts += outcome.attempts
+        metrics.playback_bytes += outcome.playback_bytes
+        for category in outcome.categories:
+            metrics.bump_attempt(category)
+        for capture in outcome.captures:
+            failure = _commit_capture_outcome(
+                capture,
+                inventory=inventory,
+                writer=writer,
+                metrics=metrics,
+            )
+            if failure is not None:
+                failures.append(failure)
+        log_url_outcome(number, payloads.url_count, outcome)
+    started = time.monotonic()
+    warcs = writer.close()
+    metrics.warc_write_s += time.monotonic() - started
     metrics.unresolved = len(failures)
     return WarcBuild(metrics, tuple(failures), tuple(warcs))
 
@@ -539,37 +559,6 @@ def build_cdxj(
         changed_warcs=[item.path for item in changed_warcs],
         warc_sizes=warc_sizes,
     )
-
-
-def _finalize_interrupted_year(
-    layout: ArchiveLayout,
-    collection_id: str,
-    writer: CollectionWarcWriter,
-    *,
-    warc_sizes: Mapping[str, int] | None = None,
-) -> None:
-    """Finalize any open shard and rebuild CDXJ; do not publish remotely."""
-
-    artifacts: list[WarcArtifact] = []
-    try:
-        artifacts = writer.close()
-        for artifact in artifacts:
-            emit(f"  published {artifact.relative_key}")
-    except Exception as error:  # noqa: BLE001 - best-effort interrupt finalization
-        emit(f"year {collection_id}: failed to finalize open WARC ({error})")
-    if not list_collection_warcs(layout, collection_id):
-        return
-    try:
-        index = publish_collection_index(
-            layout,
-            collection_id,
-            changed_warcs=[item.path for item in artifacts],
-            warc_sizes=warc_sizes,
-        )
-        if index is not None:
-            emit(f"  published {index.relative_key}")
-    except Exception as error:  # noqa: BLE001 - next run reconciles
-        emit(f"year {collection_id}: failed to rebuild index ({error})")
 
 
 def _commit_capture_outcome(
@@ -652,7 +641,6 @@ def _dedupe_captures(
 def _published_warc_artifacts(
     layout: ArchiveLayout,
     collection_id: str,
-    publisher: PublicationManager,
 ) -> list[WarcArtifact]:
     """Summarize committed WARCs from the CDXJ and size inventory."""
 
@@ -671,15 +659,11 @@ def _published_warc_artifacts(
         if isinstance(filename, str):
             warc_names.add(filename)
             capture_counts[filename] += 1
-    sizes = publisher.collection_warc_sizes(layout, collection_id)
     artifacts: list[WarcArtifact] = []
     for filename in sorted(warc_names):
         path = layout.root / filename
-        size_bytes = sizes.get(filename, path.stat().st_size if path.is_file() else 0)
-        sha256 = file_sha256(path) if path.is_file() else ""
-        remote = publisher.inventory.get(filename)
-        if not sha256 and remote is not None and remote.sha256 is not None:
-            sha256 = remote.sha256
+        size_bytes = path.stat().st_size
+        sha256 = file_sha256(path)
         artifacts.append(
             WarcArtifact(
                 relative_key=filename,
