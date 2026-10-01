@@ -59,7 +59,7 @@ archive-magic-navigator ARCHIVE [--bind ADDRESS] [--port PORT]
 ```
 
 Fetch defaults are 4 workers, 16 starts/second, and 4 retries. Navigator defaults
-are `127.0.0.1:8080`, a 60-second poll interval, and Wayback fallback on.
+are `127.0.0.1:8080`, a five-minute poll interval, and Wayback fallback on.
 
 ## Local archive
 

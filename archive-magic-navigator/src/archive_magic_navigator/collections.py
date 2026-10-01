@@ -30,6 +30,7 @@ class Archive:
     archive_id: str
     root: Path
     collections: tuple[ReplayCollection, ...]
+    replay_index: Path | None = None
 
 
 def validate_archive_id(archive_id: str) -> str:

@@ -8,8 +8,8 @@ serves replay UI/routes. It never asks Fetch to acquire data and has no control
 channel with Fetch. The two applications interact only through the archived
 WARC/CDXJ layout in a flat directory.
 
-Navigator does not mutate WARC or user-authored archive configuration. For remote
-playback it writes only validated CDXJ cache files.
+Navigator does not mutate WARC or user-authored archive configuration. For both source types
+it writes only CDXJ cache files.
 
 ## Public interface
 
@@ -41,7 +41,7 @@ Exactly one of `ARCHIVE` and `--catalog` is required. The legacy archive-ID,
 Process settings remain on the CLI:
 
 - `--bind` defaults to `127.0.0.1` and `--port` to `8080`.
-- `--poll-interval` defaults to 60 seconds and must be positive.
+- `--poll-interval` defaults to 300 seconds for both source types and must be finite and positive.
 - `--open` opens a browser only after pywb is ready.
 - `--debug` is passed to pywb.
 - `--wayback-fallback` defaults to `on` for the whole process, including catalogs.
@@ -121,8 +121,10 @@ A local archive has this exact root:
 ```
 
 Navigator discovers logical yearly collections from the strict index filenames,
-validates their index/WARC structure, and gives pywb the shared data path. Fetch
-run records live in the sibling `logs/` directory and are never exposed as archive
+copies and validates their CDXJ indexes in `navigator-cache/<archive-id>/local/`,
+and gives pywb the shared WARC data path. File identity, size, modification time,
+and change time detect index changes. A copy is rejected if these attributes change
+while it is copied/validated. Source files are never modified. Fetch run records live in the sibling `logs/` directory and are never exposed as archive
 content.
 
 ## Remote playback and visible cache
@@ -140,6 +142,7 @@ Within it, archive IDs remain separated:
 navigator-cache/
   example.org/
     example.org-2004-index.cdxj
+    .replay.cdxj
 ```
 
 WARC objects are not downloaded into this cache. The generated pywb collection uses
@@ -156,28 +159,43 @@ At startup the remote store:
 4. Stages all required index files beside their destinations and atomically replaces
    them only after validation.
 
-If remote startup fails, Navigator may use the previous cache only when every cached
-index still passes structural validation. Otherwise startup fails.
+If remote startup fails, Navigator validates the cached annual indexes and reuses
+the last published merged replay snapshot. This matters when a failed refresh
+advanced annual cache files but did not publish the merged snapshot. A cache
+created before merged indexes existed is merged after annual validation. Invalid
+cache files cause startup to fail.
 
 ## Polling and publication continuity
 
-Each remote store polls index object ETags at the configured interval by relisting
-the prefix. An unchanged index ETag is a no-op. For a changed index ETag, Navigator
-stages and validates the new CDXJ before atomically replacing the cached index.
+Each store checks its source every five minutes by default (`--poll-interval`
+overrides this). Remote stores relist the prefix and download only new or changed
+indexes, comparing object ETags and sizes. Local stores rescan the exact source
+directory and copy only changed indexes. New annual collections are adopted along
+with existing-index updates. A missing annual index does not evict captures during
+the running session. Archive routes and TOML configuration remain fixed at startup.
 
-Fetch publishes WARC objects first and replaces the CDXJ last. This order makes
-the CDXJ the visibility boundary:
+All changed indexes are staged and validated first. Sorted annual CDXJ streams are
+merged into a temporary `.replay.cdxj`, the annual cache copies are replaced, and
+only then is the merged replay snapshot atomically replaced. pywb uses this fixed
+snapshot path, so there is no server restart or configuration reload. Already-open
+readers retain their previous snapshot. An unchanged poll does not rewrite it.
+If any step fails, playback stays on the previous merged snapshot, accepted source
+state is not advanced, a warning is logged, and the next poll retries. Annual cache
+files may have advanced individually after a publication failure, but every such
+file has passed validation and the replay snapshot remains unchanged.
 
-- Before CDXJ replacement, Navigator keeps the old index.
-- After replacement, all referenced WARC byte ranges should exist.
-- If listing, downloading, or validation fails, polling logs a warning, retains
-  the previous validated cache, and retries later.
-- An extended WARC is safe with an old index because all old byte ranges are
-  unchanged.
+This keeps Boto3's existing conditional GET and validation workflow; rclone would
+add a dependency without replacing the need for validation and atomic adoption.
+Only CDXJ data is copied. The merge streams rows rather than loading all indexes
+into memory. Each changed batch rewrites the combined index, costing disk I/O
+proportional to the archive's total index size and one additional full index copy
+(plus a temporary copy during publication).
 
-Collection membership changes require a Navigator restart. Polling warns and keeps
-the currently configured route set; it hot-adopts index changes for collections
-that already exist.
+Fetch publishes WARCs first and replaces the CDXJ last. Local publishers should
+likewise atomically replace indexes once referenced WARC ranges are available.
+Extended WARCs remain safe with the old index when old byte ranges are unchanged.
+Snapshots cannot preserve payloads that are deleted or destructively rewritten
+at the source. No acquisition or portable WARC/CDXJ format changes are needed.
 
 ## Wayback fallback
 
@@ -190,11 +208,11 @@ Navigator creates a temporary runtime directory for each process invocation and
 writes generated pywb YAML there. The configuration maps route-safe archive IDs to
 their validated CDXJ and local or S3 archive locations, installs Archive Magic UI
 templates/static resources, and applies effective fallback policies. The temporary
-runtime is removed when the process exits; user data and the visible remote cache
+runtime is removed when the process exits; user data and the visible index cache
 remain.
 
 The process waits for the child server readiness signal before printing its URL or
-opening a browser. Signals and normal shutdown stop remote polling and terminate the
+opening a browser. Signals and normal shutdown stop index polling and terminate the
 child cleanly.
 
 ## Failure and trust model
@@ -220,7 +238,9 @@ multi-tenant hardening.
 - `cli.py`: public arguments, source dispatch, aggregate validation, and process
   lifecycle.
 - `collections.py`: local exact-root discovery and route-safe collection models.
-- `remote.py`: remote store, atomic cache adoption, polling, and S3 paths.
+- `remote.py`: remote discovery, conditional downloads, validation, and S3 paths.
+- `local.py`: local discovery and validated index copying.
+- `store.py`: shared polling lifecycle and atomic merged snapshot publication.
 - `validation.py`: playable archive/CDXJ checks.
 - `config.py`: per-archive pywb and fallback configuration generation.
 - `process.py`: child process readiness, loopback checks, and shutdown.
@@ -244,5 +264,5 @@ uv run pytest -q -m integration
 
 Tests cover configuration and CLI cutover, deterministic catalogs, remote
 environment compatibility, process-wide fallback generation, cached playback
-during index mismatch, atomic polling adoption, authenticated S3 archive
-paths, and local pywb startup.
+during index mismatch, failed refresh and recovery, new-year adoption, authenticated
+S3 archive paths, and real pywb playback before and after local/remote refreshes.

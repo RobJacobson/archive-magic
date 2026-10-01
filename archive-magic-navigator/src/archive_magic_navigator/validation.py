@@ -65,10 +65,16 @@ def validate_collection(
     collection: ReplayCollection,
     *,
     archive_id: str,
+    staged_index: Path | None = None,
 ) -> ValidationSummary:
-    """Validate one CDXJ and every distinct referenced WARC path."""
+    """Validate a CDXJ (optionally a private staged copy) against source WARCs."""
 
-    index_path, stream = _open_replay_index(collection, archive_id=archive_id)
+    index_collection = collection
+    if staged_index is not None:
+        index_collection = ReplayCollection(
+            collection.collection_id, staged_index.parent, staged_index
+        )
+    index_path, stream = _open_replay_index(index_collection, archive_id=archive_id)
     previous: tuple[str, str] | None = None
     warc_sizes: dict[str, int] = {}
     record_count = 0
