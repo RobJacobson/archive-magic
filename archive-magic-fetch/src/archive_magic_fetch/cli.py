@@ -9,6 +9,9 @@ from typing import Optional, Sequence
 
 from .config import load_config
 from .fetch import build_settings, run_fetch
+from .collection import ArchiveLayout
+from .staging import recover_stages
+from .storage import archive_lock, sync_archive
 
 DEFAULT_WORKERS = 4
 DEFAULT_STARTS_PER_SECOND = 16.0
@@ -53,6 +56,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--start", metavar="DATE")
     parser.add_argument("--end", metavar="DATE")
     parser.add_argument(
+        "--sync-only",
+        action="store_true",
+        help="reconcile the local WARC/CDXJ archive to the configured bucket without fetching",
+    )
+    parser.add_argument(
         "--reset-data",
         action="store_true",
         help=(
@@ -87,6 +95,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
     try:
         config = load_config(args.archive)
+        if args.sync_only:
+            if config.output.type != "remote":
+                raise ValueError("--sync-only requires remote output")
+            if args.start is not None or args.end is not None or args.reset_data:
+                raise ValueError("--sync-only cannot be combined with dates or --reset-data")
         if config.output.type == "remote" and args.reset_data:
             if args.start is not None or args.end is not None:
                 raise ValueError(
@@ -97,7 +110,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "playback will be unavailable during the rebuild.",
                 file=sys.stderr,
             )
-        settings = build_settings(
+        settings = None if args.sync_only else build_settings(
             config.url_pattern,
             archive_id=config.archive_id,
             date_start=args.start,
@@ -118,6 +131,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 2
 
     try:
+        if args.sync_only:
+            layout = ArchiveLayout(config.output.data_directory, config.archive_id)
+            with archive_lock(layout):
+                recover_stages(layout)
+                sync_archive(layout, config.output)
+            return 0
+        assert settings is not None
         result = run_fetch(settings)
     except KeyboardInterrupt:
         print("interrupted", file=sys.stderr)
