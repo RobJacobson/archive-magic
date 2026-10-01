@@ -23,11 +23,16 @@ def _collection_config(
     *,
     wayback_fallback: bool,
 ) -> dict[str, Any]:
-    local = {
-        "index_group": {
+    indexes = (
+        {"archive": str(archive.replay_index)}
+        if archive.replay_index is not None
+        else {
             collection.collection_id: str(collection.replay_index)
             for collection in archive.collections
-        },
+        }
+    )
+    local = {
+        "index_group": indexes,
         "archive_paths": list(
             dict.fromkeys(
                 collection.archive_path or (str(collection.root) + os.sep)

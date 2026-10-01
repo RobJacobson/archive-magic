@@ -131,3 +131,14 @@ def assert_forbidden_modes_absent(config):
         "enable_auto_fetch",
     ):
         assert forbidden not in text
+
+
+def test_snapshot_path_preserves_archive_paths_and_fallback(tmp_path):
+    from dataclasses import replace
+
+    archive = make_archive(tmp_path, "example.org", ("2020", "2021"))
+    archive = replace(archive, replay_index=tmp_path / "cache" / ".replay.cdxj")
+    sequence = build_config([archive])["collections"]["example.org"]["sequence"]
+    assert sequence[0]["index_group"] == {"archive": str(archive.replay_index)}
+    assert sequence[0]["archive_paths"] == [str(item.root) + "/" for item in archive.collections]
+    assert sequence[1]["index_group"] == {"ia": WAYBACK_MEMENTO_SOURCE}

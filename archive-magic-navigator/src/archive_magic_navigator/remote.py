@@ -8,12 +8,10 @@ import os
 import re
 import sys
 import tempfile
-import threading
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 import boto3
-from botocore.exceptions import ClientError
 
 from .collections import (
     Archive,
@@ -23,6 +21,7 @@ from .collections import (
 )
 from .errors import ValidationError
 from .settings import RemoteSource
+from .store import IndexStore, publish_indexes
 
 _CDX_TIMESTAMP = re.compile(r"^\d{14}$")
 _INDEX_SUFFIX = "-index.cdxj"
@@ -41,21 +40,18 @@ class RemoteCollection:
     index: RemoteObject
 
 
-class RemoteArchiveStore:
+class RemoteArchiveStore(IndexStore):
     """Own validated cached indexes for one Navigator process."""
 
     def __init__(
         self, config: RemoteSource, cache_directory: Path, poll_seconds: float
     ) -> None:
+        super().__init__(cache_directory, poll_seconds)
         self.config = config
-        self.cache_directory = cache_directory
-        self.poll_seconds = poll_seconds
         self.client = boto3.client(
             "s3", endpoint_url=config.endpoint_url, region_name=config.region
         )
         self._states: dict[str, dict[str, RemoteCollection]] = {}
-        self._stop = threading.Event()
-        self._thread: threading.Thread | None = None
 
     def load_archive(self, archive_id: str) -> Archive:
         archive_id = validate_archive_id(archive_id)
@@ -79,21 +75,9 @@ class RemoteArchiveStore:
             )
             archive = self._archive_from_cached(archive_id, cached)
             self._validate_cached_indexes(archive_id, cached)
+            publish_indexes(archive, [])
             self._states[archive_id] = cached
             return archive
-
-    def start_polling(self) -> None:
-        if self._thread is not None:
-            return
-        self._thread = threading.Thread(
-            target=self._poll_loop, daemon=True, name="archive-magic-index-sync"
-        )
-        self._thread.start()
-
-    def stop_polling(self) -> None:
-        self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=min(self.poll_seconds + 1, 5))
 
     def child_environment(self) -> dict[str, str]:
         environment = os.environ.copy()
@@ -103,90 +87,43 @@ class RemoteArchiveStore:
         environment["AWS_DEFAULT_REGION"] = self.config.region
         return environment
 
-    def _poll_loop(self) -> None:
-        while not self._stop.wait(self.poll_seconds):
-            for archive_id in tuple(self._states):
-                try:
-                    self._poll_archive(archive_id)
-                except Exception as error:  # noqa: BLE001 - keep poller alive
-                    print(
-                        f"WARNING: index synchronization failed for {archive_id}: {error}",
-                        file=sys.stderr,
-                    )
-
     def _poll_archive(self, archive_id: str) -> None:
         current = self._states[archive_id]
         inventory = self._list_inventory()
         discovered = self._discover_collections(archive_id, inventory)
-        old_ids = set(current)
-        new_ids = set(discovered)
-        if old_ids != new_ids:
-            print(
-                f"WARNING: collection membership changed for {archive_id}; "
-                "restart Navigator to apply it",
-                file=sys.stderr,
-            )
-        for collection_id in sorted(old_ids & new_ids):
-            if current[collection_id].index.etag != discovered[collection_id].index.etag:
-                self._sync_index(
-                    archive_id,
-                    collection_id,
-                    discovered[collection_id],
-                    inventory,
-                )
-        self._states[archive_id] = {
-            collection_id: discovered[collection_id]
-            for collection_id in current
-            if collection_id in discovered
-        } | {
-            collection_id: current[collection_id]
-            for collection_id in current
-            if collection_id not in discovered
+        # A missing object may be a transient/incomplete publication. Never remove
+        # a previously accepted annual collection during a running session.
+        accepted = current | discovered
+        changed = {
+            key: item
+            for key, item in discovered.items()
+            if current.get(key) != item
         }
+        if changed:
+            self._accept_collections(archive_id, accepted, inventory, changed=changed)
+            self._states[archive_id] = accepted
 
     def _accept_collections(
         self,
         archive_id: str,
         collections: dict[str, RemoteCollection],
         inventory: dict[str, RemoteObject],
+        *,
+        changed: dict[str, RemoteCollection] | None = None,
     ) -> Archive:
         staged: list[tuple[Path, Path]] = []
         try:
-            for collection_id, collection in collections.items():
-                item = self._stage_index(
-                    archive_id,
-                    collection_id,
-                    collection,
-                    inventory,
+            for collection_id, collection in (
+                collections if changed is None else changed
+            ).items():
+                staged.append(
+                    self._stage_index(archive_id, collection_id, collection, inventory)
                 )
-                if item is not None:
-                    staged.append(item)
-            for destination, temporary in staged:
-                os.replace(temporary, destination)
+            archive = self._archive_from_collections(archive_id, collections)
+            publish_indexes(archive, staged)
+            return archive
         finally:
             for _, temporary in staged:
-                temporary.unlink(missing_ok=True)
-        return self._archive_from_collections(archive_id, collections)
-
-    def _sync_index(
-        self,
-        archive_id: str,
-        collection_id: str,
-        collection: RemoteCollection,
-        inventory: dict[str, RemoteObject],
-    ) -> None:
-        staged = self._stage_index(
-            archive_id,
-            collection_id,
-            collection,
-            inventory,
-            refresh=True,
-        )
-        if staged is not None:
-            destination, temporary = staged
-            try:
-                os.replace(temporary, destination)
-            finally:
                 temporary.unlink(missing_ok=True)
 
     def _stage_index(
@@ -195,17 +132,8 @@ class RemoteArchiveStore:
         collection_id: str,
         collection: RemoteCollection,
         inventory: dict[str, RemoteObject],
-        *,
-        refresh: bool = False,
-    ) -> tuple[Path, Path] | None:
+    ) -> tuple[Path, Path]:
         destination = self._index_path(archive_id, collection_id, collection.index.key)
-        if (
-            not refresh
-            and destination.is_file()
-            and destination.stat().st_size == collection.index.size_bytes
-        ):
-            _validate_index(destination, inventory)
-            return None
         response = self.client.get_object(
             Bucket=self.config.bucket,
             Key=self._object_key(collection.index.key),
@@ -258,7 +186,7 @@ class RemoteArchiveStore:
             raise ValidationError(
                 f"remote archive {archive_id!r} has no playable collections"
             )
-        return Archive(archive_id, root, replay_collections)
+        return Archive(archive_id, root, replay_collections, root / ".replay.cdxj")
 
     def _archive_from_cached(
         self, archive_id: str, collections: dict[str, RemoteCollection]
@@ -363,6 +291,8 @@ def _validate_index(
             for item in inventory.values()
             if item.key.endswith(".warc.gz")
         }
+    previous = None
+    records = 0
     with path.open("r", encoding="utf-8") as stream:
         for number, line in enumerate(stream, 1):
             if not line.strip():
@@ -374,6 +304,11 @@ def _validate_index(
                 or not _CDX_TIMESTAMP.fullmatch(parts[1])
             ):
                 raise ValidationError(f"{path}, line {number}: malformed CDXJ")
+            current = (parts[0], parts[1])
+            if previous is not None and current < previous:
+                raise ValidationError(f"{path}, line {number}: CDXJ is not sorted")
+            previous = current
+            records += 1
             try:
                 payload = json.loads(parts[2])
                 filename = payload["filename"]
@@ -390,6 +325,8 @@ def _validate_index(
                 raise ValidationError(
                     f"{path}, line {number}: unknown WARC {filename!r}"
                 )
+            if offset < 0 or length <= 0:
+                raise ValidationError(f"{path}, line {number}: invalid WARC range")
             if inventory is not None:
                 size = warc_sizes.get(filename)
                 if size is None:
@@ -400,6 +337,9 @@ def _validate_index(
                     raise ValidationError(
                         f"{path}, line {number}: WARC range out of bounds"
                     )
+
+    if not records:
+        raise ValidationError(f"{path}: replay index is empty")
 
 
 def _is_archive_object(relative: str) -> bool:

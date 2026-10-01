@@ -4,6 +4,7 @@ import hashlib
 import io
 
 import pytest
+from archive_magic_navigator.errors import ValidationError
 from archive_magic_navigator.remote import RemoteArchiveStore
 from archive_magic_navigator.settings import (
     CONFIG_NAME,
@@ -271,6 +272,7 @@ def test_poll_atomically_replaces_a_valid_changed_index(tmp_path, monkeypatch):
     store._poll_archive("example.org")
 
     assert cache.read_bytes() == new_index
+    assert archive.replay_index.read_bytes() == new_index
     index_calls = [
         kwargs
         for key, kwargs in fake.calls
@@ -304,6 +306,7 @@ def test_metadata_mismatch_during_poll_retains_previous_cache(tmp_path, monkeypa
         store._poll_archive("example.org")
 
     assert cache.read_bytes() == old_index
+    assert archive.replay_index.read_bytes() == old_index
     assert store._states["example.org"]["2004"].index.etag == '"i"'
 
 
@@ -327,3 +330,90 @@ def test_startup_uses_validated_cache_when_remote_sync_fails(
     archive = RemoteArchiveStore(config, tmp_path, 60).load_archive("example.org")
 
     assert archive.collections[0].replay_index.read_bytes() == index
+
+
+@pytest.mark.parametrize("failure", ["listing", "download", "validation", "publication"])
+def test_remote_batch_failure_preserves_playback_and_retries(tmp_path, monkeypatch, failure):
+    from pathlib import Path
+
+    old = (
+        b"org,example)/ 20040101000000 "
+        b'{"filename":"example.org-2004-001.warc.gz","offset":"10","length":"20"}\n'
+    )
+    fake = FakeRemoteS3()
+    seed_remote(fake, index_bytes=old)
+    monkeypatch.setattr("archive_magic_navigator.remote.boto3.client", lambda *a, **k: fake)
+    store = RemoteArchiveStore(remote_config(), tmp_path, 300)
+    archive = store.load_archive("example.org")
+    state = store._states["example.org"].copy()
+    updated = old.replace(b'"offset":"10"', b'"offset":"30"')
+    added = old.replace(b"2004", b"2005")
+    fake.seed("example.org/example.org-2004-index.cdxj", updated)
+    fake.seed("example.org/example.org-2005-index.cdxj", added)
+    fake.seed("example.org/example.org-2005-001.warc.gz", b"x" * 1000)
+
+    with monkeypatch.context() as patch:
+        if failure == "listing":
+            fake.fail_list = True
+        elif failure == "download":
+            real_get = fake.get_object
+
+            def fail_second(**kwargs):
+                if "2005" in kwargs["Key"]:
+                    raise OSError("download interrupted")
+                return real_get(**kwargs)
+
+            patch.setattr(fake, "get_object", fail_second)
+        elif failure == "validation":
+            fake.seed("example.org/example.org-2005-index.cdxj", b"incomplete")
+        else:
+            import os
+            real_replace = os.replace
+
+            def fail_publication(source, target):
+                if Path(target) == archive.replay_index:
+                    raise OSError("publication interrupted")
+                real_replace(source, target)
+
+            patch.setattr("archive_magic_navigator.store.os.replace", fail_publication)
+        with pytest.raises((OSError, ClientError, ValidationError)):
+            store._poll_archive("example.org")
+
+    assert archive.replay_index.read_bytes() == old
+    assert store._states["example.org"] == state
+    assert not list(tmp_path.rglob(".tmp-*"))
+    fake.fail_list = False
+    fake.seed("example.org/example.org-2005-index.cdxj", added)
+    store._poll_archive("example.org")
+    assert archive.replay_index.read_bytes() == updated + added
+    assert set(store._states["example.org"]) == {"2004", "2005"}
+    assert not list(tmp_path.rglob("*.warc.gz"))
+    assert all(key == "list" or key.endswith(".cdxj") for key, _ in fake.calls)
+
+    # Missing annual indexes must not evict accepted captures. An unchanged
+    # inventory also causes no index downloads or snapshot replacement.
+    fake.objects.pop("example.org/example.org-2004-index.cdxj")
+    previous = archive.replay_index.stat()
+    fake.calls.clear()
+    store._poll_archive("example.org")
+    assert archive.replay_index.stat() == previous
+    assert all(key == "list" for key, _ in fake.calls)
+
+
+@pytest.mark.parametrize("invalid", [b"", b"\n", b"unsorted"])
+def test_remote_rejects_empty_or_unsorted_refresh(tmp_path, monkeypatch, invalid):
+    old = (
+        b"org,example)/ 20040101000000 "
+        b'{"filename":"example.org-2004-001.warc.gz","offset":"10","length":"20"}\n'
+    )
+    fake = FakeRemoteS3()
+    seed_remote(fake, index_bytes=old)
+    monkeypatch.setattr("archive_magic_navigator.remote.boto3.client", lambda *a, **k: fake)
+    store = RemoteArchiveStore(remote_config(), tmp_path, 300)
+    archive = store.load_archive("example.org")
+    if invalid == b"unsorted":
+        invalid = old.replace(b"20040101000000", b"20040201000000") + old
+    fake.seed("example.org/example.org-2004-index.cdxj", invalid)
+    with pytest.raises(ValidationError):
+        store._poll_archive("example.org")
+    assert archive.replay_index.read_bytes() == old

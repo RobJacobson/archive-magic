@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 import tempfile
 import webbrowser
@@ -10,9 +11,10 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from .collections import Archive, select_archive_root
+from .collections import Archive
 from .config import build_config, write_config
 from .errors import NavigatorError, ValidationError
+from .local import LocalArchiveStore
 from .process import is_loopback_bind, run_wayback
 from .remote import RemoteArchiveStore
 from .settings import (
@@ -22,7 +24,7 @@ from .settings import (
     discover_configs,
     load_config,
 )
-from .validation import validate_archive
+from .store import IndexStore
 
 
 @dataclass(frozen=True)
@@ -53,8 +55,8 @@ def _positive_number(value: str) -> float:
         parsed = float(value)
     except ValueError as error:
         raise argparse.ArgumentTypeError("must be a number") from error
-    if parsed <= 0:
-        raise argparse.ArgumentTypeError("must be positive")
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise argparse.ArgumentTypeError("must be finite and positive")
     return parsed
 
 
@@ -72,7 +74,8 @@ def parse_args(argv: Sequence[str] | None = None) -> NavigatorRequest:
     parser.add_argument(
         "--poll-interval",
         type=_positive_number,
-        default=60.0,
+        default=300.0,
+        help="index refresh interval for local and remote sources (default: 300)",
         metavar="SECONDS",
     )
     parser.add_argument("--bind", type=_bind, default="127.0.0.1", metavar="ADDRESS")
@@ -98,7 +101,7 @@ def parse_args(argv: Sequence[str] | None = None) -> NavigatorRequest:
 
 def main(argv: Sequence[str] | None = None) -> int:
     request = parse_args(argv)
-    remotes: list[RemoteArchiveStore] = []
+    stores: list[IndexStore] = []
     try:
         configs = (
             discover_configs(request.catalog)
@@ -131,18 +134,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                     ).rstrip("/")
                 else:
                     assert isinstance(item.source, LocalSource)
-                    archive = select_archive_root(
-                        item.source.directory,
-                        item.archive_id,
+                    local = LocalArchiveStore(
+                        item.source.directory, cache, request.poll_interval_seconds,
                     )
+                    archive = local.load_archive(item.archive_id)
                     label = str(item.source.directory)
-                    validate_archive(archive)
             except (NavigatorError, ValueError) as error:
                 archive_errors.append(f"{item.archive_id}: {error}")
                 continue
             if remote is not None:
-                remotes.append(remote)
                 child_environment = remote.child_environment()
+            stores.append(remote if remote is not None else local)
             labels.append(label)
             archives.append(archive)
         if archive_errors:
@@ -185,8 +187,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if request.open_browser:
                     webbrowser.open(url)
 
-            for remote in remotes:
-                remote.start_polling()
+            for store in stores:
+                store.start_polling()
             try:
                 kwargs = {}
                 if child_environment is not None:
@@ -200,8 +202,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     **kwargs,
                 )
             finally:
-                for remote in remotes:
-                    remote.stop_polling()
+                for store in stores:
+                    store.stop_polling()
     except (NavigatorError, ValueError) as error:
         print(f"ERROR: {error}", file=sys.stderr)
         return 1

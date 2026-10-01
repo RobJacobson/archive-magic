@@ -52,7 +52,8 @@ def test_parse_args_defaults_and_modes(tmp_path):
     assert request.catalog is None
     assert request.bind == "127.0.0.1"
     assert request.port == 8080
-    assert request.poll_interval_seconds == 60
+    assert request.poll_interval_seconds == 300
+    assert cli.parse_args([str(tmp_path), "--poll-interval", "60"]).poll_interval_seconds == 60
     assert request.wayback_fallback is True
     assert not hasattr(request, "source")
     assert cli.parse_args(["--catalog", str(tmp_path)]).catalog == tmp_path
@@ -67,6 +68,8 @@ def test_parse_args_defaults_and_modes(tmp_path):
         ["archive", "--port", "0"],
         ["archive", "--port", "65536"],
         ["archive", "--poll-interval", "0"],
+        ["archive", "--poll-interval", "nan"],
+        ["archive", "--poll-interval", "inf"],
     ),
 )
 def test_parser_errors_exit_two(arguments):

@@ -25,6 +25,7 @@ from archive_magic_navigator.collections import (
 )
 from archive_magic_navigator.config import build_config, write_config
 from archive_magic_navigator.errors import StartupError
+from archive_magic_navigator.local import LocalArchiveStore
 from archive_magic_navigator.process import find_wayback, run_wayback
 from archive_magic_navigator.validation import validate_archive
 
@@ -440,6 +441,9 @@ def test_real_pywb_uses_wayback_fallback_for_redirect_and_assets(
     collection = copy_fixture(archives, "fixture")
     assert validate_archive(collection).record_count == 7
     before = snapshot_tree(archives)
+    collection = LocalArchiveStore(
+        collection.root, tmp_path / "cache", 300
+    ).load_archive("fixture")
 
     with memento_server() as (source, handler):
         monkeypatch.setattr(
@@ -735,7 +739,10 @@ def test_real_pywb_aggregates_flat_collections_and_replays_same_collection_revis
     assert [item.collection_id for item in collection.collections] == ["2020", "2021"]
     before = snapshot_tree(archives)
 
-    with pywb_server(tmp_path, [collection]) as base:
+    snapshot = LocalArchiveStore(
+        collection.root, tmp_path / "cache", 300
+    ).load_archive("annual")
+    with pywb_server(tmp_path, [snapshot]) as base:
         _, original, _ = get(base + "/annual/20200601000000id_/http://example.org/")
         _, revisited, _ = get(base + "/annual/20200701000000id_/http://example.org/")
         assert b"Annual shard body" in original
@@ -748,3 +755,109 @@ def test_real_pywb_aggregates_flat_collections_and_replays_same_collection_revis
         assert b"Second portable collection" in second_body
 
     assert snapshot_tree(archives) == before
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("source_type", ["local", "remote"])
+def test_running_pywb_adopts_updates_and_new_year_and_survives_failure(
+    tmp_path, monkeypatch, source_type,
+):
+    from contextlib import ExitStack
+    from io import BytesIO
+
+    from archive_magic_navigator.errors import ValidationError
+    from archive_magic_navigator.remote import RemoteArchiveStore
+    from archive_magic_navigator.settings import RemoteSource
+    from test_settings_remote import FakeRemoteS3
+    from warcio.statusandheaders import StatusAndHeaders
+    from warcio.warcwriter import WARCWriter
+
+    source = copy_fixture(tmp_path / "archives", "fixture").root
+    index = source / "fixture-2020-index.cdxj"
+    full_index = index.read_bytes()
+    index.write_bytes(b"".join(
+        line for line in full_index.splitlines(keepends=True)
+        if b"20210101000000" not in line
+    ))
+    cache = tmp_path / "cache"
+    with ExitStack() as stack:
+        environment = None
+        fake = FakeRemoteS3()
+
+        def upload():
+            for path in source.iterdir():
+                if path.suffix in {".cdxj", ".gz"}:
+                    fake.seed(path.name, path.read_bytes())
+
+        if source_type == "local":
+            store = LocalArchiveStore(source, cache, 0.05)
+        else:
+            server, handler = stack.enter_context(private_s3_server(source))
+            upload()
+            monkeypatch.setattr("archive_magic_navigator.remote.boto3.client", lambda *a, **k: fake)
+            store = RemoteArchiveStore(
+                RemoteSource("bucket", "", f"http://127.0.0.1:{server.server_port}", "us-east-1"),
+                cache, 0.05,
+            )
+            environment = store.child_environment()
+            environment.update({
+                "AWS_ACCESS_KEY_ID": "test-read-key",
+                "AWS_SECRET_ACCESS_KEY": "test-read-secret",
+                "AWS_EC2_METADATA_DISABLED": "true",
+                "NO_PROXY": "127.0.0.1,localhost",
+            })
+        archive = store.load_archive("fixture")
+        base = stack.enter_context(pywb_server(tmp_path, [archive], child_environment=environment))
+        replay = base + "/fixture/"
+        assert b"Archived version one" in get(replay + "20200101000000id_/http://example.test/")[1]
+        assert b"20210101000000" not in get(replay + "cdx?url=http://example.test/&output=json")[1]
+
+        # Change an existing annual index while this exact server remains alive.
+        index.write_bytes(full_index)
+        upload()
+        store._poll_archive("fixture")
+        assert b"Archived version two" in get(replay + "20210101000000id_/http://example.test/")[1]
+
+        # Publish a WARC, then its index for a year absent at startup.
+        warc = source / "fixture-2021-001.warc.gz"
+        with warc.open("wb") as stream:
+            writer = WARCWriter(stream, gzip=True)
+            record = writer.create_warc_record(
+                "http://new-year.test/", "response", payload=BytesIO(b"New annual capture"),
+                http_headers=StatusAndHeaders("200 OK", [("Content-Type", "text/html")], protocol="HTTP/1.1"),
+                warc_headers_dict={"WARC-Date": "2021-01-01T00:00:00Z"},
+            )
+            writer.write_record(record)
+        new_index = source / "fixture-2021-index.cdxj"
+        new_index.write_text('test,new-year)/ 20210101000000 ' + json.dumps({
+            "url": "http://new-year.test/", "mime": "text/html", "status": "200",
+            "filename": warc.name, "offset": "0", "length": str(warc.stat().st_size),
+        }) + '\n')
+        upload()
+        # Exercise the real polling lifecycle, including the configured interval.
+        store.start_polling()
+        try:
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                if b"new-year.test" in archive.replay_index.read_bytes():
+                    break
+                time.sleep(0.02)
+            else:
+                pytest.fail("poller did not adopt new year")
+        finally:
+            store.stop_polling()
+        assert b"New annual capture" in get(replay + "20210101000000id_/http://new-year.test/")[1]
+
+        before = archive.replay_index.read_bytes()
+        index.write_bytes(b"incomplete publication")
+        upload()
+        with pytest.raises(ValidationError):
+            store._poll_archive("fixture")
+        assert archive.replay_index.read_bytes() == before
+        assert b"Archived version one" in get(replay + "20200101000000id_/http://example.test/")[1]
+        assert b"New annual capture" in get(replay + "20210101000000id_/http://new-year.test/")[1]
+        if source_type == "remote":
+            assert handler.ranges
+            assert all(byte_range and auth for _, byte_range, auth in handler.ranges)
+            assert all(key == "list" or key.endswith(".cdxj") for key, _ in fake.calls)
+        assert not list(cache.rglob("*.warc.gz"))

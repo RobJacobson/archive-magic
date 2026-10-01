@@ -17,9 +17,8 @@ Pass a configuration file or its containing directory:
 uv run archive-magic-navigator ~/archives/example.org --open
 ```
 
-Each `navigator.toml` selects exactly one source. A local source serves its exact
-`directory`. A remote source caches validated indexes locally and serves WARC
-ranges from the bucket.
+Each `navigator.toml` selects exactly one source. A local source reads WARCs from its exact `directory`. Both source types cache
+validated CDXJ snapshots. A remote source serves WARC ranges from the bucket.
 
 Useful process options are:
 
@@ -33,9 +32,22 @@ Useful process options are:
 --debug
 ```
 
-The default remote cache is the visible `navigator-cache/` beside `navigator.toml`.
-It retains the last validated index if polling observes an incomplete publication
-or transient bucket failure.
+Navigator checks both local and remote sources every five minutes by default.
+Use `--poll-interval 60` for a one-minute interval. Updated annual indexes and new
+annual collections appear in the running viewer after a successful refresh.
+
+The default index cache is `navigator-cache/` beside `navigator.toml` (or under the
+catalog directory). Local mode also needs a writable cache; `--cache PATH` overrides
+its location. Only indexes are cached, never WARC payloads. Navigator validates all
+changes before atomically switching the archive's merged replay index. Listing,
+copying, downloading, validation, or publication failures keep the previous replay
+snapshot available and retry at the next interval. Missing annual indexes are
+retained for the running session.
+
+Annual source files and configuration formats are unchanged. Publish WARCs before
+atomically replacing CDXJ files. Existing WARC byte ranges must remain available;
+index snapshots cannot protect against deletion or destructive rewriting of WARCs.
+Adding catalog entries or changing `navigator.toml` still requires a restart.
 
 ## Serve a catalog
 
