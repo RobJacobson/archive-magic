@@ -159,8 +159,11 @@ At startup the remote store:
 4. Stages all required index files beside their destinations and atomically replaces
    them only after validation.
 
-If remote startup fails, Navigator may use the previous cache only when every cached
-index still passes structural validation. Otherwise startup fails.
+If remote startup fails, Navigator validates the cached annual indexes and reuses
+the last published merged replay snapshot. This matters when a failed refresh
+advanced annual cache files but did not publish the merged snapshot. A cache
+created before merged indexes existed is merged after annual validation. Invalid
+cache files cause startup to fail.
 
 ## Polling and publication continuity
 

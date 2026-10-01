@@ -324,12 +324,59 @@ def test_startup_uses_validated_cache_when_remote_sync_fails(
         "archive_magic_navigator.remote.boto3.client", lambda *a, **k: fake
     )
     config = remote_config()
-    RemoteArchiveStore(config, tmp_path, 60).load_archive("example.org")
+    first = RemoteArchiveStore(config, tmp_path, 60).load_archive("example.org")
+    first.replay_index.unlink()  # Cache from before merged replay indexes existed.
     fake.fail_list = True
 
     archive = RemoteArchiveStore(config, tmp_path, 60).load_archive("example.org")
 
     assert archive.collections[0].replay_index.read_bytes() == index
+    assert archive.replay_index.read_bytes() == index
+
+
+def test_offline_restart_keeps_last_published_snapshot_after_failed_refresh(
+    tmp_path, monkeypatch,
+):
+    import os
+    from pathlib import Path
+
+    import archive_magic_navigator.store as store_module
+
+    old = (
+        b"org,example)/ 20040101000000 "
+        b'{"filename":"example.org-2004-001.warc.gz","offset":"10","length":"20"}\n'
+    )
+    updated = old.replace(b'"offset":"10"', b'"offset":"30"')
+    fake = FakeRemoteS3()
+    seed_remote(fake, index_bytes=old)
+    monkeypatch.setattr("archive_magic_navigator.remote.boto3.client", lambda *a, **k: fake)
+    store = RemoteArchiveStore(remote_config(), tmp_path, 300)
+    archive = store.load_archive("example.org")
+    fake.seed("example.org/example.org-2004-index.cdxj", updated)
+
+    real_replace = os.replace
+
+    def fail_snapshot(source, destination):
+        if Path(destination) == archive.replay_index:
+            raise OSError("snapshot publication interrupted")
+        real_replace(source, destination)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(store_module.os, "replace", fail_snapshot)
+        with pytest.raises(OSError, match="snapshot publication interrupted"):
+            store._poll_archive("example.org")
+
+    assert archive.replay_index.read_bytes() == old
+    assert archive.collections[0].replay_index.read_bytes() == updated
+
+    fake.fail_list = True
+    restarted = RemoteArchiveStore(remote_config(), tmp_path, 300)
+    recovered = restarted.load_archive("example.org")
+    assert recovered.replay_index.read_bytes() == old
+
+    fake.fail_list = False
+    restarted._poll_archive("example.org")
+    assert recovered.replay_index.read_bytes() == updated
 
 
 @pytest.mark.parametrize("failure", ["listing", "download", "validation", "publication"])

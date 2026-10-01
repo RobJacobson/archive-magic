@@ -75,7 +75,15 @@ class RemoteArchiveStore(IndexStore):
             )
             archive = self._archive_from_cached(archive_id, cached)
             self._validate_cached_indexes(archive_id, cached)
-            publish_indexes(archive, [])
+            snapshot = archive.replay_index
+            assert snapshot is not None
+            if snapshot.exists():
+                # Annual cache files can advance before a failed snapshot publish.
+                # The merged file is the last version accepted for playback.
+                _validate_index(snapshot)
+            else:
+                # Support caches created before merged replay indexes existed.
+                publish_indexes(archive, [])
             self._states[archive_id] = cached
             return archive
 
