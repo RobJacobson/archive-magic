@@ -11,10 +11,7 @@ from pathlib import Path
 from typing import Callable, Mapping, Optional, Sequence
 
 from .cdx import (
-    cdx_should_split,
-    date_windows,
-    fetch_cdx,
-    format_cdx_window_label,
+    acquire_year_cdx,
     parse_date_bound,
     validate_date_range,
     year_ranges,
@@ -333,90 +330,44 @@ def _run_year(
 
     collection_id = f"{year:04d}"
     year_metrics = RunMetrics()
-    emit(f"year {year}: CDX query")
-    captures: list[ParsedCapture] = []
-    failed_windows: list[dict[str, str]] = []
-    search_url = ""
-    match_type: str | None = None
-    cdx_fallback: str | None = None
-    windows: list[tuple[str, str]] = []
     cdx_started = time.monotonic()
-    try:
-        year_cdx = fetch_cdx(
-            url_pattern=settings.url_pattern,
-            date_start=date_start,
-            date_end=date_end,
-            retries=settings.retries,
-            limit=settings.cdx_page_limit,
-            sleep=sleep,
-        )
-    except Exception as error:  # noqa: BLE001 - year CDX boundary
-        year_metrics.cdx_duration_s += time.monotonic() - cdx_started
-        if not cdx_should_split(error):
-            raise
-        cdx_fallback = "date_windows"
-        windows = list(
-            date_windows(date_start, date_end, settings.cdx_window_days)
-        )
-        emit(
-            f"year {year}: CDX year query failed ({error}); "
-            f"falling back to {settings.cdx_window_days}d windows "
-            f"({len(windows)} windows)"
-        )
-        for window_start, window_end in windows:
-            label = format_cdx_window_label(window_start, window_end)
-            emit(f"year {year}: CDX {label}")
-            window_started = time.monotonic()
-            try:
-                window_cdx = fetch_cdx(
-                    url_pattern=settings.url_pattern,
-                    date_start=window_start,
-                    date_end=window_end,
-                    retries=settings.retries,
-                    limit=settings.cdx_page_limit,
-                    sleep=sleep,
-                )
-            except Exception as window_error:  # noqa: BLE001 - isolate windows
-                year_metrics.cdx_duration_s += time.monotonic() - window_started
-                emit(
-                    f"year {year}: CDX {label} failed ({window_error}); continuing"
-                )
-                failed_windows.append(
-                    {
-                        "date_start": window_start,
-                        "date_end": window_end,
-                        "message": str(window_error),
-                    }
-                )
-                continue
-            year_metrics.cdx_duration_s += time.monotonic() - window_started
-            captures.extend(window_cdx.captures)
-            search_url = window_cdx.search_url
-            match_type = window_cdx.match_type
-        if failed_windows and not captures and len(failed_windows) == len(windows):
-            raise RuntimeError(
-                f"CDX query failed for all {len(windows)} windows"
-            ) from error
-    else:
-        year_metrics.cdx_duration_s += time.monotonic() - cdx_started
-        captures = list(year_cdx.captures)
-        search_url = year_cdx.search_url
-        match_type = year_cdx.match_type
+    acquisition = acquire_year_cdx(
+        layout=stage.canonical,
+        year=year,
+        url_pattern=settings.url_pattern,
+        date_start=date_start,
+        date_end=date_end,
+        cdx_window_days=settings.cdx_window_days,
+        cdx_page_limit=settings.cdx_page_limit,
+        reset=settings.reset_data,
+        sleep=sleep,
+    )
+    year_metrics.cdx_duration_s += time.monotonic() - cdx_started
+    captures = list(acquisition.captures)
+    failed_windows = [
+        {
+            "date_start": hole.date_start,
+            "date_end": hole.date_end,
+            "kind": hole.kind,
+            "message": hole.message,
+        }
+        for hole in acquisition.holes
+    ]
 
     selected = _dedupe_captures(captures)
     year_metrics.selected += len(selected)
 
     query: dict[str, object] = {
         "url_pattern": settings.url_pattern,
-        "search_url": search_url,
-        "match_type": match_type,
+        "search_url": acquisition.search_url,
+        "match_type": acquisition.match_type,
         "result_count": len(captures),
         "cdx_page_limit": settings.cdx_page_limit,
     }
-    if cdx_fallback is not None:
-        query["cdx_fallback"] = cdx_fallback
+    if acquisition.fallback is not None:
+        query["cdx_fallback"] = acquisition.fallback
         query["cdx_window_days"] = settings.cdx_window_days
-        query["window_count"] = len(windows)
+        query["window_count"] = acquisition.window_count
         query["failed_windows"] = failed_windows
     if failed_windows:
         emit(f"year {year}: incomplete CDX coverage; skipping playback and publication")

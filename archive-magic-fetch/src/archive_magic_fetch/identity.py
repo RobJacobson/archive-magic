@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from urllib.parse import unquote, urlsplit, urlunsplit
 
@@ -222,6 +223,18 @@ def identity_to_dict(identity: CaptureIdentity) -> dict[str, str]:
         "status_token": identity.status_token,
         "payload_digest": identity.payload_digest,
     }
+
+
+def identity_from_dict(data: Mapping[str, str]) -> CaptureIdentity:
+    """Restore a capture identity from ``identity_to_dict`` output."""
+
+    return CaptureIdentity(
+        urlkey=data["urlkey"],
+        original_url=data["original_url"],
+        timestamp=data["timestamp"],
+        status_token=data["status_token"],
+        payload_digest=data["payload_digest"],
+    )
 
 
 def current_utc_cdx_timestamp() -> str:

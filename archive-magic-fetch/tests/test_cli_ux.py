@@ -592,7 +592,7 @@ def test_cli_runtime_flags_override_defaults(tmp_path, monkeypatch):
     assert captured[0].playback_workers == 4
     assert captured[0].playback_starts_per_second == 16.0
     assert captured[0].retries == 4
-    assert captured[0].cdx_window_days == 10
+    assert captured[0].cdx_window_days == 28
     assert captured[0].cdx_page_limit == 5000
     captured.clear()
     assert (
@@ -612,7 +612,7 @@ def test_cli_runtime_flags_override_defaults(tmp_path, monkeypatch):
     assert captured[0].playback_workers == 2
     assert captured[0].playback_starts_per_second == 1.5
     assert captured[0].retries == 0
-    assert captured[0].cdx_window_days == 10
+    assert captured[0].cdx_window_days == 28
     assert captured[0].cdx_page_limit == 5000
 
 

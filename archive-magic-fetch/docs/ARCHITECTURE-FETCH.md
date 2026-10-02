@@ -35,15 +35,16 @@ start = "1995-01-01"
 # end omitted means now
 # warc_target_bytes = 250000000
 # cdx_page_limit = 5000
-# cdx_window_days = 10
+# cdx_window_days = 28
 ```
 
 Remote output now means **local-authoritative with a bucket mirror**. The
 `data_directory` contains every finalized WARC and CDXJ. Fetch never downloads
 these artifacts from the bucket and never evicts them. The bucket, prefix,
 endpoint, and region configure a temporary rclone S3 backend; rclone obtains
-credentials from the AWS environment or profile. Rclone must be installed on
-the Fetch host.
+credentials from the AWS environment or profile. Missing credentials fail
+immediately instead of probing EC2 instance metadata. Rclone must be installed
+on the Fetch host.
 
 Run records and the process lock live in `logs/` beside `data_directory`.
 The hidden `data/.staging/` directory holds one year's unfinished work and is
@@ -59,13 +60,20 @@ data/
 ## Annual acquisition
 
 Fetch visits years in order. It queries the whole-year CDX through the existing
-`wayback` client, falling back to configurable date windows after timeout/504
-exhaustion. A failed CDX window makes that year incomplete: Fetch skips its
-memento work and publication and proceeds to the next year. A complete CDX
-listing is deduplicated by capture identity. The existing URL-owned playback
-workers, chronological ordering within each URL, retry policy, and cross-year
-digest representatives remain in use. Individual unresolved mementos retain
-the existing skip-and-record policy.
+`wayback` client. Playback `--retries` does not apply to CDX. A fast HTTP 504,
+read timeout, or dropped connection retries the same window three times with
+15s then 30s pauses. Exhausting those attempts, or a 300-second wall-clock
+budget, splits only that window: first into `cdx_window_days` slices (default
+28), then into 7-day slices. A 7-day window that still fails is a hole. HTTP
+429 and TCP connection refused never split; they honor `Retry-After` when it
+exceeds the backoff, otherwise use exponential pauses from 60s capped at 10
+minutes, for 10 attempts. A hole is recorded in `logs/cdx/{year}.json` with
+every completed sibling window. The next run queries only the holes. Fetch
+skips memento work and publication until the year listing is complete, then
+deletes the checkpoint. A complete CDX listing is deduplicated by capture
+identity. The existing URL-owned playback workers, chronological ordering
+within each URL, retry policy, and cross-year digest representatives remain in
+use. Individual unresolved mementos retain the existing skip-and-record policy.
 
 For each year, Fetch creates a same-filesystem stage. Unchanged WARC shards
 are hard-linked into it; the final shard is copied only if new captures need to
@@ -131,5 +139,5 @@ Fetch does not migrate or delete old root objects automatically.
 - `staging.py`: annual copy-on-write staging and interrupted-commit recovery.
 - `storage.py`: archive lock, local preflight, and ordered rclone commands.
 - `warc.py` and `index.py`: portable WARC and CDXJ construction.
-- `cdx.py`, `resolution.py`, `workers.py`, and `playback.py`: unchanged
-  Wayback acquisition behavior.
+- `cdx.py`: CDX search, failure classification, window splits, and hole checkpoints.
+- `resolution.py`, `workers.py`, and `playback.py`: Wayback playback acquisition.

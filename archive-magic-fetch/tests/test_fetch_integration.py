@@ -1202,7 +1202,6 @@ def test_multi_year_empty_run_shares_id_without_playback_collections(
     tmp_path, monkeypatch
 ):
     from archive_magic_fetch.cdx import CdxResult
-    import archive_magic_fetch.fetch as fetch_mod
 
     def empty_year(*, date_start, date_end, **_kwargs):
         return CdxResult(
@@ -1211,7 +1210,7 @@ def test_multi_year_empty_run_shares_id_without_playback_collections(
             match_type=None,
         )
 
-    monkeypatch.setattr(fetch_mod, "fetch_cdx", empty_year)
+    monkeypatch.setattr("archive_magic_fetch.cdx.fetch_cdx", empty_year)
     result = run_fetch(
         FetchSettings(
             url_pattern="http://example.org/",
@@ -1234,7 +1233,6 @@ def test_multi_year_empty_run_shares_id_without_playback_collections(
 def test_cdx_year_failure_continues_with_later_years(tmp_path, monkeypatch, capsys):
     from archive_magic_fetch.cdx import CdxResult
     from archive_magic_fetch.models import ParsedCapture
-    import archive_magic_fetch.fetch as fetch_mod
 
     first = make_capt(ts="20040601000000")
     later = make_capt(
@@ -1250,8 +1248,7 @@ def test_cdx_year_failure_continues_with_later_years(tmp_path, monkeypatch, caps
         queried.append((str(date_start), str(date_end)))
         year = int(str(date_start)[:4])
         if year == 2005:
-            # Connection refused is not a timeout/504, so no date-window fallback.
-            raise RuntimeError("CDX query failed after 5 attempts: Connection refused")
+            raise RuntimeError("CDX query failed after 10 attempts: Connection refused")
         capture = first if year == 2004 else later
         if not (str(date_start) <= capture.timestamp <= str(date_end)):
             return CdxResult(captures=(), search_url="http://example.org/", match_type=None)
@@ -1265,7 +1262,7 @@ def test_cdx_year_failure_continues_with_later_years(tmp_path, monkeypatch, caps
         downloads.append(identity.timestamp)
         return playback(identity)
 
-    monkeypatch.setattr(fetch_mod, "fetch_cdx", fake_fetch_cdx)
+    monkeypatch.setattr("archive_magic_fetch.cdx.fetch_cdx", fake_fetch_cdx)
     result = run_fetch(
         FetchSettings(
             url_pattern="http://example.org/",
@@ -1291,18 +1288,17 @@ def test_cdx_year_failure_continues_with_later_years(tmp_path, monkeypatch, caps
     assert inventory_collection(layout, "2004").contains(first)
     assert inventory_collection(layout, "2006").contains(later)
     assert not list_collection_warcs(layout, "2005")
+    assert layout.cdx_checkpoint(2005).is_file()
     output = capsys.readouterr().out
-    assert "year 2005: failed (" in output
+    assert "year 2005: incomplete CDX coverage" in output
     assert "Connection refused" in output
-    assert "falling back" not in output
-    assert "continuing with remaining years" in output
+    assert "splitting into" not in output
     assert "failed years: 2005" in output
 
 
-def test_cdx_year_timeout_falls_back_to_date_windows(tmp_path, monkeypatch, capsys):
-    from archive_magic_fetch.cdx import CdxResult
+def test_cdx_wall_clock_splits_28_then_7_then_hole(tmp_path, monkeypatch, capsys):
+    from archive_magic_fetch.cdx import CdxResult, date_windows
     from archive_magic_fetch.models import ParsedCapture
-    import archive_magic_fetch.fetch as fetch_mod
 
     january = make_capt(ts="20040105000000")
     march = make_capt(
@@ -1313,28 +1309,30 @@ def test_cdx_year_timeout_falls_back_to_date_windows(tmp_path, monkeypatch, caps
     )
     calls: list[tuple[str, str]] = []
     downloads: list[str] = []
+    year_bounds = ("20040101000000", "20040331235959")
+    windows_28 = list(date_windows(*year_bounds, 28))
+    heavy_28 = next(
+        window for window in windows_28
+        if window[0] <= "20040315000000" <= window[1]
+    )
+    windows_7 = list(date_windows(*heavy_28, 7))
+    hole_7 = next(
+        window for window in windows_7
+        if window[0] <= "20040315000000" <= window[1]
+    )
+    wall_clock = RuntimeError(
+        "CDX query failed after 1 attempts: CDX query exceeded 300s wall-clock budget"
+    )
 
     def fake_fetch_cdx(*, date_start, date_end, **_kwargs):
         start = str(date_start)
         end = str(date_end)
         calls.append((start, end))
-        if start == "20040101000000" and end == "20040331235959":
-            raise RuntimeError(
-                "CDX query failed after 5 attempts: "
-                "HTTPSConnectionPool(host='web.archive.org', port=443): "
-                "Read timed out. (read timeout=300)"
-            )
-        if start.startswith("200402"):
-            raise RuntimeError("CDX query failed after 5 attempts: read timed out")
+        if (start, end) in {year_bounds, heavy_28, hole_7}:
+            raise wall_clock
         if start <= "20040105000000" <= end:
             return CdxResult(
                 captures=(ParsedCapture(identity=january, mime="text/html"),),
-                search_url="http://example.org/",
-                match_type=None,
-            )
-        if start <= "20040315000000" <= end:
-            return CdxResult(
-                captures=(ParsedCapture(identity=march, mime="text/html"),),
                 search_url="http://example.org/",
                 match_type=None,
             )
@@ -1348,7 +1346,7 @@ def test_cdx_year_timeout_falls_back_to_date_windows(tmp_path, monkeypatch, caps
         downloads.append(identity.timestamp)
         return playback(identity)
 
-    monkeypatch.setattr(fetch_mod, "fetch_cdx", fake_fetch_cdx)
+    monkeypatch.setattr("archive_magic_fetch.cdx.fetch_cdx", fake_fetch_cdx)
     result = run_fetch(
         FetchSettings(
             url_pattern="http://example.org/",
@@ -1356,38 +1354,49 @@ def test_cdx_year_timeout_falls_back_to_date_windows(tmp_path, monkeypatch, caps
             date_end="20040331235959",
             archive_id="example.org",
             output=FetchOutput("local", tmp_path / "data"),
-            cdx_window_days=10,
         ),
         client_factory=lambda: MagicMock(),
         download_fn=download_fn,
         sleep=lambda _seconds: None,
     )
 
-    assert calls[0] == ("20040101000000", "20040331235959")
-    assert len(calls) > 1
+    assert calls[0] == year_bounds
+    assert heavy_28 in calls
+    assert hole_7 in calls
+    assert calls.count(year_bounds) == 1
+    assert calls.count(heavy_28) == 1
     assert result.exit_code == 1
     assert result.failed_years == (2004,)
     assert downloads == []
     layout = result.layout
     assert not list_collection_warcs(layout, "2004")
     assert not layout.collection_index("2004").exists()
-    year_record = json.loads(layout.logs_root.glob("*.json").__iter__().__next__().read_text())[
+    checkpoint = json.loads(layout.cdx_checkpoint(2004).read_text())
+    assert checkpoint["holes"][0]["date_start"] == hole_7[0]
+    assert checkpoint["holes"][0]["kind"] == "wall_clock"
+    year_record = json.loads(next(layout.logs_root.glob("*.json")).read_text())[
         "years"
     ]["2004"]
     assert year_record["query"]["cdx_page_limit"] == 5000
     assert year_record["query"]["cdx_fallback"] == "date_windows"
-    assert year_record["query"]["cdx_window_days"] == 10
-    assert year_record["query"]["window_count"] == 10
-    assert len(year_record["query"]["failed_windows"]) == 2
+    assert year_record["query"]["cdx_window_days"] == 28
+    assert year_record["query"]["failed_windows"] == [
+        {
+            "date_start": hole_7[0],
+            "date_end": hole_7[1],
+            "kind": "wall_clock",
+            "message": str(wall_clock),
+        }
+    ]
     output = capsys.readouterr().out
-    assert "falling back to 10d windows" in output
+    assert "splitting into 28d windows" in output
+    assert "splitting into 7d windows" in output
     assert "failed years: 2004" in output
 
 
 def test_cdx_year_success_uses_single_query(tmp_path, monkeypatch):
     from archive_magic_fetch.cdx import CdxResult
     from archive_magic_fetch.models import ParsedCapture
-    import archive_magic_fetch.fetch as fetch_mod
 
     capture = make_capt(ts="20040601000000")
     calls: list[tuple[str, str]] = []
@@ -1401,7 +1410,7 @@ def test_cdx_year_success_uses_single_query(tmp_path, monkeypatch):
             match_type=None,
         )
 
-    monkeypatch.setattr(fetch_mod, "fetch_cdx", fake_fetch_cdx)
+    monkeypatch.setattr("archive_magic_fetch.cdx.fetch_cdx", fake_fetch_cdx)
     result = run_fetch(
         FetchSettings(
             url_pattern="http://example.org/",
@@ -1423,6 +1432,150 @@ def test_cdx_year_success_uses_single_query(tmp_path, monkeypatch):
     assert year_record["query"]["cdx_page_limit"] == 5000
     assert "cdx_fallback" not in year_record["query"]
     assert "failed_windows" not in year_record["query"]
+
+
+def test_cdx_second_run_queries_only_the_hole(tmp_path, monkeypatch):
+    from archive_magic_fetch.cdx import CdxResult, date_windows
+    from archive_magic_fetch.models import ParsedCapture
+
+    january = make_capt(ts="20040105000000")
+    march = make_capt(
+        ts="20040315000000",
+        digest="sha1:" + "B" * 32,
+        urlkey="org,example)/b",
+        url="http://example.org/b",
+    )
+    year_bounds = ("20040101000000", "20040331235959")
+    heavy_28 = next(
+        window
+        for window in date_windows(*year_bounds, 28)
+        if window[0] <= "20040315000000" <= window[1]
+    )
+    hole_7 = next(
+        window
+        for window in date_windows(*heavy_28, 7)
+        if window[0] <= "20040315000000" <= window[1]
+    )
+    wall_clock = RuntimeError(
+        "CDX query failed after 1 attempts: CDX query exceeded 300s wall-clock budget"
+    )
+    fail_hole = True
+    calls: list[tuple[str, str]] = []
+
+    def fake_fetch_cdx(*, date_start, date_end, **_kwargs):
+        start = str(date_start)
+        end = str(date_end)
+        calls.append((start, end))
+        if (start, end) in {year_bounds, heavy_28} or (
+            fail_hole and (start, end) == hole_7
+        ):
+            raise wall_clock
+        if start <= "20040105000000" <= end:
+            capture = january
+        elif start <= "20040315000000" <= end:
+            capture = march
+        else:
+            return CdxResult(
+                captures=(),
+                search_url="http://example.org/",
+                match_type=None,
+            )
+        return CdxResult(
+            captures=(ParsedCapture(identity=capture, mime="text/html"),),
+            search_url="http://example.org/",
+            match_type=None,
+        )
+
+    monkeypatch.setattr("archive_magic_fetch.cdx.fetch_cdx", fake_fetch_cdx)
+    settings = FetchSettings(
+        url_pattern="http://example.org/",
+        date_start="20040101000000",
+        date_end="20040331235959",
+        archive_id="example.org",
+        output=FetchOutput("local", tmp_path / "data"),
+    )
+    first = run_fetch(
+        settings,
+        client_factory=lambda: MagicMock(),
+        download_fn=lambda _client, identity: playback(identity),
+        sleep=lambda _seconds: None,
+    )
+    assert first.exit_code == 1
+    assert first.layout.cdx_checkpoint(2004).is_file()
+    calls.clear()
+    fail_hole = False
+    second = run_fetch(
+        settings,
+        client_factory=lambda: MagicMock(),
+        download_fn=lambda _client, identity: playback(identity),
+        sleep=lambda _seconds: None,
+    )
+    assert calls == [hole_7]
+    assert second.exit_code == 0
+    assert not second.layout.cdx_checkpoint(2004).exists()
+    assert inventory_collection(second.layout, "2004").contains(january)
+    assert inventory_collection(second.layout, "2004").contains(march)
+
+
+def test_cdx_checkpoint_with_different_url_pattern_is_ignored(
+    tmp_path, monkeypatch, capsys
+):
+    from archive_magic_fetch.cdx import CdxResult
+    from archive_magic_fetch.models import ParsedCapture
+
+    capture = make_capt(ts="20040601000000")
+    layout = ArchiveLayout(tmp_path / "data", "example.org")
+    ensure_collection_dirs(layout)
+    checkpoint = layout.cdx_checkpoint(2004)
+    checkpoint.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint.write_text(
+        json.dumps(
+            {
+                "url_pattern": "*.other.org",
+                "cdx_page_limit": 5000,
+                "date_start": "20040101000000",
+                "date_end": "20041231235959",
+                "completed": [],
+                "holes": [
+                    {
+                        "date_start": "20040101000000",
+                        "date_end": "20041231235959",
+                        "kind": "transient",
+                        "message": "old hole",
+                    }
+                ],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    calls: list[tuple[str, str]] = []
+
+    def fake_fetch_cdx(*, date_start, date_end, **_kwargs):
+        calls.append((str(date_start), str(date_end)))
+        return CdxResult(
+            captures=(ParsedCapture(identity=capture, mime="text/html"),),
+            search_url="http://example.org/",
+            match_type=None,
+        )
+
+    monkeypatch.setattr("archive_magic_fetch.cdx.fetch_cdx", fake_fetch_cdx)
+    result = run_fetch(
+        FetchSettings(
+            url_pattern="http://example.org/",
+            date_start="20040101000000",
+            date_end="20041231235959",
+            archive_id="example.org",
+            output=FetchOutput("local", tmp_path / "data"),
+        ),
+        client_factory=lambda: MagicMock(),
+        download_fn=lambda _client, identity: playback(identity),
+        sleep=lambda _seconds: None,
+    )
+    assert calls == [("20040101000000", "20041231235959")]
+    assert result.exit_code == 0
+    assert not layout.cdx_checkpoint(2004).exists()
+    assert "discarding CDX checkpoint" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize(
