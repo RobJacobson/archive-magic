@@ -89,13 +89,16 @@ CDXJ offsets remain valid. Older yearly shards are not rewritten.
 Fetch waits for the completed year's rclone reconciliation before starting the
 next year. Automatic reconciliation is limited to that year's managed filenames;
 `--sync-only` reconciles every annual WARC/CDXJ in the local archive. Both use
-the same three ordered passes:
+a preflight listing of the archive root to reject legacy flat WARC/CDXJ objects,
+then the same three ordered passes targeting `<bucket>/<prefix>/data/`:
 
 1. Copy WARCs to the bucket without deleting remote files.
 2. Sync CDXJ files, which makes the newly uploaded records visible.
 3. Sync WARCs, deleting obsolete remote WARC files only after index publication.
 
-Only root-level files for the configured archive are eligible. Logs, staging,
+Only files at the root of `data/` for the configured archive are eligible.
+The configured prefix identifies the archive root; `data/` is appended automatically.
+Metadata and images are manually published siblings and are never managed by sync. Logs, staging,
 and unrelated bucket keys are excluded. A missing or empty local archive
 causes sync to fail rather than delete the bucket. Sync validates local CDXJ
 ranges against local WARC sizes before publication. A fetch and a manual sync
@@ -110,13 +113,17 @@ without contacting Wayback.
 
 Local `--reset-data` rebuilds selected years through staging. Remote
 `--reset-data` remains a destructive full-range operation: it rejects date
-overrides, warns of playback downtime, purges the configured bucket prefix,
+overrides, warns of playback downtime, deletes only managed files for this archive
+under remote `data/`, preserving metadata, assets and unrelated objects,
 clears the local data directory, and rebuilds and publishes years in order.
 
 Before switching an existing bucket-authoritative archive, finish pending
 publication with the old Fetch version. Restore its WARC/CDXJ objects into a
 fresh local `data_directory` once using rclone, and compare the local and
 remote file sets. Fetch performs no bucket download during normal operation.
+
+For existing flat bucket layouts, follow the [migration guide](../../docs/BUCKET-CATALOG-MIGRATION.md).
+Fetch does not migrate or delete old root objects automatically.
 
 ## Modules
 

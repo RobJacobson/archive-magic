@@ -1,18 +1,15 @@
-"""Load one Navigator configuration file and discover catalogs."""
-
+"""Strict, unversioned JSON catalog and bucket manifest contracts."""
 from __future__ import annotations
 
+import hashlib
+import json
 import re
-import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
+from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlsplit
 
-CONFIG_NAME = "navigator.toml"
-
-
-@dataclass(frozen=True)
-class LocalSource:
-    directory: Path
+from .collections import validate_archive_id
 
 
 @dataclass(frozen=True)
@@ -22,124 +19,99 @@ class RemoteSource:
     endpoint_url: str | None = None
     region: str = "auto"
 
+    def key(self, relative: str) -> str:
+        return "/".join(p for p in (self.prefix, relative) if p)
+
+    @property
+    def cache_key(self) -> str:
+        return hashlib.sha256(json.dumps(asdict(self), sort_keys=True).encode()).hexdigest()
+
 
 @dataclass(frozen=True)
-class NavigatorConfig:
-    archive_id: str
-    source: LocalSource | RemoteSource
-    config_path: Path
+class CatalogConfig:
+    title: str
+    archives: tuple[RemoteSource, ...]
+    path: Path
 
 
-@dataclass(frozen=True)
-class _Archive:
-    id: str
-
-
-def config_path(value: Path | str) -> Path:
-    """Resolve a Navigator configuration path or its containing directory."""
-
-    candidate = Path(value).expanduser()
-    if candidate.is_dir():
-        candidate = candidate / CONFIG_NAME
-    if not candidate.is_file():
-        raise ValueError(f"navigator configuration does not exist: {candidate}")
-    return candidate.resolve()
-
-
-def load_config(value: Path | str) -> NavigatorConfig:
-    """Load one explicit Navigator configuration."""
-
-    path = config_path(value)
-    try:
-        with path.open("rb") as stream:
-            document = tomllib.load(stream)
-        archive = _Archive(**_section(document, "archive"))
-        source_data = dict(_section(document, "source"))
-        source_type = source_data.pop("type")
-        if source_type == "local":
-            source_data["directory"] = _path(
-                path.parent, source_data.get("directory", "data")
-            )
-            source = LocalSource(**source_data)
-        elif source_type == "remote":
-            source_data["prefix"] = _prefix(source_data.get("prefix", ""))
-            source = RemoteSource(**source_data)
-        else:
-            raise ValueError("source.type must be 'local' or 'remote'")
-        if document:
-            raise TypeError(f"unexpected table(s): {', '.join(sorted(document))}")
-        archive_id = _safe_id(archive.id)
-    except (
-        OSError,
-        tomllib.TOMLDecodeError,
-        KeyError,
-        TypeError,
-        AttributeError,
-        ValueError,
-    ) as error:
-        if isinstance(error, ValueError) and str(error).startswith(
-            "navigator configuration does not exist:"
-        ):
-            raise
-        raise ValueError(f"invalid navigator configuration {path}: {error}") from error
-
-    return NavigatorConfig(
-        archive_id=archive_id,
-        source=source,
-        config_path=path,
-    )
-
-
-def discover_configs(value: Path | str) -> tuple[Path, ...]:
-    """Discover immediate non-hidden */navigator.toml catalog entries."""
-
-    catalog = Path(value).expanduser()
-    try:
-        catalog = catalog.resolve(strict=True)
-    except (OSError, RuntimeError) as error:
-        raise ValueError(
-            f"catalog does not exist or cannot be resolved: {catalog}"
-        ) from error
-    if not catalog.is_dir():
-        raise ValueError(f"catalog is not a directory: {catalog}")
-    paths = tuple(
-        child / CONFIG_NAME
-        for child in sorted(catalog.iterdir(), key=lambda item: item.name)
-        if child.is_dir()
-        and not child.name.startswith(".")
-        and (child / CONFIG_NAME).is_file()
-    )
-    if not paths:
-        raise ValueError(f"catalog contains no */{CONFIG_NAME} configurations: {catalog}")
-    return paths
-
-
-def _section(
-    document: dict[str, object], name: str, *, required: bool = True
-) -> dict[str, object]:
-    value = document.pop(name) if required else document.pop(name, {})
+def fields(value, allowed: set[str], label: str) -> dict:
     if not isinstance(value, dict):
-        raise TypeError(f"{name} must be a TOML table")
+        raise ValueError(f"{label} must be an object")
+    extra = value.keys() - allowed
+    if extra:
+        raise ValueError(f"{label}: unknown fields: {', '.join(sorted(extra))}")
     return value
 
 
-def _safe_id(value: str) -> str:
-    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", value) or value in {
-        ".",
-        "..",
-        "static",
-    }:
-        raise ValueError(f"invalid archive ID: {value!r}")
+def text(value, label: str, *, empty: bool = False) -> str:
+    if not isinstance(value, str) or (not empty and not value.strip()) or any(ord(c) < 32 for c in value):
+        raise ValueError(f"{label} must be {'a' if empty else 'a nonempty'} text string")
     return value
 
 
-def _path(base: Path, value: str) -> Path:
-    path = Path(value).expanduser()
-    return (path if path.is_absolute() else base / path).resolve()
+def object_key(value, label: str, *, empty: bool = False) -> str:
+    value = text(value, label, empty=empty)
+    if (value and any(p in {'', '.', '..'} for p in value.split('/'))) or any(c in value for c in '\\:%?#'):
+        raise ValueError(f"{label} must be a contained bucket-relative object key")
+    return value
 
 
-def _prefix(value: str) -> str:
-    parts = [part for part in value.strip("/").split("/") if part]
-    if any(part in {".", ".."} for part in parts):
-        raise ValueError("source.prefix must not contain '.' or '..'")
-    return "/".join(parts)
+def web_url(value, label: str) -> str:
+    value = text(value, label)
+    parsed = urlsplit(value)
+    if parsed.scheme not in {'http', 'https'} or not parsed.hostname or parsed.username or parsed.password:
+        raise ValueError(f"{label} must be an HTTP(S) URL without credentials")
+    return value
+
+
+def parse_manifest(value) -> dict:
+    value = fields(value, {'id', 'name', 'description', 'homepage', 'logo', 'preview', 'featured_capture'}, 'archive.json')
+    result = {
+        'id': validate_archive_id(text(value.get('id'), 'id')),
+        'name': text(value.get('name'), 'name'),
+        'homepage': web_url(value.get('homepage'), 'homepage'),
+    }
+    if 'description' in value:
+        result['description'] = text(value['description'], 'description', empty=True)
+    for role in ('logo', 'preview'):
+        if role in value:
+            entry = fields(value[role], {'src', 'alt'}, role)
+            result[role] = {'src': object_key(entry.get('src'), f'{role}.src'),
+                            'alt': text(entry.get('alt'), f'{role}.alt', empty=True)}
+    if 'featured_capture' in value:
+        entry = fields(value['featured_capture'], {'url', 'timestamp'}, 'featured_capture')
+        timestamp = text(entry.get('timestamp'), 'featured_capture.timestamp')
+        if not re.fullmatch(r'\d{14}', timestamp):
+            raise ValueError('featured_capture.timestamp must contain 14 digits')
+        datetime.strptime(timestamp, '%Y%m%d%H%M%S')
+        result['featured_capture'] = {'url': web_url(entry.get('url'), 'featured_capture.url'), 'timestamp': timestamp}
+    return result
+
+
+def load_catalog(value: Path | str) -> CatalogConfig:
+    path = Path(value).expanduser().resolve()
+    if path.is_dir() or path.suffix.lower() == '.toml':
+        raise ValueError('Navigator now requires --catalog catalog.json; migrate navigator.toml and directory catalogs')
+    try:
+        document = fields(json.loads(path.read_text()), {'title', 'storage', 'archives'}, 'catalog')
+        storage = fields(document.get('storage', {}), {'endpoint_url', 'region'}, 'storage')
+        endpoint = storage.get('endpoint_url')
+        if endpoint is not None:
+            endpoint = web_url(endpoint, 'storage.endpoint_url')
+        region = text(storage.get('region', 'auto' if endpoint else 'us-east-1'), 'storage.region')
+        entries = document.get('archives')
+        if not isinstance(entries, list):
+            raise ValueError('archives must be an array')
+        sources = []
+        for entry in entries:
+            entry = fields(entry, {'bucket', 'prefix'}, 'archives entry')
+            bucket = text(entry.get('bucket'), 'bucket')
+            if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]*', bucket):
+                raise ValueError('invalid bucket name')
+            source = RemoteSource(bucket, object_key(entry.get('prefix', ''), 'prefix', empty=True), endpoint, region)
+            if source in sources:
+                raise ValueError(f'duplicate archive location: {bucket}/{source.prefix}')
+            sources.append(source)
+        return CatalogConfig(text(document.get('title', 'Website Archive'), 'title'), tuple(sources), path)
+    except (OSError, ValueError) as error:
+        raise ValueError(f'invalid catalog {path}: {error}') from error

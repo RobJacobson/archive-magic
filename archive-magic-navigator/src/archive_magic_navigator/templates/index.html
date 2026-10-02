@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% block title %}Archive Magic Navigator{% endblock %}
+{% block title %}{{ catalog.title if catalog is defined else 'Archive Magic Navigator' }}{% endblock %}
 {% block head %}
 {{ super() }}
 <link rel="stylesheet" href="{{ static_prefix }}/archive-magic.css">
@@ -7,17 +7,45 @@
 {% block body %}
 <main class="am-shell">
   <p class="am-kicker">Archive Magic</p>
-  <h1>Browse archived websites</h1>
-  <p class="am-intro">Choose a collection to explore its snapshots and history.</p>
+  <h1>{{ catalog.title if catalog is defined else 'Browse archived websites' }}</h1>
+  <p class="am-intro">Explore preserved websites and the stories they hold.</p>
+  {% set app = env.get('pywb.app_prefix', '') %}
   <ul class="am-collections">
-    {% for route in routes | sort %}
-    <li>
-      <a href="{{ env['pywb.app_prefix'] + ('/' + env.pywb_lang if env.pywb_lang else '') + '/' + route + '/' }}">
-        <strong>{{ all_metadata[route].title if all_metadata and all_metadata[route] and all_metadata[route].title else route }}</strong>
-        <span>Open collection</span>
-      </a>
+  {% if catalog is defined %}
+    {% for archive in catalog.archives %}
+    <li class="am-card">
+      {% if archive.preview %}
+      <img class="am-preview" src="{{ app }}/{{ archive.preview.src }}" alt="{{ archive.preview.alt }}" loading="lazy">
+      {% else %}
+      <div class="am-preview am-placeholder" aria-hidden="true">A window into the past</div>
+      {% endif %}
+      <div class="am-card-body">
+        <div class="am-identity">
+          {% if archive.logo %}
+          <img class="am-logo" src="{{ app }}/{{ archive.logo.src }}" alt="{{ archive.logo.alt }}" loading="lazy">
+          {% else %}<span class="am-logo am-placeholder" aria-hidden="true">{{ archive.name[0] }}</span>{% endif %}
+          <div><h2>{{ archive.name }}</h2>{% if archive.domain %}<p class="am-domain">{{ archive.domain }}</p>{% endif %}</div>
+        </div>
+        {% if archive.description %}<p class="am-description">{{ archive.description }}</p>{% endif %}
+        {% if archive.status == 'unavailable' %}
+        <p class="am-status" role="status">Temporarily unavailable</p>
+        {% else %}
+        <p class="am-dates">Captures from {{ archive.first_capture }} to {{ archive.last_capture }}</p>
+        {% if archive.status == 'stale' %}<p class="am-status">Using cached information; refresh pending.</p>{% endif %}
+        {% if archive.search_fallback %}<p class="am-status">No capture of the entry page. Browse the available captures.</p>{% endif %}
+        <div class="am-actions">
+          <a class="am-primary" href="{{ app }}/{{ archive.replay }}">{{ 'Explore archive' if archive.search_fallback else 'Visit archived website' }}<span aria-hidden="true"> ↗</span></a>
+          <a href="{{ app }}/{{ archive.search }}">Browse captures</a>
+        </div>
+        {% endif %}
+      </div>
     </li>
+    {% else %}<li class="am-empty">No archived websites have been added yet.</li>{% endfor %}
+  {% else %}
+    {% for route in routes | sort %}
+    <li class="am-card"><div class="am-card-body"><a href="{{ app }}/{{ route }}/">{{ route }}</a></div></li>
     {% endfor %}
+  {% endif %}
   </ul>
 </main>
 {% endblock %}

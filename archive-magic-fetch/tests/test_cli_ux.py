@@ -574,7 +574,7 @@ def test_remote_reset_rejects_dates_and_warns_before_full_rebuild(
     )
     assert cli.main([str(config), "--reset-data"]) == 0
     warning = capsys.readouterr().err
-    assert "delete and rebuild the entire remote archive prefix" in warning
+    assert "delete and rebuild managed remote archive data" in warning
     assert "playback will be unavailable" in warning
 
 

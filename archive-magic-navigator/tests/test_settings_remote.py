@@ -1,168 +1,19 @@
 from __future__ import annotations
-
 import hashlib
 import io
-
 import pytest
 from archive_magic_navigator.errors import ValidationError
 from archive_magic_navigator.remote import RemoteArchiveStore
-from archive_magic_navigator.settings import (
-    CONFIG_NAME,
-    LocalSource,
-    RemoteSource,
-    discover_configs,
-    load_config,
-)
+from archive_magic_navigator.settings import RemoteSource
 from botocore.exceptions import ClientError
-
-
-def write_navigator_toml(directory, body, name=CONFIG_NAME):
-    directory.mkdir(parents=True, exist_ok=True)
-    path = directory / name
-    path.write_text(body, encoding="utf-8")
-    return path
-
-
-def test_directory_shorthand_and_relative_paths(tmp_path):
-    path = write_navigator_toml(
-        tmp_path,
-        """
-[archive]
-id = "example.org"
-[source]
-type = "local"
-directory = "data"
-""",
-    )
-    settings = load_config(tmp_path)
-    assert settings.config_path == path.resolve()
-    assert settings.archive_id == "example.org"
-    assert settings.source == LocalSource((tmp_path / "data").resolve())
-
-
-def test_explicit_arbitrary_filename(tmp_path):
-    path = write_navigator_toml(
-        tmp_path,
-        """
-[archive]
-id = "example.org"
-[source]
-type = "local"
-""",
-        name="other.toml",
-    )
-    settings = load_config(path)
-    assert settings.config_path == path.resolve()
-    assert settings.source == LocalSource((tmp_path / "data").resolve())
-
-
-def test_missing_canonical_file(tmp_path):
-    with pytest.raises(ValueError, match="navigator configuration does not exist"):
-        load_config(tmp_path)
-
-
-def test_local_source_defaults_directory(tmp_path):
-    write_navigator_toml(
-        tmp_path,
-        """
-[archive]
-id = "example.org"
-[source]
-type = "local"
-""",
-    )
-    settings = load_config(tmp_path)
-    assert settings.source.directory == (tmp_path / "data").resolve()
-
-
-def test_remote_source_parses_prefix_and_flattened_fields(tmp_path, monkeypatch):
-    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "process-key")
-    (tmp_path / ".env").write_text("AWS_ACCESS_KEY_ID=file-key\n")
-    path = write_navigator_toml(
-        tmp_path,
-        """
-[archive]
-id = "example.org"
-[source]
-type = "remote"
-bucket = "bucket"
-prefix = "/archives/example.org/"
-endpoint_url = "https://endpoint"
-region = "auto"
-""",
-    )
-    settings = load_config(path)
-    assert settings.source == RemoteSource(
-        "bucket",
-        "archives/example.org",
-        "https://endpoint",
-        "auto",
-    )
-    assert __import__("os").environ["AWS_ACCESS_KEY_ID"] == "process-key"
-
-
-@pytest.mark.parametrize(
-    "body, message",
-    [
-        (
-            "[archive]\nid='bad/id'\n[source]\ntype='local'\n",
-            "invalid archive ID",
-        ),
-        (
-            "[archive]\nid='x'\nurl_pattern='x'\n[source]\ntype='local'\n",
-            "unexpected keyword",
-        ),
-        (
-            "[archive]\nid='x'\n[source]\ntype='remote'\n",
-            "bucket",
-        ),
-        (
-            "[archive]\nid='x'\n[source]\ntype='remote'\nbucket='x'\nprefix='../bad'\n",
-            "must not contain",
-        ),
-        (
-            "[archive]\nid='x'\n[source]\ntype='local'\n[playback]\nwayback_fallback=true\n",
-            "unexpected table",
-        ),
-    ],
-)
-def test_configuration_validation(tmp_path, body, message):
-    write_navigator_toml(tmp_path, body)
-    with pytest.raises(ValueError, match=message):
-        load_config(tmp_path)
-
-
-def test_catalog_discovers_navigator_toml_only(tmp_path):
-    write_navigator_toml(
-        tmp_path / "b",
-        "[archive]\nid='b.example'\n[source]\ntype='local'\n",
-    )
-    write_navigator_toml(
-        tmp_path / "a",
-        "[archive]\nid='a.example'\n[source]\ntype='local'\n",
-    )
-    (tmp_path / ".hidden").mkdir()
-    (tmp_path / ".hidden" / CONFIG_NAME).write_text(
-        "[archive]\nid='hidden'\n[source]\ntype='local'\n",
-        encoding="utf-8",
-    )
-    (tmp_path / "ignored.toml").write_text("id='root'\n", encoding="utf-8")
-    (tmp_path / "c").mkdir()
-    (tmp_path / "c" / "fetch.toml").write_text(
-        "[archive]\nid='old'\n",
-        encoding="utf-8",
-    )
-    paths = discover_configs(tmp_path)
-    assert [path.parent.name for path in paths] == ["a", "b"]
-
 
 def remote_config(prefix="example.org"):
     return RemoteSource("bucket", prefix, "https://endpoint", "auto")
 
 
 def seed_remote(fake: FakeRemoteS3, *, index_bytes: bytes, warc_size=1000):
-    index_key = "example.org/example.org-2004-index.cdxj"
-    warc_key = "example.org/example.org-2004-001.warc.gz"
+    index_key = "example.org/data/example.org-2004-index.cdxj"
+    warc_key = "example.org/data/example.org-2004-001.warc.gz"
     fake.seed(index_key, index_bytes, etag='"i"')
     fake.seed(warc_key, b"x" * warc_size, etag='"w"')
 
@@ -227,7 +78,7 @@ def test_remote_store_caches_index_and_builds_s3_archive_path(tmp_path, monkeypa
 
     collection = archive.collections[0]
     assert collection.replay_index.read_bytes() == index
-    assert collection.archive_path == "s3://bucket/example.org/"
+    assert collection.archive_path == "s3://bucket/example.org/data/"
     environment = store.child_environment()
     assert environment["AWS_ENDPOINT_URL_S3"] == "https://endpoint"
     assert environment["AWS_DEFAULT_REGION"] == "auto"
@@ -264,7 +115,7 @@ def test_poll_atomically_replaces_a_valid_changed_index(tmp_path, monkeypatch):
     cache = archive.collections[0].replay_index
     new_index = old_index.replace(b'"offset":"10"', b'"offset":"30"')
     fake.seed(
-        "example.org/example.org-2004-index.cdxj",
+        "example.org/data/example.org-2004-index.cdxj",
         new_index,
         etag='"i2"',
     )
@@ -296,7 +147,7 @@ def test_metadata_mismatch_during_poll_retains_previous_cache(tmp_path, monkeypa
     cache = archive.collections[0].replay_index
     expected = old_index.replace(b'"offset":"10"', b'"offset":"30"')
     fake.seed(
-        "example.org/example.org-2004-index.cdxj",
+        "example.org/data/example.org-2004-index.cdxj",
         b"corrupt",
         etag='"i2"',
         metadata={"sha256": hashlib.sha256(expected).hexdigest()},
@@ -352,7 +203,7 @@ def test_offline_restart_keeps_last_published_snapshot_after_failed_refresh(
     monkeypatch.setattr("archive_magic_navigator.remote.boto3.client", lambda *a, **k: fake)
     store = RemoteArchiveStore(remote_config(), tmp_path, 300)
     archive = store.load_archive("example.org")
-    fake.seed("example.org/example.org-2004-index.cdxj", updated)
+    fake.seed("example.org/data/example.org-2004-index.cdxj", updated)
 
     real_replace = os.replace
 
@@ -395,9 +246,9 @@ def test_remote_batch_failure_preserves_playback_and_retries(tmp_path, monkeypat
     state = store._states["example.org"].copy()
     updated = old.replace(b'"offset":"10"', b'"offset":"30"')
     added = old.replace(b"2004", b"2005")
-    fake.seed("example.org/example.org-2004-index.cdxj", updated)
-    fake.seed("example.org/example.org-2005-index.cdxj", added)
-    fake.seed("example.org/example.org-2005-001.warc.gz", b"x" * 1000)
+    fake.seed("example.org/data/example.org-2004-index.cdxj", updated)
+    fake.seed("example.org/data/example.org-2005-index.cdxj", added)
+    fake.seed("example.org/data/example.org-2005-001.warc.gz", b"x" * 1000)
 
     with monkeypatch.context() as patch:
         if failure == "listing":
@@ -412,7 +263,7 @@ def test_remote_batch_failure_preserves_playback_and_retries(tmp_path, monkeypat
 
             patch.setattr(fake, "get_object", fail_second)
         elif failure == "validation":
-            fake.seed("example.org/example.org-2005-index.cdxj", b"incomplete")
+            fake.seed("example.org/data/example.org-2005-index.cdxj", b"incomplete")
         else:
             import os
             real_replace = os.replace
@@ -430,7 +281,7 @@ def test_remote_batch_failure_preserves_playback_and_retries(tmp_path, monkeypat
     assert store._states["example.org"] == state
     assert not list(tmp_path.rglob(".tmp-*"))
     fake.fail_list = False
-    fake.seed("example.org/example.org-2005-index.cdxj", added)
+    fake.seed("example.org/data/example.org-2005-index.cdxj", added)
     store._poll_archive("example.org")
     assert archive.replay_index.read_bytes() == updated + added
     assert set(store._states["example.org"]) == {"2004", "2005"}
@@ -439,7 +290,7 @@ def test_remote_batch_failure_preserves_playback_and_retries(tmp_path, monkeypat
 
     # Missing annual indexes must not evict accepted captures. An unchanged
     # inventory also causes no index downloads or snapshot replacement.
-    fake.objects.pop("example.org/example.org-2004-index.cdxj")
+    fake.objects.pop("example.org/data/example.org-2004-index.cdxj")
     previous = archive.replay_index.stat()
     fake.calls.clear()
     store._poll_archive("example.org")
@@ -460,7 +311,7 @@ def test_remote_rejects_empty_or_unsorted_refresh(tmp_path, monkeypatch, invalid
     archive = store.load_archive("example.org")
     if invalid == b"unsorted":
         invalid = old.replace(b"20040101000000", b"20040201000000") + old
-    fake.seed("example.org/example.org-2004-index.cdxj", invalid)
+    fake.seed("example.org/data/example.org-2004-index.cdxj", invalid)
     with pytest.raises(ValidationError):
         store._poll_archive("example.org")
     assert archive.replay_index.read_bytes() == old

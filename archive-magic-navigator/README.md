@@ -1,89 +1,47 @@
 # Archive Magic Navigator
 
-Navigator serves Archive Magic WARC collections through a local pywb viewer. It is
-independent from Archive Magic Fetch and reads its own per-archive `navigator.toml`.
-
-## Install
+A standalone catalog and replay server for private S3-compatible archive buckets.
+It needs no Fetch installation, configuration, or local WARC files.
 
 ```console
 uv sync
+uv run archive-magic-navigator --catalog /path/to/catalog.json --open
 ```
 
-## Serve one archive
+The only persisted Navigator configuration is [catalog.json](../examples/catalog.json).
+Its ordered entries specify bucket/prefix locations with a shared storage endpoint
+and region. Credentials come from the standard AWS chain; `.env` is not loaded.
+Each bucket supplies [archive.json](../examples/example.org/archive.json), optional
+`assets/`, and WARC/CDXJ files under `data/`. Both JSON formats are unversioned.
 
-Pass a configuration file or its containing directory:
+The homepage displays organization metadata, logo, preview, and indexed capture
+coverage. It links to an archived entry page and to capture search. PNG, JPEG,
+WebP, and GIF assets remain private in storage and are served from Navigator's
+cache. Missing images have placeholders.
 
-```console
-uv run archive-magic-navigator ~/archives/example.org --open
-```
+Runtime options: `--bind` (localhost), `--port` (8080), `--cache`,
+`--poll-interval` (300 seconds), `--wayback-fallback {on,off}` (on), `--open`,
+and `--debug`. Cache defaults to `navigator-cache/` beside the catalog and contains
+only manifests, assets, and indexes. WARC payloads are read by authenticated range
+requests. Configuration changes require restart; content refreshes automatically.
 
-Each `navigator.toml` selects exactly one source. A local source reads WARCs from its exact `directory`. Both source types cache
-validated CDXJ snapshots. A remote source serves WARC ranges from the bucket.
+Invalid catalog JSON and startup duplicate IDs fail startup. Individual bucket
+failures leave unavailable cards while other archives serve. Failed refreshes
+retain accepted snapshots; an index cache cannot preserve inaccessible WARC bytes.
+Recovered entries activate without a server restart. Changes to an accepted ID
+require a restart.
 
-Useful process options are:
+`navigator.toml`, directory catalogs, positional archive configuration, and the
+local-source CLI are removed. Follow the [migration guide](../docs/BUCKET-CATALOG-MIGRATION.md)
+for configuration and old flat bucket layouts.
 
-```text
---cache PATH
---poll-interval SECONDS
---bind ADDRESS
---port PORT
---wayback-fallback {on,off}
---open
---debug
-```
-
-Navigator checks both local and remote sources every five minutes by default.
-Use `--poll-interval 60` for a one-minute interval. Updated annual indexes and new
-annual collections appear in the running viewer after a successful refresh.
-
-The default index cache is `navigator-cache/` beside `navigator.toml` (or under the
-catalog directory). Local mode also needs a writable cache; `--cache PATH` overrides
-its location. Only indexes are cached, never WARC payloads. Navigator validates all
-changes before atomically switching the archive's merged replay index. Listing,
-copying, downloading, validation, or publication failures keep the previous replay
-snapshot available and retry at the next interval. Missing annual indexes are
-retained for the running session.
-
-Annual source files and configuration formats are unchanged. Publish WARCs before
-atomically replacing CDXJ files. Existing WARC byte ranges must remain available;
-index snapshots cannot protect against deletion or destructive rewriting of WARCs.
-Adding catalog entries or changing `navigator.toml` still requires a restart.
-
-## Serve a catalog
-
-```console
-uv run archive-magic-navigator --catalog ~/archives
-```
-
-Catalog discovery includes only immediate, non-hidden `*/navigator.toml` entries.
-Entries are sorted deterministically, and any invalid configuration or duplicate ID
-fails startup. Mixed local/remote entries are supported. Remote entries must share
-endpoint and region because pywb receives one S3 environment; their buckets and
-prefixes may differ.
-
-## Playback policy
-
-`--wayback-fallback` defaults to `on` for the whole process. Pass `off` to disable
-it for every selected archive in that invocation.
-
-## Credentials and exposure
-
-Private bucket access uses Boto3/pywb's standard AWS credential chain. Navigator
-does not load an adjacent `.env` file.
-
-Navigator defaults to `127.0.0.1`. A non-loopback bind exposes an unauthenticated
-development archive server and prints a warning; the application does not provide
-TLS or hostile-content hardening.
-
-See [the repository README](../README.md), the
-[example configuration](../examples/example.org/navigator.toml), and the
-[architecture document](docs/ARCHITECTURE-NAVIGATOR.md) for complete details.
-
-## Tests
+This remains an unauthenticated development replay server without TLS or hostile
+content hardening. See [architecture](docs/ARCHITECTURE-NAVIGATOR.md).
 
 ```console
 uv run pytest -q -m 'not integration'
+uv run pytest -q -m integration
 ```
 
-Run `uv run pytest -q -m integration` where local loopback socket binding is
-permitted.
+Integration tests require local socket binding and use simulated private buckets;
+they do not require cloud credentials or change real buckets.

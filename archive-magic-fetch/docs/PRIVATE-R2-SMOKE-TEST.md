@@ -1,12 +1,12 @@
 # Private S3-compatible bucket smoke test
 
 This procedure exercises a remote archive against a private bucket.
-Use a disposable prefix: the reset step intentionally deletes it.
+Use a disposable prefix: the reset step intentionally deletes its managed archive data.
 
 ## Configure
 
 1. Copy `examples/example.org/fetch.toml` and
-   `examples/example.org/navigator.toml` outside either implementation directory.
+   `examples/catalog.json` outside either implementation directory.
 2. In `fetch.toml`, set `output.type = "remote"` and add:
 
    ```toml
@@ -16,8 +16,9 @@ Use a disposable prefix: the reset step intentionally deletes it.
    region = "auto"
    ```
 
-3. In `navigator.toml`, set `source.type = "remote"` with the same bucket fields
-   (no `directory` on a remote source).
+3. In `catalog.json`, set the shared endpoint/region and an entry with the same
+   bucket and archive-root prefix. Publish `archive.json` and optional assets
+   separately as described in the migration/publication guide.
 4. Limit `[fetch]` to a small historical interval for the smoke test. Keep
    `data_directory = "data"` as the permanent local archive.
 5. Install rclone and configure credentials through AWS environment variables
@@ -32,17 +33,17 @@ From the Fetch project:
 uv run archive-magic-fetch /absolute/path/to/example.org/fetch.toml
 ```
 
-Confirm the prefix contains WARC and CDXJ objects and `data/` retains identical
+Confirm the prefix's `data/` contains WARC and CDXJ objects and `data/` retains identical
 finalized files. Re-run Fetch without source changes and confirm it does not
 download archive files from the bucket.
 
 From the Navigator project:
 
 ```console
-uv run archive-magic-navigator /absolute/path/to/example.org --open
+uv run archive-magic-navigator --catalog /absolute/path/to/catalog.json --open
 ```
 
-Confirm that `navigator-cache/` contains index files, no WARC copies, and
+Confirm that `navigator-cache/` contains indexes and presentation assets, no WARC copies, and
 that replay produces authenticated WARC range reads from the bucket.
 
 ## Update and continuity
@@ -69,5 +70,5 @@ uv run archive-magic-fetch /absolute/path/to/example.org --reset-data
 ```
 
 Remote reset rejects `--start`/`--end`, prints a downtime warning, deletes only the
-complete configured prefix, clears the managed data directory, and rebuilds the
-full configured range. Confirm a neighboring prefix remains untouched.
+selected archive's managed files under remote `data/`, clears the local data directory, and rebuilds the
+full configured range. Confirm archive.json, assets, unrelated files, and neighboring prefixes remain untouched.

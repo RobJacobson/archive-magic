@@ -65,7 +65,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         action="store_true",
         help=(
             "rebuild selected local collections, or delete and rebuild the complete "
-            "configured archive prefix when remote output is selected"
+            "managed archive files under data/ when remote output is selected"
         ),
     )
     parser.add_argument(
@@ -106,7 +106,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "remote --reset-data requires the configuration's complete configured date range"
                 )
             print(
-                "WARNING: --reset-data will delete and rebuild the entire remote archive prefix; "
+                "WARNING: --reset-data will delete and rebuild managed remote archive data (metadata and assets are preserved); "
                 "playback will be unavailable during the rebuild.",
                 file=sys.stderr,
             )
