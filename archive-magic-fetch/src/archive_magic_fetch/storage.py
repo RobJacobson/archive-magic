@@ -104,22 +104,24 @@ def _rclone_config(output: FetchOutput) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _remote_path(output: FetchOutput) -> str:
+def _remote_path(output: FetchOutput, *, data: bool = True) -> str:
     assert output.bucket is not None
     bucket = _safe_config_value(output.bucket, "bucket")
     if "/" in bucket or ":" in bucket:
         raise PublicationError("invalid bucket for rclone")
-    return f"archive:{bucket}/{output.prefix}".rstrip("/")
+    root = f"archive:{bucket}/{output.prefix}".rstrip("/")
+    return root + "/data" if data else root
 
 
-def _run_rclone(config_path: Path, *args: str) -> None:
+def _run_rclone(config_path: Path, *args: str) -> str:
     command = ["rclone", "--config", str(config_path), *args]
     try:
-        subprocess.run(command, check=True)
+        result = subprocess.run(command, check=True, capture_output=True, text=True)
+        return result.stdout
     except FileNotFoundError as error:
         raise PublicationError("rclone is not installed or not on PATH") from error
     except subprocess.CalledProcessError as error:
-        raise PublicationError(f"rclone {args[0]} failed with exit code {error.returncode}") from error
+        raise PublicationError(f"rclone {args[0]} failed with exit code {error.returncode}: {error.stderr or ''}") from error
 
 
 @contextmanager
@@ -145,15 +147,27 @@ def sync_archive(
     warc_filter = ["--filter", f"+ /{layout.archive_id}-{period}-*.warc.gz", "--filter", "- **"]
     index_filter = ["--filter", f"+ /{layout.archive_id}-{period}-index.cdxj", "--filter", "- **"]
     with _temporary_config(output) as config:
+        _reject_legacy_layout(config, output)
         _run_rclone(config, "copy", source, remote, *warc_filter)
         _run_rclone(config, "sync", source, remote, *index_filter)
         _run_rclone(config, "sync", source, remote, *warc_filter)
 
 
-def purge_remote(output: FetchOutput) -> None:
-    """Explicit reset: remove the exact configured archive prefix."""
+def _reject_legacy_layout(config: Path, output: FetchOutput) -> None:
+    names = _run_rclone(config, "lsf", _remote_path(output, data=False), "--files-only", "--max-depth", "1")
+    if any(name.endswith((".warc.gz", ".cdxj")) for name in names.splitlines()):
+        raise PublicationError("legacy flat archive data: copy and verify WARC/CDXJ files under data/, then explicitly remove old root objects before sync or reset")
 
+
+def purge_remote(output: FetchOutput, archive_id: str) -> None:
+    """Reset only managed archive data; never purge the bucket or archive root."""
     if output.type != "remote":
         return
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", archive_id):
+        raise PublicationError("invalid archive ID for reset")
     with _temporary_config(output) as config:
-        _run_rclone(config, "purge", _remote_path(output))
+        _reject_legacy_layout(config, output)
+        _run_rclone(config, "delete", _remote_path(output),
+                    "--filter", f"+ /{archive_id}-????-*.warc.gz",
+                    "--filter", f"+ /{archive_id}-????-index.cdxj",
+                    "--filter", "- **")

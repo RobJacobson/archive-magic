@@ -9,9 +9,11 @@ import re
 import sys
 import tempfile
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path, PurePosixPath
 
 import boto3
+from botocore.config import Config
 
 from .collections import (
     Archive,
@@ -25,6 +27,10 @@ from .store import IndexStore, publish_indexes
 
 _CDX_TIMESTAMP = re.compile(r"^\d{14}$")
 _INDEX_SUFFIX = "-index.cdxj"
+
+
+class LegacyLayoutError(ValidationError):
+    """Requires explicit migration; never masked by a cached index."""
 
 
 @dataclass(frozen=True)
@@ -46,22 +52,30 @@ class RemoteArchiveStore(IndexStore):
     def __init__(
         self, config: RemoteSource, cache_directory: Path, poll_seconds: float
     ) -> None:
-        super().__init__(cache_directory, poll_seconds)
+        super().__init__(cache_directory / config.cache_key, poll_seconds)
         self.config = config
         self.client = boto3.client(
-            "s3", endpoint_url=config.endpoint_url, region_name=config.region
+            "s3", endpoint_url=config.endpoint_url, region_name=config.region,
+            config=Config(connect_timeout=5, read_timeout=10,
+                          retries={"mode": "standard", "total_max_attempts": 2})
         )
         self._states: dict[str, dict[str, RemoteCollection]] = {}
+        self.stale = False
 
     def load_archive(self, archive_id: str) -> Archive:
         archive_id = validate_archive_id(archive_id)
+        self.stale = False
         try:
+            self.check_legacy_layout()
             inventory = self._list_inventory()
             collections = self._discover_collections(archive_id, inventory)
             archive = self._accept_collections(archive_id, collections, inventory)
             self._states[archive_id] = collections
             return archive
         except Exception as error:
+            if isinstance(error, LegacyLayoutError):
+                raise
+            self.stale = True
             cached = self._read_cached_indexes(archive_id)
             if cached is None:
                 if isinstance(error, ValidationError):
@@ -96,6 +110,7 @@ class RemoteArchiveStore(IndexStore):
         return environment
 
     def _poll_archive(self, archive_id: str) -> None:
+        self.check_legacy_layout()
         current = self._states[archive_id]
         inventory = self._list_inventory()
         discovered = self._discover_collections(archive_id, inventory)
@@ -110,6 +125,7 @@ class RemoteArchiveStore(IndexStore):
         if changed:
             self._accept_collections(archive_id, accepted, inventory, changed=changed)
             self._states[archive_id] = accepted
+        self.stale = False
 
     def _accept_collections(
         self,
@@ -253,6 +269,22 @@ class RemoteArchiveStore(IndexStore):
             collections[collection_id] = RemoteCollection(collection_id, item)
         return collections
 
+    def check_legacy_layout(self) -> None:
+        prefix = self.config.key("")
+        if prefix:
+            prefix += "/"
+        token = None
+        while True:
+            kwargs = {"Bucket": self.config.bucket, "Prefix": prefix, "Delimiter": "/"}
+            if token:
+                kwargs["ContinuationToken"] = token
+            result = self.client.list_objects_v2(**kwargs)
+            if any(_is_archive_object(_relative_key(prefix, item["Key"]) or "") for item in result.get("Contents", [])):
+                raise LegacyLayoutError("legacy flat archive data: copy and verify WARC/CDXJ files under data/, then explicitly remove the old root objects before using Navigator")
+            if not result.get("IsTruncated"):
+                return
+            token = result["NextContinuationToken"]
+
     def _list_inventory(self) -> dict[str, RemoteObject]:
         inventory: dict[str, RemoteObject] = {}
         prefix = self._object_key("")
@@ -285,7 +317,7 @@ class RemoteArchiveStore(IndexStore):
         return f"s3://{self.config.bucket}/{key + '/' if key else ''}"
 
     def _object_key(self, relative: str) -> str:
-        return "/".join(part for part in (self.config.prefix, relative) if part)
+        return self.config.key("data/" + relative)
 
 
 def _validate_index(
@@ -312,6 +344,10 @@ def _validate_index(
                 or not _CDX_TIMESTAMP.fullmatch(parts[1])
             ):
                 raise ValidationError(f"{path}, line {number}: malformed CDXJ")
+            try:
+                datetime.strptime(parts[1], "%Y%m%d%H%M%S")
+            except ValueError as error:
+                raise ValidationError(f"{path}, line {number}: invalid timestamp") from error
             current = (parts[0], parts[1])
             if previous is not None and current < previous:
                 raise ValidationError(f"{path}, line {number}: CDXJ is not sorted")

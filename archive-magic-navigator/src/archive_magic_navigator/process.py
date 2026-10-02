@@ -7,6 +7,7 @@ import secrets
 import shutil
 import signal
 import subprocess
+import sys
 import sysconfig
 import threading
 import time
@@ -152,7 +153,7 @@ def build_command(
     """Build the deliberately constrained child command."""
 
     command = [
-        executable,
+        sys.executable, "-m", "archive_magic_navigator.frontend",
         "--directory",
         str(runtime_directory),
         "--bind",

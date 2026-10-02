@@ -75,8 +75,9 @@ def test_rclone_uploads_warcs_then_index_then_prunes_warcs(tmp_path, monkeypatch
     sync_archive(layout, remote_output(layout.root))
 
     invoked = calls(log)
-    assert [args[2] for args in invoked] == ["copy", "sync", "sync"]
-    assert all(args[4] == "archive:bucket/example.org" for args in invoked)
+    assert [args[2] for args in invoked] == ["lsf", "copy", "sync", "sync"]
+    invoked = invoked[1:]
+    assert all(args[4] == "archive:bucket/example.org/data" for args in invoked)
     assert ".warc.gz" in " ".join(invoked[0])
     assert "-index.cdxj" in " ".join(invoked[1])
     assert ".warc.gz" in " ".join(invoked[2])
@@ -95,7 +96,7 @@ def test_rclone_failure_stops_before_deletion_and_is_retryable(tmp_path, monkeyp
 
     monkeypatch.setenv("RCLONE_FAIL_CALL", "0")
     sync_archive(layout, remote_output(layout.root))
-    assert [args[2] for args in calls(log)[2:]] == ["copy", "sync", "sync"]
+    assert [args[2] for args in calls(log)[2:]] == ["lsf", "copy", "sync", "sync"]
 
 
 def test_staged_append_preserves_prior_offsets_and_promotes_index_last(tmp_path):
@@ -281,16 +282,18 @@ def test_manual_sync_does_not_contact_wayback(tmp_path, monkeypatch):
     )
 
     assert cli.main([str(config), "--sync-only"]) == 0
-    assert [args[2] for args in calls(log)] == ["copy", "sync", "sync"]
+    assert [args[2] for args in calls(log)] == ["lsf", "copy", "sync", "sync"]
     assert layout.collection_index("2004").exists()
 
 
 def test_explicit_remote_reset_purges_configured_prefix(tmp_path, monkeypatch):
     log = fake_rclone(tmp_path, monkeypatch)
-    purge_remote(remote_output(tmp_path / "data"))
+    purge_remote(remote_output(tmp_path / "data"), "example.org")
     invoked = calls(log)
-    assert len(invoked) == 1
-    assert invoked[0][2:] == ["purge", "archive:bucket/example.org"]
+    assert len(invoked) == 2
+    assert invoked[1][2:4] == ["delete", "archive:bucket/example.org/data"]
+    assert "- **" in invoked[1]
+    assert "purge" not in invoked[1]
 
 
 def test_remote_reset_purges_before_rebuilding_local_archive(tmp_path, monkeypatch):
@@ -328,7 +331,50 @@ def test_remote_reset_purges_before_rebuilding_local_archive(tmp_path, monkeypat
     )
 
     assert result.exit_code == 0
-    assert [args[2] for args in calls(log)] == ["purge", "copy", "sync", "sync"]
+    assert [args[2] for args in calls(log)] == ["lsf", "delete", "lsf", "copy", "sync", "sync"]
     inventory = inventory_collection(layout, "2004")
     assert inventory.contains(replacement)
     assert not inventory.contains(old)
+
+
+def test_real_rclone_reset_and_sync_preserve_non_archive_content(tmp_path, monkeypatch):
+    """Exercise real rclone filter semantics against disposable local directories."""
+    import shutil
+    import archive_magic_fetch.storage as storage
+    if shutil.which('rclone') is None:
+        pytest.skip('rclone not installed')
+    layout = make_collection(tmp_path / 'local' / 'data')
+    remote = tmp_path / 'bucket'
+    (remote/'data').mkdir(parents=True)
+    (remote/'assets').mkdir()
+    protected = {
+        'archive.json': b'{"name":"kept"}',
+        'assets/logo.png': b'logo',
+        'data/other-2004-001.warc.gz': b'other site',
+        'data/notes.txt': b'notes',
+    }
+    for name, data in protected.items():
+        (remote/name).write_bytes(data)
+    monkeypatch.setattr(storage, '_remote_path', lambda output, *, data=True: str(remote/'data' if data else remote))
+    output = remote_output(layout.root)
+    sync_archive(layout, output)
+    assert (remote/'data'/layout.collection_index('2004').name).exists()
+    purge_remote(output, layout.archive_id)
+    assert not list((remote/'data').glob('example.org-*'))
+    assert all((remote/name).read_bytes() == body for name,body in protected.items())
+    assert layout.collection_index('2004').exists()
+
+
+def test_legacy_flat_objects_stop_sync_and_reset_before_mutation(tmp_path, monkeypatch):
+    import archive_magic_fetch.storage as storage
+    layout = make_collection(tmp_path / 'data')
+    calls = []
+    def run(config, *args):
+        calls.append(args)
+        return 'example.org-2004-001.warc.gz\n'
+    monkeypatch.setattr(storage, '_run_rclone', run)
+    for action in (lambda: sync_archive(layout, remote_output(layout.root)),
+                   lambda: purge_remote(remote_output(layout.root), layout.archive_id)):
+        with pytest.raises(PublicationError, match='legacy flat'):
+            action()
+    assert [args[0] for args in calls] == ['lsf', 'lsf']

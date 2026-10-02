@@ -1,0 +1,14 @@
+[archive]
+id = "example.org"
+url_pattern = "*.example.org"
+
+[output]
+type = "remote"
+data_directory = "data"
+bucket = "example-org"
+prefix = ""
+endpoint_url = "https://ACCOUNT_ID.r2.cloudflarestorage.com"
+region = "auto"
+
+[fetch]
+start = "2000-01-01"

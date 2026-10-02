@@ -185,7 +185,7 @@ def _run_fetch(
     """Execute serial years with parallel playback and one WARC writer."""
 
     if settings.reset_data and settings.output.type == "remote":
-        purge_remote(settings.output)
+        purge_remote(settings.output, layout.archive_id)
         if layout.root.exists():
             shutil.rmtree(layout.root)
     reject_legacy_layout(layout)

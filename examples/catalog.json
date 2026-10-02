@@ -1,0 +1,11 @@
+{
+  "title": "Website Archive",
+  "storage": {
+    "endpoint_url": "https://ACCOUNT_ID.r2.cloudflarestorage.com",
+    "region": "auto"
+  },
+  "archives": [
+    { "bucket": "example-org" },
+    { "bucket": "another-website", "prefix": "archive" }
+  ]
+}

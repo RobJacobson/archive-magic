@@ -30,7 +30,7 @@ def test_child_command_contains_only_supported_switches(tmp_path):
     )
 
     assert command == [
-        "/venv/bin/wayback",
+        process.sys.executable, "-m", "archive_magic_navigator.frontend",
         "--directory",
         str(tmp_path),
         "--bind",

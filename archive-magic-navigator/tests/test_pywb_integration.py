@@ -150,12 +150,14 @@ def get(url):
 
 
 @contextmanager
-def private_s3_server(root: Path):
+def private_s3_server(root: Path, data_prefix: bool = False):
     class S3Handler(BaseHTTPRequestHandler):
         ranges: ClassVar[list[tuple[str, str | None, str | None]]] = []
 
         def do_GET(self):
             path = unquote(urlparse(self.path).path).removeprefix("/bucket/")
+            if data_prefix:
+                path = path.removeprefix("data/")
             try:
                 source = (root / path).resolve()
                 source.relative_to(root.resolve())
@@ -787,12 +789,12 @@ def test_running_pywb_adopts_updates_and_new_year_and_survives_failure(
         def upload():
             for path in source.iterdir():
                 if path.suffix in {".cdxj", ".gz"}:
-                    fake.seed(path.name, path.read_bytes())
+                    fake.seed("data/" + path.name, path.read_bytes())
 
         if source_type == "local":
             store = LocalArchiveStore(source, cache, 0.05)
         else:
-            server, handler = stack.enter_context(private_s3_server(source))
+            server, handler = stack.enter_context(private_s3_server(source, data_prefix=True))
             upload()
             monkeypatch.setattr("archive_magic_navigator.remote.boto3.client", lambda *a, **k: fake)
             store = RemoteArchiveStore(

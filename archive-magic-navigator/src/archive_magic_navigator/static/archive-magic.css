@@ -122,3 +122,21 @@ body {
     flex-direction: column;
   }
 }
+
+.am-collections { grid-template-columns: repeat(auto-fit, minmax(min(100%, 20rem), 1fr)); align-items: stretch; }
+.am-card { background: var(--am-card); border: 1px solid var(--am-line); overflow: hidden; display: flex; flex-direction: column; }
+.am-preview { display: block; width: 100%; aspect-ratio: 16 / 10; object-fit: cover; object-position: center top; background: #e8e3d8; border-bottom: 1px solid var(--am-line); }
+.am-placeholder { display: flex; align-items: center; justify-content: center; color: var(--am-muted); font-family: Georgia, serif; }
+.am-card-body { padding: 1.5rem; display: flex; flex: 1; flex-direction: column; gap: 1rem; }
+.am-card-body p { margin: 0; }
+.am-identity { display: flex; align-items: center; gap: 0.9rem; }
+.am-logo { width: 3rem; height: 3rem; flex: 0 0 3rem; object-fit: contain; font-size: 1.6rem; }
+.am-identity h2 { font-size: 1.3rem; line-height: 1.2; margin: 0 0 0.3rem; }
+.am-domain, .am-dates, .am-status { color: var(--am-muted); font-size: 0.9rem; overflow-wrap: anywhere; }
+.am-description { line-height: 1.5; }
+.am-actions { margin-top: auto; padding-top: 0.5rem; display: flex; gap: 1rem; flex-wrap: wrap; }
+.am-collections .am-actions a { display: inline; min-height: 0; padding: 0; border: 0; font-size: 0.9rem; text-decoration: underline; text-underline-offset: 0.2em; }
+.am-collections .am-actions .am-primary { font-weight: 700; color: var(--am-accent); }
+.am-collections .am-actions span { color: inherit; }
+a:focus-visible, input:focus-visible, button:focus-visible { outline: 3px solid var(--am-accent); outline-offset: 4px; }
+.am-empty { color: var(--am-muted); padding: 2rem 0; }
