@@ -70,9 +70,6 @@ class ArchiveLayout:
     def run_log(self, run_id: str) -> Path:
         return self.logs_root / f"{self.validate_run_id(run_id)}.log"
 
-    def cdx_checkpoint(self, year: int) -> Path:
-        return self.logs_root / "cdx" / f"{year:04d}.json"
-
     def index_filename(self, collection_id: str) -> str:
         collection_id = self.validate_collection_id(collection_id)
         return f"{self.archive_id}-{collection_id}-index.cdxj"

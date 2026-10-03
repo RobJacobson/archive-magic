@@ -17,6 +17,8 @@ example.org/
   assets/
     logo.png
     preview.jpg
+  index/
+    2004.cdx.json
   data/
     example.org-2004-001.warc.gz
     example.org-2004-index.cdxj
@@ -24,7 +26,7 @@ example.org/
 ```
 
 The bucket (or configured archive-root prefix) contains only `archive.json`,
-`assets/`, and `data/`. Configuration files and logs remain local. Logs retain
+`assets/`, and `data/`. CDX caches, configuration files, and logs remain local. Logs retain
 their existing location beside the local data directory.
 
 The local `archive.json` and images are authoring copies. Explicitly publish them
@@ -51,6 +53,27 @@ the configured range. Each year is staged and validated locally before publicati
 WARCs are copied first, CDXJ indexes synced second, and obsolete WARCs removed last.
 After an upload failure, `--sync-only` retries without contacting Wayback.
 
+Playback pacing applies to every HTTP send, including retries and nearby-capture
+recovery, across all workers in one process. Each run logs request totals and peak
+counts over rolling one-second and one-minute windows; 429s also log current counts.
+Add `--trace-requests` to save each send and response with real UTC timestamps,
+capture/attempt IDs, and rolling counts in `logs/<run>.requests.jsonl`.
+See [request diagnostics](archive-magic-fetch/docs/ARCHITECTURE-FETCH.md#playback-request-diagnostics)
+for details. Separate Fetch processes have separate limits; CDX uses its own pacing.
+
+Fetch caches complete historical CDX years as `index/YYYY.cdx.json` beside
+`fetch.toml`, including when the data directory is elsewhere. On a cache miss,
+it queries the full calendar year and saves the listing before downloading WARC
+contents. Date options restrict playback downloads, not the CDX query. The
+current UTC year is always queried afresh for the full year and is never cached;
+future years are skipped. A failed annual acquisition saves no cache and skips
+that year's downloads, continuing with subsequent years with a nonzero final status.
+
+Historical caches survive WARC failures and `--reset-data`. An empty array is a
+successfully queried empty year. Corrupt caches produce errors rather than being
+silently replaced. The URL pattern must remain fixed while reusing a cache;
+explicitly clear the CDX cache if you change the query. There is no automatic refresh.
+
 Local `data/` remains authoritative for Fetch's WARC/CDXJ mirror. Do not delete
 local archive files to free space and then sync: missing managed local files can
 be deleted remotely. Fetch does not restore or evict local history automatically.
@@ -59,7 +82,7 @@ Remote `--reset-data` rejects date overrides and rebuilds the entire configured
 range. It deletes only this archive's managed WARC/CDXJ objects under remote
 `data/`, preserving metadata, images, and unrelated objects. It clears the local
 working data directory. Replay is unavailable until new indexes are published.
-Logs remain local and unchanged in location.
+Logs and CDX caches remain local and are preserved.
 
 ## Navigator
 

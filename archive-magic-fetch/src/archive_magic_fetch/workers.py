@@ -6,6 +6,7 @@ import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, Sequence
 
 from .identity import is_invalid_uri_payload_digest
@@ -16,7 +17,8 @@ from .models import (
     PlaybackResult,
     UnresolvedFailure,
 )
-from .playback import classify_playback_error
+from .playback import ArchiveMagicWaybackSession, classify_playback_error
+from .request_stats import PlaybackRequestStats
 from .retry import (
     backpressure_signal,
     backpressure_source,
@@ -140,13 +142,21 @@ class PlaybackWorkers:
         starts_per_second: float = 16.0,
         report: Callable[[str], None] = _default_report,
         retries: int = 4,
+        trace_path: Path | None = None,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._client_factory = client_factory
         self._download_fn = download_fn
         self._sleep = sleep
+        self._clock = clock
         self._gate = StartGate(
             starts_per_second if pace else 0,
             report=report,
+            clock=clock,
+            sleep=sleep,
+        )
+        self.request_stats = PlaybackRequestStats(
+            self._gate.wait, report=report, trace_path=trace_path, clock=clock,
         )
         self._executor = ThreadPoolExecutor(
             max_workers=max_workers,
@@ -160,14 +170,17 @@ class PlaybackWorkers:
 
     def close(self) -> None:
         self._executor.shutdown()
-        for owner in self._owners:
-            exit_fn = getattr(owner, "__exit__", None)
-            if callable(exit_fn):
-                exit_fn(None, None, None)
-                continue
-            close = getattr(owner, "close", None)
-            if callable(close):
-                close()
+        try:
+            for owner in self._owners:
+                exit_fn = getattr(owner, "__exit__", None)
+                if callable(exit_fn):
+                    exit_fn(None, None, None)
+                    continue
+                close = getattr(owner, "close", None)
+                if callable(close):
+                    close()
+        finally:
+            self.request_stats.close()
 
     def submit(
         self,
@@ -190,13 +203,18 @@ class PlaybackWorkers:
                 categories=(),
             )
 
-        started = time.monotonic()
+        started = self._clock()
         categories: list[str] = []
         timeout_failures = 0
         for attempt in range(1, self.max_attempts + 1):
-            self._gate.wait()
             try:
-                result = self._download_fn(self._client(), identity)
+                client = self._client()
+                # Real sessions pace every HTTP send. Keep attempt pacing for
+                # injected clients that do not expose our transport boundary.
+                if not self._local.transport_paced:
+                    self._gate.wait()
+                with self.request_stats.attempt(identity, attempt):
+                    result = self._download_fn(client, identity)
             except Exception as error:  # noqa: BLE001 - network boundary
                 category, retryable = classify_playback_error(error)
                 categories.append(category.value)
@@ -225,7 +243,7 @@ class PlaybackWorkers:
                         message=str(error) or type(error).__name__,
                     ),
                     attempts=attempt,
-                    elapsed_s=time.monotonic() - started,
+                    elapsed_s=self._clock() - started,
                     categories=tuple(categories),
                 )
             self._gate.note_success()
@@ -233,7 +251,7 @@ class PlaybackWorkers:
                 result=result,
                 failure=None,
                 attempts=attempt,
-                elapsed_s=time.monotonic() - started,
+                elapsed_s=self._clock() - started,
                 categories=tuple(categories),
             )
         raise AssertionError("playback retry loop did not terminate")
@@ -246,6 +264,10 @@ class PlaybackWorkers:
         enter = getattr(owner, "__enter__", None)
         client = enter() if callable(enter) else owner
         self._local.client = client if client is not None else owner
+        session = getattr(self._local.client, "session", None)
+        self._local.transport_paced = isinstance(session, ArchiveMagicWaybackSession)
+        if self._local.transport_paced:
+            session.track_playback(self.request_stats)
         with self._owners_lock:
             self._owners.append(owner)
         return self._local.client

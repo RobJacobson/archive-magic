@@ -86,7 +86,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         type=_positive_float,
         default=None,
         metavar="N",
-        help="new playback starts per second (default: 16, or fetch-config.toml)",
+        help="playback HTTP requests per second, including retries/recovery (default: 16, or fetch-config.toml)",
+    )
+    parser.add_argument(
+        "--trace-requests",
+        action="store_true",
+        help="write timestamped playback HTTP requests and rolling rates to logs/<run>.requests.jsonl",
     )
     parser.add_argument(
         "--retries",
@@ -127,6 +132,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             date_end=args.end,
             reset_data=args.reset_data,
             output=config.output,
+            index_directory=config.index_directory,
             warc_target_bytes=config.warc_target_bytes,
             cdx_window_days=config.cdx_window_days,
             cdx_page_limit=config.cdx_page_limit,
@@ -137,6 +143,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 else policy.starts_per_second
             ),
             retries=args.retries if args.retries is not None else policy.retries,
+            trace_requests=args.trace_requests,
             default_start=config.start,
             default_end=config.end,
         )
