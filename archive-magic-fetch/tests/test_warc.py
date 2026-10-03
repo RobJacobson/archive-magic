@@ -31,7 +31,7 @@ from archive_magic_fetch.warc import (
     CollectionWarcWriter,
     validate_warc,
 )
-from helpers import cdx_json, found_capture_client, make_capt, memento_client, patch_cdx, playback, substitution_client
+from helpers import cdx_json, found_capture_client, make_capt, memento_client, patch_cdx, playback
 
 def test_empty_redirect_playback_is_stored_with_location(tmp_path):
     """Historical 3xx captures often have an empty body; still archive them."""
@@ -69,169 +69,19 @@ def test_empty_redirect_playback_is_stored_with_location(tmp_path):
     assert rec.content_stream().read() == b""
 
 
-def test_slash_redirect_from_cdx_requires_slash_sibling():
-    from archive_magic_fetch.playback import (
-        SLASH_REDIRECT_SOURCE_URI,
-        slash_redirect_from_cdx,
-    )
-
+@pytest.mark.parametrize("status", ["200", "301"])
+def test_nearby_capture_is_not_fetched_or_reconstructed(status):
     identity = make_capt(
-        url="http://example.org/conference",
-        ts="20040303170500",
-        status="301",
-    )
-    result = slash_redirect_from_cdx(
-        identity,
-        group_urls=(
-            "http://example.org/conference",
-            "http://example.org/conference/",
-        ),
-    )
-    assert result is not None
-    assert result.source_uri == SLASH_REDIRECT_SOURCE_URI
-    assert result.status_code == 301
-    assert result.body == b""
-    assert ("Location", "http://example.org/conference/") in result.headers
-    assert (
-        slash_redirect_from_cdx(
-            identity,
-            group_urls=("http://example.org:80/conference/",),
-        )
-        is not None
-    )
-    assert (
-        slash_redirect_from_cdx(
-            identity, group_urls=("http://example.org/conference",)
-        )
-        is None
-    )
-    assert (
-        slash_redirect_from_cdx(
-            make_capt(url="http://example.org/conference/", status="301"),
-            group_urls=("http://example.org/conference/",),
-        )
-        is None
-    )
-    assert (
-        slash_redirect_from_cdx(
-            make_capt(url="http://example.org/conference", status="200"),
-            group_urls=("http://example.org/conference/",),
-        )
-        is None
-    )
-
-
-def test_slash_redirect_substitution_is_reconstructed():
-    from archive_magic_fetch.playback import (
-        SLASH_REDIRECT_SOURCE_URI,
-        download_exact,
-    )
-
-    identity = make_capt(
-        url="http://example.org/conference",
-        ts="20040303170500",
-        status="301",
-        digest="sha1:TV7A2C32YG3CFKH2CYRHAL2D4UPH7RCE",
-    )
-    client = substitution_client("http://example.org/conference/", "20040510064339")
-    result = download_exact(client, identity)
-    assert result.status_code == 301
-    assert result.body == b""
-    assert result.source_uri == SLASH_REDIRECT_SOURCE_URI
-    assert result.digest_matched is True
-    assert ("Location", "http://example.org/conference/") in result.headers
-    assert client.calls == 1
-
-    def client_for(location: str):
-        response = MagicMock()
-        response.headers = {
-            "X-Archive-Redirect-Reason": "found capture at 20040510064339",
-            "Location": location,
-        }
-
-        class Client:
-            def __init__(self):
-                self.session = MagicMock()
-                self.session.request.return_value = response
-
-            def get_memento(self, *args, **kwargs):
-                self.session.request("GET", "https://web.archive.org/web/x")
-                raise MementoPlaybackError("could not be played")
-
-        return Client()
-
-    with pytest.raises(MementoPlaybackError):
-        download_exact(
-            client_for(
-                "https://web.archive.org/web/20040510064339id_/http://example.org/elsewhere"
-            ),
-            identity,
-        )
-    with pytest.raises(MementoPlaybackError):
-        download_exact(
-            client_for(
-                "https://web.archive.org/web/20040510064339id_/http://example.org/conference/"
-            ),
-            make_capt(
-                url="http://example.org/conference",
-                ts="20040303170500",
-                status="200",
-            ),
-        )
-
-
-def test_slash_redirect_substitution_accepts_default_port_and_relative_location():
-    from archive_magic_fetch.playback import download_exact
-
-    identity = make_capt(
-        url="http://example.org/policy/edu",
-        ts="20040316070310",
-        status="301",
-    )
-    response = MagicMock()
-    response.headers = {
-        "X-Archive-Redirect-Reason": "found capture at 20040326073528",
-        "Location": "/web/20040326073528id_/http://example.org:80/policy/edu/",
-    }
-
-    class Client:
-        def __init__(self):
-            self.session = MagicMock()
-            self.session.request.return_value = response
-
-        def get_memento(self, *args, **kwargs):
-            self.session.request("GET", "https://web.archive.org/web/x")
-            raise MementoPlaybackError("could not be played")
-
-    result = download_exact(Client(), identity)
-    assert result.status_code == 301
-    assert ("Location", "http://example.org/policy/edu/") in result.headers
-
-
-def test_found_capture_substitution_is_kept_under_requested_identity():
-    from archive_magic_fetch.playback import download_exact
-
-    identity = make_capt(
-        url="http://example.org/groups/?PHPSESSID=abc",
+        url="http://example.org/groups",
         ts="20041009172745",
-        status="200",
-        digest="sha1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        status=status,
     )
-    body = b"<html>groups</html>"
     client = found_capture_client(
-        "http://example.org/groups/",
-        "20041009202542",
-        body,
+        "http://example.org/groups/", "20041009202542", b"nearby content",
     )
-    result = download_exact(client, identity)
-    assert client.calls == 2
-    assert result.substituted is True
-    assert result.body == body
-    assert result.identity == identity
-    assert result.warc_date == "2004-10-09T17:27:45Z"
-    assert result.source_uri.endswith("id_/http://example.org/groups/")
-    assert result.digest_matched is False
-    assert result.status_code == 200
+    with pytest.raises(MementoPlaybackError):
+        download_exact(client, identity)
+    assert client.calls == 1
 
 
 def test_inventory_remembers_redirect_representative_by_status(tmp_path):
@@ -444,21 +294,6 @@ def test_empty_http_200_matching_cdx_digest_is_stored():
     assert result.status_code == 200
     assert result.digest_matched is True
     assert result.warc_payload_digest == EMPTY_PAYLOAD_DIGEST
-
-
-def test_empty_http_200_from_cdx_skips_redirects():
-    from archive_magic_fetch.protocol import EMPTY_PAYLOAD_DIGEST
-    from archive_magic_fetch.playback import empty_http_200_from_cdx
-
-    empty_200 = make_capt(status="200", digest=EMPTY_PAYLOAD_DIGEST)
-    result = empty_http_200_from_cdx(empty_200, mime="text/html")
-    assert result is not None
-    assert result.body == b""
-    assert result.headers == (("Content-Type", "text/html"), ("Content-Length", "0"))
-    assert empty_http_200_from_cdx(
-        make_capt(status="301", digest=EMPTY_PAYLOAD_DIGEST), mime="text/html"
-    ) is None
-    assert empty_http_200_from_cdx(make_capt(status="200"), mime="text/html") is None
 
 
 def test_invalid_uri_playback_is_always_rejected():

@@ -1,4 +1,4 @@
-"""Measure playback HTTP sends, including redirects and recovery requests."""
+"""Measure playback HTTP sends, including redirects and retries."""
 
 from __future__ import annotations
 

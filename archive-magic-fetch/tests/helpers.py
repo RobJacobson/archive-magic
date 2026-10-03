@@ -205,37 +205,6 @@ def memento_client(
     return Client()
 
 
-def substitution_client(slash_url: str, found_ts: str):
-    """Client whose exact playback is a Wayback slash-normalizing 302."""
-
-    from wayback.exceptions import MementoPlaybackError
-
-    location = f"https://web.archive.org/web/{found_ts}id_/{slash_url}"
-    response = MagicMock()
-    response.headers = {
-        "X-Archive-Redirect-Reason": f"found capture at {found_ts}",
-        "Location": location,
-    }
-
-    class Session:
-        def request(self, method, url, **kwargs):
-            return response
-
-    class Client:
-        def __init__(self):
-            self.session = Session()
-            self.calls = 0
-
-        def get_memento(self, *args, **kwargs):
-            self.calls += 1
-            self.session.request(
-                "GET", "https://web.archive.org/web/x", allow_redirects=False
-            )
-            raise MementoPlaybackError("could not be played")
-
-    return Client()
-
-
 def found_capture_client(
     nearby_url: str,
     found_ts: str,

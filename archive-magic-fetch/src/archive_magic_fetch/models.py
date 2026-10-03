@@ -49,7 +49,6 @@ class PlaybackResult:
     source_uri: str
     warc_payload_digest: str
     digest_matched: bool = True
-    substituted: bool = False
 
 
 @dataclass(frozen=True)

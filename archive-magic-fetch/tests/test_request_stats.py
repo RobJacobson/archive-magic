@@ -53,21 +53,15 @@ def workers_for(clock, path, **kwargs):
     )
 
 
-def test_recovery_and_429_retry_are_individually_paced_and_traced(tmp_path, monkeypatch):
+def test_429_retry_is_paced_and_traced(tmp_path, monkeypatch):
     clock = Clock()
     path = tmp_path / "requests.jsonl"
     calls = []
     identity = make_capt(digest=payload_digest(b"hello"))
-    nearby = "https://web.archive.org/web/20040615000001id_/http://example.org/"
 
     def send(_adapter, request, **kwargs):
         calls.append((clock(), request.url))
-        if request.url != nearby:
-            return response(request, 302, {
-                "Location": nearby,
-                "X-Archive-Redirect-Reason": "found capture at 20040615000001",
-            }, memento=False)
-        if len(calls) == 2:
+        if len(calls) == 1:
             return response(request, 429, {"Retry-After": "60"})
         return response(request)
 
@@ -78,22 +72,48 @@ def test_recovery_and_429_retry_are_individually_paced_and_traced(tmp_path, monk
     finally:
         workers.close()
     assert outcome.failure is None
-    assert outcome.result.substituted
     assert outcome.attempts == 2
-    assert [t for t, _ in calls] == [100, 100.5, 160.5, 161]
+    assert [t for t, _ in calls] == [100, 160]
     trace = events(path)
     starts = [e for e in trace if e["event"] == "request_start"]
     ends = [e for e in trace if e["event"] == "request_end"]
-    assert [e["attempt"] for e in starts] == [1, 1, 2, 2]
-    assert [e["request_in_attempt"] for e in starts] == [1, 2, 1, 2]
-    assert [e["request_id"] for e in starts] == [1, 2, 3, 4]
-    assert [e["status"] for e in ends] == [302, 429, 302, 200]
-    assert ends[1]["retry_after"] == "60"
+    assert [e["attempt"] for e in starts] == [1, 2]
+    assert [e["request_in_attempt"] for e in starts] == [1, 1]
+    assert [e["request_id"] for e in starts] == [1, 2]
+    assert [e["status"] for e in ends] == [429, 200]
+    assert ends[0]["retry_after"] == "60"
     assert starts[0]["capture"]["timestamp"] == identity.timestamp
     assert datetime.fromisoformat(starts[0]["time_utc"]).utcoffset().total_seconds() == 0
-    assert trace[-1]["requests_total"] == 4
+    assert trace[-1]["requests_total"] == 2
     assert trace[-1]["http_429"] == 1
-    assert trace[-1]["peak_starts_1s"] == 2
+    assert trace[-1]["peak_starts_1s"] == 1
+
+
+def test_nearby_redirect_stops_after_one_http_request(tmp_path, monkeypatch):
+    clock = Clock()
+    path = tmp_path / "requests.jsonl"
+    calls = []
+    identity = make_capt(digest=payload_digest(b"hello"))
+    nearby = "https://web.archive.org/web/20040615000001id_/http://example.org/"
+
+    def send(_adapter, request, **kwargs):
+        calls.append(request.url)
+        return response(request, 302, {
+            "Location": nearby,
+            "X-Archive-Redirect-Reason": "found capture at 20040615000001",
+        }, memento=False)
+
+    monkeypatch.setattr(HTTPAdapter, "send", send)
+    workers = workers_for(clock, path)
+    try:
+        outcome = workers.download(identity)
+    finally:
+        workers.close()
+    assert outcome.failure is not None
+    assert outcome.attempts == 1
+    assert len(calls) == 1
+    assert nearby not in calls
+    assert events(path)[-1]["requests_total"] == 1
 
 
 def test_requests_redirects_do_not_bypass_gate_or_double_count(tmp_path, monkeypatch):

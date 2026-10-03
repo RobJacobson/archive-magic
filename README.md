@@ -54,7 +54,7 @@ WARCs are copied first, CDXJ indexes synced second, and obsolete WARCs removed l
 After an upload failure, `--sync-only` retries without contacting Wayback.
 
 Playback pacing applies to every HTTP send, including retries and nearby-capture
-recovery, across all workers in one process. Each run logs request totals and peak
+redirects, across all workers in one process. Each run logs request totals and peak
 counts over rolling one-second and one-minute windows; 429s also log current counts.
 Add `--trace-requests` to save each send and response with real UTC timestamps,
 capture/attempt IDs, and rolling counts in `logs/<run>.requests.jsonl`.

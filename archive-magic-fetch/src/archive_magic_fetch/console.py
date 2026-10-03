@@ -127,27 +127,21 @@ def _capture_line(outcome: CaptureOutcome) -> tuple[str, str]:
         return "Ignored [already represented]", "dim"
     if outcome.kind is CaptureKind.REVISIT:
         return "Revisit", "revisit"
-    if outcome.kind is CaptureKind.EMPTY:
-        return "Empty payload", "revisit"
     if outcome.kind is CaptureKind.FAILURE:
         assert outcome.failure is not None
         reason = outcome.failure.category.value.replace("_", " ")
         if is_invalid_uri_payload_digest(outcome.identity.payload_digest):
             reason = "invalid URI"
         return _with_timing(f"Ignored [{reason}]", outcome), "warning"
-    if outcome.kind is CaptureKind.SLASH_REDIRECT:
-        return _with_timing("Slash redirect", outcome), "revisit"
 
     assert outcome.kind is CaptureKind.DOWNLOADED
     assert outcome.playback is not None
     extra = playback_timing(outcome)
-    if outcome.playback.substituted:
-        extra += ", substituted"
     if not outcome.playback.digest_matched:
         extra += ", digest mismatch kept"
     style = (
         "warning"
-        if outcome.playback.substituted or not outcome.playback.digest_matched
+        if not outcome.playback.digest_matched
         else "success"
     )
     return f"Downloaded ({extra})", style
