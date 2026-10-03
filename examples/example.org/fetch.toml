@@ -1,6 +1,8 @@
 [archive]
 id = "example.org"
 url_pattern = "*.example.org"
+# Complete historical CDX years are cached in index/ beside this file.
+# Keep this query fixed, or explicitly clear the cache when changing it.
 
 [output]
 type = "remote"
@@ -11,4 +13,6 @@ endpoint_url = "https://ACCOUNT_ID.r2.cloudflarestorage.com"
 region = "auto"
 
 [fetch]
+# Dates select WARC captures; uncached CDX queries cover each full calendar year.
+# The current UTC year is queried on every run and is never cached.
 start = "2000-01-01"

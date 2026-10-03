@@ -7,7 +7,7 @@ and CDXJ indexes. Navigator reads that flat file format independently.
 
 ```text
 archive-magic-fetch ARCHIVE [--config PATH] [--start DATE] [--end DATE] [--reset-data]
-  [--workers N] [--starts-per-second N] [--retries N]
+  [--workers N] [--starts-per-second N] [--retries N] [--trace-requests]
 archive-magic-fetch ARCHIVE --sync-only
 ```
 
@@ -26,6 +26,64 @@ retries = 4
 override the file for one run. A missing file keeps the code defaults: 4
 workers, 16 starts/second, and 4 retries. These fields do not belong in
 per-archive `fetch.toml`.
+
+### Playback request diagnostics
+
+`starts_per_second` controls HTTP transport sends shared across a run's workers.
+At 2, sends are spaced at least 0.5 seconds apart. The gate sits immediately before
+the Requests HTTP adapter sends, so extra requests for nearby-capture recovery,
+redirects, and capture retries each consume a slot. Wayback and urllib3 automatic
+retries are disabled. `retries = 4` allows up to five capture attempts; one attempt
+can issue several HTTP requests. Existing `playback_attempts` metrics still count
+capture attempts. Duplicate capture identities and reusable revisits require no
+additional HTTP requests. The limit is per process, and CDX requests use their
+own pacing and are excluded from these playback counters.
+
+The startup line prints effective worker/rate/retry settings. Every run prints a
+`playback HTTP` summary with total sends, peak counts in rolling 1s and 60s windows,
+and the number of 429 responses. Each 429 prints its request ID and recent counts
+before the existing cooldown message. Windows are `(now - window, now]`; failed
+connection attempts count as sends. These counters measure attempted HTTP sends,
+not packets or successful payload downloads.
+
+For a detailed trace:
+
+```console
+uv run archive-magic-fetch /path/to/archive --trace-requests
+```
+
+This writes a flushed `logs/<run>.requests.jsonl` beside the normal run log. Every
+`request_start` has a real `time_utc`, monotonic timestamp, process/thread ID,
+request ID, method/URL, requested capture identity, attempt number, request number
+within that attempt, and recent/peak counts. A matching `request_end` has status,
+Retry-After, Location, or transport exception type. Response elapsed time covers
+headers only; streamed payload reads happen afterward. Interrupted sends may have
+only a start event. A final `summary` is written when workers shut down.
+
+Repeated URLs with increasing `attempt` values are capture retries. A
+`request_in_attempt` greater than 1 exposes recovery or redirect requests. Capture
+timestamps in ordinary progress output are historical capture dates, so they
+cannot establish the real request rate. Trace files contain full requested URLs.
+
+To count sends in each UTC calendar second and minute (rather than rolling windows):
+
+```sh
+python - /path/to/logs/RUN.requests.jsonl <<'PY'
+import collections, json, sys
+buckets = {"second": collections.Counter(), "minute": collections.Counter()}
+with open(sys.argv[1]) as stream:
+    for line in stream:
+        event = json.loads(line)
+        if event["event"] == "request_start":
+            buckets["second"][event["time_utc"][:19]] += 1
+            buckets["minute"][event["time_utc"][:16]] += 1
+for unit, counts in buckets.items():
+    for timestamp, count in sorted(counts.items()):
+        print(unit, timestamp + "Z", count)
+PY
+```
+
+### Archive configuration
 
 The `--sync-only` form requires remote output and does not query Wayback. It cannot
 be combined with dates or `--reset-data`.
@@ -74,22 +132,52 @@ data/
 
 ## Annual acquisition
 
-Fetch visits years in order. It queries the whole-year CDX through the existing
-`wayback` client. Playback `--retries` does not apply to CDX. HTTP 504, read
-timeouts, 429, and connection refused retry the same window ten times with
-exponential pauses from 60s capped at 10 minutes (about an hour). If that
-year still has no listing, Fetch records a hole, skips downloads for that
-year, and continues with the next year. Date splitting is reserved for a
-300-second wall-clock budget, which means the window itself is too expensive:
-first `cdx_window_days` slices (default 28), then 7-day slices. A 7-day
-window that still fails is a hole. A hole is recorded in
-`logs/cdx/{year}.json` with every completed sibling window. The next run
-queries only the holes. Fetch skips memento work and publication until the
-year listing is complete, then deletes the checkpoint. A complete CDX listing
-is deduplicated by capture identity. The existing URL-owned playback workers,
-chronological ordering within each URL, retry policy, and cross-year digest
-representatives remain in use. Individual unresolved mementos retain the
-existing skip-and-record policy.
+Fetch visits selected years in order, taking the current UTC year once at run
+start and skipping future years. CDX queries always cover January 1 00:00:00
+through December 31 23:59:59. Exact configured/CLI dates filter playback captures
+after acquisition; they do not narrow the CDX query.
+
+Complete historical years are cached as ordinary JSON arrays in
+`index/YYYY.cdx.json` beside `fetch.toml`. An existing valid cache avoids all CDX
+requests for that year. Each record contains `urlkey`, `original_url`, `timestamp`,
+`status_token`, `payload_digest`, and `mime`; `[]` represents a successfully
+queried empty year. Fetch saves a cache only after every page and fallback slice
+succeeds, writing a temporary sibling and atomically renaming it before WARC work.
+Temporary files are never cache hits. Invalid JSON, fields, timestamps, or records
+from the wrong year fail that year without replacing or re-fetching the cache.
+The current UTC year is always queried afresh and never reads or writes a
+persistent cache, even when playback dates select only completed months.
+
+The pinned `wayback` client still handles pagination and shared CDX pacing.
+Playback `--retries` does not apply to CDX. HTTP 504, read timeouts, 429, and
+connection refused retry the same window up to ten attempts with exponential
+pauses from 60s capped at 10 minutes, honoring a longer `Retry-After`. Other
+transient failures retain their three-attempt budget. A 300-second wall-clock
+budget triggers smaller windows: first `cdx_window_days` (default 28), then
+7-day windows when smaller. Fallback slices run sequentially in memory. A
+terminal failure stops that year immediately, discards its results, skips WARC
+processing, and continues to later years with a nonzero final exit status.
+Failed acquisitions retain no progress between runs.
+
+There is no coverage manifest, refresh mechanism, or persisted partial checkpoint.
+Legacy files in `logs/cdx/` are ignored and left untouched. The normalized URL
+query must remain fixed for a cache's lifetime; explicitly clear the cache before
+changing it. Cached historical years are retained indefinitely, accepting that
+captures made visible later, including around the UTC year boundary, are missed.
+A completed acquisition is not a guarantee of permanent upstream completeness.
+
+The cache stays beside `fetch.toml` even with a custom data directory. Programmatic
+settings may provide `index_directory`; its default is `data_directory.parent /
+"index"`. The resolved cache directory must be outside the data directory, so
+resetting data cannot delete it. The existing archive lock enforces one process
+per archive layout; no separate cache lock is added. Concurrent processes sharing
+a cache through different archive layouts are unsupported. Only WARC/CDXJ data
+is published to the bucket.
+
+After acquisition, requested playback captures are sorted and deduplicated by
+identity. The existing URL-owned playback workers, chronological ordering within
+each URL, retry policy, and cross-year digest representatives remain in use.
+Individual unresolved mementos retain the existing skip-and-record policy.
 
 For each year, Fetch creates a same-filesystem stage. Unchanged WARC shards
 are hard-linked into it; the final shard is copied only if new captures need to
@@ -140,6 +228,9 @@ Local `--reset-data` rebuilds selected years through staging. Remote
 overrides, warns of playback downtime, deletes only managed files for this archive
 under remote `data/`, preserving metadata, assets and unrelated objects,
 clears the local data directory, and rebuilds and publishes years in order.
+Both reset modes preserve historical CDX caches and reuse them to rebuild WARC
+contents. A successful empty selection can clear a local year through reset
+staging. WARC failures also leave completed CDX caches intact.
 
 Before switching an existing bucket-authoritative archive, finish pending
 publication with the old Fetch version. Restore its WARC/CDXJ objects into a
@@ -155,5 +246,5 @@ Fetch does not migrate or delete old root objects automatically.
 - `staging.py`: annual copy-on-write staging and interrupted-commit recovery.
 - `storage.py`: archive lock, local preflight, and ordered rclone commands.
 - `warc.py` and `index.py`: portable WARC and CDXJ construction.
-- `cdx.py`: CDX search, failure classification, window splits, and hole checkpoints.
+- `cdx.py`: CDX search, failure classification, window splits, and complete historical-year caches.
 - `resolution.py`, `workers.py`, and `playback.py`: Wayback playback acquisition.

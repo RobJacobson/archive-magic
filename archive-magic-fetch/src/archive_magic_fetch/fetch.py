@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Callable, Mapping, Optional, Sequence
 
 from .cdx import (
-    acquire_year_cdx,
+    load_or_fetch_year_cdx,
     parse_date_bound,
     validate_date_range,
     year_ranges,
@@ -90,6 +90,18 @@ class FetchSettings:
     playback_workers: int = 4
     playback_starts_per_second: float = 16.0
     retries: int = DEFAULT_RETRIES
+    trace_requests: bool = False
+    index_directory: Path | None = None
+
+    def __post_init__(self) -> None:
+        data_directory = Path(self.output.data_directory).expanduser().resolve()
+        index_directory = (
+            Path(self.index_directory)
+            if self.index_directory is not None else data_directory.parent / "index"
+        ).expanduser().resolve()
+        if index_directory == data_directory or data_directory in index_directory.parents:
+            raise ValueError("index_directory must be outside data_directory")
+        object.__setattr__(self, "index_directory", index_directory)
 
 
 @dataclass
@@ -110,7 +122,6 @@ class _YearResult:
     warcs: tuple[WarcArtifact, ...]
     index: IndexArtifact | None
     skip_errors: int
-    incomplete: bool = False
     query: dict[str, object] | None = None
     representatives: dict[tuple[str, str, str], StoredResponse] | None = None
 
@@ -141,23 +152,31 @@ def run_fetch(
 ) -> FetchResult:
     """Execute the annual fetch pipeline with bounded playback workers."""
 
+    current_year = int(current_utc_cdx_timestamp()[:4])
     layout = ArchiveLayout(settings.output.data_directory, settings.archive_id)
     layout.logs_root.mkdir(parents=True, exist_ok=True)
     run_id = init_run_id(layout)
     init_run_record(layout, run_id)
     factory = client_factory or make_client
-    workers = PlaybackWorkers(
-        factory,
-        download_fn or download_exact,
-        sleep=sleep,
-        pace=download_fn is None,
-        report=emit,
-        max_workers=settings.playback_workers,
-        starts_per_second=settings.playback_starts_per_second,
-        retries=settings.retries,
+    trace_path = (
+        layout.run_log(run_id).with_suffix(".requests.jsonl")
+        if settings.trace_requests else None
     )
-    try:
-        with mirror_output(layout.run_log(run_id)):
+    with mirror_output(layout.run_log(run_id)):
+        workers = PlaybackWorkers(
+            factory,
+            download_fn or download_exact,
+            sleep=sleep,
+            pace=download_fn is None,
+            report=emit,
+            max_workers=settings.playback_workers,
+            starts_per_second=settings.playback_starts_per_second,
+            retries=settings.retries,
+            trace_path=trace_path,
+        )
+        try:
+            if trace_path is not None:
+                emit(f"playback HTTP trace: {trace_path}")
             with archive_lock(layout):
                 recover_stages(layout)
                 return _run_fetch(
@@ -165,10 +184,11 @@ def run_fetch(
                     layout=layout,
                     run_id=run_id,
                     workers=workers,
+                    current_year=current_year,
                     sleep=sleep,
                 )
-    finally:
-        workers.close()
+        finally:
+            workers.close()
 
 
 def _run_fetch(
@@ -177,6 +197,7 @@ def _run_fetch(
     layout: ArchiveLayout,
     run_id: str,
     workers: PlaybackWorkers,
+    current_year: int,
     sleep,
 ) -> FetchResult:
     """Execute serial years with parallel playback and one WARC writer."""
@@ -197,7 +218,8 @@ def _run_fetch(
     emit(f"archive {layout.archive_id}: collections {first_year}-{last_year}")
     emit(
         f"download: workers={settings.playback_workers}, "
-        f"starts/second={settings.playback_starts_per_second:g}"
+        f"starts/second={settings.playback_starts_per_second:g}, "
+        f"retries={settings.retries} (HTTP sends, including retries/recovery; per process)"
     )
 
     run_skips_errors = 0
@@ -206,6 +228,9 @@ def _run_fetch(
     for year, year_start, year_end in year_ranges(
         settings.date_start, settings.date_end
     ):
+        if year > current_year:
+            emit(f"skipping future CDX year {year}")
+            continue
         year_started = time.monotonic()
         stage = YearStage(
             layout,
@@ -218,29 +243,13 @@ def _run_fetch(
                 layout=stage.layout,
                 stage=stage,
                 year=year,
+                current_year=current_year,
                 date_start=year_start,
                 date_end=year_end,
                 workers=workers,
                 representatives=representatives,
                 sleep=sleep,
             )
-            if result.incomplete:
-                stage.abort()
-                failed_years.append(year)
-                write_run_record(
-                    layout,
-                    collection_id=f"{year:04d}",
-                    run_id=run_id,
-                    url_pattern=settings.url_pattern,
-                    date_start=year_start,
-                    date_end=year_end,
-                    query=result.query or {},
-                    warcs=[],
-                    index=None,
-                    metrics=result.metrics,
-                    failures=[],
-                )
-                continue
             stage.commit(
                 result.warcs,
                 index_changed=bool(result.warcs) or (
@@ -320,6 +329,7 @@ def _run_year(
     layout: ArchiveLayout,
     stage: YearStage,
     year: int,
+    current_year: int,
     date_start: str,
     date_end: str,
     workers: PlaybackWorkers,
@@ -331,30 +341,24 @@ def _run_year(
     collection_id = f"{year:04d}"
     year_metrics = RunMetrics()
     cdx_started = time.monotonic()
-    acquisition = acquire_year_cdx(
-        layout=stage.canonical,
+    assert settings.index_directory is not None
+    acquisition = load_or_fetch_year_cdx(
+        index_directory=settings.index_directory,
         year=year,
+        current_year=current_year,
         url_pattern=settings.url_pattern,
-        date_start=date_start,
-        date_end=date_end,
         cdx_window_days=settings.cdx_window_days,
         cdx_page_limit=settings.cdx_page_limit,
-        reset=settings.reset_data,
         sleep=sleep,
     )
     year_metrics.cdx_duration_s += time.monotonic() - cdx_started
-    captures = list(acquisition.captures)
-    failed_windows = [
-        {
-            "date_start": hole.date_start,
-            "date_end": hole.date_end,
-            "kind": hole.kind,
-            "message": hole.message,
-        }
-        for hole in acquisition.holes
-    ]
-
-    selected = _dedupe_captures(captures)
+    captures = acquisition.captures
+    selected = _dedupe_captures(
+        sorted(
+            (item for item in captures if date_start <= item.identity.timestamp <= date_end),
+            key=lambda item: item.identity.sort_key(),
+        )
+    )
     year_metrics.selected += len(selected)
 
     query: dict[str, object] = {
@@ -364,17 +368,6 @@ def _run_year(
         "result_count": len(captures),
         "cdx_page_limit": settings.cdx_page_limit,
     }
-    if acquisition.fallback is not None:
-        query["cdx_fallback"] = acquisition.fallback
-        query["cdx_window_days"] = settings.cdx_window_days
-        query["window_count"] = acquisition.window_count
-        query["failed_windows"] = failed_windows
-    if failed_windows:
-        emit(f"not downloading {year}.")
-        return _YearResult(
-            metrics=year_metrics, failures=(), warcs=(), index=None,
-            skip_errors=0, incomplete=True, query=query,
-        )
 
     inventory = inventory_collection(layout, collection_id)
     for stored in representatives.values():
@@ -664,12 +657,14 @@ def build_settings(
     *,
     reset_data: bool = False,
     output: FetchOutput,
+    index_directory: Path | None = None,
     warc_target_bytes: int = DEFAULT_WARC_TARGET_BYTES,
     cdx_window_days: int = DEFAULT_CDX_WINDOW_DAYS,
     cdx_page_limit: int = DEFAULT_CDX_PAGE_LIMIT,
     playback_workers: int = 4,
     playback_starts_per_second: float = 16.0,
     retries: int = DEFAULT_RETRIES,
+    trace_requests: bool = False,
     default_start: str = "1995-01-01",
     default_end: str | None = None,
 ) -> FetchSettings:
@@ -704,10 +699,12 @@ def build_settings(
         date_end=end,
         reset_data=reset_data,
         output=output,
+        index_directory=index_directory,
         warc_target_bytes=warc_target_bytes,
         cdx_window_days=cdx_window_days,
         cdx_page_limit=cdx_page_limit,
         playback_workers=playback_workers,
         playback_starts_per_second=playback_starts_per_second,
         retries=retries,
+        trace_requests=trace_requests,
     )

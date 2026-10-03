@@ -9,6 +9,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
+
 from archive_magic_fetch.models import FailureCategory
 from archive_magic_fetch.protocol import (
     INVALID_URI_PAYLOAD_DIGEST,
@@ -552,10 +554,14 @@ def test_cli_rejects_reversed_range(tmp_path):
     assert code == 2
 
 
-def test_cli_uses_configured_history(tmp_path, monkeypatch):
+@pytest.mark.parametrize("data_directory", ["data", "../storage/data"])
+def test_cli_uses_configured_history(tmp_path, monkeypatch, data_directory):
     from archive_magic_fetch import cli
 
     config = write_cli_config(tmp_path)
+    config.write_text(config.read_text().replace(
+        'data_directory = "data"', f'data_directory = "{data_directory}"'
+    ))
     captured = []
 
     def run(settings):
@@ -567,7 +573,8 @@ def test_cli_uses_configured_history(tmp_path, monkeypatch):
     assert captured[0].archive_id == "example.org"
     assert captured[0].date_start == "20000101000000"
     assert captured[0].date_end == "20011231235959"
-    assert captured[0].output.data_directory == (tmp_path / "data").resolve()
+    assert captured[0].output.data_directory == (tmp_path / data_directory).resolve()
+    assert captured[0].index_directory == tmp_path / "index"
 
 
 def test_remote_reset_rejects_dates_and_warns_before_full_rebuild(
@@ -606,6 +613,7 @@ def test_cli_runtime_flags_override_defaults(tmp_path, monkeypatch):
     assert captured[0].playback_workers == 4
     assert captured[0].playback_starts_per_second == 16.0
     assert captured[0].retries == 4
+    assert captured[0].trace_requests is False
     assert captured[0].cdx_window_days == 28
     assert captured[0].cdx_page_limit == 5000
     captured.clear()
@@ -619,6 +627,7 @@ def test_cli_runtime_flags_override_defaults(tmp_path, monkeypatch):
                 "1.5",
                 "--retries",
                 "0",
+                "--trace-requests",
             ]
         )
         == 0
@@ -626,6 +635,7 @@ def test_cli_runtime_flags_override_defaults(tmp_path, monkeypatch):
     assert captured[0].playback_workers == 2
     assert captured[0].playback_starts_per_second == 1.5
     assert captured[0].retries == 0
+    assert captured[0].trace_requests is True
     assert captured[0].cdx_window_days == 28
     assert captured[0].cdx_page_limit == 5000
 
@@ -729,4 +739,3 @@ def test_log_url_outcome_omits_already_represented_lines(capsys):
     assert "1/397 http://www.nclr.org/special/award.html" in text
     assert "already represented" not in text
     assert "Downloaded" in text
-

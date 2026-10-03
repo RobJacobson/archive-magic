@@ -315,7 +315,7 @@ def test_explicit_remote_reset_purges_configured_prefix(tmp_path, monkeypatch):
 
 
 def test_remote_reset_purges_before_rebuilding_local_archive(tmp_path, monkeypatch):
-    from archive_magic_fetch.cdx import CdxResult
+    from archive_magic_fetch.cdx import CdxResult, load_or_fetch_year_cdx
     from archive_magic_fetch.models import ParsedCapture
 
     layout = make_collection(tmp_path / "data")
@@ -332,6 +332,16 @@ def test_remote_reset_purges_before_rebuilding_local_archive(tmp_path, monkeypat
             captures=(ParsedCapture(identity=replacement, mime="text/html"),),
             search_url="http://example.org/", match_type=None,
         ),
+    )
+    cache = tmp_path / "index" / "2004.cdx.json"
+    load_or_fetch_year_cdx(
+        index_directory=cache.parent, year=2004, current_year=2005,
+        url_pattern="http://example.org/",
+    )
+    before = cache.read_bytes()
+    monkeypatch.setattr(
+        "archive_magic_fetch.cdx.fetch_cdx",
+        lambda **_kw: pytest.fail("reset re-fetched cached CDX"),
     )
     result = run_fetch(
         FetchSettings(
@@ -352,6 +362,7 @@ def test_remote_reset_purges_before_rebuilding_local_archive(tmp_path, monkeypat
     inventory = inventory_collection(layout, "2004")
     assert inventory.contains(replacement)
     assert not inventory.contains(old)
+    assert cache.read_bytes() == before
 
 
 def test_real_rclone_reset_and_sync_preserve_non_archive_content(tmp_path, monkeypatch):
@@ -361,6 +372,9 @@ def test_real_rclone_reset_and_sync_preserve_non_archive_content(tmp_path, monke
     if shutil.which('rclone') is None:
         pytest.skip('rclone not installed')
     layout = make_collection(tmp_path / 'local' / 'data')
+    cache = layout.root.parent / "index" / "2004.cdx.json"
+    cache.parent.mkdir()
+    cache.write_text("[]")
     remote = tmp_path / 'bucket'
     (remote/'data').mkdir(parents=True)
     (remote/'assets').mkdir()
@@ -378,10 +392,12 @@ def test_real_rclone_reset_and_sync_preserve_non_archive_content(tmp_path, monke
     output = remote_output(layout.root)
     sync_archive(layout, output)
     assert (remote/'data'/layout.collection_index('2004').name).exists()
+    assert not list(remote.rglob("*.cdx.json"))
     purge_remote(output, layout.archive_id)
     assert not list((remote/'data').glob('example.org-*'))
     assert all((remote/name).read_bytes() == body for name,body in protected.items())
     assert layout.collection_index('2004').exists()
+    assert cache.read_text() == "[]"
 
 
 def test_legacy_flat_objects_stop_sync_and_reset_before_mutation(tmp_path, monkeypatch):

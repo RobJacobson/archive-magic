@@ -40,6 +40,7 @@ class FetchConfig:
     cdx_page_limit: int = DEFAULT_CDX_PAGE_LIMIT
     start: str = DEFAULT_START
     end: str | None = None
+    index_directory: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -135,6 +136,7 @@ def load_config(value: Path | str) -> FetchConfig:
         cdx_page_limit=options.cdx_page_limit,
         start=options.start,
         end=options.end,
+        index_directory=source.parent / "index",
     )
 
 

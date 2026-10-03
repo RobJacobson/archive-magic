@@ -9,7 +9,7 @@ import time
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeoutError
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
@@ -17,7 +17,6 @@ from pathlib import Path
 from wayback import CdxRecord, WaybackClient
 
 from .collection import (
-    ArchiveLayout,
     exclusive_temp_path,
     normalize_domain,
     publish_file_atomically,
@@ -186,7 +185,7 @@ def next_split_days(
     date_end: str,
     first_split_days: int,
 ) -> int | None:
-    """Return the next split width, or None when the window is a hole."""
+    """Return the next split width, or None at the smallest window."""
 
     width = window_calendar_days(date_start, date_end)
     if width > first_split_days:
@@ -209,26 +208,6 @@ class CdxFailureKind(str, Enum):
     TRANSIENT = "transient"
     WALL_CLOCK = "wall_clock"
     RATE_LIMIT = "rate_limit"
-
-
-@dataclass(frozen=True)
-class CdxHole:
-    date_start: str
-    date_end: str
-    kind: str
-    message: str
-
-
-@dataclass(frozen=True)
-class CdxAcquisition:
-    """Completed year listing, or the holes that still block publication."""
-
-    captures: tuple[ParsedCapture, ...]
-    search_url: str
-    match_type: str | None
-    holes: tuple[CdxHole, ...]
-    fallback: str | None
-    window_count: int
 
 
 def _parsed_capture(record: CdxRecord) -> ParsedCapture:
@@ -385,7 +364,7 @@ def classify_cdx_failure(error: BaseException) -> CdxFailureKind | None:
 
 
 def cdx_should_split(error: BaseException) -> bool:
-    """True when a failed window should split rather than become a hole.
+    """True when a failed window should split rather than fail the year.
 
     Only a wall-clock budget means the window itself is too expensive.
     HTTP 504 and dropped connections are IA overload; splitting them
@@ -395,241 +374,86 @@ def cdx_should_split(error: BaseException) -> bool:
     return classify_cdx_failure(error) is CdxFailureKind.WALL_CLOCK
 
 
-def acquire_year_cdx(
+def load_or_fetch_year_cdx(
     *,
-    layout: ArchiveLayout,
+    index_directory: Path,
     year: int,
+    current_year: int,
     url_pattern: str,
-    date_start: str,
-    date_end: str,
     cdx_window_days: int = DEFAULT_CDX_WINDOW_DAYS,
     cdx_page_limit: int = DEFAULT_CDX_PAGE_LIMIT,
-    reset: bool = False,
     sleep: Callable[[float], None] = time.sleep,
     report: Callable[[str], None] = emit,
-) -> CdxAcquisition:
-    """Query one year, splitting and checkpointing only the windows that fail."""
+) -> CdxResult:
+    """Return a full calendar-year listing, caching only completed past years.
 
-    path = layout.cdx_checkpoint(year)
-    if reset:
-        path.unlink(missing_ok=True)
-    state = _load_checkpoint(path, url_pattern, cdx_page_limit, date_start, date_end)
-    if state is None and path.is_file():
-        report("ignoring saved CDX index progress (search settings changed).")
-        path.unlink(missing_ok=True)
-        state = _empty_checkpoint(url_pattern, cdx_page_limit, date_start, date_end)
-    if state is None:
-        state = _empty_checkpoint(url_pattern, cdx_page_limit, date_start, date_end)
+    A final cache file is published only after every query page and fallback
+    window succeeds. The caller holds the archive lock for this operation.
+    Current-year results are always fetched and remain in memory.
+    """
 
-    if state.holes:
-        pending = list(state.holes)
-        for hole in pending:
-            _acquire_window(
-                state,
-                layout=layout,
-                year=year,
-                date_start=hole["date_start"],
-                date_end=hole["date_end"],
-                first_split_days=cdx_window_days,
-                sleep=sleep,
-                report=report,
-            )
-    elif state.completed:
-        path.unlink(missing_ok=True)
-        return _acquisition_from_state(state)
-    else:
+    if not 1 <= year <= current_year:
+        raise ValueError(f"cannot acquire CDX year {year} (current year: {current_year})")
+    if cdx_window_days < 1 or cdx_page_limit < 1:
+        raise ValueError("CDX window days and page limit must be positive")
+    search_url, match_type = normalize_cdx_search(url_pattern)
+    path = index_directory / f"{year:04d}.cdx.json"
+    historical = year < current_year
+    if historical and (path.exists() or path.is_symlink()):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(payload, list):
+                raise ValueError("expected an array of captures")
+            captures = tuple(_capture_from_dict(item) for item in payload)
+            if any(int(item.identity.timestamp[:4]) != year for item in captures):
+                raise ValueError(f"captures must belong to {year}")
+        except (OSError, UnicodeError, ValueError) as error:
+            raise ValueError(f"invalid CDX cache {path}: {error}") from error
+        report(f"using cached CDX index for {year}: {path}")
+        return CdxResult(captures, search_url, match_type)
+
+    def acquire(date_start: str, date_end: str) -> tuple[ParsedCapture, ...]:
         report(
             "fetching CDX index for "
             f"{format_cdx_index_scope(year, date_start, date_end)}"
         )
         try:
-            result = fetch_cdx(
+            return fetch_cdx(
                 url_pattern=url_pattern,
                 date_start=date_start,
                 date_end=date_end,
                 limit=cdx_page_limit,
                 sleep=sleep,
                 report=report,
-            )
-        except Exception as error:  # noqa: BLE001 - year CDX boundary
-            kind = classify_cdx_failure(error)
-            if kind is None:
-                raise
+            ).captures
+        except Exception as error:  # noqa: BLE001 - CDX network boundary
             split_days = (
                 next_split_days(date_start, date_end, cdx_window_days)
-                if cdx_should_split(error)
-                else None
+                if cdx_should_split(error) else None
             )
             if split_days is None:
-                report(
-                    "Could not get the CDX index for "
-                    f"{format_cdx_index_scope(year, date_start, date_end)}."
-                )
-                state.set_hole(
-                    date_start,
-                    date_end,
-                    kind=kind.value,
-                    message=str(error),
-                )
-                _save_checkpoint(layout, year, state)
-            else:
-                state.fallback = "date_windows"
-                children = list(date_windows(date_start, date_end, split_days))
-                for child_start, child_end in children:
-                    state.set_hole(
-                        child_start,
-                        child_end,
-                        kind=kind.value,
-                        message=str(error),
-                    )
-                _save_checkpoint(layout, year, state)
-                report("CDX index took too long.")
-                report(
-                    f"fetching {split_days}-day ranges ({len(children)} ranges)."
-                )
-                for child_start, child_end in children:
-                    _acquire_window(
-                        state,
-                        layout=layout,
-                        year=year,
-                        date_start=child_start,
-                        date_end=child_end,
-                        first_split_days=cdx_window_days,
-                        sleep=sleep,
-                        report=report,
-                    )
-        else:
-            path.unlink(missing_ok=True)
-            return CdxAcquisition(
-                captures=result.captures,
-                search_url=result.search_url,
-                match_type=result.match_type,
-                holes=(),
-                fallback=None,
-                window_count=1,
-            )
+                raise
+            report("CDX index took too long.")
+            report(f"fetching {split_days}-day ranges.")
+        # Fail immediately on any terminal child error. No partial result or
+        # completed-window checkpoint survives a failed annual acquisition.
+        captures = []
+        for start, end in date_windows(date_start, date_end, split_days):
+            captures.extend(acquire(start, end))
+        return tuple(captures)
 
-    holes = tuple(
-        CdxHole(
-            date_start=item["date_start"],
-            date_end=item["date_end"],
-            kind=item["kind"],
-            message=item["message"],
-        )
-        for item in state.holes
-    )
-    if holes:
-        _save_checkpoint(layout, year, state)
-    else:
-        path.unlink(missing_ok=True)
-    return _acquisition_from_state(state)
-
-
-def _acquisition_from_state(state: "_CdxCheckpoint") -> CdxAcquisition:
-    captures: list[ParsedCapture] = []
-    for window in state.completed:
-        for capture in window["captures"]:
-            if isinstance(capture, ParsedCapture):
-                captures.append(capture)
-            else:
-                captures.append(_capture_from_dict(capture))
-    holes = tuple(
-        CdxHole(
-            date_start=item["date_start"],
-            date_end=item["date_end"],
-            kind=item["kind"],
-            message=item["message"],
-        )
-        for item in state.holes
-    )
-    return CdxAcquisition(
-        captures=tuple(captures),
-        search_url=state.search_url,
-        match_type=state.match_type,
-        holes=holes,
-        fallback=state.fallback,
-        window_count=len(state.completed) + len(state.holes),
-    )
-
-
-def _acquire_window(
-    state: "_CdxCheckpoint",
-    *,
-    layout: ArchiveLayout,
-    year: int,
-    date_start: str,
-    date_end: str,
-    first_split_days: int,
-    sleep: Callable[[float], None],
-    report: Callable[[str], None],
-) -> None:
-    if state.has_completed(date_start, date_end):
-        return
-    report(
-        "fetching CDX index for "
-        f"{format_cdx_index_scope(year, date_start, date_end)}"
-    )
-    try:
-        result = fetch_cdx(
-            url_pattern=state.url_pattern,
-            date_start=date_start,
-            date_end=date_end,
-            limit=state.cdx_page_limit,
-            sleep=sleep,
-            report=report,
-        )
-    except Exception as error:  # noqa: BLE001 - isolate windows
-        kind = classify_cdx_failure(error)
-        if kind is None:
-            raise
-        split_days = (
-            next_split_days(date_start, date_end, first_split_days)
-            if cdx_should_split(error)
-            else None
-        )
-        if split_days is None:
-            report(
-                "Could not get the CDX index for "
-                f"{format_cdx_index_scope(year, date_start, date_end)}."
-            )
-            state.set_hole(
-                date_start,
-                date_end,
-                kind=kind.value,
-                message=str(error),
-            )
-            _save_checkpoint(layout, year, state)
-            return
-        state.fallback = "date_windows"
-        children = list(date_windows(date_start, date_end, split_days))
-        state.remove_bounds(date_start, date_end)
-        for child_start, child_end in children:
-            if not state.has_completed(child_start, child_end):
-                state.set_hole(
-                    child_start,
-                    child_end,
-                    kind=kind.value,
-                    message=str(error),
-                )
-        _save_checkpoint(layout, year, state)
-        report("CDX index took too long.")
-        report(f"fetching {split_days}-day ranges ({len(children)} ranges).")
-        for child_start, child_end in children:
-            _acquire_window(
-                state,
-                layout=layout,
-                year=year,
-                date_start=child_start,
-                date_end=child_end,
-                first_split_days=first_split_days,
-                sleep=sleep,
-                report=report,
-            )
-        return
-    state.search_url = result.search_url
-    state.match_type = result.match_type
-    state.add_completed(date_start, date_end, result.captures)
-    _save_checkpoint(layout, year, state)
+    captures = acquire(f"{year:04d}0101000000", f"{year:04d}1231235959")
+    if historical:
+        tmp = exclusive_temp_path(path.parent, suffix=".cdx.json.tmp")
+        try:
+            with tmp.open("w", encoding="utf-8") as stream:
+                json.dump([_capture_to_dict(item) for item in captures], stream)
+                stream.write("\n")
+            publish_file_atomically(tmp, path)
+        finally:
+            tmp.unlink(missing_ok=True)
+        report(f"saved CDX index for {year}: {path}")
+    return CdxResult(captures, search_url, match_type)
 
 
 def _cdx_max_attempts(kind: CdxFailureKind) -> int:
@@ -713,170 +537,16 @@ def _capture_to_dict(capture: ParsedCapture) -> dict[str, str]:
     return payload
 
 
-def _capture_from_dict(data: dict[str, str]) -> ParsedCapture:
-    mime = data["mime"]
-    identity = identity_from_dict(
-        {key: value for key, value in data.items() if key != "mime"}
+def _capture_from_dict(data: object) -> ParsedCapture:
+    fields = (
+        "urlkey", "original_url", "timestamp", "status_token", "payload_digest", "mime",
     )
-    return ParsedCapture(identity=identity, mime=mime)
-
-
-@dataclass
-class _CdxCheckpoint:
-    url_pattern: str
-    cdx_page_limit: int
-    date_start: str
-    date_end: str
-    search_url: str = ""
-    match_type: str | None = None
-    completed: list[dict[str, object]] = field(default_factory=list)
-    holes: list[dict[str, str]] = field(default_factory=list)
-    fallback: str | None = None
-
-    def has_completed(self, date_start: str, date_end: str) -> bool:
-        return any(
-            item["date_start"] == date_start and item["date_end"] == date_end
-            for item in self.completed
-        )
-
-    def remove_bounds(self, date_start: str, date_end: str) -> None:
-        self.completed = [
-            item
-            for item in self.completed
-            if item["date_start"] != date_start or item["date_end"] != date_end
-        ]
-        self.holes = [
-            item
-            for item in self.holes
-            if item["date_start"] != date_start or item["date_end"] != date_end
-        ]
-
-    def add_completed(
-        self,
-        date_start: str,
-        date_end: str,
-        captures: tuple[ParsedCapture, ...],
-    ) -> None:
-        self.remove_bounds(date_start, date_end)
-        self.completed.append(
-            {
-                "date_start": date_start,
-                "date_end": date_end,
-                "captures": [_capture_to_dict(item) for item in captures],
-            }
-        )
-        self.completed.sort(key=lambda item: (item["date_start"], item["date_end"]))
-
-    def set_hole(
-        self,
-        date_start: str,
-        date_end: str,
-        *,
-        kind: str,
-        message: str,
-    ) -> None:
-        self.remove_bounds(date_start, date_end)
-        self.holes.append(
-            {
-                "date_start": date_start,
-                "date_end": date_end,
-                "kind": kind,
-                "message": message,
-            }
-        )
-        self.holes.sort(key=lambda item: (item["date_start"], item["date_end"]))
-
-
-def _empty_checkpoint(
-    url_pattern: str,
-    cdx_page_limit: int,
-    date_start: str,
-    date_end: str,
-) -> _CdxCheckpoint:
-    return _CdxCheckpoint(
-        url_pattern=url_pattern,
-        cdx_page_limit=cdx_page_limit,
-        date_start=date_start,
-        date_end=date_end,
-    )
-
-
-def _load_checkpoint(
-    path: Path,
-    url_pattern: str,
-    cdx_page_limit: int,
-    date_start: str,
-    date_end: str,
-) -> _CdxCheckpoint | None:
-    if not path.is_file():
-        return None
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-    if (
-        payload.get("url_pattern") != url_pattern
-        or payload.get("cdx_page_limit") != cdx_page_limit
+    if not isinstance(data, dict) or any(
+        not isinstance(data.get(key), str) or not data[key] for key in fields
     ):
-        return None
-    completed = []
-    for item in payload.get("completed") or []:
-        completed.append(
-            {
-                "date_start": item["date_start"],
-                "date_end": item["date_end"],
-                "captures": [
-                    _capture_from_dict(capture) for capture in item.get("captures") or []
-                ],
-            }
-        )
-    # Store captures as ParsedCapture in memory; serialize on save.
-    state = _CdxCheckpoint(
-        url_pattern=url_pattern,
-        cdx_page_limit=cdx_page_limit,
-        date_start=date_start,
-        date_end=date_end,
-        search_url=payload.get("search_url") or "",
-        match_type=payload.get("match_type"),
-        fallback=payload.get("fallback"),
-        holes=list(payload.get("holes") or []),
-    )
-    for item in completed:
-        state.completed.append(
-            {
-                "date_start": item["date_start"],
-                "date_end": item["date_end"],
-                "captures": item["captures"],
-            }
-        )
-    return state
-
-
-def _save_checkpoint(layout: ArchiveLayout, year: int, state: _CdxCheckpoint) -> None:
-    destination = layout.cdx_checkpoint(year)
-    payload = {
-        "url_pattern": state.url_pattern,
-        "cdx_page_limit": state.cdx_page_limit,
-        "date_start": state.date_start,
-        "date_end": state.date_end,
-        "search_url": state.search_url,
-        "match_type": state.match_type,
-        "fallback": state.fallback,
-        "completed": [
-            {
-                "date_start": item["date_start"],
-                "date_end": item["date_end"],
-                "captures": [
-                    _capture_to_dict(capture)
-                    if isinstance(capture, ParsedCapture)
-                    else capture
-                    for capture in item["captures"]
-                ],
-            }
-            for item in state.completed
-        ],
-        "holes": state.holes,
-    }
-    tmp = exclusive_temp_path(destination.parent, suffix=".json")
-    tmp.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-    publish_file_atomically(tmp, destination)
+        raise ValueError("capture fields must be non-empty strings")
+    timestamp = data["timestamp"]
+    if len(timestamp) != 14 or not timestamp.isascii() or not timestamp.isdigit():
+        raise ValueError(f"invalid CDX timestamp: {timestamp!r}")
+    datetime.strptime(timestamp, "%Y%m%d%H%M%S")
+    return ParsedCapture(identity=identity_from_dict(data), mime=data["mime"])

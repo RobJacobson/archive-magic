@@ -1288,17 +1288,16 @@ def test_cdx_year_failure_continues_with_later_years(tmp_path, monkeypatch, caps
     assert inventory_collection(layout, "2004").contains(first)
     assert inventory_collection(layout, "2006").contains(later)
     assert not list_collection_warcs(layout, "2005")
-    assert layout.cdx_checkpoint(2005).is_file()
+    assert not (tmp_path / "index" / "2005.cdx.json").exists()
     output = capsys.readouterr().out
-    assert "Could not get the CDX index for 2005." in output
-    assert "not downloading 2005." in output
+    assert "year 2005: failed" in output
     assert "not querying" not in output
     assert "splitting into" not in output
     assert "fetching 28-day ranges" not in output
     assert "failed years: 2005" in output
 
 
-def test_cdx_504_records_year_hole_without_splitting_and_continues(
+def test_cdx_504_skips_year_without_splitting_and_continues(
     tmp_path, monkeypatch, capsys
 ):
     from archive_magic_fetch.cdx import CdxResult
@@ -1348,25 +1347,17 @@ def test_cdx_504_records_year_hole_without_splitting_and_continues(
     ]
     assert result.exit_code == 1
     assert result.failed_years == (2004,)
-    checkpoint = json.loads(result.layout.cdx_checkpoint(2004).read_text())
-    assert checkpoint["holes"] == [
-        {
-            "date_start": "20040101000000",
-            "date_end": "20041231235959",
-            "kind": "rate_limit",
-            "message": gateway,
-        }
-    ]
+    assert not (tmp_path / "index" / "2004.cdx.json").exists()
+    assert (tmp_path / "index" / "2005.cdx.json").is_file()
     output = capsys.readouterr().out
-    assert "Could not get the CDX index for 2004." in output
-    assert "not downloading 2004." in output
+    assert "year 2004: failed" in output
     assert "splitting into" not in output
     assert "fetching 28-day ranges" not in output
     assert "not querying" not in output
     assert "failed years: 2004" in output
 
 
-def test_cdx_wall_clock_splits_28_then_7_then_hole(tmp_path, monkeypatch, capsys):
+def test_cdx_wall_clock_splits_28_then_7_and_stops_on_failure(tmp_path, monkeypatch, capsys):
     from archive_magic_fetch.cdx import CdxResult, date_windows
     from archive_magic_fetch.models import ParsedCapture
 
@@ -1379,7 +1370,7 @@ def test_cdx_wall_clock_splits_28_then_7_then_hole(tmp_path, monkeypatch, capsys
     )
     calls: list[tuple[str, str]] = []
     downloads: list[str] = []
-    year_bounds = ("20040101000000", "20040331235959")
+    year_bounds = ("20040101000000", "20041231235959")
     windows_28 = list(date_windows(*year_bounds, 28))
     heavy_28 = next(
         window for window in windows_28
@@ -1441,23 +1432,9 @@ def test_cdx_wall_clock_splits_28_then_7_then_hole(tmp_path, monkeypatch, capsys
     layout = result.layout
     assert not list_collection_warcs(layout, "2004")
     assert not layout.collection_index("2004").exists()
-    checkpoint = json.loads(layout.cdx_checkpoint(2004).read_text())
-    assert checkpoint["holes"][0]["date_start"] == hole_7[0]
-    assert checkpoint["holes"][0]["kind"] == "wall_clock"
-    year_record = json.loads(next(layout.logs_root.glob("*.json")).read_text())[
-        "years"
-    ]["2004"]
-    assert year_record["query"]["cdx_page_limit"] == 5000
-    assert year_record["query"]["cdx_fallback"] == "date_windows"
-    assert year_record["query"]["cdx_window_days"] == 28
-    assert year_record["query"]["failed_windows"] == [
-        {
-            "date_start": hole_7[0],
-            "date_end": hole_7[1],
-            "kind": "wall_clock",
-            "message": str(wall_clock),
-        }
-    ]
+    assert calls[-1] == hole_7
+    assert not (tmp_path / "index" / "2004.cdx.json").exists()
+    assert not (layout.logs_root / "cdx").exists()
     output = capsys.readouterr().out
     assert "CDX index took too long." in output
     assert "fetching 28-day ranges" in output
@@ -1505,7 +1482,7 @@ def test_cdx_year_success_uses_single_query(tmp_path, monkeypatch):
     assert "failed_windows" not in year_record["query"]
 
 
-def test_cdx_second_run_queries_only_the_hole(tmp_path, monkeypatch):
+def test_cdx_failed_year_restarts_and_successful_fallback_is_cached(tmp_path, monkeypatch):
     from archive_magic_fetch.cdx import CdxResult, date_windows
     from archive_magic_fetch.models import ParsedCapture
 
@@ -1516,7 +1493,7 @@ def test_cdx_second_run_queries_only_the_hole(tmp_path, monkeypatch):
         urlkey="org,example)/b",
         url="http://example.org/b",
     )
-    year_bounds = ("20040101000000", "20040331235959")
+    year_bounds = ("20040101000000", "20041231235959")
     heavy_28 = next(
         window
         for window in date_windows(*year_bounds, 28)
@@ -1572,7 +1549,8 @@ def test_cdx_second_run_queries_only_the_hole(tmp_path, monkeypatch):
         sleep=lambda _seconds: None,
     )
     assert first.exit_code == 1
-    assert first.layout.cdx_checkpoint(2004).is_file()
+    assert not (tmp_path / "index" / "2004.cdx.json").exists()
+    failed_calls = list(calls)
     calls.clear()
     fail_hole = False
     second = run_fetch(
@@ -1581,14 +1559,24 @@ def test_cdx_second_run_queries_only_the_hole(tmp_path, monkeypatch):
         download_fn=lambda _client, identity: playback(identity),
         sleep=lambda _seconds: None,
     )
-    assert calls == [hole_7]
+    assert calls[:len(failed_calls)] == failed_calls
+    assert calls[-1][1] == "20041231235959"
     assert second.exit_code == 0
-    assert not second.layout.cdx_checkpoint(2004).exists()
+    cached = json.loads((tmp_path / "index" / "2004.cdx.json").read_text())
+    assert [item["timestamp"] for item in cached] == [january.timestamp, march.timestamp]
+    calls.clear()
+    third = run_fetch(
+        settings,
+        client_factory=lambda: MagicMock(),
+        download_fn=lambda *_args: pytest.fail("cached WARC capture downloaded again"),
+    )
+    assert third.exit_code == 0
+    assert calls == []
     assert inventory_collection(second.layout, "2004").contains(january)
     assert inventory_collection(second.layout, "2004").contains(march)
 
 
-def test_cdx_checkpoint_with_different_url_pattern_is_ignored(
+def test_legacy_cdx_checkpoint_is_ignored_and_preserved(
     tmp_path, monkeypatch, capsys
 ):
     from archive_magic_fetch.cdx import CdxResult
@@ -1597,7 +1585,7 @@ def test_cdx_checkpoint_with_different_url_pattern_is_ignored(
     capture = make_capt(ts="20040601000000")
     layout = ArchiveLayout(tmp_path / "data", "example.org")
     ensure_collection_dirs(layout)
-    checkpoint = layout.cdx_checkpoint(2004)
+    checkpoint = layout.logs_root / "cdx" / "2004.json"
     checkpoint.parent.mkdir(parents=True, exist_ok=True)
     checkpoint.write_text(
         json.dumps(
@@ -1645,10 +1633,8 @@ def test_cdx_checkpoint_with_different_url_pattern_is_ignored(
     )
     assert calls == [("20040101000000", "20041231235959")]
     assert result.exit_code == 0
-    assert not layout.cdx_checkpoint(2004).exists()
-    assert "ignoring saved CDX index progress (search settings changed)." in (
-        capsys.readouterr().out
-    )
+    assert json.loads(checkpoint.read_text())["url_pattern"] == "*.other.org"
+    assert (tmp_path / "index" / "2004.cdx.json").is_file()
 
 
 @pytest.mark.parametrize(
@@ -1755,7 +1741,8 @@ def test_interrupt_discards_staged_year_without_run_json(tmp_path, monkeypatch):
     assert json.loads(records[0].read_text())["years"] == {}
     logs = list(layout.logs_root.glob("*.log"))
     assert len(logs) == 1
-    assert "fetching CDX index for 2004-06-01 to 2004-06-02" in logs[0].read_text()
+    assert "fetching CDX index for 2004\n" in logs[0].read_text()
+    assert (tmp_path / "index" / "2004.cdx.json").is_file()
     assert not list(layout.collection_dir("2004").glob("*.partial"))
 
     downloaded.clear()

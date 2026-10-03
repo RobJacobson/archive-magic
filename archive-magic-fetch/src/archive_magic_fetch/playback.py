@@ -32,6 +32,7 @@ from .identity import (
 )
 from .models import CaptureIdentity, FailureCategory, PlaybackResult
 from .protocol import EMPTY_PAYLOAD_DIGEST
+from .request_stats import PlaybackHTTPAdapter, PlaybackRequestStats
 from .retry import parse_retry_after
 
 
@@ -71,6 +72,14 @@ class ArchiveMagicWaybackSession(WaybackSession):
     def __init__(self, *args, **kwargs) -> None:
         kwargs.setdefault("retries", 0)
         super().__init__(*args, **kwargs)
+
+    def track_playback(self, stats: PlaybackRequestStats) -> None:
+        """Apply one shared gate and counter at the HTTP transport boundary."""
+
+        self.retries = 0
+        for prefix in ("https://", "http://"):
+            self.adapters[prefix].close()
+            self.mount(prefix, PlaybackHTTPAdapter(stats))
 
     def send(self, request, **kwargs):
         # requests.Session.send() eagerly reads ``response.content`` unless

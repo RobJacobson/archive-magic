@@ -56,6 +56,7 @@ start = "2000-01-01"
     assert config.cdx_page_limit == DEFAULT_CDX_PAGE_LIMIT
     assert config.start == "2000-01-01"
     assert config.end is None
+    assert config.index_directory == tmp_path / "index"
 
     settings = build_settings(
         config.url_pattern,
@@ -68,6 +69,39 @@ start = "2000-01-01"
     assert settings.date_end == "20041231235959"
     assert settings.cdx_window_days == DEFAULT_CDX_WINDOW_DAYS
     assert settings.cdx_page_limit == DEFAULT_CDX_PAGE_LIMIT
+    assert settings.index_directory == tmp_path / "index"
+
+
+def test_programmatic_cache_directory_override(tmp_path):
+    settings = build_settings(
+        "example.org", output=FetchOutput("local", tmp_path / "data"),
+        index_directory=tmp_path / "custom-cache", date_end="2004",
+    )
+    assert settings.index_directory == tmp_path / "custom-cache"
+
+
+@pytest.mark.parametrize("location", ["same", "nested", "symlink", "default_symlink"])
+def test_cache_inside_data_is_rejected_before_reset(tmp_path, location):
+    data = tmp_path / "data"
+    data.mkdir()
+    sentinel = data / "preserve-me"
+    sentinel.write_text("existing archive")
+    if location == "same":
+        cache = data
+    elif location == "nested":
+        cache = data / "nested" / "index"
+    elif location == "symlink":
+        cache = tmp_path / "linked-index"
+        cache.symlink_to(data, target_is_directory=True)
+    else:
+        (tmp_path / "index").symlink_to(data, target_is_directory=True)
+        cache = None
+    with pytest.raises(ValueError, match="index_directory must be outside"):
+        build_settings(
+            "example.org", output=FetchOutput("remote", data, bucket="bucket"),
+            index_directory=cache, reset_data=True, date_end="2004",
+        )
+    assert sentinel.read_text() == "existing archive"
 
 
 def test_cdx_window_days_override_from_toml(tmp_path):

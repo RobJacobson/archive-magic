@@ -8,4 +8,5 @@ archives/
 .env
 data/
 logs/
+*.cdx.json
 navigator-cache/
