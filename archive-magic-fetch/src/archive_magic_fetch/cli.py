@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 from typing import Optional, Sequence
 
-from .config import load_config
+from .config import load_config, load_playback_policy
 from .fetch import build_settings, run_fetch
 from .collection import ArchiveLayout
 from .staging import recover_stages
@@ -69,22 +69,31 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--config",
+        type=Path,
+        metavar="PATH",
+        help="host-level fetch-config.toml (default: ~/.config/archive-magic-fetch/fetch-config.toml)",
+    )
+    parser.add_argument(
         "--workers",
         type=_positive_int,
-        default=DEFAULT_WORKERS,
+        default=None,
         metavar="N",
+        help="playback workers (default: 4, or fetch-config.toml)",
     )
     parser.add_argument(
         "--starts-per-second",
         type=_positive_float,
-        default=DEFAULT_STARTS_PER_SECOND,
+        default=None,
         metavar="N",
+        help="new playback starts per second (default: 16, or fetch-config.toml)",
     )
     parser.add_argument(
         "--retries",
         type=_nonnegative_int,
-        default=DEFAULT_RETRIES,
+        default=None,
         metavar="N",
+        help="playback retries (default: 4, or fetch-config.toml)",
     )
     return parser.parse_args(argv)
 
@@ -110,6 +119,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "playback will be unavailable during the rebuild.",
                 file=sys.stderr,
             )
+        policy = load_playback_policy(args.config)
         settings = None if args.sync_only else build_settings(
             config.url_pattern,
             archive_id=config.archive_id,
@@ -120,9 +130,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             warc_target_bytes=config.warc_target_bytes,
             cdx_window_days=config.cdx_window_days,
             cdx_page_limit=config.cdx_page_limit,
-            playback_workers=args.workers,
-            playback_starts_per_second=args.starts_per_second,
-            retries=args.retries,
+            playback_workers=args.workers if args.workers is not None else policy.workers,
+            playback_starts_per_second=(
+                args.starts_per_second
+                if args.starts_per_second is not None
+                else policy.starts_per_second
+            ),
+            retries=args.retries if args.retries is not None else policy.retries,
             default_start=config.start,
             default_end=config.end,
         )

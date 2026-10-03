@@ -44,7 +44,9 @@ uv run archive-magic-fetch /path/to/example.org
 uv run archive-magic-fetch /path/to/example.org --sync-only
 ```
 
-Fetch defaults to 4 workers, 16 starts/second, and 4 retries. Date flags may narrow
+Fetch defaults to 4 workers, 16 starts/second, and 4 retries. Override them for
+every run in `~/.config/archive-magic-fetch/fetch-config.toml`, or for one run
+with `--workers`, `--starts-per-second`, and `--retries`. Date flags may narrow
 the configured range. Each year is staged and validated locally before publication:
 WARCs are copied first, CDXJ indexes synced second, and obsolete WARCs removed last.
 After an upload failure, `--sync-only` retries without contacting Wayback.

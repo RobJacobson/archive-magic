@@ -23,7 +23,8 @@ Use a disposable prefix: the reset step intentionally deletes its managed archiv
    `data_directory = "data"` as the permanent local archive.
 5. Install rclone and configure credentials through AWS environment variables
    or an AWS profile. Fetch derives rclone's bucket settings from `fetch.toml`;
-   it does not load `.env`.
+   it does not load `.env`. Missing credentials fail immediately instead of
+   probing EC2 instance metadata.
 
 ## Publish and play
 

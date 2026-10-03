@@ -61,6 +61,9 @@ def fake_rclone(tmp_path: Path, monkeypatch, *, fail_call: int = 0) -> Path:
     monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ['PATH']}")
     monkeypatch.setenv("RCLONE_TEST_LOG", str(log))
     monkeypatch.setenv("RCLONE_FAIL_CALL", str(fail_call))
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "test-key")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "test-secret")
+    monkeypatch.delenv("AWS_PROFILE", raising=False)
     return log
 
 
@@ -97,6 +100,21 @@ def test_rclone_failure_stops_before_deletion_and_is_retryable(tmp_path, monkeyp
     monkeypatch.setenv("RCLONE_FAIL_CALL", "0")
     sync_archive(layout, remote_output(layout.root))
     assert [args[2] for args in calls(log)[2:]] == ["lsf", "copy", "sync", "sync"]
+
+
+def test_missing_aws_credentials_fail_before_rclone(tmp_path, monkeypatch):
+    layout = make_collection(tmp_path / "data")
+    log = fake_rclone(tmp_path, monkeypatch)
+    monkeypatch.delenv("AWS_ACCESS_KEY_ID", raising=False)
+    monkeypatch.delenv("AWS_SECRET_ACCESS_KEY", raising=False)
+    monkeypatch.delenv("AWS_PROFILE", raising=False)
+    monkeypatch.setattr(
+        "archive_magic_fetch.storage.Path.home",
+        lambda: tmp_path / "no-home",
+    )
+    with pytest.raises(PublicationError, match="AWS_ACCESS_KEY_ID"):
+        sync_archive(layout, remote_output(layout.root))
+    assert not log.exists()
 
 
 def test_staged_append_preserves_prior_offsets_and_promotes_index_last(tmp_path):
@@ -241,7 +259,7 @@ def test_fetch_waits_for_sync_and_stops_after_sync_failure(tmp_path, monkeypatch
         synced.append(year)
         raise PublicationError("simulated upload outage")
 
-    monkeypatch.setattr(fetch_module, "fetch_cdx", cdx)
+    monkeypatch.setattr("archive_magic_fetch.cdx.fetch_cdx", cdx)
     monkeypatch.setattr(fetch_module, "sync_archive", fail_sync)
     root = tmp_path / "data"
     settings = FetchSettings(
@@ -299,7 +317,6 @@ def test_explicit_remote_reset_purges_configured_prefix(tmp_path, monkeypatch):
 def test_remote_reset_purges_before_rebuilding_local_archive(tmp_path, monkeypatch):
     from archive_magic_fetch.cdx import CdxResult
     from archive_magic_fetch.models import ParsedCapture
-    import archive_magic_fetch.fetch as fetch_module
 
     layout = make_collection(tmp_path / "data")
     old = make_capt()
@@ -310,7 +327,7 @@ def test_remote_reset_purges_before_rebuilding_local_archive(tmp_path, monkeypat
     )
     log = fake_rclone(tmp_path, monkeypatch)
     monkeypatch.setattr(
-        fetch_module, "fetch_cdx",
+        "archive_magic_fetch.cdx.fetch_cdx",
         lambda **_kwargs: CdxResult(
             captures=(ParsedCapture(identity=replacement, mime="text/html"),),
             search_url="http://example.org/", match_type=None,
@@ -356,6 +373,8 @@ def test_real_rclone_reset_and_sync_preserve_non_archive_content(tmp_path, monke
     for name, data in protected.items():
         (remote/name).write_bytes(data)
     monkeypatch.setattr(storage, '_remote_path', lambda output, *, data=True: str(remote/'data' if data else remote))
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "test-key")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "test-secret")
     output = remote_output(layout.root)
     sync_archive(layout, output)
     assert (remote/'data'/layout.collection_index('2004').name).exists()
@@ -373,6 +392,8 @@ def test_legacy_flat_objects_stop_sync_and_reset_before_mutation(tmp_path, monke
         calls.append(args)
         return 'example.org-2004-001.warc.gz\n'
     monkeypatch.setattr(storage, '_run_rclone', run)
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "test-key")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "test-secret")
     for action in (lambda: sync_archive(layout, remote_output(layout.root)),
                    lambda: purge_remote(remote_output(layout.root), layout.archive_id)):
         with pytest.raises(PublicationError, match='legacy flat'):

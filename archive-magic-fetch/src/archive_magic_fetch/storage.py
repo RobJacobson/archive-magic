@@ -86,6 +86,28 @@ def validate_local_archive(
     return artifacts
 
 
+def _require_aws_credentials() -> None:
+    """Fail fast instead of waiting for the AWS SDK to time out on EC2 IMDS."""
+
+    if os.environ.get("AWS_ACCESS_KEY_ID") and os.environ.get("AWS_SECRET_ACCESS_KEY"):
+        return
+    if os.environ.get("AWS_PROFILE"):
+        return
+    if (Path.home() / ".aws" / "credentials").is_file():
+        return
+    raise PublicationError(
+        "remote output requires S3-compatible credentials: set "
+        "AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY (Cloudflare R2 access "
+        "keys use these names), or AWS_PROFILE / ~/.aws/credentials"
+    )
+
+
+def _rclone_env() -> dict[str, str]:
+    env = os.environ.copy()
+    env["AWS_EC2_METADATA_DISABLED"] = "true"
+    return env
+
+
 def _safe_config_value(value: str, label: str) -> str:
     if not value or any(ord(char) < 32 for char in value):
         raise PublicationError(f"invalid {label} for rclone")
@@ -116,7 +138,9 @@ def _remote_path(output: FetchOutput, *, data: bool = True) -> str:
 def _run_rclone(config_path: Path, *args: str) -> str:
     command = ["rclone", "--config", str(config_path), *args]
     try:
-        result = subprocess.run(command, check=True, capture_output=True, text=True)
+        result = subprocess.run(
+            command, check=True, capture_output=True, text=True, env=_rclone_env()
+        )
         return result.stdout
     except FileNotFoundError as error:
         raise PublicationError("rclone is not installed or not on PATH") from error
@@ -141,6 +165,7 @@ def sync_archive(
     if output.type != "remote":
         return
     validate_local_archive(layout, year=year)
+    _require_aws_credentials()
     remote = _remote_path(output)
     source = str(layout.root)
     period = year if year is not None else "????"
@@ -163,6 +188,7 @@ def purge_remote(output: FetchOutput, archive_id: str) -> None:
     """Reset only managed archive data; never purge the bucket or archive root."""
     if output.type != "remote":
         return
+    _require_aws_credentials()
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", archive_id):
         raise PublicationError("invalid archive ID for reset")
     with _temporary_config(output) as config:

@@ -6,13 +6,28 @@ Fetch turns Internet Archive capture history into annual WARC 1.1 collections
 and CDXJ indexes. Navigator reads that flat file format independently.
 
 ```text
-archive-magic-fetch ARCHIVE [--start DATE] [--end DATE] [--reset-data]
+archive-magic-fetch ARCHIVE [--config PATH] [--start DATE] [--end DATE] [--reset-data]
   [--workers N] [--starts-per-second N] [--retries N]
 archive-magic-fetch ARCHIVE --sync-only
 ```
 
-`ARCHIVE` is a TOML path or a directory containing `fetch.toml`. The
-`--sync-only` form requires remote output and does not query Wayback. It cannot
+`ARCHIVE` is a TOML path or a directory containing `fetch.toml`. Playback
+workers, start rate, and retries are host policy. They come from
+`~/.config/archive-magic-fetch/fetch-config.toml` when that file exists:
+
+```toml
+[playback]
+workers = 4
+starts_per_second = 8
+retries = 4
+```
+
+`--config PATH` or `ARCHIVE_MAGIC_FETCH_CONFIG` selects another file. CLI flags
+override the file for one run. A missing file keeps the code defaults: 4
+workers, 16 starts/second, and 4 retries. These fields do not belong in
+per-archive `fetch.toml`.
+
+The `--sync-only` form requires remote output and does not query Wayback. It cannot
 be combined with dates or `--reset-data`.
 
 The existing TOML fields stay in place:
@@ -35,15 +50,16 @@ start = "1995-01-01"
 # end omitted means now
 # warc_target_bytes = 250000000
 # cdx_page_limit = 5000
-# cdx_window_days = 10
+# cdx_window_days = 28
 ```
 
 Remote output now means **local-authoritative with a bucket mirror**. The
 `data_directory` contains every finalized WARC and CDXJ. Fetch never downloads
 these artifacts from the bucket and never evicts them. The bucket, prefix,
 endpoint, and region configure a temporary rclone S3 backend; rclone obtains
-credentials from the AWS environment or profile. Rclone must be installed on
-the Fetch host.
+credentials from the AWS environment or profile. Missing credentials fail
+immediately instead of probing EC2 instance metadata. Rclone must be installed
+on the Fetch host.
 
 Run records and the process lock live in `logs/` beside `data_directory`.
 The hidden `data/.staging/` directory holds one year's unfinished work and is
@@ -59,13 +75,21 @@ data/
 ## Annual acquisition
 
 Fetch visits years in order. It queries the whole-year CDX through the existing
-`wayback` client, falling back to configurable date windows after timeout/504
-exhaustion. A failed CDX window makes that year incomplete: Fetch skips its
-memento work and publication and proceeds to the next year. A complete CDX
-listing is deduplicated by capture identity. The existing URL-owned playback
-workers, chronological ordering within each URL, retry policy, and cross-year
-digest representatives remain in use. Individual unresolved mementos retain
-the existing skip-and-record policy.
+`wayback` client. Playback `--retries` does not apply to CDX. HTTP 504, read
+timeouts, 429, and connection refused retry the same window ten times with
+exponential pauses from 60s capped at 10 minutes (about an hour). If that
+year still has no listing, Fetch records a hole, skips downloads for that
+year, and continues with the next year. Date splitting is reserved for a
+300-second wall-clock budget, which means the window itself is too expensive:
+first `cdx_window_days` slices (default 28), then 7-day slices. A 7-day
+window that still fails is a hole. A hole is recorded in
+`logs/cdx/{year}.json` with every completed sibling window. The next run
+queries only the holes. Fetch skips memento work and publication until the
+year listing is complete, then deletes the checkpoint. A complete CDX listing
+is deduplicated by capture identity. The existing URL-owned playback workers,
+chronological ordering within each URL, retry policy, and cross-year digest
+representatives remain in use. Individual unresolved mementos retain the
+existing skip-and-record policy.
 
 For each year, Fetch creates a same-filesystem stage. Unchanged WARC shards
 are hard-linked into it; the final shard is copied only if new captures need to
@@ -131,5 +155,5 @@ Fetch does not migrate or delete old root objects automatically.
 - `staging.py`: annual copy-on-write staging and interrupted-commit recovery.
 - `storage.py`: archive lock, local preflight, and ordered rclone commands.
 - `warc.py` and `index.py`: portable WARC and CDXJ construction.
-- `cdx.py`, `resolution.py`, `workers.py`, and `playback.py`: unchanged
-  Wayback acquisition behavior.
+- `cdx.py`: CDX search, failure classification, window splits, and hole checkpoints.
+- `resolution.py`, `workers.py`, and `playback.py`: Wayback playback acquisition.
