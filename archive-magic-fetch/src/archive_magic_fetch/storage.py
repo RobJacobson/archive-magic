@@ -96,8 +96,9 @@ def _require_aws_credentials() -> None:
     if (Path.home() / ".aws" / "credentials").is_file():
         return
     raise PublicationError(
-        "remote output requires AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY, "
-        "or AWS_PROFILE / ~/.aws/credentials"
+        "remote output requires S3-compatible credentials: set "
+        "AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY (Cloudflare R2 access "
+        "keys use these names), or AWS_PROFILE / ~/.aws/credentials"
     )
 
 

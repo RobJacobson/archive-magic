@@ -11,6 +11,7 @@ from archive_magic_fetch.cdx import (
     classify_cdx_failure,
     date_windows,
     fetch_cdx,
+    format_cdx_index_scope,
     format_cdx_window_label,
     next_split_days,
     normalize_cdx_search,
@@ -106,23 +107,23 @@ def test_fetch_cdx_respects_custom_page_limit(monkeypatch):
 
 def test_classify_cdx_failure_kinds():
     assert classify_cdx_failure(TimeoutError("read timed out")) is (
-        CdxFailureKind.TRANSIENT
+        CdxFailureKind.RATE_LIMIT
     )
     assert classify_cdx_failure(
         RuntimeError(
             "HTTPSConnectionPool(host='web.archive.org', port=443): "
             "Read timed out. (read timeout=60)"
         )
-    ) is CdxFailureKind.TRANSIENT
+    ) is CdxFailureKind.RATE_LIMIT
     assert classify_cdx_failure(
         ConnectionError(
             "('Connection aborted.', RemoteDisconnected("
             "'Remote end closed connection without response'))"
         )
-    ) is CdxFailureKind.TRANSIENT
+    ) is CdxFailureKind.RATE_LIMIT
     gateway = RuntimeError("504 Gateway Timeout")
     gateway.status_code = 504
-    assert classify_cdx_failure(gateway) is CdxFailureKind.TRANSIENT
+    assert classify_cdx_failure(gateway) is CdxFailureKind.RATE_LIMIT
     wall = TimeoutError("CDX query exceeded 300s wall-clock budget")
     assert classify_cdx_failure(wall) is CdxFailureKind.WALL_CLOCK
     refused = ConnectionError("Connection refused")
@@ -133,13 +134,14 @@ def test_classify_cdx_failure_kinds():
     assert classify_cdx_failure(ValueError("malformed CDX")) is None
     from archive_magic_fetch.cdx import cdx_should_split
 
-    assert cdx_should_split(TimeoutError("read timed out"))
+    assert not cdx_should_split(TimeoutError("read timed out"))
     assert cdx_should_split(TimeoutError("CDX query exceeded 300s wall-clock budget"))
+    assert not cdx_should_split(gateway)
     assert not cdx_should_split(refused)
     assert not cdx_should_split(rate)
 
 
-def test_fetch_cdx_retries_fast_504_with_transient_backoff(monkeypatch):
+def test_fetch_cdx_retries_504_with_unavailable_backoff(monkeypatch):
     attempts = {"n": 0}
     sleeps: list[float] = []
     reports: list[str] = []
@@ -148,10 +150,9 @@ def test_fetch_cdx_retries_fast_504_with_transient_backoff(monkeypatch):
         def search(self, *args, **kwargs):
             attempts["n"] += 1
             if attempts["n"] < 3:
-                raise TimeoutError(
-                    "HTTPSConnectionPool(host='web.archive.org', port=443): "
-                    "Read timed out."
-                )
+                error = RuntimeError("504 Gateway Timeout")
+                error.status_code = 504
+                raise error
             return iter([record()])
 
         def close(self):
@@ -171,15 +172,64 @@ def test_fetch_cdx_retries_fast_504_with_transient_backoff(monkeypatch):
 
     assert len(result.captures) == 1
     assert attempts["n"] == 3
-    assert sleeps == [15.0, 30.0]
+    assert sleeps == [60.0, 120.0]
     assert reports == [
-        "CDX query attempt 1",
-        "transient during CDX query; "
-        "pausing 15s before attempt 2/3",
-        "CDX query attempt 2/3",
-        "transient during CDX query; "
-        "pausing 30s before attempt 3/3",
-        "CDX query attempt 3/3",
+        "Wayback timed out looking up the CDX index (HTTP 504).",
+        "waiting 60s (attempt 2/10).",
+        "Wayback timed out looking up the CDX index (HTTP 504).",
+        "waiting 120s (attempt 3/10).",
+    ]
+
+
+def test_fetch_cdx_keeps_one_unavailable_budget_for_504_and_429(monkeypatch):
+    attempts = {"n": 0}
+    sleeps: list[float] = []
+    reports: list[str] = []
+
+    class MixedClient:
+        def search(self, *args, **kwargs):
+            attempts["n"] += 1
+            if attempts["n"] <= 2:
+                error = RuntimeError("504 Gateway Timeout")
+                error.status_code = 504
+                raise error
+            if attempts["n"] == 3:
+                error = RuntimeError("Wayback rate limit exceeded")
+                error.status_code = 429
+                raise error
+            if attempts["n"] == 4:
+                error = RuntimeError("504 Gateway Timeout")
+                error.status_code = 504
+                raise error
+            return iter([record()])
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(
+        "archive_magic_fetch.cdx.WaybackClient",
+        lambda **_kwargs: MixedClient(),
+    )
+    result = fetch_cdx(
+        url_pattern="*.example.org",
+        date_start="20040101000000",
+        date_end="20041231235959",
+        sleep=sleeps.append,
+        report=reports.append,
+    )
+
+    assert len(result.captures) == 1
+    assert attempts["n"] == 5
+    assert sleeps == [60.0, 120.0, 240.0, 480.0]
+    assert reports == [
+        "Wayback timed out looking up the CDX index (HTTP 504).",
+        "waiting 60s (attempt 2/10).",
+        "Wayback timed out looking up the CDX index (HTTP 504).",
+        "waiting 120s (attempt 3/10).",
+        "Wayback returned HTTP 429 (too many requests).",
+        "waiting 240s (attempt 4/10).",
+        "Wayback timed out looking up the CDX index (HTTP 504).",
+        "waiting 480s (attempt 5/10).",
     ]
 
 
@@ -218,7 +268,7 @@ def test_fetch_cdx_enforces_wall_clock_budget(monkeypatch):
             report=reports.append,
         )
     assert sleeps == []
-    assert reports == ["CDX query attempt 1"]
+    assert reports == []
     assert closed["n"] >= 1
 
 
@@ -265,13 +315,10 @@ def test_fetch_cdx_uses_linear_backoff_on_connection_refused(monkeypatch):
     assert attempts["n"] == 3
     assert sleeps == [60.0, 120.0]
     assert reports == [
-        "CDX query attempt 1",
-        "rate limit during CDX query; "
-        "pausing 60s before attempt 2/10",
-        "CDX query attempt 2/10",
-        "rate limit during CDX query; "
-        "pausing 120s before attempt 3/10",
-        "CDX query attempt 3/10",
+        "Could not connect to Wayback.",
+        "waiting 60s (attempt 2/10).",
+        "Could not connect to Wayback.",
+        "waiting 120s (attempt 3/10).",
     ]
 
 
@@ -311,13 +358,12 @@ def test_fetch_cdx_escalates_past_retry_after_on_http_429(monkeypatch):
     assert attempts["n"] == 4
     assert sleeps == [60.0, 120.0, 240.0]
     assert reports == [
-        "CDX query attempt 1",
-        "rate limit during CDX query; pausing 60s before attempt 2/10",
-        "CDX query attempt 2/10",
-        "rate limit during CDX query; pausing 120s before attempt 3/10",
-        "CDX query attempt 3/10",
-        "rate limit during CDX query; pausing 240s before attempt 4/10",
-        "CDX query attempt 4/10",
+        "Wayback returned HTTP 429 (too many requests).",
+        "waiting 60s (attempt 2/10).",
+        "Wayback returned HTTP 429 (too many requests).",
+        "waiting 120s (attempt 3/10).",
+        "Wayback returned HTTP 429 (too many requests).",
+        "waiting 240s (attempt 4/10).",
     ]
 
 
@@ -489,6 +535,10 @@ def test_next_split_days_uses_28_then_7():
     assert window_calendar_days("20040101000000", "20040128235959") == 28
     assert format_cdx_window_label("20040101000000", "20040110235959") == (
         "2004-01-01..2004-01-10"
+    )
+    assert format_cdx_index_scope(2004, "20040101000000", "20041231235959") == "2004"
+    assert format_cdx_index_scope(2004, "20040101000000", "20040128235959") == (
+        "2004-01-01 to 2004-01-28"
     )
 
 

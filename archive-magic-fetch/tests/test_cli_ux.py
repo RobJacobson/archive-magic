@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import subprocess
+import sys
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -522,6 +524,18 @@ def test_skip_groups_yield_before_next_download_starts():
         workers.close()
 
 
+def test_cli_startup_hides_pkg_resources_deprecation():
+    completed = subprocess.run(
+        [sys.executable, "-c", "import archive_magic_fetch.cli"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0
+    assert "pkg_resources is deprecated" not in completed.stderr
+    assert "pkg_resources is deprecated" not in completed.stdout
+
+
 def test_cli_rejects_reversed_range(tmp_path):
     from archive_magic_fetch.cli import main
 
@@ -614,6 +628,39 @@ def test_cli_runtime_flags_override_defaults(tmp_path, monkeypatch):
     assert captured[0].retries == 0
     assert captured[0].cdx_window_days == 28
     assert captured[0].cdx_page_limit == 5000
+
+
+def test_cli_uses_instance_fetch_config_and_cli_overrides(tmp_path, monkeypatch):
+    from archive_magic_fetch import cli
+
+    archive = write_cli_config(tmp_path)
+    policy = tmp_path / "fetch-config.toml"
+    policy.write_text(
+        """
+[playback]
+workers = 3
+starts_per_second = 8
+retries = 6
+""",
+        encoding="utf-8",
+    )
+    captured = []
+    monkeypatch.setattr(
+        cli,
+        "run_fetch",
+        lambda item: captured.append(item) or SimpleNamespace(exit_code=0),
+    )
+    assert cli.main([str(archive), "--config", str(policy)]) == 0
+    assert captured[0].playback_workers == 3
+    assert captured[0].playback_starts_per_second == 8.0
+    assert captured[0].retries == 6
+    captured.clear()
+    assert cli.main(
+        [str(archive), "--config", str(policy), "--starts-per-second", "1.5"]
+    ) == 0
+    assert captured[0].playback_workers == 3
+    assert captured[0].playback_starts_per_second == 1.5
+    assert captured[0].retries == 6
 
 
 def test_cli_uses_cdx_settings_from_toml(tmp_path, monkeypatch):

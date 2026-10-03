@@ -1290,10 +1290,80 @@ def test_cdx_year_failure_continues_with_later_years(tmp_path, monkeypatch, caps
     assert not list_collection_warcs(layout, "2005")
     assert layout.cdx_checkpoint(2005).is_file()
     output = capsys.readouterr().out
-    assert "year 2005: incomplete CDX coverage" in output
-    assert "Connection refused" in output
+    assert "Could not get the CDX index for 2005." in output
+    assert "not downloading 2005." in output
+    assert "not querying" not in output
     assert "splitting into" not in output
+    assert "fetching 28-day ranges" not in output
     assert "failed years: 2005" in output
+
+
+def test_cdx_504_records_year_hole_without_splitting_and_continues(
+    tmp_path, monkeypatch, capsys
+):
+    from archive_magic_fetch.cdx import CdxResult
+    from archive_magic_fetch.models import ParsedCapture
+
+    later = make_capt(
+        ts="20050601000000",
+        digest="sha1:" + "B" * 32,
+        urlkey="org,example)/b",
+        url="http://example.org/b",
+    )
+    queried: list[tuple[str, str]] = []
+    gateway = (
+        "CDX query failed after 10 attempts: "
+        "504 Server Error: Gateway Time-out for url: "
+        "https://web.archive.org/cdx/search/cdx?url=example.org"
+    )
+
+    def fake_fetch_cdx(*, date_start, date_end, **_kwargs):
+        queried.append((str(date_start), str(date_end)))
+        year = int(str(date_start)[:4])
+        if year == 2004:
+            raise RuntimeError(gateway)
+        return CdxResult(
+            captures=(ParsedCapture(identity=later, mime="text/html"),),
+            search_url="http://example.org/",
+            match_type=None,
+        )
+
+    monkeypatch.setattr("archive_magic_fetch.cdx.fetch_cdx", fake_fetch_cdx)
+    result = run_fetch(
+        FetchSettings(
+            url_pattern="http://example.org/",
+            date_start="20040101000000",
+            date_end="20051231235959",
+            archive_id="example.org",
+            output=FetchOutput("local", tmp_path / "data"),
+        ),
+        client_factory=lambda: MagicMock(),
+        download_fn=lambda _client, identity: playback(identity),
+        sleep=lambda _seconds: None,
+    )
+
+    assert queried == [
+        ("20040101000000", "20041231235959"),
+        ("20050101000000", "20051231235959"),
+    ]
+    assert result.exit_code == 1
+    assert result.failed_years == (2004,)
+    checkpoint = json.loads(result.layout.cdx_checkpoint(2004).read_text())
+    assert checkpoint["holes"] == [
+        {
+            "date_start": "20040101000000",
+            "date_end": "20041231235959",
+            "kind": "rate_limit",
+            "message": gateway,
+        }
+    ]
+    output = capsys.readouterr().out
+    assert "Could not get the CDX index for 2004." in output
+    assert "not downloading 2004." in output
+    assert "splitting into" not in output
+    assert "fetching 28-day ranges" not in output
+    assert "not querying" not in output
+    assert "failed years: 2004" in output
 
 
 def test_cdx_wall_clock_splits_28_then_7_then_hole(tmp_path, monkeypatch, capsys):
@@ -1389,8 +1459,9 @@ def test_cdx_wall_clock_splits_28_then_7_then_hole(tmp_path, monkeypatch, capsys
         }
     ]
     output = capsys.readouterr().out
-    assert "splitting into 28d windows" in output
-    assert "splitting into 7d windows" in output
+    assert "CDX index took too long." in output
+    assert "fetching 28-day ranges" in output
+    assert "fetching 7-day ranges" in output
     assert "failed years: 2004" in output
 
 
@@ -1575,7 +1646,9 @@ def test_cdx_checkpoint_with_different_url_pattern_is_ignored(
     assert calls == [("20040101000000", "20041231235959")]
     assert result.exit_code == 0
     assert not layout.cdx_checkpoint(2004).exists()
-    assert "discarding CDX checkpoint" in capsys.readouterr().out
+    assert "ignoring saved CDX index progress (search settings changed)." in (
+        capsys.readouterr().out
+    )
 
 
 @pytest.mark.parametrize(
@@ -1682,7 +1755,7 @@ def test_interrupt_discards_staged_year_without_run_json(tmp_path, monkeypatch):
     assert json.loads(records[0].read_text())["years"] == {}
     logs = list(layout.logs_root.glob("*.log"))
     assert len(logs) == 1
-    assert "year 2004: CDX query" in logs[0].read_text()
+    assert "fetching CDX index for 2004-06-01 to 2004-06-02" in logs[0].read_text()
     assert not list(layout.collection_dir("2004").glob("*.partial"))
 
     downloaded.clear()

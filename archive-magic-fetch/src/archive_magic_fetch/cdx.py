@@ -33,7 +33,7 @@ from .retry import backpressure_signal, iter_error_chain, retry_after_from_error
 DEFAULT_CDX_TIMEOUT_SECONDS = 300.0
 CDX_SPLIT_FLOOR_DAYS = 7
 CDX_TRANSIENT_ATTEMPTS = 3
-CDX_TRANSIENT_DELAYS = (15.0, 30.0, 60.0)
+CDX_TRANSIENT_DELAYS = (60.0, 120.0, 240.0)
 CDX_RATE_LIMIT_ATTEMPTS = 10
 CDX_RATE_LIMIT_INITIAL_DELAY = 60.0
 CDX_RATE_LIMIT_MAX_DELAY = 600.0
@@ -161,6 +161,18 @@ def format_cdx_window_label(date_start: str, date_end: str) -> str:
     return f"{_day(date_start)}..{_day(date_end)}"
 
 
+def format_cdx_index_scope(year: int, date_start: str, date_end: str) -> str:
+    """Date range for 'fetching CDX index for …' lines."""
+
+    if date_start[:8] == f"{year:04d}0101" and date_end[:8] == f"{year:04d}1231":
+        return str(year)
+    start = f"{date_start[:4]}-{date_start[4:6]}-{date_start[6:8]}"
+    end = f"{date_end[:4]}-{date_end[4:6]}-{date_end[6:8]}"
+    if start == end:
+        return start
+    return f"{start} to {end}"
+
+
 def window_calendar_days(date_start: str, date_end: str) -> int:
     """Inclusive calendar-day span of a CDX timestamp window."""
 
@@ -269,12 +281,13 @@ def fetch_cdx(
 ) -> CdxResult:
     """Fetch and parse a CDX range through ``WaybackClient.search``.
 
-    Fetch owns CDX retries. Playback ``--retries`` does not apply. Transient
-    gateway failures retry three times with 15s, 30s delays. Rate limits retry
-    ten times with ``Retry-After`` or capped exponential backoff. A wall-clock
-    budget failure is not retried at the same scope. ``limit`` is the resumeKey
-    page size per HTTP request. A failed query is retried from the start of the
-    requested ``from``/``to`` window so the result is never a partial listing.
+    Fetch owns CDX retries. Playback ``--retries`` does not apply. HTTP 504,
+    read timeouts, 429s, and connection refused share one budget: ten attempts
+    with ``Retry-After`` or exponential pauses from 60s capped at 10 minutes
+    (about an hour of waiting). A wall-clock budget failure is not retried at
+    the same scope. ``limit`` is the resumeKey page size per HTTP request.
+    A failed query is retried from the start of the requested ``from``/``to``
+    window so the result is never a partial listing.
 
     Each attempt has a wall-clock budget of ``DEFAULT_CDX_TIMEOUT_SECONDS``
     covering every resumeKey page. Socket read timeouts alone are not enough:
@@ -287,12 +300,10 @@ def fetch_cdx(
     last_error: BaseException | None = None
     attempt = 0
     max_attempts = 1
+    seen_rate_limit = False
+    rate_limit_failures = 0
     while True:
         attempt += 1
-        if attempt == 1:
-            report("CDX query attempt 1")
-        else:
-            report(f"CDX query attempt {attempt}/{max_attempts}")
         client = WaybackClient(
             session=ArchiveMagicWaybackSession(
                 user_agent="archive-magic-fetch",
@@ -325,13 +336,25 @@ def fetch_cdx(
         except Exception as error:  # noqa: BLE001 - network boundary
             last_error = error
             kind = classify_cdx_failure(error)
-            if kind is None:
+            if kind is None or kind is CdxFailureKind.WALL_CLOCK:
                 break
+            if kind is CdxFailureKind.RATE_LIMIT:
+                seen_rate_limit = True
+            if seen_rate_limit:
+                kind = CdxFailureKind.RATE_LIMIT
+                rate_limit_failures += 1
+                delay_attempt = rate_limit_failures
+            else:
+                delay_attempt = attempt
             max_attempts = _cdx_max_attempts(kind)
             if attempt >= max_attempts:
+                report(_cdx_error_summary(error))
                 break
-            delay = _cdx_retry_delay(kind, error, attempt)
-            report(_cdx_retry_message(kind, delay, attempt, max_attempts))
+            delay = _cdx_retry_delay(kind, error, delay_attempt)
+            report(_cdx_error_summary(error))
+            report(
+                f"waiting {delay:g}s (attempt {attempt + 1}/{max_attempts})."
+            )
             sleep(delay)
         finally:
             pool.shutdown(wait=False, cancel_futures=True)
@@ -354,7 +377,7 @@ def classify_cdx_failure(error: BaseException) -> CdxFailureKind | None:
         if kind == "timeout":
             if _is_wall_clock(error):
                 return CdxFailureKind.WALL_CLOCK
-            return CdxFailureKind.TRANSIENT
+            return CdxFailureKind.RATE_LIMIT
     _, retryable = classify_playback_error(error)
     if retryable:
         return CdxFailureKind.TRANSIENT
@@ -362,10 +385,14 @@ def classify_cdx_failure(error: BaseException) -> CdxFailureKind | None:
 
 
 def cdx_should_split(error: BaseException) -> bool:
-    """True when a failed window should split rather than become a hole."""
+    """True when a failed window should split rather than become a hole.
 
-    kind = classify_cdx_failure(error)
-    return kind in {CdxFailureKind.TRANSIENT, CdxFailureKind.WALL_CLOCK}
+    Only a wall-clock budget means the window itself is too expensive.
+    HTTP 504 and dropped connections are IA overload; splitting them
+    multiplies CDX traffic and turns a short outage into 429s.
+    """
+
+    return classify_cdx_failure(error) is CdxFailureKind.WALL_CLOCK
 
 
 def acquire_year_cdx(
@@ -388,17 +415,13 @@ def acquire_year_cdx(
         path.unlink(missing_ok=True)
     state = _load_checkpoint(path, url_pattern, cdx_page_limit, date_start, date_end)
     if state is None and path.is_file():
-        report(
-            f"year {year}: discarding CDX checkpoint "
-            "(url_pattern or cdx_page_limit changed)"
-        )
+        report("ignoring saved CDX index progress (search settings changed).")
         path.unlink(missing_ok=True)
         state = _empty_checkpoint(url_pattern, cdx_page_limit, date_start, date_end)
     if state is None:
         state = _empty_checkpoint(url_pattern, cdx_page_limit, date_start, date_end)
 
     if state.holes:
-        report(f"year {year}: resuming {len(state.holes)} CDX hole(s)")
         pending = list(state.holes)
         for hole in pending:
             _acquire_window(
@@ -415,7 +438,10 @@ def acquire_year_cdx(
         path.unlink(missing_ok=True)
         return _acquisition_from_state(state)
     else:
-        report(f"year {year}: CDX query")
+        report(
+            "fetching CDX index for "
+            f"{format_cdx_index_scope(year, date_start, date_end)}"
+        )
         try:
             result = fetch_cdx(
                 url_pattern=url_pattern,
@@ -435,7 +461,10 @@ def acquire_year_cdx(
                 else None
             )
             if split_days is None:
-                report(f"year {year}: CDX query failed ({error}); recording hole")
+                report(
+                    "Could not get the CDX index for "
+                    f"{format_cdx_index_scope(year, date_start, date_end)}."
+                )
                 state.set_hole(
                     date_start,
                     date_end,
@@ -454,10 +483,9 @@ def acquire_year_cdx(
                         message=str(error),
                     )
                 _save_checkpoint(layout, year, state)
+                report("CDX index took too long.")
                 report(
-                    f"year {year}: CDX year query failed ({error}); "
-                    f"splitting into {split_days}d windows "
-                    f"({len(children)} windows)"
+                    f"fetching {split_days}-day ranges ({len(children)} ranges)."
                 )
                 for child_start, child_end in children:
                     _acquire_window(
@@ -537,8 +565,10 @@ def _acquire_window(
 ) -> None:
     if state.has_completed(date_start, date_end):
         return
-    label = format_cdx_window_label(date_start, date_end)
-    report(f"year {year}: CDX {label}")
+    report(
+        "fetching CDX index for "
+        f"{format_cdx_index_scope(year, date_start, date_end)}"
+    )
     try:
         result = fetch_cdx(
             url_pattern=state.url_pattern,
@@ -558,7 +588,10 @@ def _acquire_window(
             else None
         )
         if split_days is None:
-            report(f"year {year}: CDX {label} failed ({error}); continuing")
+            report(
+                "Could not get the CDX index for "
+                f"{format_cdx_index_scope(year, date_start, date_end)}."
+            )
             state.set_hole(
                 date_start,
                 date_end,
@@ -579,10 +612,8 @@ def _acquire_window(
                     message=str(error),
                 )
         _save_checkpoint(layout, year, state)
-        report(
-            f"year {year}: CDX {label} failed ({error}); "
-            f"splitting into {split_days}d windows ({len(children)} windows)"
-        )
+        report("CDX index took too long.")
+        report(f"fetching {split_days}-day ranges ({len(children)} ranges).")
         for child_start, child_end in children:
             _acquire_window(
                 state,
@@ -626,21 +657,43 @@ def _cdx_retry_delay(
     return max(retry_after or 0.0, delay)
 
 
-def _cdx_retry_message(
-    kind: CdxFailureKind,
-    delay: float,
-    attempt: int,
-    max_attempts: int,
-) -> str:
-    label = {
-        CdxFailureKind.TRANSIENT: "transient",
-        CdxFailureKind.WALL_CLOCK: "wall-clock",
-        CdxFailureKind.RATE_LIMIT: "rate limit",
-    }[kind]
-    return (
-        f"{label} during CDX query; "
-        f"pausing {delay:g}s before attempt {attempt + 1}/{max_attempts}"
-    )
+_HTTP_STATUS = re.compile(r"\b(429|502|503|504)\b")
+
+
+def _http_status_from_error(error: BaseException) -> int | None:
+    for candidate in iter_error_chain(error):
+        for value in (
+            getattr(candidate, "status_code", None),
+            getattr(getattr(candidate, "response", None), "status_code", None),
+        ):
+            if isinstance(value, int) and 400 <= value <= 599:
+                return value
+        match = _HTTP_STATUS.search(str(candidate))
+        if match:
+            return int(match.group(1))
+    return None
+
+
+def _cdx_error_summary(error: BaseException) -> str:
+    if _is_wall_clock(error):
+        return "CDX index took too long."
+    status = _http_status_from_error(error)
+    if status == 504:
+        return "Wayback timed out looking up the CDX index (HTTP 504)."
+    if status == 429:
+        return "Wayback returned HTTP 429 (too many requests)."
+    if status == 503:
+        return "Wayback is temporarily unavailable (HTTP 503)."
+    if status == 502:
+        return "Wayback returned a bad gateway (HTTP 502)."
+    if status is not None:
+        return f"Wayback returned HTTP {status} for the CDX index."
+    signal = backpressure_signal(error)
+    if signal is not None and signal[0] == "tcp":
+        return "Could not connect to Wayback."
+    if signal is not None and signal[0] == "timeout":
+        return "Wayback timed out looking up the CDX index."
+    return "CDX index request failed."
 
 
 def _is_wall_clock(error: BaseException) -> bool:

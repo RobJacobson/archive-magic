@@ -5,9 +5,15 @@ from archive_magic_fetch.config import (
     CONFIG_NAME,
     DEFAULT_CDX_PAGE_LIMIT,
     DEFAULT_CDX_WINDOW_DAYS,
+    DEFAULT_PLAYBACK_RETRIES,
+    DEFAULT_PLAYBACK_STARTS_PER_SECOND,
+    DEFAULT_PLAYBACK_WORKERS,
     DEFAULT_WARC_TARGET_BYTES,
     FetchOutput,
+    INSTANCE_CONFIG_ENV,
+    PlaybackPolicy,
     load_config,
+    load_playback_policy,
 )
 from archive_magic_fetch.fetch import build_settings
 
@@ -217,3 +223,54 @@ end = "2001-12-31"
             default_start=config.start,
             default_end=config.end,
         )
+
+
+def test_playback_policy_defaults_when_file_absent():
+    assert load_playback_policy() == PlaybackPolicy()
+    assert load_playback_policy().workers == DEFAULT_PLAYBACK_WORKERS
+    assert load_playback_policy().starts_per_second == DEFAULT_PLAYBACK_STARTS_PER_SECOND
+    assert load_playback_policy().retries == DEFAULT_PLAYBACK_RETRIES
+
+
+def test_playback_policy_reads_partial_toml(tmp_path):
+    path = tmp_path / "fetch-config.toml"
+    path.write_text(
+        """
+[playback]
+starts_per_second = 8
+""",
+        encoding="utf-8",
+    )
+    policy = load_playback_policy(path)
+    assert policy.workers == DEFAULT_PLAYBACK_WORKERS
+    assert policy.starts_per_second == 8.0
+    assert policy.retries == DEFAULT_PLAYBACK_RETRIES
+
+
+def test_playback_policy_env_path(tmp_path, monkeypatch):
+    path = tmp_path / "host.toml"
+    path.write_text(
+        """
+[playback]
+workers = 2
+starts_per_second = 8
+retries = 1
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(INSTANCE_CONFIG_ENV, str(path))
+    assert load_playback_policy() == PlaybackPolicy(2, 8.0, 1)
+
+
+def test_playback_policy_rejects_unknown_and_invalid(tmp_path):
+    unknown = tmp_path / "unknown.toml"
+    unknown.write_text("[other]\nworkers = 2\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="unexpected table"):
+        load_playback_policy(unknown)
+    invalid = tmp_path / "invalid.toml"
+    invalid.write_text("[playback]\nworkers = 0\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="must be positive"):
+        load_playback_policy(invalid)
+    missing = tmp_path / "missing.toml"
+    with pytest.raises(ValueError, match="does not exist"):
+        load_playback_policy(missing)

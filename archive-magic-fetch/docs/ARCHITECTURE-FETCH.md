@@ -6,13 +6,28 @@ Fetch turns Internet Archive capture history into annual WARC 1.1 collections
 and CDXJ indexes. Navigator reads that flat file format independently.
 
 ```text
-archive-magic-fetch ARCHIVE [--start DATE] [--end DATE] [--reset-data]
+archive-magic-fetch ARCHIVE [--config PATH] [--start DATE] [--end DATE] [--reset-data]
   [--workers N] [--starts-per-second N] [--retries N]
 archive-magic-fetch ARCHIVE --sync-only
 ```
 
-`ARCHIVE` is a TOML path or a directory containing `fetch.toml`. The
-`--sync-only` form requires remote output and does not query Wayback. It cannot
+`ARCHIVE` is a TOML path or a directory containing `fetch.toml`. Playback
+workers, start rate, and retries are host policy. They come from
+`~/.config/archive-magic-fetch/fetch-config.toml` when that file exists:
+
+```toml
+[playback]
+workers = 4
+starts_per_second = 8
+retries = 4
+```
+
+`--config PATH` or `ARCHIVE_MAGIC_FETCH_CONFIG` selects another file. CLI flags
+override the file for one run. A missing file keeps the code defaults: 4
+workers, 16 starts/second, and 4 retries. These fields do not belong in
+per-archive `fetch.toml`.
+
+The `--sync-only` form requires remote output and does not query Wayback. It cannot
 be combined with dates or `--reset-data`.
 
 The existing TOML fields stay in place:
@@ -60,20 +75,21 @@ data/
 ## Annual acquisition
 
 Fetch visits years in order. It queries the whole-year CDX through the existing
-`wayback` client. Playback `--retries` does not apply to CDX. A fast HTTP 504,
-read timeout, or dropped connection retries the same window three times with
-15s then 30s pauses. Exhausting those attempts, or a 300-second wall-clock
-budget, splits only that window: first into `cdx_window_days` slices (default
-28), then into 7-day slices. A 7-day window that still fails is a hole. HTTP
-429 and TCP connection refused never split; they honor `Retry-After` when it
-exceeds the backoff, otherwise use exponential pauses from 60s capped at 10
-minutes, for 10 attempts. A hole is recorded in `logs/cdx/{year}.json` with
-every completed sibling window. The next run queries only the holes. Fetch
-skips memento work and publication until the year listing is complete, then
-deletes the checkpoint. A complete CDX listing is deduplicated by capture
-identity. The existing URL-owned playback workers, chronological ordering
-within each URL, retry policy, and cross-year digest representatives remain in
-use. Individual unresolved mementos retain the existing skip-and-record policy.
+`wayback` client. Playback `--retries` does not apply to CDX. HTTP 504, read
+timeouts, 429, and connection refused retry the same window ten times with
+exponential pauses from 60s capped at 10 minutes (about an hour). If that
+year still has no listing, Fetch records a hole, skips downloads for that
+year, and continues with the next year. Date splitting is reserved for a
+300-second wall-clock budget, which means the window itself is too expensive:
+first `cdx_window_days` slices (default 28), then 7-day slices. A 7-day
+window that still fails is a hole. A hole is recorded in
+`logs/cdx/{year}.json` with every completed sibling window. The next run
+queries only the holes. Fetch skips memento work and publication until the
+year listing is complete, then deletes the checkpoint. A complete CDX listing
+is deduplicated by capture identity. The existing URL-owned playback workers,
+chronological ordering within each URL, retry policy, and cross-year digest
+representatives remain in use. Individual unresolved mementos retain the
+existing skip-and-record policy.
 
 For each year, Fetch creates a same-filesystem stage. Unchanged WARC shards
 are hard-linked into it; the final shard is copied only if new captures need to

@@ -370,7 +370,7 @@ def _run_year(
         query["window_count"] = acquisition.window_count
         query["failed_windows"] = failed_windows
     if failed_windows:
-        emit(f"year {year}: incomplete CDX coverage; skipping playback and publication")
+        emit(f"not downloading {year}.")
         return _YearResult(
             metrics=year_metrics, failures=(), warcs=(), index=None,
             skip_errors=0, incomplete=True, query=query,
