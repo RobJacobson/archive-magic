@@ -82,12 +82,12 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         type=_positive_float,
         default=None,
         metavar="N",
-        help="playback HTTP requests per second, including retries/redirects (default: 8, or fetch-config.toml)",
+        help="HTTP starts per second for playback and Wayback CDX, including retries/redirects (default: 8, or fetch-config.toml)",
     )
     parser.add_argument(
         "--trace-requests",
         action="store_true",
-        help="write one CSV row per playback HTTP request with millisecond timing and rolling rates to logs/<run>.requests.csv",
+        help="trace playback and Wayback CDX HTTP requests, phases, timing, and rolling rates to logs/<run>.requests.csv",
     )
     parser.add_argument(
         "--retries",

@@ -34,7 +34,7 @@ def test_neutral_source_discovers_resolves_writes_indexes_and_resumes(tmp_path):
     )
     calls, clients, closed, requests = [], [], [], []
 
-    def discover(request):
+    def discover(request, stats):
         requests.append(request)
         return CaptureListing((later, outside, first, first), {"provider": "fixture"})
 
@@ -121,7 +121,7 @@ def test_worker_client_closes_when_acquisition_fails_or_is_interrupted(
         raise failure
 
     source = SourceAdapter(
-        lambda request: CaptureListing((capture,), {}),
+        lambda request, stats: CaptureListing((capture,), {}),
         open_client,
         fetch,
         lambda ref: None,
@@ -167,7 +167,7 @@ def _annual_fixture(tmp_path):
         calls.append(capture.identity)
         return playback(capture.identity)
 
-    def discover(request):
+    def discover(request, stats):
         return CaptureListing(
             tuple(c for c in captures if c.identity.timestamp.startswith(str(request.year))),
             {},
@@ -204,7 +204,7 @@ def test_reset_earlier_year_leaves_later_year_self_contained(tmp_path, empty):
     replacement = CaptureRef(make_capt(digest=payload_digest(b"changed")), "text/html")
     resetting = replace(
         source,
-        discover=lambda _: CaptureListing(() if empty else (replacement,), {}),
+        discover=lambda _, stats: CaptureListing(() if empty else (replacement,), {}),
         fetch=lambda client, capture: playback(capture.identity, body=b"changed"),
     )
     result = run_fetch(
@@ -294,7 +294,7 @@ def test_failed_year_drains_workers_before_abort_and_next_year(
             assert settled.is_set()
             closed.append(client)
 
-    def discover(request):
+    def discover(request, stats):
         discoveries.append(request.year)
         if request.year == 2005:
             assert settled.is_set()

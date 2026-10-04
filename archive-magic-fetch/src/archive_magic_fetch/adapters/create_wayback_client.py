@@ -52,7 +52,7 @@ class ArchiveMagicWaybackSession(WaybackSession):
         kwargs.setdefault("retries", 0)
         super().__init__(*args, **kwargs)
 
-    def track_playback(self, stats: RequestStats) -> None:
+    def track_requests(self, stats: RequestStats) -> None:
         """Apply one shared gate and counter at the HTTP transport boundary."""
 
         self.retries = 0

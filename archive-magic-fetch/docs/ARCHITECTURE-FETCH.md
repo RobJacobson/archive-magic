@@ -38,18 +38,22 @@ run. These fields do not belong in per-archive `fetch.toml`.
 
 ### Playback request diagnostics
 
-`starts_per_second` controls HTTP transport sends shared across a run's workers.
+`starts_per_second` controls playback and Wayback CDX HTTP transport sends shared
+across a run's workers.
 At 2, sends are spaced at least 0.5 seconds apart. The gate sits immediately before
 the Requests HTTP adapter sends, so redirects and capture retries each consume
 a slot. Wayback and urllib3 automatic
 retries are disabled. `retries = 4` allows up to five capture attempts; one attempt
 can issue several HTTP requests. Existing `playback_attempts` metrics still count
 capture attempts. Duplicate capture identities and reusable revisits require no
-additional HTTP requests. The limit is per process, and CDX requests use their
-own pacing and are excluded from these playback counters.
+additional HTTP requests. The limit is per process. Wayback CDX searches, pages,
+retries, and redirects use the same gate and counters as playback. CDX keeps its
+2.5-second endpoint minimum; both deadlines are reserved atomically so a prior
+cooldown cannot create a burst. This also spaces the CDX-to-playback transition.
+Common Crawl discovery retains its separate pacing and counters.
 
 The startup line prints effective worker/rate/retry settings. Every run prints a
-`playback HTTP` summary with total sends, peak counts in rolling 1s and 60s windows,
+`HTTP` summary with total sends, peak counts in rolling 1s and 60s windows,
 and the number of 429 responses. Each 429 prints its request ID and recent counts
 before the existing cooldown message. Windows are `(now - window, now]`; failed
 connection attempts count as sends. These counters measure attempted HTTP sends,
@@ -67,7 +71,9 @@ one row per request, flushed when its response headers or transport error arrive
 an integer number of milliseconds measured with the monotonic clock. Duration
 covers headers only; streamed payload reads happen afterward. `capture_time` is
 the historical capture date and `digest` is its last six characters, matching the
-progress log. The SURT URL key is omitted.
+progress log. The SURT URL key is omitted. `phase` is `cdx` or `playback`. CDX rows
+leave capture fields empty; `attempt` identifies the query retry and
+`request_in_attempt` counts all pages and redirects within it.
 
 Request ID, timing, HTTP status, capture date/digest, attempt number, request number
 within the attempt, and rolling 1s/60s counts are on the left. Counts are sampled
@@ -79,8 +85,19 @@ On orderly shutdown, unfinished requests get one row marked `Interrupted` with
 blank duration and status. Totals and peak rates remain in the normal run log,
 without adding non-request rows to the CSV.
 
+Every run also writes `logs/<run>.429.jsonl` when the first 429 occurs, whether or
+not CSV tracing is enabled. Each JSON line records the request ID, phase, URL,
+status, UTC observation time, selected response headers (including Server, Date,
+Content-Type, Retry-After, cache/request IDs, and Wayback markers), and a body
+excerpt of at most 4096 decoded bytes. Header values are capped at 1024 characters.
+Body collection reads at most 8193 wire bytes, with bounded gzip/deflate decoding;
+the rejected response is then closed instead of draining the rest. Cookies and
+authorization headers are excluded. Truncation and body-read failures are recorded;
+diagnostic failures do not replace the 429 or change its retry classification.
+CSV durations still end at response headers, before diagnostic body reads.
+
 Repeated URLs with increasing `attempt` values are capture retries. A
-`request_in_attempt` greater than 1 exposes redirect requests. Capture
+`request_in_attempt` greater than 1 exposes redirect requests or CDX pagination. Capture
 timestamps in ordinary progress output are historical capture dates, so they
 cannot establish the real request rate. Trace files contain full requested URLs.
 
@@ -231,7 +248,9 @@ with the first success after the pause. Cooldown time alone does not count as
 recovery. Other acquisition failures interrupt recovery without pausing the pool.
 Console messages report the applied cooldown and remaining pause; the request
 CSV retains the raw `Retry-After` header, empty when absent, for diagnostics.
-CDX discovery keeps its separate retry policy.
+CDX discovery keeps its separate retry policy. Its query timeout excludes time
+waiting at the shared gate. Timed-out or cancelled queries cannot start further
+page requests; already in-flight requests finish under their socket timeouts.
 
 Resolution and writing share an explicit annual worker batch. On failure or
 Ctrl-C, it cancels queued groups, stops active groups before new captures,
@@ -537,7 +556,8 @@ same transaction recovery and publication code as fetch.
 
 `SourceAdapter` is a typed bundle of callables, assembled with composition:
 
-- `discover(request)` returns a complete `CaptureListing` and query metadata.
+- `discover(request, stats)` returns a complete `CaptureListing` and query metadata;
+  Wayback discovery installs the run's shared transport instrumentation.
 - `open_client(stats)` is a context manager creating one persistent worker client;
   the source explicitly installs transport instrumentation before yielding it.
 - `fetch(client, capture)` performs one retrieval-and-decoding attempt and returns
@@ -564,7 +584,7 @@ Capture identity, Wayback cache serialization, and the public archive format are
 unchanged. `CaptureRef` adds an optional typed Common Crawl locator (crawl ID,
 filename, offset, length); that locator is retained in CC discovery caches but is
 not part of capture identity. Failure display labels are transient; existing
-run-record fields and trace column names remain unchanged. CC query metadata in
+run-record fields remain unchanged; the request trace adds a `phase` column. CC query metadata in
 run records identifies the source and selected collections. `WARC-Source-URI`
 records the source WARC URL, while terminal capture links open its collection's
 index query rather than offering a fictitious replay URL.

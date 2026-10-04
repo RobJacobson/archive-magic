@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import json
 import threading
 import time
 from datetime import datetime
@@ -12,6 +13,7 @@ import archive_magic_fetch.pipeline.run_fetch as fetch
 import pytest
 import requests
 from archive_magic_fetch.adapters.create_wayback_client import make_client
+from archive_magic_fetch.adapters.build_wayback_source import build_source
 from archive_magic_fetch.archive.identity import payload_digest
 from archive_magic_fetch.config.models import FetchOutput
 from archive_magic_fetch.config.build_settings import FetchSettings
@@ -340,7 +342,7 @@ def test_fetch_deduplicates_and_reuses_without_extra_http_and_logs_summary(
     assert result.metrics.revisits == 1
     run_log = next(result.layout.logs_root.glob("*.log"))
     assert (
-        "playback HTTP: requests=1, peak/1s=1, peak/60s=1, 429s=0"
+        "HTTP: requests=1, peak/1s=1, peak/60s=1, 429s=0"
         in run_log.read_text()
     )
     trace = run_log.with_suffix(".requests.csv")
@@ -400,3 +402,134 @@ def test_csv_pairs_out_of_order_completions_and_flushes_interrupted_requests(tmp
 )
 def test_trace_timestamps_round_to_milliseconds(source, expected):
     assert format_trace_time(datetime.fromisoformat(source)) == expected
+
+
+@pytest.mark.parametrize("rate, starts", [
+    (0.25, [100, 160, 164, 168]),
+    (8, [100, 160, 162.5, 162.625]),
+])
+@pytest.mark.parametrize("trace_requests", [False, True])
+def test_cdx_retry_pagination_and_playback_share_transport_gate(
+    tmp_path, monkeypatch, rate, starts, trace_requests,
+):
+    clock = Clock()
+    calls = []
+    digest = payload_digest(b"hello").removeprefix("sha1:")
+    cdx_page = (
+        f"org,example)/ 20040615000000 http://example.org/ text/html 200 {digest} 5\n"
+        "\nresume-token\n"
+    ).encode()
+
+    def send(adapter, request, **kwargs):
+        assert adapter.max_retries.total == 0
+        calls.append((clock(), request.url))
+        if "/cdx/" in request.url:
+            result = response(request, 429 if len(calls) == 1 else 200, memento=False)
+            result._content = (
+                b"temporarily rate limited" if len(calls) == 1 else
+                b"" if "resumeKey=" in request.url else cdx_page
+            )
+            return result
+        return response(request)
+
+    monkeypatch.setattr(HTTPAdapter, "send", send)
+    settings = FetchSettings(
+        url_pattern="*.example.org", archive_id="example.org",
+        date_start="20040101000000", date_end="20041231235959",
+        output=FetchOutput("local", tmp_path / "data"), playback_workers=1,
+        playback_starts_per_second=rate, trace_requests=trace_requests,
+    )
+    source = build_source(index_directory=tmp_path / "index", sleep=clock.sleep)
+    result = fetch.run_fetch(settings, source=source, clock=clock, sleep=clock.sleep)
+    assert result.exit_code == 0
+    assert result.metrics.downloads == 1
+    assert [t for t, _ in calls] == starts
+    run_log = next(result.layout.logs_root.glob("*.log"))
+    assert "HTTP: requests=4" in run_log.read_text()
+    assert "cdx HTTP 429 request #1" in run_log.read_text()
+    if trace_requests:
+        rows = events(run_log.with_suffix(".requests.csv"))
+        assert [r["phase"] for r in rows] == ["cdx", "cdx", "cdx", "playback"]
+        assert [r["attempt"] for r in rows] == ["1", "2", "2", "1"]
+        assert [r["request_in_attempt"] for r in rows] == ["1", "1", "2", "1"]
+        assert [r["capture_time"] for r in rows[:3]] == ["", "", ""]
+    diagnostics = [json.loads(line) for line in run_log.with_suffix(".429.jsonl").read_text().splitlines()]
+    assert len(diagnostics) == 1
+    assert diagnostics[0]["request_id"] == 1
+    assert diagnostics[0]["phase"] == "cdx"
+    assert diagnostics[0]["body_excerpt"] == "temporarily rate limited"
+
+
+def test_cdx_waits_do_not_consume_query_timeout(tmp_path, monkeypatch):
+    from archive_magic_fetch.runtime.pace_requests import StartGate
+
+    gate = StartGate(10)
+    stats = RequestStats(gate.wait, report=lambda _: None)
+    gate.wait()  # The CDX request must wait 0.1s, beyond its 0.03s I/O budget.
+    monkeypatch.setattr(cdx, "DEFAULT_CDX_TIMEOUT_SECONDS", 0.03)
+
+    def send(adapter, request, **kwargs):
+        result = response(request, memento=False)
+        result._content = b""
+        return result
+
+    monkeypatch.setattr(HTTPAdapter, "send", send)
+    try:
+        result = cdx._fetch_cdx(
+            url_pattern="example.org", date_start="20040101000000",
+            date_end="20041231235959", stats=stats,
+        )
+        assert result.captures == ()
+        assert stats.snapshot()["requests_total"] == 1
+    finally:
+        stats.close()
+
+
+def test_timed_out_cdx_cannot_send_another_page(tmp_path, monkeypatch):
+    from archive_magic_fetch.runtime.pace_requests import StartGate
+
+    release = threading.Event()
+    settled = threading.Event()
+    calls = []
+    stats = RequestStats(StartGate(0).wait, report=lambda _: None)
+    monkeypatch.setattr(cdx, "DEFAULT_CDX_TIMEOUT_SECONDS", 0.03)
+    original = cdx._materialize_cdx_search
+
+    def search(*args, **kwargs):
+        try:
+            return original(*args, **kwargs)
+        finally:
+            settled.set()
+
+    def send(adapter, request, **kwargs):
+        calls.append(request.url)
+        assert release.wait(2)
+        result = response(request, memento=False)
+        result._content = b"\nresume-token\n"
+        return result
+
+    monkeypatch.setattr(cdx, "_materialize_cdx_search", search)
+    monkeypatch.setattr(HTTPAdapter, "send", send)
+    try:
+        with pytest.raises(RuntimeError, match="wall-clock budget"):
+            cdx._fetch_cdx(
+                url_pattern="example.org", date_start="20040101000000",
+                date_end="20041231235959", stats=stats,
+            )
+    finally:
+        release.set()
+        assert settled.wait(2)
+        stats.close()
+    assert len(calls) == 1
+
+
+def test_closed_request_stats_cannot_send(tmp_path, monkeypatch):
+    from concurrent.futures import CancelledError
+    from unittest.mock import Mock
+
+    wait = Mock()
+    stats = RequestStats(wait, report=lambda _: None)
+    stats.close()
+    with pytest.raises(CancelledError):
+        stats.start(requests.Request("GET", "https://example.org").prepare())
+    wait.assert_not_called()

@@ -115,7 +115,7 @@ def test_decoding_timeout_retries_the_complete_attempt_and_closes_both_responses
 
     source = replace(
         build_source(index_directory=tmp_path / "index"),
-        discover=lambda request: CaptureListing((capture,), {}),
+        discover=lambda request, stats: CaptureListing((capture,), {}),
         open_client=open_client,
     )
     settings = FetchSettings(

@@ -305,7 +305,7 @@ def make_source(
                 if isinstance(
                     getattr(client, "session", None), ArchiveMagicWaybackSession
                 ):
-                    client.session.track_playback(stats)
+                    client.session.track_requests(stats)
                 yield client
 
         source = replace(source, open_client=open_client)

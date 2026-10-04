@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 import time
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeoutError
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import Enum
@@ -38,8 +40,11 @@ from archive_magic_fetch.runtime.manage_archive_files import (
 )
 from archive_magic_fetch.runtime.report_progress import emit
 from archive_magic_fetch.runtime.calculate_retry_delay import iter_error_chain, retry_after_from_error
+from archive_magic_fetch.runtime.track_http_requests import RequestStats
 
 DEFAULT_CDX_TIMEOUT_SECONDS = 300.0
+# wayback 0.5.1's CDX endpoint limit, enforced atomically with the run's limit.
+CDX_REQUEST_INTERVAL_SECONDS = 2.5
 
 CDX_SPLIT_FLOOR_DAYS = 7
 
@@ -82,6 +87,7 @@ def load_or_fetch_year_cdx(
     cdx_page_limit: int = DEFAULT_CDX_PAGE_LIMIT,
     sleep: Callable[[float], None] = time.sleep,
     report: Callable[[str], None] = emit,
+    stats: RequestStats | None = None,
 ) -> CaptureListing:
     """Return a full calendar-year listing, caching only completed past years.
 
@@ -125,6 +131,7 @@ def load_or_fetch_year_cdx(
                 limit=cdx_page_limit,
                 sleep=sleep,
                 report=report,
+                stats=stats,
             ).captures
         except Exception as error:  # noqa: BLE001 - CDX network boundary
             split_days = (
@@ -248,22 +255,33 @@ def _materialize_cdx_search(
     date_start: str,
     date_end: str,
     limit: int,
+    stats: RequestStats | None = None,
+    attempt: int = 1,
+    cancelled: threading.Event | None = None,
 ) -> tuple[CaptureRef, ...]:
-    records = client.search(
-        search_url,
-        match_type=match_type,
-        from_date=date_start,
-        to_date=date_end,
-        limit=limit,
-        resolve_revisits=False,
-        skip_malformed_results=True,
-    )
-    return tuple(
-        sorted(
-            map(_parsed_capture, records),
-            key=lambda item: item.identity.sort_key(),
+    context = (
+        stats.attempt(
+            None, attempt, phase="cdx", cancelled=cancelled,
+            minimum_interval=CDX_REQUEST_INTERVAL_SECONDS,
         )
+        if stats is not None else nullcontext()
     )
+    with context:
+        records = client.search(
+            search_url,
+            match_type=match_type,
+            from_date=date_start,
+            to_date=date_end,
+            limit=limit,
+            resolve_revisits=False,
+            skip_malformed_results=True,
+        )
+        return tuple(
+            sorted(
+                map(_parsed_capture, records),
+                key=lambda item: item.identity.sort_key(),
+            )
+        )
 
 
 def _fetch_cdx(
@@ -274,6 +292,7 @@ def _fetch_cdx(
     limit: int = DEFAULT_CDX_PAGE_LIMIT,
     sleep: Callable[[float], None] = time.sleep,
     report: Callable[[str], None] = emit,
+    stats: RequestStats | None = None,
 ) -> _CdxResult:
     """Fetch and parse a CDX range through ``WaybackClient.search``.
 
@@ -286,7 +305,7 @@ def _fetch_cdx(
     window so the result is never a partial listing.
 
     Each attempt has a wall-clock budget of ``DEFAULT_CDX_TIMEOUT_SECONDS``
-    covering every resumeKey page. Socket read timeouts alone are not enough:
+    covering every resumeKey page, excluding shared-gate waits. Socket read timeouts alone are not enough:
     IA can trickle bytes forever and reset the per-read timer.
     """
 
@@ -300,15 +319,21 @@ def _fetch_cdx(
     rate_limit_failures = 0
     while True:
         attempt += 1
-        client = WaybackClient(
-            session=ArchiveMagicWaybackSession(
-                user_agent="archive-magic-fetch",
-                retries=0,
-                timeout=DEFAULT_CDX_TIMEOUT_SECONDS,
-            )
+        session = ArchiveMagicWaybackSession(
+            user_agent="archive-magic-fetch",
+            retries=0,
+            timeout=DEFAULT_CDX_TIMEOUT_SECONDS,
+            **({"search_calls_per_second": 0, "memento_calls_per_second": 0}
+               if stats is not None else {}),
         )
+        if stats is not None:
+            session.track_requests(stats)
+        client = WaybackClient(session=session)
+        cancelled = threading.Event()
         pool = ThreadPoolExecutor(max_workers=1)
         try:
+            started = time.monotonic()
+            waited = stats.waited_seconds() if stats is not None else 0.0
             future = pool.submit(
                 _materialize_cdx_search,
                 client,
@@ -317,17 +342,28 @@ def _fetch_cdx(
                 date_start=date_start,
                 date_end=date_end,
                 limit=limit,
+                stats=stats,
+                attempt=attempt,
+                cancelled=cancelled,
             )
-            try:
-                captures = future.result(timeout=DEFAULT_CDX_TIMEOUT_SECONDS)
-            except FuturesTimeoutError as error:
-                if future.done():
-                    raise
-                client.close()
-                raise TimeoutError(
-                    f"CDX query exceeded {DEFAULT_CDX_TIMEOUT_SECONDS:g}s "
-                    "wall-clock budget"
-                ) from error
+            timeout = DEFAULT_CDX_TIMEOUT_SECONDS
+            while True:
+                try:
+                    captures = future.result(timeout=timeout)
+                    break
+                except FuturesTimeoutError as error:
+                    if future.done():
+                        raise
+                    pacing = stats.waited_seconds() - waited if stats is not None else 0.0
+                    timeout = DEFAULT_CDX_TIMEOUT_SECONDS + pacing - (time.monotonic() - started)
+                    if timeout > 0:
+                        continue
+                    cancelled.set()
+                    client.close()
+                    raise TimeoutError(
+                        f"CDX query exceeded {DEFAULT_CDX_TIMEOUT_SECONDS:g}s "
+                        "wall-clock budget"
+                    ) from error
             return _CdxResult(captures, search_url, match_type)
         except Exception as error:  # noqa: BLE001 - network boundary
             last_error = error
@@ -351,6 +387,7 @@ def _fetch_cdx(
             report(f"waiting {delay:g}s (attempt {attempt + 1}/{max_attempts}).")
             sleep(delay)
         finally:
+            cancelled.set()
             pool.shutdown(wait=False, cancel_futures=True)
             client.close()
     assert last_error is not None

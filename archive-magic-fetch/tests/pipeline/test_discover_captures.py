@@ -63,7 +63,7 @@ def test_selection_keeps_first_complete_reference_and_query_metadata():
     query = {"result_count": 4}
     source = replace(
         make_source(),
-        discover=lambda _: CaptureListing((later, outside, first, duplicate), query),
+        discover=lambda _, stats: CaptureListing((later, outside, first, duplicate), query),
     )
     result = discover_captures(
         source,

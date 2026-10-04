@@ -49,7 +49,7 @@ class FailureAdvice:
 class SourceAdapter(Generic[Client]):
     """Bound source operations; fetch includes decoding but never owns retries."""
 
-    discover: Callable[[DiscoveryRequest], CaptureListing]
+    discover: Callable[[DiscoveryRequest, RequestStats | None], CaptureListing]
     open_client: Callable[[RequestStats], AbstractContextManager[Client]]
     fetch: Callable[[Client, CaptureRef], CaptureResult]
     preflight: Callable[[CaptureRef], UnresolvedFailure | None]

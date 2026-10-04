@@ -38,18 +38,27 @@ class StartGate:
         self._sleep = sleep
         self._lock = threading.Lock()
         self._next_start = 0.0
+        self._endpoint_starts: dict[str, float] = {}
         self._blocked_until = 0.0
         self._level = 0
         self._recovery_started_at: float | None = None
 
-    def wait(self, *, cancelled: threading.Event | None = None) -> None:
+    def wait(
+        self, *, cancelled: threading.Event | None = None,
+        endpoint: str = "", minimum_interval: float = 0.0,
+    ) -> None:
         while True:
             check_cancelled(cancelled)
             with self._lock:
                 now = self._clock()
-                deadline = max(self._next_start, self._blocked_until)
+                deadline = max(
+                    self._next_start, self._blocked_until,
+                    self._endpoint_starts.get(endpoint, 0.0),
+                )
                 if now >= deadline:
                     self._next_start = now + self._interval
+                    if minimum_interval:
+                        self._endpoint_starts[endpoint] = now + minimum_interval
                     return
             wait_or_cancel(deadline - now, cancelled=cancelled, sleep=self._sleep)
 

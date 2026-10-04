@@ -91,7 +91,11 @@ def run_fetch(
         gate = StartGate(
             settings.playback_starts_per_second, report=emit, clock=clock, sleep=sleep
         )
-        stats = RequestStats(gate.wait, report=emit, trace_path=trace_path, clock=clock)
+        diagnostics_path = layout.run_log(run_id).with_suffix(".429.jsonl")
+        stats = RequestStats(
+            gate.wait, report=emit, trace_path=trace_path,
+            diagnostics_path=diagnostics_path, clock=clock,
+        )
         workers = CaptureWorkers(source, stats, max_workers=settings.playback_workers)
         download = partial(
             fetch_capture,
@@ -105,7 +109,8 @@ def run_fetch(
         )
         try:
             if trace_path is not None:
-                emit(f"playback HTTP trace: {trace_path}")
+                emit(f"HTTP trace: {trace_path}")
+            emit(f"HTTP 429 diagnostics (written on first 429): {diagnostics_path}")
             with archive_lock(layout):
                 YearStage.recover(layout)
                 return _run_fetch(
@@ -279,6 +284,7 @@ def _run_year(
         DiscoveryRequest(settings.url_pattern, year, current_year),
         date_start=date_start,
         date_end=date_end,
+        stats=workers.stats,
     )
     year_metrics.cdx_duration_s += clock() - cdx_started
     selected = acquisition.captures
