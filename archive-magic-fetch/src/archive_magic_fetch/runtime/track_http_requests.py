@@ -7,6 +7,7 @@ import os
 import threading
 import time
 from collections import deque
+from concurrent.futures import CancelledError
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -16,12 +17,14 @@ from requests.adapters import HTTPAdapter
 
 from archive_magic_fetch.models import CaptureIdentity
 from archive_magic_fetch.runtime.pace_requests import check_cancelled
+from archive_magic_fetch.runtime.record_http_diagnostics import RateLimitDiagnostics
 
 TRACE_COLUMNS = (
     "request_id",
     "start_utc",
     "duration_ms",
     "status",
+    "phase",
     "capture_time",
     "digest",
     "attempt",
@@ -71,6 +74,7 @@ class RequestStats:
         *,
         report: Callable[[str], None],
         trace_path: Path | None = None,
+        diagnostics_path: Path | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._wait = wait
@@ -83,6 +87,13 @@ class RequestStats:
         self._peak_second = 0
         self._peak_minute = 0
         self._http_429 = 0
+        self._closed = False
+        self._waiting: dict[int, float] = {}
+        self._wait_seconds = 0.0
+        self._diagnostics = (
+            RateLimitDiagnostics(diagnostics_path, report)
+            if diagnostics_path is not None else None
+        )
         self._pending: dict[int, dict[str, object]] = {}
         self._stream: TextIO | None = (
             trace_path.open("x", encoding="utf-8", newline="", buffering=1)
@@ -100,21 +111,34 @@ class RequestStats:
     @contextmanager
     def attempt(
         self,
-        identity: CaptureIdentity,
+        identity: CaptureIdentity | None,
         number: int,
         *,
         cancelled: threading.Event | None = None,
+        phase: str = "playback",
+        minimum_interval: float = 0.0,
     ) -> Iterator[None]:
         self._local.capture = identity
         self._local.attempt = number
         self._local.request_in_attempt = 0
         self._local.cancelled = cancelled
+        self._local.phase = phase
+        self._local.minimum_interval = minimum_interval
         try:
             yield
         finally:
             self._local.capture = None
             self._local.attempt = None
             self._local.cancelled = None
+            self._local.phase = "playback"
+            self._local.minimum_interval = 0.0
+
+    def waited_seconds(self) -> float:
+        """Include active gate waits so discovery excludes pacing from its timeout."""
+
+        with self._lock:
+            now = self._clock()
+            return self._wait_seconds + sum(now - start for start in self._waiting.values())
 
     def _counts(self, now: float) -> dict[str, int]:
         while self._recent and self._recent[0] <= now - 60:
@@ -133,12 +157,24 @@ class RequestStats:
         # Never hold the stats lock while waiting: in-flight responses must
         # still be able to finish and trigger a pool-wide cooldown.
         cancelled = getattr(self._local, "cancelled", None)
-        if cancelled is None:
-            self._wait()
-        else:
-            self._wait(cancelled=cancelled)
+        options = {"cancelled": cancelled} if cancelled is not None else {}
+        minimum_interval = getattr(self._local, "minimum_interval", 0.0)
+        if minimum_interval:
+            options.update(endpoint=self._local.phase, minimum_interval=minimum_interval)
+        thread_id = threading.get_ident()
+        with self._lock:
+            if self._closed:
+                raise CancelledError("HTTP request tracking closed")
+            self._waiting[thread_id] = self._clock()
+        try:
+            self._wait(**options)
+        finally:
+            with self._lock:
+                self._wait_seconds += self._clock() - self._waiting.pop(thread_id)
         check_cancelled(cancelled)
         with self._lock:
+            if self._closed:
+                raise CancelledError("HTTP request tracking closed")
             now = self._clock()
             self._total += 1
             self._recent.append(now)
@@ -153,6 +189,7 @@ class RequestStats:
                 self._pending[self._total] = {
                     "request_id": self._total,
                     "start_utc": format_trace_time(datetime.now(timezone.utc)),
+                    "phase": getattr(self._local, "phase", "playback"),
                     "capture_time": format_capture_time(capture.timestamp)
                     if capture
                     else "",
@@ -190,12 +227,15 @@ class RequestStats:
                     }
                 )
         if status == 429:
+            phase = getattr(self._local, "phase", "playback")
             self._report(
-                f"playback HTTP 429 request #{request_id}: "
+                f"{phase} HTTP 429 request #{request_id}: "
                 f"last 1s={counts['starts_last_1s']}, "
                 f"last 60s={counts['starts_last_60s']}, "
                 f"total={counts['requests_total']}"
             )
+            if self._diagnostics is not None:
+                self._diagnostics.record(request_id, phase, response)
 
     def snapshot(self) -> dict[str, int]:
         with self._lock:
@@ -203,6 +243,7 @@ class RequestStats:
 
     def close(self) -> None:
         with self._lock:
+            self._closed = True
             counts = self._counts(self._clock())
             if self._writer is not None:
                 for row in self._pending.values():
@@ -212,8 +253,10 @@ class RequestStats:
             if self._stream is not None:
                 self._stream.close()
                 self._stream = None
+        if self._diagnostics is not None:
+            self._diagnostics.close()
         self._report(
-            f"playback HTTP: requests={counts['requests_total']}, "
+            f"HTTP: requests={counts['requests_total']}, "
             f"peak/1s={counts['peak_starts_1s']}, "
             f"peak/60s={counts['peak_starts_60s']}, 429s={counts['http_429']}"
         )

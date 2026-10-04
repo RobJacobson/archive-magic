@@ -72,15 +72,19 @@ Date flags may narrow the configured range. Each year is staged and validated lo
 WARCs are copied first, CDXJ indexes synced second, and obsolete WARCs removed last.
 After an upload failure, `--sync-only` retries without contacting either source.
 
-Playback pacing applies to every HTTP send, including retries and nearby-capture
-redirects, across all workers in one process. Each run logs request totals and peak
+Pacing applies to every playback and Wayback CDX HTTP send, including retries and
+redirects, across all workers in one process. CDX also retains a minimum spacing
+of 2.5 seconds; the stricter limit applies. Each run logs request totals and peak
 counts over rolling one-second and one-minute windows; 429s also log current counts.
 Add `--trace-requests` to save one CSV row per request in `logs/<run>.requests.csv`,
 with UTC start time and duration rounded to milliseconds, six-character capture
-digests, attempt IDs, response status, and rolling counts. URLs and other
+digests, attempt IDs, response status, phase (`cdx` or `playback`), and rolling counts. URLs and other
 variable-width fields appear on the right.
 See [request diagnostics](archive-magic-fetch/docs/ARCHITECTURE-FETCH.md#playback-request-diagnostics)
-for details. Separate Fetch processes have separate limits; CDX uses its own pacing.
+for details. Separate Fetch processes have separate limits. Common Crawl discovery
+keeps its separate pacing. Every run saves selected 429 response headers and a
+bounded body excerpt to `logs/<run>.429.jsonl` on the first 429, even without
+`--trace-requests`.
 
 With the default Wayback source, Fetch caches complete historical CDX years as `index/YYYY.cdx.json` beside
 `fetch.toml`, including when the data directory is elsewhere. On a cache miss,

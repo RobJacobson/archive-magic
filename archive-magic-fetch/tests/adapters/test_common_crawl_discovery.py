@@ -48,7 +48,7 @@ def test_pages_overlap_duplicate_locators_and_narrow_then_expanded_dates(tmp_pat
 
     client = Client(serve)
     from types import SimpleNamespace
-    source = SimpleNamespace(discover=lambda request: query(tmp_path, client))
+    source = SimpleNamespace(discover=lambda request, stats: query(tmp_path, client))
     request = DiscoveryRequest("*.example.org", 2017, 2017)
     narrow = discover_captures(source, request, date_start="20170601000000", date_end="20170630235959")
     assert len(narrow.captures) == 1 and narrow.captures[0].locator.offset == 100

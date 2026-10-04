@@ -43,14 +43,13 @@ class FailureAdvice:
     cooldown: tuple[str, float | None, str] | None = None
     group: str | None = None
     group_limit: int | None = None
-    reset_gate: bool = True
 
 
 @dataclass(frozen=True)
 class SourceAdapter(Generic[Client]):
     """Bound source operations; fetch includes decoding but never owns retries."""
 
-    discover: Callable[[DiscoveryRequest], CaptureListing]
+    discover: Callable[[DiscoveryRequest, RequestStats | None], CaptureListing]
     open_client: Callable[[RequestStats], AbstractContextManager[Client]]
     fetch: Callable[[Client, CaptureRef], CaptureResult]
     preflight: Callable[[CaptureRef], UnresolvedFailure | None]

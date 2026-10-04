@@ -51,7 +51,6 @@ def failure_advice(error: BaseException, attempt: int) -> FailureAdvice:
         cooldown=cooldown,
         group="timeout" if kind == "timeout" else None,
         group_limit=2 if kind == "timeout" else None,
-        reset_gate=kind != "timeout",
     )
 
 

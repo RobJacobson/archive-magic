@@ -11,15 +11,17 @@ from archive_magic_fetch.models import CaptureIdentity
 from archive_magic_fetch.runtime.report_progress import emit
 from archive_magic_fetch.runtime.calculate_retry_delay import linear_backpressure_delay
 
+BACKPRESSURE_RECOVERY_SECONDS = 300.0
+
 
 class StartGate:
     """Smooth request starts and pause every worker on source-directed cooldowns.
 
-    Successive waves from different captures escalate with a linear 60s, 120s,
-    180s, ... cooldown (never shorter than ``Retry-After``). Concurrent 429s in
-    the same pause window share one level. Retries of a capture that already
-    paused this wave stay at the current level. A non-backpressure completion
-    after the pause clears resets the escalation.
+    Each failure after a cooldown escalates the pause, including retries of
+    the same capture: 60s, 120s, 180s, ... up to ten minutes, never shorter than
+    ``Retry-After``. Concurrent failures during a pause share one level.
+    Successful acquisitions spanning five minutes without a failure reset
+    escalation. The recovery window starts with a success after the pause.
     """
 
     def __init__(
@@ -36,30 +38,48 @@ class StartGate:
         self._sleep = sleep
         self._lock = threading.Lock()
         self._next_start = 0.0
+        self._endpoint_starts: dict[str, float] = {}
         self._blocked_until = 0.0
-        self._max_retry_after = 0.0
         self._level = 0
-        self._wave_identities: set[CaptureIdentity] = set()
+        self._recovery_started_at: float | None = None
 
-    def wait(self, *, cancelled: threading.Event | None = None) -> None:
+    def wait(
+        self, *, cancelled: threading.Event | None = None,
+        endpoint: str = "", minimum_interval: float = 0.0,
+    ) -> None:
         while True:
             check_cancelled(cancelled)
             with self._lock:
                 now = self._clock()
-                deadline = max(self._next_start, self._blocked_until)
+                deadline = max(
+                    self._next_start, self._blocked_until,
+                    self._endpoint_starts.get(endpoint, 0.0),
+                )
                 if now >= deadline:
                     self._next_start = now + self._interval
+                    if minimum_interval:
+                        self._endpoint_starts[endpoint] = now + minimum_interval
                     return
             wait_or_cancel(deadline - now, cancelled=cancelled, sleep=self._sleep)
 
     def note_success(self) -> None:
-        """Reset escalation after a non-backpressure completion past the pause."""
+        """Reset only after sustained successful acquisition outside cooldowns."""
 
         with self._lock:
-            if self._clock() >= self._blocked_until:
+            now = self._clock()
+            if self._level == 0 or now < self._blocked_until:
+                return
+            if self._recovery_started_at is None:
+                self._recovery_started_at = now
+            elif now - self._recovery_started_at >= BACKPRESSURE_RECOVERY_SECONDS:
                 self._level = 0
-                self._max_retry_after = 0.0
-                self._wave_identities.clear()
+                self._recovery_started_at = None
+
+    def note_failure(self) -> None:
+        """A failed acquisition breaks recovery without resetting escalation."""
+
+        with self._lock:
+            self._recovery_started_at = None
 
     def pause(
         self,
@@ -72,28 +92,16 @@ class StartGate:
         with self._lock:
             now = self._clock()
             if now >= self._blocked_until:
-                retry_from_wave = identity in self._wave_identities and self._level > 0
-                if not retry_from_wave:
-                    self._level += 1
-                    self._max_retry_after = 0.0
-                    self._wave_identities = set()
-            self._wave_identities.add(identity)
+                self._level += 1
+            self._recovery_started_at = None
             delay = linear_backpressure_delay(self._level, retry_after)
-            self._max_retry_after = max(self._max_retry_after, delay)
             self._blocked_until = max(self._blocked_until, now + delay)
-            maximum = self._max_retry_after
             remaining = self._blocked_until - now
             level = self._level
         source = label or kind
-        if retry_after is not None and kind == "http":
-            policy = f"Retry-After={retry_after:g}s, applied={delay:g}s"
-        elif kind == "http":
-            policy = f"Retry-After=absent, applied={delay:g}s"
-        else:
-            policy = f"cooldown={delay:g}s"
         self._report(
             f"{source} at {identity.timestamp}; "
-            f"{policy}, level={level}, maximum={maximum:g}s; "
+            f"cooldown={delay:g}s, level={level}; "
             f"new starts paused for {remaining:g}s"
         )
 

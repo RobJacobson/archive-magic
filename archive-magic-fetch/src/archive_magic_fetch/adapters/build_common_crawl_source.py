@@ -19,7 +19,7 @@ from archive_magic_fetch.runtime.track_http_requests import InstrumentedHTTPAdap
 def build_source(*, index_directory: Path) -> SourceAdapter:
     index = CommonCrawlIndex()
 
-    def discover(request):
+    def discover(request, stats):
         with requests.Session() as client:
             return load_or_fetch_common_crawl_year(
                 request, index_directory=index_directory, index=index, client=client,

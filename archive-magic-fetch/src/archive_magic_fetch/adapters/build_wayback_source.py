@@ -40,7 +40,7 @@ def build_source(
     cdx_page_limit: int = DEFAULT_CDX_PAGE_LIMIT,
     sleep: Callable[[float], None] = time.sleep,
 ) -> SourceAdapter[WaybackClient]:
-    def discover(request: DiscoveryRequest) -> CaptureListing:
+    def discover(request: DiscoveryRequest, stats: RequestStats | None) -> CaptureListing:
         return discovery.load_or_fetch_year_cdx(
             index_directory=index_directory,
             year=request.year,
@@ -49,6 +49,7 @@ def build_source(
             cdx_window_days=cdx_window_days,
             cdx_page_limit=cdx_page_limit,
             sleep=sleep,
+            stats=stats,
         )
 
     return SourceAdapter(
@@ -66,7 +67,7 @@ def build_source(
 @contextmanager
 def _open_client(stats: RequestStats) -> Iterator[WaybackClient]:
     with make_client() as client:
-        client.session.track_playback(stats)
+        client.session.track_requests(stats)
         yield client
 
 
