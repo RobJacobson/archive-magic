@@ -214,10 +214,10 @@ updates to that year. Resetting one year cannot invalidate another year's revisi
 Playback backpressure pauses all workers for 60, 120, 180 seconds and so on,
 capped at ten minutes unless the source requests a longer wait. A failure after
 the pause escalates even when retrying the same capture; failures received during
-an active pause share its level and never shorten the pause. Escalation resets
-only after successful acquisitions span five minutes without a failure, starting
-with the first success after the pause. Cooldown time alone does not count as
-recovery. Other acquisition failures interrupt recovery without pausing the pool.
+an active pause share its level and never shorten the pause. A successful
+download after the pause resets escalation to the first step. A completion that
+arrives during the pause does not reset it, and cooldown or idle time alone does
+not count. Other acquisition failures neither pause the pool nor change the level.
 Console messages report the applied cooldown and remaining pause; the request
 CSV retains the raw `Retry-After` header, empty when absent, for diagnostics.
 CDX discovery keeps its separate retry policy. Its query timeout excludes time
