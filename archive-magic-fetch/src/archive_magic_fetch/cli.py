@@ -68,7 +68,7 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--config",
         type=Path,
         metavar="PATH",
-        help="host-level fetch-config.toml (default: ~/.config/archive-magic-fetch/fetch-config.toml)",
+        help="host-level fetch-config.toml, created if missing (default: ~/.config/archive-magic-fetch/fetch-config.toml)",
     )
     parser.add_argument(
         "--workers",
@@ -82,7 +82,7 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         type=_positive_float,
         default=None,
         metavar="N",
-        help="playback HTTP requests per second, including retries/redirects (default: 16, or fetch-config.toml)",
+        help="playback HTTP requests per second, including retries/redirects (default: 8, or fetch-config.toml)",
     )
     parser.add_argument(
         "--trace-requests",

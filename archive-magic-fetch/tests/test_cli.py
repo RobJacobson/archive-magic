@@ -134,7 +134,7 @@ def test_cli_runtime_flags_override_defaults(tmp_path, monkeypatch):
     )
     assert cli.main([str(config)]) == 0
     assert captured[0].playback_workers == 4
-    assert captured[0].playback_starts_per_second == 16.0
+    assert captured[0].playback_starts_per_second == 8.0
     assert captured[0].retries == 4
     assert captured[0].trace_requests is False
     assert captured[0].cdx_window_days == 28
@@ -163,18 +163,32 @@ def test_cli_runtime_flags_override_defaults(tmp_path, monkeypatch):
     assert captured[0].cdx_page_limit == 5000
 
 
-def test_cli_uses_instance_fetch_config_and_cli_overrides(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    "source, workers, rate, retries",
+    [("wayback", 3, 8.0, 6), ("common-crawl", 2, 4.0, 1)],
+)
+def test_cli_uses_instance_fetch_config_and_cli_overrides(
+    tmp_path, monkeypatch, source, workers, rate, retries
+):
     import archive_magic_fetch.run_application as app
     import archive_magic_fetch.cli as cli
 
     archive = write_cli_config(tmp_path)
+    archive.write_text(archive.read_text().replace(
+        "[archive]", f'[archive]\nsource = "{source}"'
+    ))
     policy = tmp_path / "fetch-config.toml"
     policy.write_text(
         """
-[playback]
+[wayback]
 workers = 3
 starts_per_second = 8
 retries = 6
+
+[common-crawl]
+workers = 2
+starts_per_second = 4
+retries = 1
 """,
         encoding="utf-8",
     )
@@ -185,17 +199,17 @@ retries = 6
         lambda item, **kwargs: captured.append(item) or SimpleNamespace(exit_code=0),
     )
     assert cli.main([str(archive), "--config", str(policy)]) == 0
-    assert captured[0].playback_workers == 3
-    assert captured[0].playback_starts_per_second == 8.0
-    assert captured[0].retries == 6
+    assert captured[0].playback_workers == workers
+    assert captured[0].playback_starts_per_second == rate
+    assert captured[0].retries == retries
     captured.clear()
     assert (
         cli.main([str(archive), "--config", str(policy), "--starts-per-second", "1.5"])
         == 0
     )
-    assert captured[0].playback_workers == 3
+    assert captured[0].playback_workers == workers
     assert captured[0].playback_starts_per_second == 1.5
-    assert captured[0].retries == 6
+    assert captured[0].retries == retries
 
 
 def test_cli_uses_cdx_settings_from_toml(tmp_path, monkeypatch):

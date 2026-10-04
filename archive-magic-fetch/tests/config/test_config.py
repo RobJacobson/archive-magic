@@ -1,4 +1,5 @@
 from pathlib import Path
+import tomllib
 
 import pytest
 from archive_magic_fetch.config.load_archive_config import load_config
@@ -7,9 +8,6 @@ from archive_magic_fetch.config.models import (
     CONFIG_NAME,
     DEFAULT_CDX_PAGE_LIMIT,
     DEFAULT_CDX_WINDOW_DAYS,
-    DEFAULT_PLAYBACK_RETRIES,
-    DEFAULT_PLAYBACK_STARTS_PER_SECOND,
-    DEFAULT_PLAYBACK_WORKERS,
     DEFAULT_WARC_TARGET_BYTES,
     INSTANCE_CONFIG_ENV,
     FetchOutput,
@@ -264,54 +262,96 @@ end = "2001-12-31"
         )
 
 
-def test_playback_policy_defaults_when_file_absent():
-    assert load_playback_policy() == PlaybackPolicy()
-    assert load_playback_policy().workers == DEFAULT_PLAYBACK_WORKERS
-    assert (
-        load_playback_policy().starts_per_second == DEFAULT_PLAYBACK_STARTS_PER_SECOND
-    )
-    assert load_playback_policy().retries == DEFAULT_PLAYBACK_RETRIES
-
-
-def test_playback_policy_reads_partial_toml(tmp_path):
-    path = tmp_path / "fetch-config.toml"
-    path.write_text(
-        """
-[playback]
-starts_per_second = 8
-""",
-        encoding="utf-8",
-    )
-    policy = load_playback_policy(path)
-    assert policy.workers == DEFAULT_PLAYBACK_WORKERS
-    assert policy.starts_per_second == 8.0
-    assert policy.retries == DEFAULT_PLAYBACK_RETRIES
-
-
-def test_playback_policy_env_path(tmp_path, monkeypatch):
-    path = tmp_path / "host.toml"
-    path.write_text(
-        """
-[playback]
+def policy_document():
+    return """[wayback]
 workers = 2
-starts_per_second = 8
+starts_per_second = 3.5
 retries = 1
-""",
-        encoding="utf-8",
-    )
-    monkeypatch.setenv(INSTANCE_CONFIG_ENV, str(path))
-    assert load_playback_policy() == PlaybackPolicy(2, 8.0, 1)
+
+[common-crawl]
+workers = 6
+starts_per_second = 7
+retries = 5
+"""
 
 
-def test_playback_policy_rejects_unknown_and_invalid(tmp_path):
-    unknown = tmp_path / "unknown.toml"
-    unknown.write_text("[other]\nworkers = 2\n", encoding="utf-8")
-    with pytest.raises(ValueError, match="unexpected table"):
-        load_playback_policy(unknown)
-    invalid = tmp_path / "invalid.toml"
-    invalid.write_text("[playback]\nworkers = 0\n", encoding="utf-8")
-    with pytest.raises(ValueError, match="must be positive"):
-        load_playback_policy(invalid)
-    missing = tmp_path / "missing.toml"
-    with pytest.raises(ValueError, match="does not exist"):
-        load_playback_policy(missing)
+@pytest.mark.parametrize("location", ["default", "environment", "explicit"])
+def test_playback_policy_creates_missing_config(tmp_path, monkeypatch, location):
+    path = tmp_path / "nested" / "fetch-config.toml"
+    value = None
+    if location == "default":
+        path = tmp_path / "xdg-config" / "archive-magic-fetch" / "fetch-config.toml"
+    elif location == "environment":
+        monkeypatch.setenv(INSTANCE_CONFIG_ENV, str(path))
+    else:
+        value = path
+    assert load_playback_policy(value) == PlaybackPolicy(4, 8.0, 4)
+    assert load_playback_policy(value, source="common-crawl") == PlaybackPolicy(4, 8.0, 4)
+    assert tomllib.loads(path.read_text()) == {
+        name: {"workers": 4, "starts_per_second": 8, "retries": 4}
+        for name in ("wayback", "common-crawl")
+    }
+
+
+@pytest.mark.parametrize(
+    "source, expected",
+    [("wayback", PlaybackPolicy(2, 3.5, 1)), ("common-crawl", PlaybackPolicy(6, 7.0, 5))],
+)
+def test_playback_policy_selects_service_and_preserves_file(tmp_path, source, expected):
+    path = tmp_path / "fetch-config.toml"
+    original = "# Preserve custom settings and comments.\n" + policy_document()
+    path.write_text(original)
+    assert load_playback_policy(path, source=source) == expected
+    assert path.read_text() == original
+
+
+def test_playback_policy_path_precedence(tmp_path, monkeypatch):
+    env = tmp_path / "env.toml"
+    env.write_text(policy_document())
+    monkeypatch.setenv(INSTANCE_CONFIG_ENV, str(env))
+    assert load_playback_policy() == PlaybackPolicy(2, 3.5, 1)
+    explicit = tmp_path / "explicit.toml"
+    assert load_playback_policy(explicit) == PlaybackPolicy(4, 8.0, 4)
+    assert env.read_text() == policy_document()
+
+
+@pytest.mark.parametrize(
+    "document, message",
+    [
+        (policy_document() + "[other]\nworkers = 2\n", "unexpected table"),
+        (policy_document().replace("workers = 2", "workers = 0"), "wayback.workers"),
+        (policy_document().replace("workers = 2", "workers = true"), "wayback.workers"),
+        (policy_document().replace("workers = 2", "workers = 1.5"), "wayback.workers"),
+        (policy_document().replace("starts_per_second = 3.5", "starts_per_second = 0"), "wayback.starts_per_second"),
+        (policy_document().replace("starts_per_second = 3.5", "starts_per_second = inf"), "wayback.starts_per_second"),
+        (policy_document().replace("starts_per_second = 3.5", "starts_per_second = nan"), "wayback.starts_per_second"),
+        (policy_document().replace("retries = 5", "retries = -1"), "common-crawl.retries"),
+        (policy_document().replace("retries = 5", "retries = true"), "common-crawl.retries"),
+        (policy_document().replace("workers = 2\n", ""), "missing settings"),
+        (policy_document().replace("workers = 2", "worker = 2"), "unexpected settings"),
+        (policy_document().split("[common-crawl]")[0], "common-crawl"),
+        ("[wayback", "invalid fetch instance configuration"),
+        ("wayback = 1", "wayback must be a TOML table"),
+        ("", "wayback"),
+    ],
+)
+def test_playback_policy_rejects_invalid_without_overwriting(tmp_path, document, message):
+    path = tmp_path / "fetch-config.toml"
+    path.write_text(document)
+    with pytest.raises(ValueError, match=message):
+        load_playback_policy(path)
+    assert path.read_text() == document
+
+
+def test_playback_policy_reports_creation_failure(tmp_path, monkeypatch):
+    def denied(*args, **kwargs):
+        raise PermissionError("permission denied")
+
+    monkeypatch.setattr(Path, "mkdir", denied)
+    with pytest.raises(ValueError, match="invalid fetch instance configuration.*permission denied"):
+        load_playback_policy(tmp_path / "nested" / "fetch-config.toml")
+
+
+def test_playback_policy_rejects_directory(tmp_path):
+    with pytest.raises(ValueError, match="invalid fetch instance configuration"):
+        load_playback_policy(tmp_path)
