@@ -5,12 +5,13 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "archive-magic-fetch"
 version = "0.1.0"
-description = "Build portable WARC 1.1 and CDXJ collections from Internet Archive history"
+description = "Build portable WARC 1.1 and CDXJ collections from Wayback or Common Crawl history"
 requires-python = ">=3.12"
 license = { text = "MIT" }
 dependencies = [
     "cdxj-indexer==1.4.6",
     "surt==0.3.1",
+    "requests==2.34.2",
     "wayback==0.5.1",
     "warcio==1.8.1",
 ]

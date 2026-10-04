@@ -118,7 +118,7 @@ def log_url_outcome(
     total: int,
     outcome: UrlOutcome,
     *,
-    capture_link=lambda identity: identity.original_url,
+    capture_link=lambda ref: ref.identity.original_url,
 ) -> None:
     links = links_enabled()
     color = color_enabled()
@@ -130,8 +130,8 @@ def log_url_outcome(
             continue
         detail, style = _capture_line(capture)
         lines.append(
-            f"  {timestamp_link(capture.identity, destination=capture_link(capture.identity), enabled=links)}  "
-            f"{_safe(capture.identity.payload_digest[-6:]):>6}  "
+            f"  {timestamp_link(capture.capture.identity, destination=capture_link(capture.capture), enabled=links)}  "
+            f"{_safe(capture.capture.identity.payload_digest[-6:]):>6}  "
             f"{style_result(detail, style, enabled=color)}"
         )
     emit("\n".join(lines))

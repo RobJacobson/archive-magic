@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from archive_magic_fetch.archive.format import semantic_headers
 from urllib.parse import unquote, urlsplit
 
 from wayback import Memento
@@ -21,17 +21,6 @@ from archive_magic_fetch.archive.identity import (
     warc_date_to_cdx,
 )
 from archive_magic_fetch.models import CaptureRef, CaptureResult
-
-_REPRESENTATION_HEADERS = {
-    "content-digest",
-    "content-encoding",
-    "content-length",
-    "content-md5",
-    "digest",
-    "etag",
-    "repr-digest",
-    "transfer-encoding",
-}
 
 
 def decode_memento(memento: Memento, capture: CaptureRef) -> CaptureResult:
@@ -126,7 +115,7 @@ def _playback_from_memento(
         memento_url = memento.memento_url
         memento_timestamp = memento.timestamp
         headers = tuple(
-            _semantic_headers(memento.headers, len(body), status_code=status_code)
+            semantic_headers(memento.headers.items(), len(body), status_code=status_code)
         )
         url = memento.url
     unusable = _is_unusable_playback_body(
@@ -135,22 +124,6 @@ def _playback_from_memento(
     if unusable is not None:
         raise UnusablePlaybackError(unusable)
     return body, status_code, memento_url, memento_timestamp, headers, url
-
-
-def _semantic_headers(
-    headers: Mapping[str, str],
-    payload_length: int,
-    *,
-    status_code: int,
-) -> list[tuple[str, str]]:
-    skip = set(_REPRESENTATION_HEADERS)
-    if status_code != 206:
-        skip.add("content-range")
-    semantic = [
-        (name, value) for name, value in headers.items() if name.lower() not in skip
-    ]
-    semantic.append(("Content-Length", str(payload_length)))
-    return semantic
 
 
 def _same_original_url(left: str, right: str) -> bool:

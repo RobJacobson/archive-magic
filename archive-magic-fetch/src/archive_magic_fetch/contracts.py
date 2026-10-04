@@ -8,7 +8,6 @@ from dataclasses import dataclass
 from typing import Generic, TypeVar
 
 from archive_magic_fetch.models import (
-    CaptureIdentity,
     CaptureListing,
     CaptureRef,
     CaptureResult,
@@ -56,4 +55,4 @@ class SourceAdapter(Generic[Client]):
     fetch: Callable[[Client, CaptureRef], CaptureResult]
     preflight: Callable[[CaptureRef], UnresolvedFailure | None]
     failure_advice: Callable[[BaseException, int], FailureAdvice]
-    capture_link: Callable[[CaptureIdentity], str]
+    capture_link: Callable[[CaptureRef], str]

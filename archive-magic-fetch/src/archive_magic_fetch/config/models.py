@@ -56,6 +56,7 @@ class FetchConfig:
     start: str = DEFAULT_START
     end: str | None = None
     index_directory: Path | None = None
+    source: str = "wayback"
 
 
 @dataclass(frozen=True)

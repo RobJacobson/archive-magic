@@ -238,7 +238,7 @@ def test_cli_rejects_start_before_project_range(tmp_path):
 
 
 def test_log_url_outcome_omits_already_represented_lines(capsys):
-    from archive_magic_fetch.models import CaptureKind, CaptureOutcome, UrlOutcome
+    from archive_magic_fetch.models import CaptureKind, CaptureOutcome, CaptureRef, UrlOutcome
     from archive_magic_fetch.runtime.report_progress import log_url_outcome
 
     existing = make_capt(ts="19990117001820")
@@ -248,9 +248,9 @@ def test_log_url_outcome_omits_already_represented_lines(capsys):
     outcome = UrlOutcome(
         url="http://www.nclr.org/special/award.html",
         captures=(
-            CaptureOutcome(identity=existing, kind=CaptureKind.EXISTING),
+            CaptureOutcome(capture=CaptureRef(existing, "text/html"), kind=CaptureKind.EXISTING),
             CaptureOutcome(
-                identity=downloaded,
+                capture=CaptureRef(downloaded, "text/html"),
                 kind=CaptureKind.DOWNLOADED,
                 playback=playback(downloaded),
                 attempts=1,
@@ -267,3 +267,39 @@ def test_log_url_outcome_omits_already_represented_lines(capsys):
     assert "1/397 http://www.nclr.org/special/award.html" in text
     assert "already represented" not in text
     assert "Downloaded" in text
+
+
+@pytest.mark.parametrize("source", [None, "wayback", "common-crawl"])
+def test_source_selection_in_application(tmp_path, monkeypatch, source):
+    import archive_magic_fetch.run_application as app
+    from archive_magic_fetch.cli import main
+    from archive_magic_fetch.config.load_archive_config import load_config
+
+    config = write_cli_config(tmp_path)
+    if source:
+        config.write_text(config.read_text().replace('[archive]', f'[archive]\nsource = "{source}"'))
+    assert load_config(config).source == (source or "wayback")
+    selected = []
+    monkeypatch.setattr(app, "build_wayback_source", lambda **kw: "wayback")
+    monkeypatch.setattr(app, "build_common_crawl_source", lambda **kw: "common-crawl")
+    monkeypatch.setattr(app, "run_fetch", lambda settings, source: selected.append((settings, source)) or SimpleNamespace(exit_code=0))
+    assert main([str(config), "--workers", "2", "--retries", "0"]) == 0
+    assert selected[0][1] == (source or "wayback")
+    assert selected[0][0].playback_workers == 2 and selected[0][0].retries == 0
+
+
+def test_invalid_source_and_cc_sync_only(tmp_path, monkeypatch):
+    import archive_magic_fetch.run_application as app
+    from archive_magic_fetch.cli import main
+
+    config = write_cli_config(tmp_path, output_type="remote")
+    config.write_text(config.read_text().replace('[archive]', '[archive]\nsource = "invalid"'))
+    assert main([str(config)]) == 2
+    config.write_text(config.read_text().replace('source = "invalid"', 'source = "common-crawl"'))
+    def forbidden(**kwargs):
+        raise AssertionError("sync must not construct any source")
+    monkeypatch.setattr(app, "build_wayback_source", forbidden)
+    monkeypatch.setattr(app, "build_common_crawl_source", forbidden)
+    synced = []
+    monkeypatch.setattr(app, "sync_archive", lambda *args: synced.append(args))
+    assert main([str(config), "--sync-only"]) == 0 and len(synced) == 1

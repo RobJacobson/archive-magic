@@ -1,6 +1,6 @@
 # Archive Magic
 
-Archive Magic Fetch downloads Internet Archive captures into WARC files and CDXJ
+Archive Magic Fetch downloads Wayback or Common Crawl captures into WARC files and CDXJ
 indexes. Archive Magic Navigator independently serves published archives from
 private S3-compatible buckets, including Cloudflare R2.
 
@@ -40,6 +40,7 @@ its archive ID, URL pattern, dates, and storage destination. `output.prefix`
 identifies the archive root; Fetch appends `data/` automatically. Relative local
 paths resolve from `fetch.toml`, with `data_directory = "data"` by default.
 Use `output.type = "local"` for acquisition without remote publication.
+Set `[archive].source = "common-crawl"` for CC, or omit it to use Wayback.
 
 ```console
 uv run archive-magic-fetch /path/to/example.org
@@ -51,7 +52,7 @@ every run in `~/.config/archive-magic-fetch/fetch-config.toml`, or for one run
 with `--workers`, `--starts-per-second`, and `--retries`. Date flags may narrow
 the configured range. Each year is staged and validated locally before publication:
 WARCs are copied first, CDXJ indexes synced second, and obsolete WARCs removed last.
-After an upload failure, `--sync-only` retries without contacting Wayback.
+After an upload failure, `--sync-only` retries without contacting either source.
 
 Playback pacing applies to every HTTP send, including retries and nearby-capture
 redirects, across all workers in one process. Each run logs request totals and peak
@@ -63,7 +64,7 @@ variable-width fields appear on the right.
 See [request diagnostics](archive-magic-fetch/docs/ARCHITECTURE-FETCH.md#playback-request-diagnostics)
 for details. Separate Fetch processes have separate limits; CDX uses its own pacing.
 
-Fetch caches complete historical CDX years as `index/YYYY.cdx.json` beside
+With the default Wayback source, Fetch caches complete historical CDX years as `index/YYYY.cdx.json` beside
 `fetch.toml`, including when the data directory is elsewhere. On a cache miss,
 it queries the full calendar year and saves the listing before downloading WARC
 contents. Date options restrict playback downloads, not the CDX query. The
@@ -75,6 +76,17 @@ Historical caches survive WARC failures and `--reset-data`. An empty array is a
 successfully queried empty year. Corrupt caches produce errors rather than being
 silently replaced. The URL pattern must remain fixed while reusing a cache;
 explicitly clear the CDX cache if you change the query. There is no automatic refresh.
+
+Common Crawl uses complete per-crawl calendar-year caches under
+`index/common-crawl/`, isolated by query. Each run refreshes the crawl catalog;
+completed entries, including current-year entries, are reused until collection
+metadata changes or their cache is manually cleared. Narrow dates filter after
+full-year discovery. CC downloads individual compressed WARC ranges with strict
+gzip, length, and digest checks. Legacy ARC, unresolved source revisits, and
+malformed historical records requiring repair are unsupported. See
+[Common Crawl acquisition](archive-magic-fetch/docs/ARCHITECTURE-FETCH.md#common-crawl-acquisition)
+for details and an opt-in local smoke procedure. Changing source/query does not
+remove existing output; use a separate archive directory for isolated collections.
 
 Local `data/` remains authoritative for Fetch's WARC/CDXJ mirror. Do not delete
 local archive files to free space and then sync: missing managed local files can

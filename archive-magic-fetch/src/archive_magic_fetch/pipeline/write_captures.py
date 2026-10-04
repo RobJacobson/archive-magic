@@ -109,7 +109,7 @@ def _commit_capture_outcome(
     if outcome.kind is CaptureKind.REVISIT:
         assert outcome.representative is not None
         _write_revisit(
-            identity=outcome.identity,
+            identity=outcome.capture.identity,
             stored=outcome.representative,
             inventory=inventory,
             writer=writer,
@@ -123,7 +123,7 @@ def _commit_capture_outcome(
     writer.write_playback(result)
     metrics.warc_write_s += time.monotonic() - started
     metrics.represented += 1
-    inventory.identities.add(outcome.identity)
+    inventory.identities.add(outcome.capture.identity)
     metrics.downloads += 1
     if not result.digest_matched:
         metrics.digest_mismatch_accepted += 1

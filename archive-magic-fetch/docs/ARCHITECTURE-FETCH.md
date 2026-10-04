@@ -2,7 +2,7 @@
 
 ## Purpose and interface
 
-Fetch turns Internet Archive capture history into annual WARC 1.1 collections
+Fetch turns Wayback or Common Crawl capture history into annual WARC 1.1 collections
 and CDXJ indexes. Navigator reads that flat file format independently.
 
 ```text
@@ -93,7 +93,7 @@ PY
 
 ### Archive configuration
 
-The `--sync-only` form requires remote output and does not query Wayback. It cannot
+The `--sync-only` form requires remote output and does not query either source. It cannot
 be combined with dates or `--reset-data`.
 
 The existing TOML fields stay in place:
@@ -102,6 +102,7 @@ The existing TOML fields stay in place:
 [archive]
 id = "example.org"
 url_pattern = "*.example.org"
+source = "wayback" # default; or "common-crawl"
 
 [output]
 type = "remote" # or "local"
@@ -145,7 +146,7 @@ start and skipping future years. CDX queries always cover January 1 00:00:00
 through December 31 23:59:59. Exact configured/CLI dates filter playback captures
 after acquisition; they do not narrow the CDX query.
 
-Complete historical years are cached as ordinary JSON arrays in
+For Wayback, complete historical years are cached as ordinary JSON arrays in
 `index/YYYY.cdx.json` beside `fetch.toml`. An existing valid cache avoids all CDX
 requests for that year. Each record contains `urlkey`, `original_url`, `timestamp`,
 `status_token`, `payload_digest`, and `mime`; `[]` represents a successfully
@@ -238,6 +239,141 @@ The default compressed WARC target is 250,000,000 bytes. Normal updates only
 extend a year's final shard or create a new shard; the previous byte prefix and
 CDXJ offsets remain valid. Older yearly shards are not rewritten.
 
+## Common Crawl acquisition
+
+Set `[archive].source = "common-crawl"` to select CC; omitted source remains
+`"wayback"`. Unknown values are configuration errors. There is one source per
+archive configuration and no automatic fallback or simultaneous source merging.
+Changing source or query does not remove existing output: use a separate archive
+directory for an isolated collection. Sync-only constructs no source client.
+Wayback's `cdx_page_limit` and `cdx_window_days` do not tune CC discovery.
+
+### Complete annual discovery and cache freshness
+
+Fetch reads a fresh [catalog](https://index.commoncrawl.org/collinfo.json) once
+per run and chooses collections by their actual UTC coverage bounds, not by the
+year in the collection ID. It queries every page of every overlapping collection
+with `showNumPages` and consistent `pageSize=5` (compressed index blocks, not
+rows). Status and MIME filters and digest collapse are not applied. Query syntax
+supports the same exact, domain-wildcard, and prefix-wildcard forms as Wayback.
+When shared normalization leaves the match type unspecified, the request omits
+`matchType`, preserving CDX inference for patterns such as `https://example.org/news*`.
+Its cache key reflects those actual query parameters, so earlier forced-exact
+entries are not reused for corrected queries and can remain on disk.
+Only matching captures available in the chosen source can be acquired; this does
+not guarantee complete historical coverage of a website.
+
+Every query and cache entry covers January 1 00:00:00 through December 31
+23:59:59 UTC of the requested year. Configured and CLI dates filter the complete
+listing afterward. A June-only run therefore cannot populate a June-only annual
+cache. Collections are ordered by coverage start and ID, pages numerically, and
+records in response order; shared deduplication retains the first complete
+reference for each identity.
+
+CC caches are versioned JSON envelopes at
+`index/common-crawl/<query-hash>/<crawl-id>/<year>.json`, outside the resettable
+data directory. They contain normalized query, full-year bounds, collection
+metadata, and capture references including byte-range locators. Only complete
+per-crawl queries are published atomically. A failed page or crawl prevents an
+annual listing from reaching WARC work; already completed crawl caches survive.
+Valid empty results are cached. Page counts precede date filtering, so a numbered
+page's recognized no-captures 404 is also a valid empty result; other HTTP or
+parsing errors still fail discovery. Corrupt entries fail explicitly, without silently
+refetching or replacing them. Wayback cache paths and arrays are unchanged.
+
+Completed entries are reused even for the current year. A new run's catalog adds
+newly published collections and invalidates entries whose collection metadata
+changed. This is metadata-only freshness: updates within an existing collection
+with unchanged metadata are not detected. Remove its cache entry to force a
+refresh, or remove the CC query directory to refresh that query. Changed queries
+use separate hashes. Resetting data does not clear discovery caches.
+
+Index requests are sequential, paced at one start per second, separate from
+acquisition metrics. Connection failures, timeouts, 429, and 5xx responses have
+five total attempts, with 60-second exponential delays capped at 600 seconds,
+honoring longer `Retry-After`. Connection/read timeouts are 10/120 seconds. A
+failed catalog is never interpreted as empty coverage.
+
+### Ranges, validation, and supported records
+
+Worker clients use HTTPS ranges from `data.commoncrawl.org` without AWS
+credentials. Each request selects `offset` through `offset + length - 1` and
+requires HTTP 206, matching range metadata, and the exact compressed byte count.
+Reads are bounded to the advertised length plus one byte; ignored ranges,
+redirects, and unexpected outer content encoding are rejected before consuming
+an unbounded body. Responses close on success, failure, or interruption.
+
+Validation first uses independent gzip decompression with completed member,
+CRC, and trailer-size checks. Missing trailers, extra members, and trailing
+garbage fail. Then warcio parses one WARC record, with explicit block-length and
+framing checks and independent verification of every supplied block and payload
+digest. Both WARC and HTTP header boundaries are measured from raw bytes, not
+warcio's decoded-character counts, so UTF-8 headers retain correct byte extents. Parser EOF or an aggregate digest flag alone does not establish validity.
+Target URL, timestamp, and available original HTTP status must match discovery.
+The HTTP 206 of the range transport is not the original response status.
+
+CC already removes HTTP content and transfer encoding. Read `raw_stream`
+without interpreting stale encoding headers, as documented in its
+[format notes](https://github.com/commoncrawl/arc2warc-conversion/blob/main/README.md#required-rewriting-of-http-headers).
+The shared header helper accepts ordered pairs; CC retains repeated headers such
+as `Set-Cookie`, and Wayback supplies its mapping's `.items()`. Obsolete
+representation headers are removed and output length/digest reflect stored bytes.
+An index-only digest mismatch can retain a valid exact response, but cannot seed
+reuse. Missing digests cannot seed reuse either. A failed supplied WARC digest
+is an acquisition failure, not an accepted index mismatch.
+
+Support is limited to complete WARC 1.0/1.1 response records (CC's WARC era,
+starting in 2013). Legacy ARC, segmented or non-response records, declared
+truncation, and unresolved source revisits are explicit failures. Shared
+same-year reuse can still satisfy a capture without acquisition. External revisit
+chains are never copied into output or fetched to reconstruct payloads.
+
+Strict rejection without historical repair excludes some otherwise recoverable
+captures. For example, `CC-MAIN-2018-34` has an
+[extra CRLF defect](https://commoncrawl.org/errata/extra-line-in-response-records-between-headers-and-payload)
+between HTTP headers and payload. Records failing length or digest verification
+remain failures; Fetch does not strip bytes to repair them or reject the entire
+collection by its ID. Old crawls may also omit truncation metadata, so structural
+and digest validation cannot establish that every original website response was
+fully crawled. Wayback-specific stub detection and newline tolerance do not apply.
+
+Retrieval and decoding are one shared acquisition attempt. Connection/read
+timeouts are 10/60 seconds. Host worker/rate/retry policy applies; transport
+retries are disabled. Corrupt records, incomplete transfers, timeouts, connection
+failures, 429, and 5xx may retry within that budget. Invalid locators, identity
+mismatches, unsupported types, declared source truncation, and permanent HTTP
+failures do not. Per-capture delays start at five seconds and double to 60 seconds,
+honoring longer `Retry-After`. HTTP 429/503 and connection refusal pause the pool
+for at least 60 seconds or a longer requested delay. Cancellation-aware waits,
+worker draining, and late backpressure preservation remain shared behavior.
+
+### Optional local smoke procedure
+
+Automated tests use generated source records and fake HTTP responses. For an
+explicitly opted-in live check, create a fresh directory with this `fetch.toml`:
+
+```toml
+[archive]
+id = "cc-smoke"
+source = "common-crawl"
+url_pattern = "https://commoncrawl.org/"
+
+[output]
+type = "local"
+data_directory = "data"
+
+[fetch]
+start = "2024-06-01"
+end = "2024-06-30"
+```
+
+Run `uv run archive-magic-fetch /path/to/cc-smoke --workers 1 --starts-per-second 1
+--retries 1 --trace-requests` on one shell line. Discovery still covers the full
+calendar year for this exact URL. Inspect the run log, request trace, WARC/CDXJ,
+and any explicit unresolved records. Repeat to check resume. This example can
+legitimately select no captures; choose another exact URL or short period if
+needed. It writes only local output and never publishes to a bucket.
+
 ## Publication
 
 Fetch waits for the completed year's rclone reconciliation before starting the
@@ -261,7 +397,7 @@ cannot run concurrently on the same archive.
 An acquisition failure skips the affected year and allows later years to run.
 An rclone failure stops the run immediately. Local completed files stay
 available; `archive-magic-fetch ARCHIVE --sync-only` retries publication
-without contacting Wayback.
+without contacting either source.
 
 ## Reset and migration
 
@@ -270,7 +406,7 @@ Local `--reset-data` rebuilds selected years through staging. Remote
 overrides, warns of playback downtime, deletes only managed files for this archive
 under remote `data/`, preserving metadata, assets and unrelated objects,
 clears the local data directory, and rebuilds and publishes years in order.
-Both reset modes preserve historical CDX caches and reuse them to rebuild WARC
+Both reset modes preserve discovery caches and reuse them to rebuild WARC
 contents. A successful empty selection can clear a local year through reset
 staging. WARC failures also leave completed CDX caches intact.
 
@@ -313,18 +449,24 @@ archive_magic_fetch/
     models.py                       configuration records and defaults
   adapters/
     build_wayback_source.py         bind the Wayback implementation
+    build_common_crawl_source.py    bind CC discovery and worker clients
+    query_common_crawl_index.py     run-scoped catalog and index request policy
+    interpret_common_crawl_failures.py  CC acquisition failure advice
     create_wayback_client.py        construct clients and repair transport
     interpret_wayback_failures.py   interpret failures and replay-specific rules
   pipeline/
     run_fetch.py                    coordinate annual work
     discovery/
       discover_captures.py          select an ordered unique set
-      load_or_fetch_year_cdx.py     acquire complete CDX listings with caching
+      load_or_fetch_year_cdx.py     acquire complete Wayback listings with caching
+      load_or_fetch_common_crawl_year.py  acquire complete per-crawl annual queries
     retrieval/
       fetch_capture.py              execute and retry an acquisition
       retrieve_memento.py           request exact replay
+      retrieve_warc_range.py        request and bound one CC compressed byte range
     decoding/
-      decode_memento.py             validate and normalize the response
+      decode_memento.py             validate and normalize the Wayback response
+      decode_warc_capture.py        strictly validate and normalize a CC record
     resolve_captures.py             reuse stored payloads or acquire captures
     write_captures.py               serialize and append WARCs
     build_collection_index.py      construct local CDXJ
@@ -339,6 +481,7 @@ archive_magic_fetch/
     validate_local_archive.py      validate finalized artifacts for publication
     layout.py                       archive paths and artifact inventories
     identity.py                     capture identity and digest primitives
+    normalize_cdx_search.py          shared domain/prefix/exact query syntax
     dates.py                        date bounds and annual partitions
     format.py                       archive fields and CDXJ primitives
   runtime/
@@ -383,7 +526,7 @@ same transaction recovery and publication code as fetch.
 - `preflight(capture)` may return a failure without starting an attempt.
 - `failure_advice(error, attempt)` supplies a neutral category, retry decision,
   delay, coordinated cooldown, and optional failure-group limit.
-- `capture_link(identity)` supplies the source URL used in terminal links.
+- `capture_link(capture)` receives the complete `CaptureRef` and supplies the source URL used in terminal links. Capture outcomes carry that reference through reporting.
 
 The retrieval stage owns attempts and counters. The source owns interpretation:
 Wayback stub digests, exact-capture rules, newline digest tolerance, and exception
@@ -397,11 +540,14 @@ consume a misleadingly encoded response; a repair failure or interruption closes
 the response there before propagating the error. Worker clients close after
 outstanding work finishes, and request traces close even if client cleanup fails.
 
-Capture identity and cache serialization are unchanged. `CaptureRef` and
-`CaptureResult` replace the old internal `ParsedCapture` and `PlaybackResult`
-names. Failure display labels are transient; existing run-record fields and trace
-column names remain unchanged. No source selector, CC locator, or new persistent
-provenance schema is introduced here.
+Capture identity, Wayback cache serialization, and the public archive format are
+unchanged. `CaptureRef` adds an optional typed Common Crawl locator (crawl ID,
+filename, offset, length); that locator is retained in CC discovery caches but is
+not part of capture identity. Failure display labels are transient; existing
+run-record fields and trace column names remain unchanged. CC query metadata in
+run records identifies the source and selected collections. `WARC-Source-URI`
+records the source WARC URL, while terminal capture links open its collection's
+index query rather than offering a fictitious replay URL.
 
 Archives previously written with cross-year revisits must be discarded and
 rebuilt before using annual independence. No conversion is provided. Historical

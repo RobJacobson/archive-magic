@@ -67,7 +67,7 @@ def test_neutral_source_discovers_resolves_writes_indexes_and_resumes(tmp_path):
         fetch,
         lambda ref: None,
         lambda error, attempt: FailureAdvice(FailureCategory.UNAVAILABLE, False),
-        lambda identity: "fixture://capture/" + identity.timestamp,
+        lambda capture: "fixture://capture/" + capture.identity.timestamp,
     )
     settings = FetchSettings(
         "example.org",

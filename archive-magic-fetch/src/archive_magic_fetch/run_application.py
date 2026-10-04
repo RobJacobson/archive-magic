@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import sys
 
-from archive_magic_fetch.adapters.build_wayback_source import build_source
+from archive_magic_fetch.adapters.build_wayback_source import build_source as build_wayback_source
+from archive_magic_fetch.adapters.build_common_crawl_source import build_source as build_common_crawl_source
 from archive_magic_fetch.archive.layout import ArchiveLayout
 from archive_magic_fetch.config.load_archive_config import load_config
 from archive_magic_fetch.config.load_playback_policy import load_playback_policy
@@ -80,7 +81,9 @@ def run_application(args) -> int:
         assert settings is not None
         result = run_fetch(
             settings,
-            source=build_source(
+            source=build_common_crawl_source(index_directory=settings.index_directory)
+            if config.source == "common-crawl"
+            else build_wayback_source(
                 index_directory=settings.index_directory,
                 cdx_window_days=settings.cdx_window_days,
                 cdx_page_limit=settings.cdx_page_limit,
