@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 from unittest.mock import MagicMock
-from wayback import CdxRecord
 
-from archive_magic_fetch.identity import make_identity
-from archive_magic_fetch.models import CaptureIdentity, PlaybackResult
-from archive_magic_fetch.playback import payload_digest
+from archive_magic_fetch.archive.identity import make_identity, payload_digest
+from archive_magic_fetch.archive.layout import ArchiveLayout, ensure_collection_dirs
+from archive_magic_fetch.models import CaptureIdentity, CaptureResult
+from archive_magic_fetch.pipeline.indexing import publish_collection_index
+from archive_magic_fetch.pipeline.writing import _CollectionWarcWriter
+from wayback import CdxRecord
 
 
 def make_capt(
@@ -33,8 +36,8 @@ def playback(
     capt: CaptureIdentity,
     body: bytes = b"hello",
     status: int = 200,
-) -> PlaybackResult:
-    return PlaybackResult(
+) -> CaptureResult:
+    return CaptureResult(
         identity=capt,
         body=body,
         status_code=status,
@@ -121,10 +124,9 @@ class FakeCdxClient:
 
 
 def patch_cdx(body: bytes):
-    from archive_magic_fetch import cdx as cdx_mod
-    from archive_magic_fetch import fetch as fetch_mod
+    import archive_magic_fetch.pipeline.discovery.wayback as cdx_mod
 
-    original = cdx_mod.fetch_cdx
+    original = cdx_mod._fetch_cdx
     rows = json.loads(body)
 
     def fake_fetch_cdx(**kwargs):
@@ -135,16 +137,15 @@ def patch_cdx(body: bytes):
         finally:
             cdx_mod.WaybackClient = previous
 
-    cdx_mod.fetch_cdx = fake_fetch_cdx
-    fetch_mod.fetch_cdx = fake_fetch_cdx
-    return original, cdx_mod, fetch_mod
+    cdx_mod._fetch_cdx = fake_fetch_cdx
+
+    return original, cdx_mod
 
 
 def patch_cdx_by_year(bodies_by_year: dict[int, bytes]):
-    from archive_magic_fetch import cdx as cdx_mod
-    from archive_magic_fetch import fetch as fetch_mod
+    import archive_magic_fetch.pipeline.discovery.wayback as cdx_mod
 
-    original = cdx_mod.fetch_cdx
+    original = cdx_mod._fetch_cdx
 
     def fake_fetch_cdx(**kwargs):
         year = int(str(kwargs["date_start"])[:4])
@@ -156,9 +157,9 @@ def patch_cdx_by_year(bodies_by_year: dict[int, bytes]):
         finally:
             cdx_mod.WaybackClient = previous
 
-    cdx_mod.fetch_cdx = fake_fetch_cdx
-    fetch_mod.fetch_cdx = fake_fetch_cdx
-    return original, cdx_mod, fetch_mod
+    cdx_mod._fetch_cdx = fake_fetch_cdx
+
+    return original, cdx_mod
 
 
 def memento_client(
@@ -196,9 +197,7 @@ def memento_client(
             )
             memento.headers = {"Content-Type": "text/html", **(headers or {})}
             memento.url = (
-                returned_url
-                if returned_url is not None
-                else identity.original_url
+                returned_url if returned_url is not None else identity.original_url
             )
             return memento
 
@@ -261,3 +260,139 @@ def found_capture_client(
             return memento
 
     return Client()
+
+
+def fetch_memento(client, identity):
+    from archive_magic_fetch.models import CaptureRef
+    from archive_magic_fetch.pipeline.decoding.wayback import decode_memento
+    from archive_magic_fetch.pipeline.retrieval.wayback import retrieve_memento
+
+    capture = CaptureRef(identity, "text/html")
+    return decode_memento(retrieve_memento(client, capture), capture)
+
+
+def make_source(
+    settings=None, *, client_factory=None, download=None, sleep=lambda _: None
+):
+    """Script acquisition while exercising the actual Wayback discovery and policy."""
+    from contextlib import ExitStack, contextmanager
+    from dataclasses import replace
+    from pathlib import Path
+
+    from archive_magic_fetch.adapters.wayback import build_source
+    from archive_magic_fetch.adapters.wayback_session import ArchiveMagicWaybackSession
+
+    source = build_source(
+        index_directory=settings.index_directory
+        if settings
+        else Path("/unused-test-cache"),
+        cdx_window_days=settings.cdx_window_days if settings else 28,
+        cdx_page_limit=settings.cdx_page_limit if settings else 5000,
+        sleep=sleep,
+    )
+    if client_factory is not None:
+
+        @contextmanager
+        def open_client(stats):
+            owner = client_factory()
+            with ExitStack() as stack:
+                if hasattr(owner, "__enter__"):
+                    client = stack.enter_context(owner)
+                else:
+                    client = owner
+                    if hasattr(owner, "close"):
+                        stack.callback(owner.close)
+                if isinstance(
+                    getattr(client, "session", None), ArchiveMagicWaybackSession
+                ):
+                    client.session.track_playback(stats)
+                yield client
+
+        source = replace(source, open_client=open_client)
+    if download is not None:
+        source = replace(
+            source, fetch=lambda client, capture: download(client, capture.identity)
+        )
+    return source
+
+
+class AcquisitionHarness:
+    """Compose production execution primitives for focused acquisition tests."""
+
+    def __init__(
+        self,
+        source,
+        *,
+        sleep,
+        pace=True,
+        max_workers=4,
+        starts_per_second=16,
+        retries=4,
+        trace_path=None,
+        clock=None,
+        report=None,
+    ):
+        import time
+
+        from archive_magic_fetch.runtime.http import RequestStats
+        from archive_magic_fetch.runtime.pacing import StartGate
+        from archive_magic_fetch.runtime.reporting import emit
+        from archive_magic_fetch.runtime.workers import CaptureWorkers
+
+        self.source = source
+        self.clock = clock or time.monotonic
+        self.sleep = sleep
+        self.max_attempts = retries + 1
+        self._gate = StartGate(
+            starts_per_second if pace else 0,
+            clock=self.clock,
+            sleep=sleep,
+            report=report or emit,
+        )
+        self.request_stats = RequestStats(
+            self._gate.wait,
+            clock=self.clock,
+            trace_path=trace_path,
+            report=report or emit,
+        )
+        self.workers = CaptureWorkers(
+            source, self.request_stats, max_workers=max_workers
+        )
+        self.max_workers = max_workers
+
+    def download(self, identity):
+        from archive_magic_fetch.models import CaptureRef
+        from archive_magic_fetch.pipeline.retrieval.stage import fetch_capture
+
+        return fetch_capture(
+            CaptureRef(identity, "text/html"),
+            source=self.source,
+            client=self.workers.client,
+            gate=self._gate,
+            stats=self.request_stats,
+            max_attempts=self.max_attempts,
+            clock=self.clock,
+            sleep=self.sleep,
+        )
+
+    def map(self, process, groups):
+        return self.workers.map(process, groups)
+
+    def submit(self, process, group):
+        return self.workers._executor.submit(process, group)
+
+    def close(self):
+        try:
+            self.workers.close()
+        finally:
+            self.request_stats.close()
+
+
+def make_collection(root: Path) -> ArchiveLayout:
+    layout = ArchiveLayout(root, "example.org")
+    ensure_collection_dirs(layout)
+    writer = _CollectionWarcWriter(layout, "2004")
+    writer.write_playback(playback(make_capt()))
+    writer.close()
+    publish_collection_index(layout, "2004")
+    return layout

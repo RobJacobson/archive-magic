@@ -1,4 +1,4 @@
-"""Shared data models for acquisition, playback, and publication."""
+"""Source-neutral capture, resolution, artifact, and metrics records."""
 
 from __future__ import annotations
 
@@ -34,13 +34,13 @@ class CaptureIdentity:
 
 
 @dataclass(frozen=True)
-class ParsedCapture:
+class CaptureRef:
     identity: CaptureIdentity
     mime: str
 
 
 @dataclass(frozen=True)
-class PlaybackResult:
+class CaptureResult:
     identity: CaptureIdentity
     body: bytes
     status_code: int
@@ -66,6 +66,7 @@ class UnresolvedFailure:
     identity: CaptureIdentity
     category: FailureCategory
     message: str
+    display_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -109,3 +110,64 @@ class RunMetrics:
         self.attempts_by_category[category] = (
             self.attempts_by_category.get(category, 0) + 1
         )
+
+
+class CaptureKind(str, Enum):
+    EXISTING = "existing"
+    REVISIT = "revisit"
+    DOWNLOADED = "downloaded"
+    FAILURE = "failure"
+
+
+@dataclass(frozen=True)
+class CaptureOutcome:
+    identity: CaptureIdentity
+    kind: CaptureKind
+    playback: CaptureResult | None = None
+    representative: StoredResponse | None = None
+    failure: UnresolvedFailure | None = None
+    attempts: int = 0
+    elapsed_s: float = 0.0
+
+
+@dataclass(frozen=True)
+class UrlOutcome:
+    url: str
+    captures: tuple[CaptureOutcome, ...]
+    attempts: int
+    playback_bytes: int
+    categories: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class DownloadOutcome:
+    result: CaptureResult | None
+    failure: UnresolvedFailure | None
+    attempts: int
+    elapsed_s: float
+    categories: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class CaptureListing:
+    captures: tuple[CaptureRef, ...]
+    query: dict[str, object]
+
+
+class PublicationError(RuntimeError):
+    """The local archive was retained, but its remote mirror is incomplete."""
+
+
+@dataclass(frozen=True)
+class StoredResponse:
+    """Compact revisit reference for one full response.
+
+    Never retain payload bytes or HTTP headers; pywb resolves them from the
+    referenced full response.
+    """
+
+    identity: CaptureIdentity
+    warc_date: str
+    warc_payload_digest: str
+    target_uri: str
+    status_code: int

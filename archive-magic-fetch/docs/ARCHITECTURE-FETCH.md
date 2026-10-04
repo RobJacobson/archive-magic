@@ -269,11 +269,109 @@ remote file sets. Fetch performs no bucket download during normal operation.
 For existing flat bucket layouts, follow the [migration guide](../../docs/BUCKET-CATALOG-MIGRATION.md).
 Fetch does not migrate or delete old root objects automatically.
 
-## Modules
+## Code organization
 
-- `fetch.py`: annual CDX, playback, deduplication, and promotion orchestration.
-- `staging.py`: annual copy-on-write staging and interrupted-commit recovery.
-- `storage.py`: archive lock, local preflight, and ordered rclone commands.
-- `warc.py` and `index.py`: portable WARC and CDXJ construction.
-- `cdx.py`: CDX search, failure classification, window splits, and complete historical-year caches.
-- `resolution.py`, `workers.py`, and `playback.py`: Wayback playback acquisition.
+Fetch is organized by pipeline stage. Workflow modules expose one primary
+operation near the top, followed by private helpers. Shared records, cohesive
+stateful classes, and reusable primitives may expose the related operations they
+need. Internal Python import paths are not a compatibility interface; the CLI,
+configuration, caches, and published archive format are unchanged.
+
+```text
+archive_magic_fetch/
+  cli.py                      main: parse arguments and dispatch
+  app.py                      run_application: configure fetch or sync-only
+  models.py                   capture, outcome, artifact, and metrics records
+  contracts.py                source callbacks and failure advice
+  config/                     archive config, host policy, effective settings
+  adapters/
+    wayback.py                build_source: bind the Wayback implementation
+    wayback_session.py        client construction and early transport repair
+    wayback_policy.py         failure interpretation and replay-specific rules
+  pipeline/
+    runner.py                 run_fetch: coordinate annual work
+    discovery/
+      stage.py                discover_captures: select an ordered unique set
+      wayback.py              complete CDX acquisition and historical caching
+    retrieval/
+      stage.py                fetch_capture: execute and retry an acquisition
+      wayback.py              retrieve_memento: request exact replay
+    decoding/
+      wayback.py              decode_memento: validate and normalize the response
+    resolution.py             resolve_captures: chronological reuse/acquisition
+    writing.py                write_captures: serialize and append WARCs
+    indexing.py               publish_collection_index: construct local CDXJ
+    reconciliation.py         repair existing indexes through the same indexer
+    commit.py                 YearStage: prepare, commit, abort, and recover
+    publication/
+      stage.py                sync_archive: publish committed artifacts
+      reset.py                purge_remote: explicitly reset managed data
+      client.py               shared rclone configuration and command primitives
+  archive/                    layout, identity, dates, format, inventory, validation
+  runtime/                    workers, HTTP instrumentation, pacing, files, reporting
+```
+
+Application setup selects the adapter. The runner and shared stages depend on
+neutral contracts; they do not construct Wayback clients or inspect Wayback
+exceptions. Archive and runtime support do not import pipeline stages. Discovery
+reads the source index; output indexing constructs our archive's CDXJ. They remain
+separate despite both using CDX terminology.
+
+```text
+Discover -> Resolve -> Write -> Index -> Commit -> Publish
+                |
+                +-- when needed: Retrieve -> Decode
+```
+
+These are responsibility boundaries, not whole-run buffering barriers. Resolution
+walks each URL group chronologically. Bounded workers acquire missing captures,
+and one writer consumes the ordered outcomes. A successful response can enable
+later revisits; only promoted years seed subsequent years. Local commit and remote
+publication retain separate failure and recovery boundaries. Sync-only uses the
+same transaction recovery and publication code as fetch.
+
+### Source contract
+
+`SourceAdapter` is a typed bundle of callables, assembled with composition:
+
+- `discover(request)` returns a complete `CaptureListing` and query metadata.
+- `open_client(stats)` is a context manager creating one persistent worker client;
+  the source explicitly installs transport instrumentation before yielding it.
+- `fetch(client, capture)` performs one retrieval-and-decoding attempt and returns
+  a normalized `CaptureResult`. It receives the complete `CaptureRef`, not just
+  its identity.
+- `preflight(capture)` may return a failure without starting an attempt.
+- `failure_advice(error, attempt)` supplies a neutral category, retry decision,
+  delay, coordinated cooldown, and optional failure-group limit.
+- `capture_link(identity)` supplies the source URL used in terminal links.
+
+The retrieval stage owns attempts and counters. The source owns interpretation:
+Wayback stub digests, exact-capture rules, newline digest tolerance, and exception
+classification stay in its implementation. Retry advice preserves the distinction
+between pool cooldowns and per-capture timeouts. CDX window retries and splitting
+remain within Wayback discovery, independently of capture retry settings.
+
+The Wayback decoder closes its Memento even when reading fails or is interrupted.
+False-gzip repair remains at the session boundary, before the upstream client can
+consume a misleadingly encoded response. Worker clients close after outstanding
+work finishes, and request traces close even if client cleanup fails.
+
+Capture identity and cache serialization are unchanged. `CaptureRef` and
+`CaptureResult` replace the old internal `ParsedCapture` and `PlaybackResult`
+names. Failure display labels are transient; existing run-record fields and trace
+column names remain unchanged. No source selector, CC locator, or new persistent
+provenance schema is introduced here.
+
+### Verification
+
+Tests are grouped under `adapters/`, `archive/`, `config/`, `pipeline/`, `runtime/`,
+and `integration/`. A fake source exercises the complete shared pipeline, including
+resume and revisits, without using Wayback acquisition. Dedicated tests cover
+response/client cleanup and retries spanning response decoding. Existing fixtures
+continue to cover cache boundaries, transport pacing, transaction recovery, and
+ordered rclone publication. Run Fetch and Navigator suites separately:
+
+```console
+.venv/bin/python -m pytest archive-magic-fetch/tests -q
+.venv/bin/python -m pytest archive-magic-navigator/tests -q
+```
