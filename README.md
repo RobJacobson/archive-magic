@@ -47,10 +47,28 @@ uv run archive-magic-fetch /path/to/example.org
 uv run archive-magic-fetch /path/to/example.org --sync-only
 ```
 
-Fetch defaults to 4 workers, 16 starts/second, and 4 retries. Override them for
-every run in `~/.config/archive-magic-fetch/fetch-config.toml`, or for one run
-with `--workers`, `--starts-per-second`, and `--retries`. Date flags may narrow
-the configured range. Each year is staged and validated locally before publication:
+Fetch stores separate settings for each source in
+`~/.config/archive-magic-fetch/fetch-config.toml` (under `$XDG_CONFIG_HOME` when set).
+If the file is missing, Fetch creates it, including parent directories, with:
+
+```toml
+[wayback]
+workers = 4
+starts_per_second = 8
+retries = 4
+
+[common-crawl]
+workers = 4
+starts_per_second = 8
+retries = 4
+```
+
+The archive's `source` selects its section. Both sections must contain all three
+settings; neither inherits from the other. `--config PATH` or
+`ARCHIVE_MAGIC_FETCH_CONFIG` selects another file, also created if missing;
+`--config` takes precedence. Existing files are left unchanged. Override settings
+for one run with `--workers`, `--starts-per-second`, and `--retries`.
+Date flags may narrow the configured range. Each year is staged and validated locally before publication:
 WARCs are copied first, CDXJ indexes synced second, and obsolete WARCs removed last.
 After an upload failure, `--sync-only` retries without contacting either source.
 

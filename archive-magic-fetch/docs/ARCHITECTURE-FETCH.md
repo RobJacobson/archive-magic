@@ -12,20 +12,29 @@ archive-magic-fetch ARCHIVE --sync-only
 ```
 
 `ARCHIVE` is a TOML path or a directory containing `fetch.toml`. Playback
-workers, start rate, and retries are host policy. They come from
-`~/.config/archive-magic-fetch/fetch-config.toml` when that file exists:
+workers, start rate, and retries are host policy, configured independently for each
+source. They come from `~/.config/archive-magic-fetch/fetch-config.toml`
+(or `$XDG_CONFIG_HOME/archive-magic-fetch/fetch-config.toml`). If missing, the file
+and its parent directories are created with these defaults:
 
 ```toml
-[playback]
+[wayback]
+workers = 4
+starts_per_second = 8
+retries = 4
+
+[common-crawl]
 workers = 4
 starts_per_second = 8
 retries = 4
 ```
 
-`--config PATH` or `ARCHIVE_MAGIC_FETCH_CONFIG` selects another file. CLI flags
-override the file for one run. A missing file keeps the code defaults: 4
-workers, 16 starts/second, and 4 retries. These fields do not belong in
-per-archive `fetch.toml`.
+`--config PATH` takes precedence over `ARCHIVE_MAGIC_FETCH_CONFIG`, which takes
+precedence over the default path. A missing file is created at the selected path;
+existing files are left unchanged. Both source sections require all three settings,
+with no shared defaults or inheritance between sections. The archive's
+`[archive].source` selects its policy, and CLI flags override that policy for one
+run. These fields do not belong in per-archive `fetch.toml`.
 
 ### Playback request diagnostics
 

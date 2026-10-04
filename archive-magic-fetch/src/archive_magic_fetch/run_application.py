@@ -38,7 +38,7 @@ def run_application(args) -> int:
                 "playback will be unavailable during the rebuild.",
                 file=sys.stderr,
             )
-        policy = load_playback_policy(args.config)
+        policy = load_playback_policy(args.config, source=config.source)
         settings = (
             None
             if args.sync_only
