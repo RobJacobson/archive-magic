@@ -8,6 +8,7 @@ import pytest
 from archive_magic_fetch.archive.identity import identity_to_dict
 from archive_magic_fetch.models import CaptureRef
 from helpers import make_capt
+from archive_magic_fetch.pipeline.discovery.cache import wayback_path, wayback_document
 
 
 def acquire(tmp_path, **overrides):
@@ -36,8 +37,8 @@ def test_complete_year_round_trip_and_cache_hit(tmp_path, monkeypatch, empty):
 
     monkeypatch.setattr(cdx, "_fetch_cdx", fetch)
     result = acquire(tmp_path)
-    path = tmp_path / "index" / "2004.cdx.json"
-    assert json.loads(path.read_text()) == ([] if empty else [capture_json()])
+    path = wayback_path(tmp_path / "index", "*.example.org", 2004)
+    assert json.loads(path.read_text())["captures"] == ([] if empty else [capture_json()])
     assert list(path.parent.iterdir()) == [path]
     assert requests[0]["date_start"] == "20040101000000"
     assert requests[0]["date_end"] == "20041231235959"
@@ -67,8 +68,14 @@ def test_complete_year_round_trip_and_cache_hit(tmp_path, monkeypatch, empty):
     ],
 )
 def test_invalid_cache_is_preserved_without_network(tmp_path, monkeypatch, content):
-    path = tmp_path / "index" / "2004.cdx.json"
-    path.parent.mkdir()
+    path = wayback_path(tmp_path / "index", "*.example.org", 2004)
+    path.parent.mkdir(parents=True)
+    try:
+        rows = json.loads(content)
+    except ValueError:
+        rows = None
+    if isinstance(rows, list):
+        content = json.dumps(wayback_document('*.example.org', 2004, rows))
     path.write_text(content)
     monkeypatch.setattr(cdx, "_fetch_cdx", lambda **_kw: pytest.fail("CDX requested"))
     with pytest.raises(ValueError, match="invalid CDX cache"):
@@ -77,8 +84,8 @@ def test_invalid_cache_is_preserved_without_network(tmp_path, monkeypatch, conte
 
 
 def test_unreadable_cache_is_not_a_cache_miss(tmp_path, monkeypatch):
-    path = tmp_path / "index" / "2004.cdx.json"
-    path.parent.mkdir()
+    path = wayback_path(tmp_path / "index", "*.example.org", 2004)
+    path.parent.mkdir(parents=True)
     path.write_text("[]")
     original_read = Path.read_text
 
@@ -99,7 +106,7 @@ def test_unreadable_cache_is_not_a_cache_miss(tmp_path, monkeypatch):
 def test_failed_cache_save_never_publishes_partial_file(
     tmp_path, monkeypatch, failure, boundary
 ):
-    path = tmp_path / "index" / "2004.cdx.json"
+    path = wayback_path(tmp_path / "index", "*.example.org", 2004)
     monkeypatch.setattr(
         cdx, "_fetch_cdx", lambda **_kw: cdx._CdxResult((), "example.org", "domain")
     )
@@ -109,7 +116,7 @@ def test_failed_cache_save_never_publishes_partial_file(
         raise failure
 
     def fail_rename(source, destination):
-        assert json.loads(source.read_text()) == []
+        assert json.loads(source.read_text())["captures"] == []
         assert destination == path
         assert not path.exists()
         raise failure
@@ -124,7 +131,7 @@ def test_failed_cache_save_never_publishes_partial_file(
     assert not path.exists()
     assert list(path.parent.iterdir()) == []
     acquire(tmp_path)
-    assert json.loads(path.read_text()) == []
+    assert json.loads(path.read_text())["captures"] == []
 
 
 def test_abandoned_temporary_file_is_not_a_cache(tmp_path, monkeypatch):
@@ -141,14 +148,14 @@ def test_abandoned_temporary_file_is_not_a_cache(tmp_path, monkeypatch):
     monkeypatch.setattr(cdx, "_fetch_cdx", fetch)
     acquire(tmp_path)
     assert len(requests) == 1
-    assert json.loads((directory / "2004.cdx.json").read_text()) == []
+    assert json.loads(wayback_path(directory, "*.example.org", 2004).read_text())["captures"] == []
 
 
 def test_current_year_ignores_existing_cache_and_never_replaces_it(
     tmp_path, monkeypatch
 ):
-    path = tmp_path / "index" / "2004.cdx.json"
-    path.parent.mkdir()
+    path = wayback_path(tmp_path / "index", "*.example.org", 2004)
+    path.parent.mkdir(parents=True)
     path.write_text("corrupt, but irrelevant for the current year")
     requests = []
 
@@ -173,7 +180,7 @@ def test_later_page_failure_retries_without_publishing_partial_results(
     from wayback import CdxRecord
 
     requests = []
-    path = tmp_path / "index" / "2004.cdx.json"
+    path = wayback_path(tmp_path / "index", "*.example.org", 2004)
 
     class Client:
         def search(self, _url, **kwargs):
@@ -208,4 +215,4 @@ def test_later_page_failure_retries_without_publishing_partial_results(
             "20040601000000",
             "20040602000000",
         ]
-        assert len(json.loads(path.read_text())) == 2
+        assert len(json.loads(path.read_text())["captures"]) == 2

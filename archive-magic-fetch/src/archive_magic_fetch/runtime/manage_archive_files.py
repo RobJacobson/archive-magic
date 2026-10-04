@@ -67,11 +67,12 @@ def exclusive_temp_path(directory: Path, *, suffix: str) -> Path:
 
 
 @contextmanager
-def archive_lock(layout: ArchiveLayout) -> Iterator[None]:
+def archive_lock(layout: ArchiveLayout, directory: Path | None = None) -> Iterator[None]:
     """Prevent concurrent fetch, reset, and manual publication for one archive."""
 
-    layout.logs_root.mkdir(parents=True, exist_ok=True)
-    with (layout.logs_root / ".archive-magic.lock").open("a+b") as stream:
+    directory = directory or layout.logs_root
+    directory.mkdir(parents=True, exist_ok=True)
+    with (directory / ".archive-magic.lock").open("a+b") as stream:
         try:
             fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as error:

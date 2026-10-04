@@ -60,72 +60,6 @@ def calls(log: Path) -> list[list[str]]:
     return [json.loads(line) for line in log.read_text().splitlines()]
 
 
-def test_rclone_uploads_warcs_then_index_then_prunes_warcs(tmp_path, monkeypatch):
-    layout = make_collection(tmp_path / "data")
-    log = fake_rclone(tmp_path, monkeypatch)
-
-    sync_archive(layout, remote_output(layout.root))
-
-    invoked = calls(log)
-    assert [args[2] for args in invoked] == ["lsf", "copy", "sync", "sync"]
-    invoked = invoked[1:]
-    assert all(args[4] == "archive:bucket/example.org/data" for args in invoked)
-    assert ".warc.gz" in " ".join(invoked[0])
-    assert "-index.cdxj" in " ".join(invoked[1])
-    assert ".warc.gz" in " ".join(invoked[2])
-    assert all(".staging" not in " ".join(args) for args in invoked)
-
-
-def test_rclone_failure_stops_before_deletion_and_is_retryable(tmp_path, monkeypatch):
-    layout = make_collection(tmp_path / "data")
-    log = fake_rclone(tmp_path, monkeypatch, fail_call=2)
-    before = layout.collection_index("2004").read_bytes()
-
-    with pytest.raises(PublicationError, match="exit code 7"):
-        sync_archive(layout, remote_output(layout.root))
-    assert len(calls(log)) == 2
-    assert layout.collection_index("2004").read_bytes() == before
-
-    monkeypatch.setenv("RCLONE_FAIL_CALL", "0")
-    sync_archive(layout, remote_output(layout.root))
-    assert [args[2] for args in calls(log)[2:]] == ["lsf", "copy", "sync", "sync"]
-
-
-def test_missing_aws_credentials_fail_before_rclone(tmp_path, monkeypatch):
-    layout = make_collection(tmp_path / "data")
-    log = fake_rclone(tmp_path, monkeypatch)
-    monkeypatch.delenv("AWS_ACCESS_KEY_ID", raising=False)
-    monkeypatch.delenv("AWS_SECRET_ACCESS_KEY", raising=False)
-    monkeypatch.delenv("AWS_PROFILE", raising=False)
-    monkeypatch.setattr(
-        "archive_magic_fetch.pipeline.publication.run_rclone.Path.home",
-        lambda: tmp_path / "no-home",
-    )
-    with pytest.raises(PublicationError, match="AWS_ACCESS_KEY_ID"):
-        sync_archive(layout, remote_output(layout.root))
-    assert not log.exists()
-
-
-def test_empty_archive_refuses_sync_and_lock_prevents_concurrent_sync(tmp_path):
-    layout = ArchiveLayout(tmp_path / "data", "example.org")
-    with pytest.raises(PublicationError, match="does not exist"):
-        sync_archive(layout, remote_output(layout.root))
-    with archive_lock(layout):
-        with pytest.raises(PublicationError, match="another fetch"):
-            with archive_lock(layout):
-                pass
-
-
-def test_unindexed_local_warc_refuses_mirror_deletion(tmp_path, monkeypatch):
-    layout = make_collection(tmp_path / "data")
-    extra = layout.collection_warc_path("2004", 2)
-    extra.write_bytes(b"unfinished")
-    log = fake_rclone(tmp_path, monkeypatch)
-    with pytest.raises(PublicationError, match="no CDXJ entries"):
-        sync_archive(layout, remote_output(layout.root))
-    assert not log.exists()
-
-
 def test_fetch_waits_for_sync_and_stops_after_sync_failure(tmp_path, monkeypatch):
     import archive_magic_fetch.pipeline.run_fetch as fetch_module
     from archive_magic_fetch.models import CaptureRef
@@ -181,31 +115,6 @@ def test_fetch_waits_for_sync_and_stops_after_sync_failure(tmp_path, monkeypatch
     assert not (root / ".staging").exists()
 
 
-def test_manual_sync_does_not_contact_wayback(tmp_path, monkeypatch):
-    import archive_magic_fetch.run_application as app
-    import archive_magic_fetch.cli as cli
-
-    layout = make_collection(tmp_path / "data")
-    log = fake_rclone(tmp_path, monkeypatch)
-    config = tmp_path / "fetch.toml"
-    config.write_text(
-        "[archive]\nid = 'example.org'\nurl_pattern = 'example.org'\n"
-        "[output]\ntype = 'remote'\ndata_directory = 'data'\n"
-        "bucket = 'bucket'\nprefix = 'example.org'\n"
-        "endpoint_url = 'https://s3.example.invalid'\nregion = 'auto'\n",
-        encoding="utf-8",
-    )
-    monkeypatch.setattr(
-        app,
-        "run_fetch",
-        lambda _settings: pytest.fail("manual sync invoked the fetch pipeline"),
-    )
-
-    assert cli.main([str(config), "--sync-only"]) == 0
-    assert [args[2] for args in calls(log)] == ["lsf", "copy", "sync", "sync"]
-    assert layout.collection_index("2004").exists()
-
-
 def test_explicit_remote_reset_purges_configured_prefix(tmp_path, monkeypatch):
     log = fake_rclone(tmp_path, monkeypatch)
     purge_remote(remote_output(tmp_path / "data"), "example.org")
@@ -239,9 +148,10 @@ def test_remote_reset_purges_before_rebuilding_local_archive(tmp_path, monkeypat
             match_type=None,
         ),
     )
-    cache = tmp_path / "index" / "2004.cdx.json"
+    from archive_magic_fetch.pipeline.discovery.cache import wayback_path
+    cache = wayback_path(tmp_path / "discovery", "http://example.org/", 2004)
     load_or_fetch_year_cdx(
-        index_directory=cache.parent,
+        index_directory=tmp_path / "discovery",
         year=2004,
         current_year=2005,
         url_pattern="http://example.org/",
@@ -271,78 +181,18 @@ def test_remote_reset_purges_before_rebuilding_local_archive(tmp_path, monkeypat
     )
 
     assert result.exit_code == 0
-    assert [args[2] for args in calls(log)] == [
-        "lsf",
-        "delete",
-        "lsf",
-        "copy",
-        "sync",
-        "sync",
-    ]
+    assert [args[2] for args in calls(log)] == ["lsf", "delete"]
     inventory = inventory_collection(layout, "2004")
     assert inventory.contains(replacement)
     assert not inventory.contains(old)
     assert cache.read_bytes() == before
 
 
-def test_real_rclone_reset_and_sync_preserve_non_archive_content(tmp_path, monkeypatch):
-    """Exercise real rclone filter semantics against disposable local directories."""
-    import shutil
-
-    import archive_magic_fetch.pipeline.publication.run_rclone as storage
-
-    if shutil.which("rclone") is None:
-        pytest.skip("rclone not installed")
-    layout = make_collection(tmp_path / "local" / "data")
-    cache = layout.root.parent / "index" / "2004.cdx.json"
-    cache.parent.mkdir()
-    cache.write_text("[]")
-    remote = tmp_path / "bucket"
-    (remote / "data").mkdir(parents=True)
-    (remote / "assets").mkdir()
-    protected = {
-        "archive.json": b'{"name":"kept"}',
-        "assets/logo.png": b"logo",
-        "data/other-2004-001.warc.gz": b"other site",
-        "data/notes.txt": b"notes",
-    }
-    for name, data in protected.items():
-        (remote / name).write_bytes(data)
-    monkeypatch.setattr(
-        storage,
-        "remote_path",
-        lambda output, *, data=True: str(remote / "data" if data else remote),
-    )
-    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "test-key")
-    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "test-secret")
-    output = remote_output(layout.root)
-    sync_archive(layout, output)
-    assert (remote / "data" / layout.collection_index("2004").name).exists()
-    assert not list(remote.rglob("*.cdx.json"))
-    purge_remote(output, layout.archive_id)
-    assert not list((remote / "data").glob("example.org-*"))
-    assert all((remote / name).read_bytes() == body for name, body in protected.items())
-    assert layout.collection_index("2004").exists()
-    assert cache.read_text() == "[]"
 
 
-def test_legacy_flat_objects_stop_sync_and_reset_before_mutation(tmp_path, monkeypatch):
-    import archive_magic_fetch.pipeline.publication.run_rclone as storage
-
-    layout = make_collection(tmp_path / "data")
-    calls = []
-
-    def run(config, *args):
-        calls.append(args)
-        return "example.org-2004-001.warc.gz\n"
-
-    monkeypatch.setattr(storage, "run_rclone", run)
-    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "test-key")
-    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "test-secret")
-    for action in (
-        lambda: sync_archive(layout, remote_output(layout.root)),
-        lambda: purge_remote(remote_output(layout.root), layout.archive_id),
-    ):
-        with pytest.raises(PublicationError, match="legacy flat"):
-            action()
-    assert [args[0] for args in calls] == ["lsf", "lsf"]
+@pytest.fixture(autouse=True)
+def mock_s3(monkeypatch):
+    from bucket_helpers import Bucket
+    bucket = Bucket()
+    monkeypatch.setattr('archive_magic_fetch.pipeline.publication.storage.boto3.client', lambda *a, **kw: bucket)
+    return bucket

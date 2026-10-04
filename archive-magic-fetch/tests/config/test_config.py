@@ -25,14 +25,15 @@ def write_config(directory: Path, body: str, name: str = CONFIG_NAME) -> Path:
 
 def local_config(extra: str = "") -> str:
     return f"""
-[archive]
+[collection]
 id = "example.org"
+[storage.local]
+directory = "../output"
+[fetch]
 url_pattern = "*.example.org"
-[output]
-type = "local"
-data_directory = "data"
-{extra}
+{extra.replace('[fetch]', '')}
 """
+
 
 
 def test_local_config_resolves_directory_and_defaults(tmp_path):
@@ -48,13 +49,13 @@ start = "2000-01-01"
     config = load_config(tmp_path)
     assert config.archive_id == "example.org"
     assert config.url_pattern == "*.example.org"
-    assert config.output == FetchOutput("local", (tmp_path / "data").resolve())
+    assert config.output == FetchOutput("local", (tmp_path.parent / "output" / "data").resolve())
     assert config.warc_target_bytes == DEFAULT_WARC_TARGET_BYTES
     assert config.cdx_window_days == DEFAULT_CDX_WINDOW_DAYS
     assert config.cdx_page_limit == DEFAULT_CDX_PAGE_LIMIT
     assert config.start == "2000-01-01"
     assert config.end is None
-    assert config.index_directory == tmp_path / "index"
+    assert config.index_directory == tmp_path.parent / "output" / "discovery"
 
     settings = build_settings(
         config.url_pattern,
@@ -67,7 +68,7 @@ start = "2000-01-01"
     assert settings.date_end == "20041231235959"
     assert settings.cdx_window_days == DEFAULT_CDX_WINDOW_DAYS
     assert settings.cdx_page_limit == DEFAULT_CDX_PAGE_LIMIT
-    assert settings.index_directory == tmp_path / "index"
+    assert settings.index_directory == tmp_path.parent / "output" / "discovery"
 
 
 def test_programmatic_cache_directory_override(tmp_path):
@@ -94,7 +95,7 @@ def test_cache_inside_data_is_rejected_before_reset(tmp_path, location):
         cache = tmp_path / "linked-index"
         cache.symlink_to(data, target_is_directory=True)
     else:
-        (tmp_path / "index").symlink_to(data, target_is_directory=True)
+        (tmp_path / "discovery").symlink_to(data, target_is_directory=True)
         cache = None
     with pytest.raises(ValueError, match="index_directory must be outside"):
         build_settings(
@@ -166,12 +167,13 @@ def test_remote_config_normalizes_prefix_without_loading_dotenv(tmp_path, monkey
     write_config(
         tmp_path,
         """
-[archive]
+[collection]
 id = "example.org"
+[fetch]
 url_pattern = "example.org"
-[output]
-type = "remote"
-data_directory = "data"
+[storage.local]
+directory = "../output"
+[storage.remote]
 bucket = "bucket"
 prefix = "/archives/example.org/"
 endpoint_url = "https://example.invalid"
@@ -181,7 +183,7 @@ region = "auto"
     config = load_config(tmp_path)
     assert config.output == FetchOutput(
         "remote",
-        (tmp_path / "data").resolve(),
+        (tmp_path.parent / "output" / "data").resolve(),
         "bucket",
         "archives/example.org",
         "https://example.invalid",
@@ -194,27 +196,27 @@ region = "auto"
     "body, message",
     [
         (
-            "[archive]\nid='bad/id'\nurl_pattern='x'\n[output]\ntype='local'\n",
+            "[collection]\nid='bad/id'\n[storage.local]\ndirectory='../output'\n[fetch]\nurl_pattern='x'\n",
             "invalid archive ID",
         ),
         (
-            "[archive]\nid='x'\nurl_pattern='x'\n[output]\ntype='local'\n[fetch]\nworkers=2\n",
+            "[collection]\nid='x'\n[storage.local]\ndirectory='../output'\n[fetch]\nurl_pattern='x'\nworkers=2\n",
             "unexpected keyword",
         ),
         (
-            "[archive]\nid='x'\nurl_pattern='x'\n[output]\ntype='remote'\nbucket='x'\nprefix='../bad'\n",
+            "[collection]\nid='x'\n[fetch]\nurl_pattern='x'\n[storage.local]\ndirectory='../output'\n[storage.remote]\nbucket='x'\nprefix='../bad'\n",
             "must not contain",
         ),
         (
-            "[archive]\nid='x'\nurl_pattern='x'\n[output]\ntype='local'\n[fetch]\nwarc_target_bytes=0\n",
+            "[collection]\nid='x'\n[storage.local]\ndirectory='../output'\n[fetch]\nurl_pattern='x'\nwarc_target_bytes=0\n",
             "must be positive",
         ),
         (
-            "[archive]\nid='x'\nurl_pattern='x'\n[output]\ntype='local'\n[fetch]\ncdx_window_days=0\n",
+            "[collection]\nid='x'\n[storage.local]\ndirectory='../output'\n[fetch]\nurl_pattern='x'\ncdx_window_days=0\n",
             "must be positive",
         ),
         (
-            "[archive]\nid='x'\nurl_pattern='x'\n[output]\ntype='local'\n[fetch]\ncdx_page_limit=0\n",
+            "[collection]\nid='x'\n[storage.local]\ndirectory='../output'\n[fetch]\nurl_pattern='x'\ncdx_page_limit=0\n",
             "must be positive",
         ),
     ],
@@ -280,7 +282,7 @@ def test_playback_policy_creates_missing_config(tmp_path, monkeypatch, location)
     path = tmp_path / "nested" / "fetch-config.toml"
     value = None
     if location == "default":
-        path = tmp_path / "xdg-config" / "archive-magic-fetch" / "fetch-config.toml"
+        path = tmp_path / "archive-magic" / "fetch-config.toml"
     elif location == "environment":
         monkeypatch.setenv(INSTANCE_CONFIG_ENV, str(path))
     else:
@@ -355,3 +357,51 @@ def test_playback_policy_reports_creation_failure(tmp_path, monkeypatch):
 def test_playback_policy_rejects_directory(tmp_path):
     with pytest.raises(ValueError, match="invalid fetch instance configuration"):
         load_playback_policy(tmp_path)
+
+
+@pytest.mark.parametrize('location', ['.', '..', 'assets/output'])
+def test_collection_output_cannot_overlap_authored_inputs(tmp_path, location):
+    write_config(tmp_path, local_config().replace('../output', location))
+    with pytest.raises(ValueError, match='separate|overlaps'):
+        load_config(tmp_path)
+
+
+def test_legacy_filename_has_actionable_migration_error(tmp_path):
+    write_config(tmp_path, '[archive]\nid="example.org"', name='fetch.toml')
+    with pytest.raises(ValueError, match='migrate to collection.toml'):
+        load_config(tmp_path)
+
+
+@pytest.mark.parametrize('src', ['../logo.png', 'assets/../logo.png', 'assets/link.png'])
+def test_presentation_asset_containment(tmp_path, src):
+    outside = tmp_path.parent / 'outside.png'
+    outside.write_bytes(b'image')
+    (tmp_path / 'assets').mkdir()
+    (tmp_path / 'assets/link.png').symlink_to(outside)
+    text = local_config() + f'\n[collection.logo]\nsrc="{src}"\nalt="Logo"\n'
+    write_config(tmp_path, text)
+    with pytest.raises(ValueError, match='assets|escapes'):
+        load_config(tmp_path)
+
+
+def test_bare_collection_name_uses_workspace_even_with_local_collision(tmp_path, monkeypatch):
+    workspace = tmp_path / 'archive-magic' / 'collections' / 'example.org'
+    write_config(workspace, local_config())
+    cwd = tmp_path / 'checkout'
+    write_config(cwd / 'example.org', local_config().replace('id = "example.org"', 'id = "local.example.org"'))
+    monkeypatch.chdir(cwd)
+    assert load_config('example.org').collection_directory == workspace
+    assert load_config('./example.org').archive_id == 'local.example.org'
+
+
+def test_missing_bare_name_reports_workspace_config_path(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(ValueError) as error:
+        load_config('missing-site')
+    assert str(tmp_path / 'archive-magic/collections/missing-site/collection.toml') in str(error.value)
+
+
+def test_relative_toml_filename_remains_explicit(tmp_path, monkeypatch):
+    write_config(tmp_path, local_config(), name='custom.toml')
+    monkeypatch.chdir(tmp_path)
+    assert load_config('custom.toml').collection_directory == tmp_path

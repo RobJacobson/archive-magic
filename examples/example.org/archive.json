@@ -1,8 +1,0 @@
-{
-  "id": "example.org",
-  "name": "Example Organization",
-  "description": "An archive of the organization's website.",
-  "homepage": "https://example.org/",
-  "logo": { "src": "assets/logo.png", "alt": "Example Organization" },
-  "preview": { "src": "assets/preview.jpg", "alt": "The archived website's homepage" }
-}

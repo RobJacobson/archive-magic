@@ -48,13 +48,24 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     """Parse the fetch command line."""
 
     parser = argparse.ArgumentParser(prog="archive-magic-fetch")
-    parser.add_argument("archive", type=Path, metavar="ARCHIVE")
+    parser.add_argument(
+        "archive",
+        metavar="COLLECTION",
+        help="collection name under ~/archive-magic/collections/, or an explicit directory/TOML path",
+    )
     parser.add_argument("--start", metavar="DATE")
     parser.add_argument("--end", metavar="DATE")
-    parser.add_argument(
+    operations = parser.add_mutually_exclusive_group()
+    for flag, help_text in {
+        'restore': 'restore managed archive data and discovery caches from the bucket',
+        'evict-local': 'verify bucket copies by content, then remove local archive output',
+        'publish-metadata': 'publish assets and generate archive.json from collection.toml',
+    }.items():
+        operations.add_argument('--' + flag, action='store_true', help=help_text)
+    operations.add_argument(
         "--sync-only",
         action="store_true",
-        help="reconcile the local WARC/CDXJ archive to the configured bucket without fetching",
+        help="publish local WARC/CDXJ and discovery caches without fetching or remote deletions",
     )
     parser.add_argument(
         "--reset-data",
@@ -68,7 +79,7 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--config",
         type=Path,
         metavar="PATH",
-        help="host-level fetch-config.toml, created if missing (default: ~/.config/archive-magic-fetch/fetch-config.toml)",
+        help="host-level fetch-config.toml, created if missing (default: ~/archive-magic/fetch-config.toml)",
     )
     parser.add_argument(
         "--workers",

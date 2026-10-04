@@ -61,7 +61,7 @@ def _bind(value: str) -> str:
 def parse_args(argv: Sequence[str] | None = None) -> NavigatorRequest:
     parser = argparse.ArgumentParser(prog="archive-magic-navigator")
     parser.add_argument("archive", nargs="?", type=Path, help=argparse.SUPPRESS)
-    parser.add_argument("--catalog", type=Path, metavar="PATH")
+    parser.add_argument("--catalog", type=Path, metavar="PATH", default=Path.home() / "archive-magic" / "catalog.json")
     parser.add_argument("--cache", type=Path, metavar="PATH")
     parser.add_argument(
         "--poll-interval",
@@ -96,7 +96,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     request = parse_args(argv)
     try:
         config = load_catalog(request.catalog)
-        cache = (request.cache.expanduser().resolve() if request.cache else config.path.parent / "navigator-cache")
+        cache = (request.cache.expanduser().resolve() if request.cache else config.path.parent / "cache" / "navigator")
         if not is_loopback_bind(request.bind):
             print("WARNING: non-loopback binding exposes an unauthenticated development archive server; TLS and hostile-content hardening are not provided.", file=sys.stderr)
         with tempfile.TemporaryDirectory(prefix="archive-magic-navigator-") as name:

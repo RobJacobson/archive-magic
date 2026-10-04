@@ -17,13 +17,7 @@ from archive_magic_fetch.config.models import (
     FetchOutput,
 )
 from archive_magic_fetch.config.read_toml_section import read_section
-
-
-@dataclass(frozen=True)
-class _Archive:
-    id: str
-    url_pattern: str
-    source: str = "wayback"
+from archive_magic_fetch.config.presentation import metadata, asset_path
 
 
 @dataclass(frozen=True)
@@ -42,20 +36,36 @@ def load_config(value: Path | str) -> FetchConfig:
     try:
         with source.open("rb") as stream:
             document = tomllib.load(stream)
-        archive = _Archive(**read_section(document, "archive"))
-        output_data = dict(read_section(document, "output"))
-        output_type = output_data.pop("type")
-        output_data["data_directory"] = _path(
-            source.parent, output_data.get("data_directory", "data")
-        )
-        if output_type == "remote":
-            output_data["prefix"] = _prefix(output_data.get("prefix", ""))
-        elif output_type != "local":
-            raise ValueError("output.type must be 'local' or 'remote'")
-        output = FetchOutput(output_type, **output_data)
-        if output.type == "remote" and not output.bucket:
-            raise ValueError("output.bucket is required for remote output")
-        options = _FetchOptions(**read_section(document, "fetch", required=False))
+        if 'archive' in document or 'output' in document:
+            raise ValueError('legacy fetch.toml format; migrate to collection.toml (see docs/BUCKET-CATALOG-MIGRATION.md)')
+        presentation = metadata(read_section(document, 'collection'))
+        archive_id = _safe_id(presentation['id'])
+        fetch = dict(read_section(document, 'fetch'))
+        url_pattern = fetch.pop('url_pattern')
+        if not isinstance(url_pattern, str) or not url_pattern.strip():
+            raise ValueError('fetch.url_pattern must be nonempty text')
+        source_name = fetch.pop('source', 'wayback')
+        storage = dict(read_section(document, 'storage'))
+        local = dict(storage.pop('local'))
+        directory = _path(source.parent, local.pop('directory'))
+        if local or directory == source.parent or directory in source.parent.parents or source.parent in directory.parents:
+            raise ValueError('local output must be separate from collection inputs')
+        assets = (source.parent / 'assets').resolve()
+        if directory == assets or directory in assets.parents or assets in directory.parents:
+            raise ValueError('local output overlaps assets')
+        for role in ('logo', 'preview'):
+            if role in presentation:
+                asset_path(source.parent, presentation[role]['src'])
+        remote = storage.pop('remote', None)
+        if storage:
+            raise ValueError('unknown storage settings')
+        output_data = dict(remote or {})
+        if remote is not None:
+            output_data['prefix'] = _prefix(output_data.get('prefix', ''))
+        output = FetchOutput('remote' if remote is not None else 'local', directory / 'data', **output_data)
+        if output.type == 'remote' and not output.bucket:
+            raise ValueError('storage.remote.bucket is required')
+        options = _FetchOptions(**fetch)
         if options.warc_target_bytes <= 0:
             raise ValueError("fetch.warc_target_bytes must be positive")
         if options.cdx_window_days <= 0:
@@ -64,9 +74,8 @@ def load_config(value: Path | str) -> FetchConfig:
             raise ValueError("fetch.cdx_page_limit must be positive")
         if document:
             raise TypeError(f"unexpected table(s): {', '.join(sorted(document))}")
-        archive_id = _safe_id(archive.id)
-        if archive.source not in ("wayback", "common-crawl"):
-            raise ValueError("archive.source must be 'wayback' or 'common-crawl'")
+        if source_name not in ("wayback", "common-crawl"):
+            raise ValueError("fetch.source must be 'wayback' or 'common-crawl'")
     except (
         OSError,
         tomllib.TOMLDecodeError,
@@ -83,23 +92,41 @@ def load_config(value: Path | str) -> FetchConfig:
 
     return FetchConfig(
         archive_id=archive_id,
-        source=archive.source,
-        url_pattern=archive.url_pattern,
+        source=source_name,
+        url_pattern=url_pattern,
         output=output,
         warc_target_bytes=options.warc_target_bytes,
         cdx_window_days=options.cdx_window_days,
         cdx_page_limit=options.cdx_page_limit,
         start=options.start,
         end=options.end,
-        index_directory=source.parent / "index",
+        index_directory=directory / "discovery",
+        collection_directory=source.parent,
+        presentation=presentation,
     )
 
 
 def _config_path(value: Path | str) -> Path:
-    """Resolve a Fetch configuration path or its containing directory."""
+    """Resolve a workspace collection name, explicit directory, or TOML path."""
 
+    raw = str(value)
     candidate = Path(value).expanduser()
-    if candidate.is_dir():
+    # Preserve explicit ./ paths by accepting the original CLI string, not Path.
+    named_collection = (
+        not candidate.is_absolute()
+        and '/' not in raw
+        and '\\' not in raw
+        and raw not in {'.', '..'}
+        and not raw.lower().endswith('.toml')
+    )
+    if named_collection:
+        candidate = Path.home() / 'archive-magic' / 'collections' / raw
+
+    if candidate.name == "fetch.toml":
+        raise ValueError("legacy fetch.toml; migrate to collection.toml")
+    if named_collection or candidate.is_dir():
+        if not (candidate / CONFIG_NAME).exists() and (candidate / "fetch.toml").exists():
+            raise ValueError("legacy fetch.toml; migrate to collection.toml")
         candidate = candidate / CONFIG_NAME
     if not candidate.is_file():
         raise ValueError(f"fetch configuration does not exist: {candidate}")

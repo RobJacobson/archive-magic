@@ -1,0 +1,28 @@
+# One authored definition; shared pacing/retry settings live in fetch-config.toml.
+[collection]
+id = "example.org"
+name = "Example Organization"
+homepage = "https://example.org/"
+description = "An archive of the organization's website."
+# Add [collection.logo] or [collection.preview] with src = "assets/..." and alt.
+# Add [collection.featured_capture] with url and a quoted 14-digit UTC timestamp.
+
+[fetch]
+url_pattern = "*.example.org"
+source = "wayback" # Or "common-crawl"; defaults to Wayback.
+start = "2000-01-01"
+# end omitted means now. Dates filter captures after full-year discovery.
+# warc_target_bytes = 250000000
+# cdx_page_limit = 5000
+# cdx_window_days = 28
+
+[storage.local]
+# Relative to this collection.toml; data/, discovery/, logs/, .state/ go here.
+directory = "../../archives/example.org"
+
+# Omit this table for local-only acquisition. Never put credentials here.
+[storage.remote]
+bucket = "example-org"
+prefix = "" # Collection root; Fetch adds data/ and discovery/ itself.
+endpoint_url = "https://ACCOUNT_ID.r2.cloudflarestorage.com"
+region = "auto"

@@ -14,7 +14,7 @@ from archive_magic_fetch.models import PublicationError
 
 
 def validate_local_archive(
-    layout: ArchiveLayout, *, year: str | None = None
+    layout: ArchiveLayout, *, year: str | None = None, allow_unindexed: bool = False
 ) -> list[Path]:
     """Validate local index locators before allowing mirror deletions."""
 
@@ -62,7 +62,7 @@ def validate_local_archive(
         for path in artifacts
         if path.name.endswith(".warc.gz") and path.name not in referenced_all
     ]
-    if unindexed:
+    if unindexed and not allow_unindexed:
         raise PublicationError(
             "local WARC has no CDXJ entries: " + ", ".join(sorted(unindexed))
         )

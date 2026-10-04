@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-CONFIG_NAME = "fetch.toml"
+CONFIG_NAME = "collection.toml"
 
 
 INSTANCE_CONFIG_NAME = "fetch-config.toml"
@@ -57,6 +57,8 @@ class FetchConfig:
     end: str | None = None
     index_directory: Path | None = None
     source: str = "wayback"
+    collection_directory: Path | None = None
+    presentation: dict | None = None
 
 
 @dataclass(frozen=True)

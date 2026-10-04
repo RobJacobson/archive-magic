@@ -21,6 +21,21 @@ def run_application(args) -> int:
 
     try:
         config = load_config(args.archive)
+        special = next((name for name in ('restore', 'evict_local', 'publish_metadata') if getattr(args, name, False)), None)
+        if special and (config.output.type != 'remote' or args.start is not None or args.end is not None or args.reset_data):
+            raise ValueError('restore, eviction and metadata publication require remote storage and cannot use date/reset flags')
+        if special:
+            from archive_magic_fetch.pipeline.publication.storage import BucketStorage
+            layout = ArchiveLayout(config.output.data_directory, config.archive_id)
+            with archive_lock(layout, config.collection_directory):
+                store = BucketStorage(config.output, config.archive_id)
+                if special == 'restore':
+                    store.restore()
+                elif special == 'evict_local':
+                    store.evict()
+                else:
+                    store.publish_metadata(config)
+            return 0
         if args.sync_only:
             if config.output.type != "remote":
                 raise ValueError("--sync-only requires remote output")
@@ -50,6 +65,7 @@ def run_application(args) -> int:
                 reset_data=args.reset_data,
                 output=config.output,
                 index_directory=config.index_directory,
+                collection_directory=config.collection_directory,
                 warc_target_bytes=config.warc_target_bytes,
                 cdx_window_days=config.cdx_window_days,
                 cdx_page_limit=config.cdx_page_limit,
@@ -67,16 +83,26 @@ def run_application(args) -> int:
                 default_end=config.end,
             )
         )
-    except ValueError as error:
+    except KeyboardInterrupt:
+        print("interrupted", file=sys.stderr)
+        return 130
+    except (ValueError, OSError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
+    except Exception as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
 
     try:
         if args.sync_only:
             layout = ArchiveLayout(config.output.data_directory, config.archive_id)
-            with archive_lock(layout):
+            with archive_lock(layout, config.collection_directory):
+                from archive_magic_fetch.pipeline.publication.storage import BucketStorage, active_storage
+                store = BucketStorage(config.output, config.archive_id)
                 YearStage.recover(layout)
-                sync_archive(layout, config.output)
+                store.preflight()
+                with active_storage(store):
+                    sync_archive(layout, config.output)
             return 0
         assert settings is not None
         result = run_fetch(

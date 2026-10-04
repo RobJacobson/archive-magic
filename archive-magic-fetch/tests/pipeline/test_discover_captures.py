@@ -1,5 +1,6 @@
 from archive_magic_fetch.config.build_settings import FetchSettings
 from helpers import make_source
+from archive_magic_fetch.pipeline.discovery.cache import wayback_path
 
 """Annual caching integrated with playback, reset, and invocation boundaries."""
 
@@ -89,7 +90,7 @@ def test_full_year_cache_filters_sorts_dedupes_and_survives_reset(
         ]
     ]
     requests, downloaded = [], []
-    path = settings.index_directory / "2004.cdx.json"
+    path = wayback_path(settings.index_directory, settings.url_pattern, 2004)
 
     def query(**kwargs):
         requests.append((kwargs["date_start"], kwargs["date_end"]))
@@ -97,7 +98,7 @@ def test_full_year_cache_filters_sorts_dedupes_and_survives_reset(
 
     def download(_client, identity):
         # Historical cache publication precedes even the first WARC download.
-        assert len(json.loads(path.read_text())) == 5
+        assert len(json.loads(path.read_text())["captures"]) == 5
         downloaded.append(identity)
         return playback(identity)
 
@@ -128,7 +129,7 @@ def test_empty_selection_reset_clears_year_and_preserves_cache(settings, monkeyp
     initial = run(settings)
     assert initial.exit_code == 0
     assert initial.layout.collection_index("2004").is_file()
-    path = settings.index_directory / "2004.cdx.json"
+    path = wayback_path(settings.index_directory, settings.url_pattern, 2004)
     cached = path.read_bytes()
     monkeypatch.setattr(cdx, "_fetch_cdx", lambda **_kw: pytest.fail("CDX requested"))
     empty_selection = replace(
@@ -146,7 +147,7 @@ def test_empty_selection_reset_clears_year_and_preserves_cache(settings, monkeyp
 def test_current_year_repeats_then_caches_after_utc_rollover(settings, monkeypatch):
     requests, downloaded, clock_reads = [], [], []
     clock = ["20041231235959"]
-    path = settings.index_directory / "2004.cdx.json"
+    path = wayback_path(settings.index_directory, settings.url_pattern, 2004)
 
     def now():
         clock_reads.append(clock[0])
@@ -184,7 +185,7 @@ def test_save_and_warc_failures_have_separate_cache_outcomes(
     settings, monkeypatch, boundary
 ):
     queries, downloaded = [], []
-    path = settings.index_directory / "2004.cdx.json"
+    path = wayback_path(settings.index_directory, settings.url_pattern, 2004)
 
     def query(**kwargs):
         queries.append(kwargs)
@@ -219,9 +220,9 @@ def test_save_and_warc_failures_have_separate_cache_outcomes(
 
 @pytest.mark.parametrize("failure", ["corrupt", "429"])
 def test_failed_year_continues_without_warc_work(settings, monkeypatch, failure):
-    path = settings.index_directory / "2004.cdx.json"
+    path = wayback_path(settings.index_directory, settings.url_pattern, 2004)
     if failure == "corrupt":
-        path.parent.mkdir()
+        path.parent.mkdir(parents=True)
         path.write_text("[")
     requests, sleeps = [], []
 
@@ -254,7 +255,7 @@ def test_failed_year_continues_without_warc_work(settings, monkeypatch, failure)
     assert result.failed_years == (2004,)
     assert requests == (["2004"] * 10 if failure == "429" else []) + ["2005"]
     assert len(sleeps) == (9 if failure == "429" else 0)
-    assert json.loads((path.parent / "2005.cdx.json").read_text()) == []
+    assert json.loads((path.parent / "2005.cdx.json").read_text())["captures"] == []
     if failure == "corrupt":
         assert path.read_text() == "["
     else:

@@ -205,7 +205,7 @@ def test_unspecified_match_type_preserves_inference_and_isolates_old_exact_cache
     # must not poison the corrected query or require deleting other caches.
     old_query = {"url": pattern, "matchType": "exact"}
     old_hash = hashlib.sha256(json.dumps(old_query, sort_keys=True).encode()).hexdigest()
-    old_cache = tmp_path / "index" / "common-crawl" / old_hash / collection()["id"] / "2017.json"
+    old_cache = tmp_path / "index" / "common-crawl" / "v1" / old_hash / collection()["id"] / "2017.json"
     old_cache.parent.mkdir(parents=True)
     old_cache.write_text(json.dumps({
         "version": 1, "query": old_query, "from": "20170101000000", "to": "20171231235959",

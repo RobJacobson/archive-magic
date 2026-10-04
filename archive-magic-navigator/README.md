@@ -8,10 +8,10 @@ uv sync
 uv run archive-magic-navigator --catalog /path/to/catalog.json --open
 ```
 
-The only persisted Navigator configuration is [catalog.json](../examples/catalog.json).
+The default catalog is `~/archive-magic/catalog.json`. The only authored Navigator configuration is [catalog.json](../examples/catalog.json).
 Its ordered entries specify bucket/prefix locations with a shared storage endpoint
 and region. Credentials come from the standard AWS chain; `.env` is not loaded.
-Each bucket supplies [archive.json](../examples/example.org/archive.json), optional
+Each bucket supplies generated `archive.json`, optional
 `assets/`, and WARC/CDXJ files under `data/`. Both JSON formats are unversioned.
 
 The homepage displays organization metadata, logo, preview, and indexed capture
@@ -21,7 +21,7 @@ cache. Missing images have placeholders.
 
 Runtime options: `--bind` (localhost), `--port` (8080), `--cache`,
 `--poll-interval` (300 seconds), `--wayback-fallback {on,off}` (on), `--open`,
-and `--debug`. Cache defaults to `navigator-cache/` beside the catalog and contains
+and `--debug`. Cache defaults to `cache/navigator/` beside the catalog and contains
 only manifests, assets, and indexes. WARC payloads are read by authenticated range
 requests. Configuration changes require restart; content refreshes automatically.
 
@@ -45,3 +45,8 @@ uv run pytest -q -m integration
 
 Integration tests require local socket binding and use simulated private buckets;
 they do not require cloud credentials or change real buckets.
+
+See the [annotated user workspace and bucket layouts](../README.md#user-workspace).
+Navigator ignores bucket discovery caches and continues replay after local Fetch
+output is evicted. It never reads collection.toml; publish its presentation edits
+explicitly with Fetch --publish-metadata.

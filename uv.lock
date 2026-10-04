@@ -29,6 +29,7 @@ name = "archive-magic-fetch"
 version = "0.1.0"
 source = { editable = "archive-magic-fetch" }
 dependencies = [
+    { name = "boto3" },
     { name = "cdxj-indexer" },
     { name = "requests" },
     { name = "surt" },
@@ -43,6 +44,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "boto3", specifier = ">=1.35,<2" },
     { name = "cdxj-indexer", specifier = "==1.4.6" },
     { name = "requests", specifier = "==2.34.2" },
     { name = "surt", specifier = "==0.3.1" },
