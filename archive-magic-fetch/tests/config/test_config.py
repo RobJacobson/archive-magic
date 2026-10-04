@@ -382,3 +382,26 @@ def test_presentation_asset_containment(tmp_path, src):
     write_config(tmp_path, text)
     with pytest.raises(ValueError, match='assets|escapes'):
         load_config(tmp_path)
+
+
+def test_bare_collection_name_uses_workspace_even_with_local_collision(tmp_path, monkeypatch):
+    workspace = tmp_path / 'archive-magic' / 'collections' / 'example.org'
+    write_config(workspace, local_config())
+    cwd = tmp_path / 'checkout'
+    write_config(cwd / 'example.org', local_config().replace('id = "example.org"', 'id = "local.example.org"'))
+    monkeypatch.chdir(cwd)
+    assert load_config('example.org').collection_directory == workspace
+    assert load_config('./example.org').archive_id == 'local.example.org'
+
+
+def test_missing_bare_name_reports_workspace_config_path(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(ValueError) as error:
+        load_config('missing-site')
+    assert str(tmp_path / 'archive-magic/collections/missing-site/collection.toml') in str(error.value)
+
+
+def test_relative_toml_filename_remains_explicit(tmp_path, monkeypatch):
+    write_config(tmp_path, local_config(), name='custom.toml')
+    monkeypatch.chdir(tmp_path)
+    assert load_config('custom.toml').collection_directory == tmp_path

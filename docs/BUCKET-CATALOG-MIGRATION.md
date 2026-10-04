@@ -54,13 +54,13 @@ No bucket metadata is republished and no discovery caches are uploaded by migrat
 
 ```sh
 # Retry archive and discovery publication; no Wayback/Common Crawl acquisition.
-uv run archive-magic-fetch ~/archive-magic/collections/example.org --sync-only
+uv run archive-magic-fetch example.org --sync-only
 # Restore managed WARC/CDXJ and discovery files without overwriting local conflicts.
-uv run archive-magic-fetch ~/archive-magic/collections/example.org --restore
+uv run archive-magic-fetch example.org --restore
 # Verify actual bucket bytes, then remove local data, discovery, state, and logs.
-uv run archive-magic-fetch ~/archive-magic/collections/example.org --evict-local
+uv run archive-magic-fetch example.org --evict-local
 # Validate and publish assets, then generate archive.json from collection.toml.
-uv run archive-magic-fetch ~/archive-magic/collections/example.org --publish-metadata
+uv run archive-magic-fetch example.org --publish-metadata
 ```
 
 A missing local baseline stops Fetch with restore instructions. Pending publications

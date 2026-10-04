@@ -107,12 +107,24 @@ def load_config(value: Path | str) -> FetchConfig:
 
 
 def _config_path(value: Path | str) -> Path:
-    """Resolve a Fetch configuration path or its containing directory."""
+    """Resolve a workspace collection name, explicit directory, or TOML path."""
 
+    raw = str(value)
     candidate = Path(value).expanduser()
+    # Preserve explicit ./ paths by accepting the original CLI string, not Path.
+    named_collection = (
+        not candidate.is_absolute()
+        and '/' not in raw
+        and '\\' not in raw
+        and raw not in {'.', '..'}
+        and not raw.lower().endswith('.toml')
+    )
+    if named_collection:
+        candidate = Path.home() / 'archive-magic' / 'collections' / raw
+
     if candidate.name == "fetch.toml":
         raise ValueError("legacy fetch.toml; migrate to collection.toml")
-    if candidate.is_dir():
+    if named_collection or candidate.is_dir():
         if not (candidate / CONFIG_NAME).exists() and (candidate / "fetch.toml").exists():
             raise ValueError("legacy fetch.toml; migrate to collection.toml")
         candidate = candidate / CONFIG_NAME

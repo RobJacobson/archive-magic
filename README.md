@@ -98,21 +98,27 @@ Run these commands from the code checkout, or use the installed entry points:
 
 ```sh
 # Acquire captures; automatically publish completed data and discovery to S3.
-uv run archive-magic-fetch ~/archive-magic/collections/example.org
+uv run archive-magic-fetch example.org
 
 # Retry data/discovery publication without contacting upstream capture sources.
 # Works for discovery-only output after WARC acquisition failed.
-uv run archive-magic-fetch ~/archive-magic/collections/example.org --sync-only
+uv run archive-magic-fetch example.org --sync-only
 
 # Explicitly recover data and discovery caches from the bucket.
-uv run archive-magic-fetch ~/archive-magic/collections/example.org --restore
+uv run archive-magic-fetch example.org --restore
 
 # Verify remote copies by content, then remove this collection's local output.
-uv run archive-magic-fetch ~/archive-magic/collections/example.org --evict-local
+uv run archive-magic-fetch example.org --evict-local
 
 # Publish authored assets, then generate and publish archive.json.
-uv run archive-magic-fetch ~/archive-magic/collections/example.org --publish-metadata
+uv run archive-magic-fetch example.org --publish-metadata
 ```
+
+A bare name such as `example.org` selects
+`~/archive-magic/collections/example.org/collection.toml`, regardless of the current
+working directory. To use a directory elsewhere, pass `./example.org`, another
+relative path, or an absolute path. Explicit `.toml` filenames also remain supported.
+The shorthand works with every operation flag and does not change output paths.
 
 Operation flags are mutually exclusive. Restore, eviction, and metadata
 publication require remote storage and cannot use acquisition date/reset flags.

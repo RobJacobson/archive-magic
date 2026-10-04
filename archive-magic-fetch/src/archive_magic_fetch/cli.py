@@ -48,7 +48,11 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     """Parse the fetch command line."""
 
     parser = argparse.ArgumentParser(prog="archive-magic-fetch")
-    parser.add_argument("archive", type=Path, metavar="COLLECTION")
+    parser.add_argument(
+        "archive",
+        metavar="COLLECTION",
+        help="collection name under ~/archive-magic/collections/, or an explicit directory/TOML path",
+    )
     parser.add_argument("--start", metavar="DATE")
     parser.add_argument("--end", metavar="DATE")
     operations = parser.add_mutually_exclusive_group()

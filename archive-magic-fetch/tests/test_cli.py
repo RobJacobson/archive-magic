@@ -334,3 +334,19 @@ def test_lifecycle_operations_are_mutually_exclusive(tmp_path):
     from archive_magic_fetch.cli import _parse_args
     with pytest.raises(SystemExit):
         _parse_args([str(tmp_path), '--sync-only', '--restore'])
+
+
+def test_cli_shorthand_and_explicit_relative_directory(tmp_path, monkeypatch):
+    import archive_magic_fetch.run_application as app
+    from archive_magic_fetch.cli import main
+    workspace = tmp_path / 'archive-magic' / 'collections' / 'example.org'
+    write_cli_config(workspace)
+    cwd = tmp_path / 'checkout'
+    local = cwd / 'example.org'
+    write_cli_config(local)
+    monkeypatch.chdir(cwd)
+    selected = []
+    monkeypatch.setattr(app, 'run_fetch', lambda settings, **kwargs: selected.append(settings.collection_directory) or SimpleNamespace(exit_code=0))
+    assert main(['example.org']) == 0
+    assert main(['./example.org']) == 0
+    assert selected == [workspace, local]

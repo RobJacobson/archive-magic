@@ -11,7 +11,10 @@ archive-magic-fetch ARCHIVE [--config PATH] [--start DATE] [--end DATE] [--reset
 archive-magic-fetch ARCHIVE --sync-only
 ```
 
-`ARCHIVE` is a TOML path or a directory containing `collection.toml`. Playback
+`ARCHIVE` is a bare collection name under `~/archive-magic/collections/`, an
+explicit directory (such as `./example.org`), or a TOML path. Bare names always
+select the user workspace, even if a same-named directory exists in the current
+working directory. Playback
 workers, start rate, and retries are host policy, configured independently for each
 source. They come from `~/archive-magic/fetch-config.toml`
 (independent of `$XDG_CONFIG_HOME`). If missing, the file
