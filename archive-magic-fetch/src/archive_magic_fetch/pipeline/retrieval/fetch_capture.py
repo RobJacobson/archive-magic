@@ -52,8 +52,6 @@ def fetch_capture(
             if advice.cooldown is not None:
                 kind, delay, label = advice.cooldown
                 gate.pause(kind, delay, capture.identity, label=label)
-            else:
-                gate.note_failure()
             check_cancelled(cancelled)
             categories.append(advice.category.value)
             retryable = advice.retryable

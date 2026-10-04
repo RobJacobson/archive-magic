@@ -112,7 +112,7 @@ def test_429_retry_is_paced_and_traced(tmp_path, monkeypatch, capsys, retry_afte
     assert "Retry-After" not in output
 
 
-def test_429_backoff_escalates_across_success_and_same_capture_retries(tmp_path, monkeypatch):
+def test_429_backoff_resets_after_success_and_escalates_on_retries(tmp_path, monkeypatch):
     clock = Clock()
     path = tmp_path / "requests.csv"
     calls = []
@@ -136,7 +136,7 @@ def test_429_backoff_escalates_across_success_and_same_capture_retries(tmp_path,
     assert second.failure is None
     assert first.attempts == 2
     assert second.attempts == 3
-    assert calls == [100, 160, 160.5, 280.5, 460.5]
+    assert calls == [100, 160, 160.5, 220.5, 340.5]
     trace = events(path)
     assert [e["status"] for e in trace] == ["429", "200", "429", "429", "200"]
     assert all(e["retry_after"] == "" for e in trace)

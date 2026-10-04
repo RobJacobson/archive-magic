@@ -11,8 +11,6 @@ from archive_magic_fetch.models import CaptureIdentity
 from archive_magic_fetch.runtime.report_progress import emit
 from archive_magic_fetch.runtime.calculate_retry_delay import linear_backpressure_delay
 
-BACKPRESSURE_RECOVERY_SECONDS = 300.0
-
 
 class StartGate:
     """Smooth request starts and pause every worker on source-directed cooldowns.
@@ -20,8 +18,8 @@ class StartGate:
     Each failure after a cooldown escalates the pause, including retries of
     the same capture: 60s, 120s, 180s, ... up to ten minutes, never shorter than
     ``Retry-After``. Concurrent failures during a pause share one level.
-    Successful acquisitions spanning five minutes without a failure reset
-    escalation. The recovery window starts with a success after the pause.
+    A successful download after the pause resets escalation. A completion that
+    arrives during the pause does not, and idle time alone does not either.
     """
 
     def __init__(
@@ -41,7 +39,6 @@ class StartGate:
         self._endpoint_starts: dict[str, float] = {}
         self._blocked_until = 0.0
         self._level = 0
-        self._recovery_started_at: float | None = None
 
     def wait(
         self, *, cancelled: threading.Event | None = None,
@@ -63,23 +60,12 @@ class StartGate:
             wait_or_cancel(deadline - now, cancelled=cancelled, sleep=self._sleep)
 
     def note_success(self) -> None:
-        """Reset only after sustained successful acquisition outside cooldowns."""
+        """A completed download outside an active cooldown clears escalation."""
 
         with self._lock:
-            now = self._clock()
-            if self._level == 0 or now < self._blocked_until:
+            if self._level == 0 or self._clock() < self._blocked_until:
                 return
-            if self._recovery_started_at is None:
-                self._recovery_started_at = now
-            elif now - self._recovery_started_at >= BACKPRESSURE_RECOVERY_SECONDS:
-                self._level = 0
-                self._recovery_started_at = None
-
-    def note_failure(self) -> None:
-        """A failed acquisition breaks recovery without resetting escalation."""
-
-        with self._lock:
-            self._recovery_started_at = None
+            self._level = 0
 
     def pause(
         self,
@@ -93,7 +79,6 @@ class StartGate:
             now = self._clock()
             if now >= self._blocked_until:
                 self._level += 1
-            self._recovery_started_at = None
             delay = linear_backpressure_delay(self._level, retry_after)
             self._blocked_until = max(self._blocked_until, now + delay)
             remaining = self._blocked_until - now
