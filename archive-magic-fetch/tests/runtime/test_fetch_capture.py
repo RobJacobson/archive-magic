@@ -5,6 +5,8 @@ from __future__ import annotations
 import threading
 from unittest.mock import MagicMock
 
+import pytest
+
 from archive_magic_fetch.adapters.interpret_wayback_failures import (
     INVALID_URI_PAYLOAD_DIGEST,
     backpressure_signal,
@@ -68,7 +70,8 @@ def test_rate_gate_keeps_maximum_retry_after(capsys):
     assert sleeps == [90.0]
     output = capsys.readouterr().out
     assert output.startswith("HTTP 429 at ")
-    assert "Retry-After=20s, applied=60s, level=1, maximum=90s" in output
+    assert "cooldown=60s, level=1; new starts paused for 90s" in output
+    assert "Retry-After" not in output
 
 
 def test_rate_gate_escalates_across_waves(capsys):
@@ -96,13 +99,12 @@ def test_rate_gate_escalates_across_waves(capsys):
 
     assert sleeps == [60.0, 120.0, 180.0]
     output = capsys.readouterr().out
-    assert "level=1, maximum=60s" in output
-    assert "level=2, maximum=120s" in output
-    assert "applied=120s, level=2, maximum=120s" in output
-    assert "level=3, maximum=180s" in output
+    assert "cooldown=60s, level=1" in output
+    assert "cooldown=120s, level=2" in output
+    assert "cooldown=180s, level=3" in output
 
 
-def test_rate_gate_same_identity_does_not_escalate(capsys):
+def test_rate_gate_same_identity_escalates_after_each_cooldown(capsys):
     clock = {"now": 100.0}
     sleeps: list[float] = []
     identity = make_capt()
@@ -123,13 +125,13 @@ def test_rate_gate_same_identity_does_not_escalate(capsys):
     gate.pause("http", 60, identity)
     gate.wait()
 
-    assert sleeps == [60.0, 60.0, 60.0]
+    assert sleeps == [60.0, 120.0, 180.0]
     output = capsys.readouterr().out
-    assert output.count("level=1,") == 3
-    assert "level=2" not in output
+    assert "cooldown=120s, level=2" in output
+    assert "cooldown=180s, level=3" in output
 
 
-def test_rate_gate_wave_retries_do_not_escalate(capsys):
+def test_rate_gate_concurrent_failures_share_level_but_next_retry_escalates(capsys):
     clock = {"now": 100.0}
     sleeps: list[float] = []
     first = make_capt(ts="20040615000001")
@@ -150,12 +152,14 @@ def test_rate_gate_wave_retries_do_not_escalate(capsys):
     gate.pause("http", 60, first)
     gate.wait()
 
-    assert sleeps == [60.0, 60.0]
+    assert sleeps == [60.0, 120.0]
     output = capsys.readouterr().out
-    assert "level=2" not in output
+    assert output.count("level=1;") == 2
+    assert output.count("level=2;") == 1
 
 
-def test_rate_gate_resets_escalation_after_success(capsys):
+@pytest.mark.parametrize("healthy_seconds, next_delay", [(0, 180), (299, 180), (300, 60)])
+def test_rate_gate_reset_requires_five_minutes_of_success(healthy_seconds, next_delay):
     clock = {"now": 100.0}
     sleeps: list[float] = []
     first = make_capt(ts="20040615000001")
@@ -176,13 +180,78 @@ def test_rate_gate_resets_escalation_after_success(capsys):
     gate.pause("http", 60, second)
     gate.wait()
     gate.note_success()
+    clock["now"] += healthy_seconds
+    gate.note_success()
     gate.pause("http", 60, third)
     gate.wait()
 
-    assert sleeps == [60.0, 120.0, 60.0]
-    output = capsys.readouterr().out
-    assert output.count("level=1,") == 2
-    assert "level=2, maximum=120s" in output
+    assert sleeps == [60.0, 120.0, next_delay]
+
+
+def test_rate_gate_failure_restarts_recovery_window():
+    clock = {"now": 100.0}
+    sleeps = []
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        clock["now"] += seconds
+
+    gate = StartGate(0, clock=lambda: clock["now"], sleep=sleep)
+    identity = make_capt()
+    gate.pause("http", None, identity)
+    gate.wait()
+    gate.note_success()
+    clock["now"] += 299
+    gate.note_failure()
+    clock["now"] += 1
+    gate.note_success()
+    gate.pause("http", None, identity)
+    gate.wait()
+
+    assert sleeps == [60.0, 120.0]
+
+
+def test_rate_gate_cooldown_and_idle_time_do_not_count_as_recovery():
+    clock = {"now": 100.0}
+    sleeps = []
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        clock["now"] += seconds
+
+    gate = StartGate(0, clock=lambda: clock["now"], sleep=sleep)
+    identity = make_capt()
+    gate.pause("http", 600, identity)
+    # A completion from an in-flight worker cannot start recovery during a pause.
+    gate.note_success()
+    gate.wait()
+    clock["now"] += 600
+    gate.note_success()
+    gate.pause("http", None, identity)
+    gate.wait()
+
+    assert sleeps == [600.0, 120.0]
+
+
+def test_rate_gate_caps_policy_delay_but_honors_longer_retry_after():
+    clock = {"now": 100.0}
+    sleeps = []
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        clock["now"] += seconds
+
+    gate = StartGate(0, clock=lambda: clock["now"], sleep=sleep)
+    identity = make_capt()
+    for _ in range(12):
+        gate.pause("http", None, identity)
+        gate.wait()
+    gate.pause("http", 900, identity)
+    gate.wait()
+    gate.pause("http", None, identity)
+    gate.wait()
+
+    assert sleeps == [60.0 * level for level in range(1, 11)] + [600, 600, 900, 600]
 
 
 def test_permanent_failure_does_not_retry():
@@ -342,7 +411,7 @@ def test_http_504_retries_once_without_pausing_pool(capsys):
     assert "new starts paused" not in capsys.readouterr().out
 
 
-def test_unavailable_failure_resets_rate_gate():
+def test_unavailable_failure_interrupts_recovery_without_resetting_rate_gate():
     workers = AcquisitionHarness(
         make_source(
             client_factory=lambda: MagicMock(),
@@ -354,6 +423,7 @@ def test_unavailable_failure_resets_rate_gate():
         retries=0,
     )
     workers._gate.note_success = MagicMock(wraps=workers._gate.note_success)
+    workers._gate.note_failure = MagicMock(wraps=workers._gate.note_failure)
     workers._gate.pause = MagicMock(wraps=workers._gate.pause)
     try:
         outcome = workers.download(make_capt())
@@ -362,7 +432,8 @@ def test_unavailable_failure_resets_rate_gate():
 
     assert outcome.failure is not None
     workers._gate.pause.assert_not_called()
-    workers._gate.note_success.assert_called_once()
+    workers._gate.note_success.assert_not_called()
+    workers._gate.note_failure.assert_called_once()
 
 
 def test_http_429_pauses_pool_without_reset():

@@ -67,7 +67,8 @@ def workers_for(clock, path, **kwargs):
     )
 
 
-def test_429_retry_is_paced_and_traced(tmp_path, monkeypatch):
+@pytest.mark.parametrize("retry_after", [None, "60", "900"])
+def test_429_retry_is_paced_and_traced(tmp_path, monkeypatch, capsys, retry_after):
     clock = Clock()
     path = tmp_path / "requests.csv"
     calls = []
@@ -76,7 +77,8 @@ def test_429_retry_is_paced_and_traced(tmp_path, monkeypatch):
     def send(_adapter, request, **kwargs):
         calls.append((clock(), request.url))
         if len(calls) == 1:
-            return response(request, 429, {"Retry-After": "60"})
+            headers = {"Retry-After": retry_after} if retry_after is not None else {}
+            return response(request, 429, headers, memento=False)
         return response(request)
 
     monkeypatch.setattr(HTTPAdapter, "send", send)
@@ -87,13 +89,14 @@ def test_429_retry_is_paced_and_traced(tmp_path, monkeypatch):
         workers.close()
     assert outcome.failure is None
     assert outcome.attempts == 2
-    assert [t for t, _ in calls] == [100, 160]
+    delay = max(60, int(retry_after or 0))
+    assert [t for t, _ in calls] == [100, 100 + delay]
     trace = events(path)
     assert [e["attempt"] for e in trace] == ["1", "2"]
     assert [e["request_in_attempt"] for e in trace] == ["1", "1"]
     assert [e["request_id"] for e in trace] == ["1", "2"]
     assert [e["status"] for e in trace] == ["429", "200"]
-    assert trace[0]["retry_after"] == "60"
+    assert trace[0]["retry_after"] == (retry_after or "")
     assert trace[0]["capture_time"] == "2004-06-15T00:00:00"
     assert trace[0]["digest"] == identity.payload_digest[-6:]
     assert (
@@ -102,6 +105,39 @@ def test_429_retry_is_paced_and_traced(tmp_path, monkeypatch):
     assert len(trace[0]["start_utc"]) == 24
     assert workers.request_stats.snapshot()["http_429"] == 1
     assert workers.request_stats.snapshot()["peak_starts_1s"] == 1
+    output = capsys.readouterr().out
+    assert f"cooldown={delay}s, level=1" in output
+    assert "Retry-After" not in output
+
+
+def test_429_backoff_escalates_across_success_and_same_capture_retries(tmp_path, monkeypatch):
+    clock = Clock()
+    path = tmp_path / "requests.csv"
+    calls = []
+    statuses = iter([429, 200, 429, 429, 200])
+    identity = make_capt(digest=payload_digest(b"hello"))
+
+    def send(_adapter, request, **kwargs):
+        calls.append(clock())
+        status = next(statuses)
+        return response(request, status, memento=status == 200)
+
+    monkeypatch.setattr(HTTPAdapter, "send", send)
+    workers = workers_for(clock, path)
+    try:
+        first = workers.download(identity)
+        second = workers.download(identity)
+    finally:
+        workers.close()
+
+    assert first.failure is None
+    assert second.failure is None
+    assert first.attempts == 2
+    assert second.attempts == 3
+    assert calls == [100, 160, 160.5, 280.5, 460.5]
+    trace = events(path)
+    assert [e["status"] for e in trace] == ["429", "200", "429", "429", "200"]
+    assert all(e["retry_after"] == "" for e in trace)
 
 
 def test_nearby_redirect_stops_after_one_http_request(tmp_path, monkeypatch):

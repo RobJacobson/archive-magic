@@ -222,6 +222,17 @@ Revisits refer only to earlier successful responses in the same year. A staged
 write failure aborts the year; only successfully promoted data seeds subsequent
 updates to that year. Resetting one year cannot invalidate another year's revisits.
 
+Playback backpressure pauses all workers for 60, 120, 180 seconds and so on,
+capped at ten minutes unless the source requests a longer wait. A failure after
+the pause escalates even when retrying the same capture; failures received during
+an active pause share its level and never shorten the pause. Escalation resets
+only after successful acquisitions span five minutes without a failure, starting
+with the first success after the pause. Cooldown time alone does not count as
+recovery. Other acquisition failures interrupt recovery without pausing the pool.
+Console messages report the applied cooldown and remaining pause; the request
+CSV retains the raw `Retry-After` header, empty when absent, for diagnostics.
+CDX discovery keeps its separate retry policy.
+
 Resolution and writing share an explicit annual worker batch. On failure or
 Ctrl-C, it cancels queued groups, stops active groups before new captures,
 attempts, or transport sends, and wakes retry and pacing waits. In-flight HTTP

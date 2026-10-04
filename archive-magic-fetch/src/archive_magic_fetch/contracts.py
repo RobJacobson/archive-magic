@@ -43,7 +43,6 @@ class FailureAdvice:
     cooldown: tuple[str, float | None, str] | None = None
     group: str | None = None
     group_limit: int | None = None
-    reset_gate: bool = True
 
 
 @dataclass(frozen=True)

@@ -40,7 +40,7 @@ def failure_advice(error: BaseException, attempt: int) -> FailureAdvice:
     )
     return FailureAdvice(
         FailureCategory.RETRY_EXHAUSTED if retryable else FailureCategory.UNAVAILABLE,
-        retryable, delay=delay, reset_gate=False,
+        retryable, delay=delay,
     )
 
 

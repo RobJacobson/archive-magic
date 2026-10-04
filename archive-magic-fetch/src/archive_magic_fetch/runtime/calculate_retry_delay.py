@@ -7,15 +7,19 @@ from email.utils import mktime_tz, parsedate_tz
 from typing import Optional
 
 BACKPRESSURE_COOLDOWN_SECONDS = 60.0
+MAX_BACKPRESSURE_COOLDOWN_SECONDS = 600.0
 
 
 def linear_backpressure_delay(
     attempt: int,
     retry_after: float | None = None,
 ) -> float:
-    """Linear 60s, 120s, 180s, ... pause, never shorter than Retry-After."""
+    """Linear pauses capped at ten minutes, never shorter than Retry-After."""
 
-    return max(retry_after or 0.0, BACKPRESSURE_COOLDOWN_SECONDS * attempt)
+    delay = min(
+        BACKPRESSURE_COOLDOWN_SECONDS * attempt, MAX_BACKPRESSURE_COOLDOWN_SECONDS
+    )
+    return max(retry_after or 0.0, delay)
 
 
 def parse_retry_after(value: object) -> Optional[float]:
