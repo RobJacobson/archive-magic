@@ -38,6 +38,7 @@ class FetchSettings:
     retries: int = DEFAULT_PLAYBACK_RETRIES
     trace_requests: bool = False
     index_directory: Path | None = None
+    collection_directory: Path | None = None
 
     def __post_init__(self) -> None:
         data_directory = Path(self.output.data_directory).expanduser().resolve()
@@ -45,7 +46,7 @@ class FetchSettings:
             (
                 Path(self.index_directory)
                 if self.index_directory is not None
-                else data_directory.parent / "index"
+                else data_directory.parent / "discovery"
             )
             .expanduser()
             .resolve()
@@ -67,6 +68,7 @@ def build_settings(
     reset_data: bool = False,
     output: FetchOutput,
     index_directory: Path | None = None,
+    collection_directory: Path | None = None,
     warc_target_bytes: int = DEFAULT_WARC_TARGET_BYTES,
     cdx_window_days: int = DEFAULT_CDX_WINDOW_DAYS,
     cdx_page_limit: int = DEFAULT_CDX_PAGE_LIMIT,
@@ -107,6 +109,7 @@ def build_settings(
         reset_data=reset_data,
         output=output,
         index_directory=index_directory,
+        collection_directory=collection_directory,
         warc_target_bytes=warc_target_bytes,
         cdx_window_days=cdx_window_days,
         cdx_page_limit=cdx_page_limit,

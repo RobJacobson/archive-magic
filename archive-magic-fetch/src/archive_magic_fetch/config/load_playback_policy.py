@@ -89,9 +89,7 @@ def _create_instance_config(path: Path) -> None:
 def _default_instance_config_path() -> Path:
     """Return the default host-level Fetch policy path."""
 
-    xdg = os.environ.get("XDG_CONFIG_HOME")
-    base = Path(xdg).expanduser() if xdg else Path.home() / ".config"
-    return (base / "archive-magic-fetch" / INSTANCE_CONFIG_NAME).resolve()
+    return (Path.home() / "archive-magic" / INSTANCE_CONFIG_NAME).resolve()
 
 
 def _instance_config_path(value: Path | str | None = None) -> Path:

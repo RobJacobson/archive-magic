@@ -11,10 +11,10 @@ archive-magic-fetch ARCHIVE [--config PATH] [--start DATE] [--end DATE] [--reset
 archive-magic-fetch ARCHIVE --sync-only
 ```
 
-`ARCHIVE` is a TOML path or a directory containing `fetch.toml`. Playback
+`ARCHIVE` is a TOML path or a directory containing `collection.toml`. Playback
 workers, start rate, and retries are host policy, configured independently for each
-source. They come from `~/.config/archive-magic-fetch/fetch-config.toml`
-(or `$XDG_CONFIG_HOME/archive-magic-fetch/fetch-config.toml`). If missing, the file
+source. They come from `~/archive-magic/fetch-config.toml`
+(independent of `$XDG_CONFIG_HOME`). If missing, the file
 and its parent directories are created with these defaults:
 
 ```toml
@@ -34,7 +34,7 @@ precedence over the default path. A missing file is created at the selected path
 existing files are left unchanged. Both source sections require all three settings,
 with no shared defaults or inheritance between sections. The archive's
 `[archive].source` selects its policy, and CLI flags override that policy for one
-run. These fields do not belong in per-archive `fetch.toml`.
+run. These fields do not belong in per-archive `collection.toml`.
 
 ### Playback request diagnostics
 
@@ -122,48 +122,19 @@ PY
 The `--sync-only` form requires remote output and does not query either source. It cannot
 be combined with dates or `--reset-data`.
 
-The existing TOML fields stay in place:
+Collection configuration now uses `[collection]`, `[fetch]`, `[storage.local]`,
+and optional `[storage.remote]`. See the [annotated workspace layout and complete
+example](../../README.md#user-workspace). `storage.local.directory` is the working
+root, resolved relative to the authored definition, outside its input directory.
+It contains `data/`, `discovery/`, disposable `logs/`, and `.state/` receipts.
+The lock lives beside `collection.toml`, surviving eviction of the working root.
+`data/.staging/` holds recoverable annual transactions and is never uploaded.
 
-```toml
-[archive]
-id = "example.org"
-url_pattern = "*.example.org"
-source = "wayback" # default; or "common-crawl"
-
-[output]
-type = "remote" # or "local"
-data_directory = "data"
-bucket = "archive-magic"
-prefix = "example.org"
-endpoint_url = "https://s3.example.invalid"
-region = "auto"
-
-[fetch]
-start = "1995-01-01"
-# end omitted means now
-# warc_target_bytes = 250000000
-# cdx_page_limit = 5000
-# cdx_window_days = 28
-```
-
-Remote output now means **local-authoritative with a bucket mirror**. The
-`data_directory` contains every finalized WARC and CDXJ. Fetch never downloads
-these artifacts from the bucket and never evicts them. The bucket, prefix,
-endpoint, and region configure a temporary rclone S3 backend; rclone obtains
-credentials from the AWS environment or profile. Missing credentials fail
-immediately instead of probing EC2 instance metadata. Rclone must be installed
-on the Fetch host.
-
-Run records and the process lock live in `logs/` beside `data_directory`.
-The hidden `data/.staging/` directory holds one year's unfinished work and is
-excluded from publication. The public archive format remains a flat directory:
-
-```text
-data/
-  example.org-2004-001.warc.gz
-  example.org-2004-002.warc.gz
-  example.org-2004-index.cdxj
-```
+Boto3 handles verified publication, restoration, and eviction. Explicit remote
+reset still uses narrowly filtered rclone deletion. Credentials remain outside
+configuration in the standard AWS credential chain. No component loads `.env`.
+One process may own a local collection definition, and one writer may publish to
+a bucket/prefix; cross-machine distributed locking is not implemented.
 
 ## Annual acquisition
 
@@ -172,10 +143,11 @@ start and skipping future years. CDX queries always cover January 1 00:00:00
 through December 31 23:59:59. Exact configured/CLI dates filter playback captures
 after acquisition; they do not narrow the CDX query.
 
-For Wayback, complete historical years are cached as ordinary JSON arrays in
-`index/YYYY.cdx.json` beside `fetch.toml`. An existing valid cache avoids all CDX
+For Wayback, complete historical years are cached as versioned JSON envelopes in
+`discovery/wayback/v1/<query-hash>/YYYY.cdx.json` under the working root.
+The envelope binds source, normalized query, year, and capture records. An existing valid cache avoids all CDX
 requests for that year. Each record contains `urlkey`, `original_url`, `timestamp`,
-`status_token`, `payload_digest`, and `mime`; `[]` represents a successfully
+`status_token`, `payload_digest`, and `mime`; an empty captures array represents a successfully
 queried empty year. Fetch saves a cache only after every page and fallback slice
 succeeds, writing a temporary sibling and atomically renaming it before WARC work.
 Temporary files are never cache hits. Invalid JSON, fields, timestamps, or records
@@ -194,20 +166,17 @@ terminal failure stops that year immediately, discards its results, skips WARC
 processing, and continues to later years with a nonzero final exit status.
 Failed acquisitions retain no progress between runs.
 
-There is no coverage manifest, refresh mechanism, or persisted partial checkpoint.
-Legacy files in `logs/cdx/` are ignored and left untouched. The normalized URL
-query must remain fixed for a cache's lifetime; explicitly clear the cache before
-changing it. Cached historical years are retained indefinitely, accepting that
-captures made visible later, including around the UTC year boundary, are missed.
-A completed acquisition is not a guarantee of permanent upstream completeness.
+There is no persisted partial Wayback checkpoint. Historical caches remain
+reusable indefinitely, so later upstream additions require an intentional cache
+refresh. Source, query, and format version select a namespace; changing queries
+cannot silently reuse an incompatible listing. Completed Common Crawl units
+remain reusable according to their crawl metadata freshness checks.
 
-The cache stays beside `fetch.toml` even with a custom data directory. Programmatic
-settings may provide `index_directory`; its default is `data_directory.parent /
-"index"`. The resolved cache directory must be outside the data directory, so
-resetting data cannot delete it. The existing archive lock enforces one process
-per archive layout; no separate cache lock is added. Concurrent processes sharing
-a cache through different archive layouts are unsupported. Only WARC/CDXJ data
-is published to the bucket.
+The CLI derives discovery from the working root. Programmatic settings may
+supply `index_directory`; its default is `data_directory.parent / "discovery"`.
+Completed validated cache files invoke the active bucket publication callback
+immediately, including before a later WARC or discovery unit fails. Missing
+remote caches require explicit restore. Logs are never used as publication state.
 
 After acquisition, playback captures are filtered by the requested dates,
 deduplicated by identity, and sorted. Each CDX URL group is assigned to one worker,
@@ -310,7 +279,7 @@ records in response order; shared deduplication retains the first complete
 reference for each identity.
 
 CC caches are versioned JSON envelopes at
-`index/common-crawl/<query-hash>/<crawl-id>/<year>.json`, outside the resettable
+`discovery/common-crawl/v1/<query-hash>/<crawl-id>/<year>.json`, outside the resettable
 data directory. They contain normalized query, full-year bounds, collection
 metadata, and capture references including byte-range locators. Only complete
 per-crawl queries are published atomically. A failed page or crawl prevents an
@@ -318,7 +287,7 @@ annual listing from reaching WARC work; already completed crawl caches survive.
 Valid empty results are cached. Page counts precede date filtering, so a numbered
 page's recognized no-captures 404 is also a valid empty result; other HTTP or
 parsing errors still fail discovery. Corrupt entries fail explicitly, without silently
-refetching or replacing them. Wayback cache paths and arrays are unchanged.
+refetching or replacing them. Wayback uses its separate versioned envelope and query namespace.
 
 Completed entries are reused even for the current year. A new run's catalog adds
 newly published collections and invalidates entries whose collection metadata
@@ -389,54 +358,38 @@ worker draining, and late backpressure preservation remain shared behavior.
 ### Optional local smoke procedure
 
 Automated tests use generated source records and fake HTTP responses. For an
-explicitly opted-in live check, create a fresh directory with this `fetch.toml`:
-
-```toml
-[archive]
-id = "cc-smoke"
-source = "common-crawl"
-url_pattern = "https://commoncrawl.org/"
-
-[output]
-type = "local"
-data_directory = "data"
-
-[fetch]
-start = "2024-06-01"
-end = "2024-06-30"
-```
-
-Run `uv run archive-magic-fetch /path/to/cc-smoke --workers 1 --starts-per-second 1
---retries 1 --trace-requests` on one shell line. Discovery still covers the full
-calendar year for this exact URL. Inspect the run log, request trace, WARC/CDXJ,
-and any explicit unresolved records. Repeat to check resume. This example can
-legitimately select no captures; choose another exact URL or short period if
-needed. It writes only local output and never publishes to a bucket.
+explicitly opted-in live check, copy the repository collection example, set
+`fetch.source = "common-crawl"`, choose a small date range, and omit
+`[storage.remote]` for local-only acquisition. Follow the smoke guide for any
+separately authorized bucket operations.
 
 ## Publication
 
-Fetch waits for the completed year's rclone reconciliation before starting the
-next year. Automatic reconciliation is limited to that year's managed filenames;
-`--sync-only` reconciles every annual WARC/CDXJ in the local archive. Both use
-a preflight listing of the archive root to reject legacy flat WARC/CDXJ objects,
-then the same three ordered passes targeting `<bucket>/<prefix>/data/`:
+Fetch publishes each completed year before advancing. `--sync-only` retries
+all local data and discovery without contacting upstream capture sources. It can
+publish discovery alone when WARC acquisition failed. Data indexes are validated
+against WARC byte ranges; WARCs upload before indexes. No ordinary operation
+mirrors missing local files as remote deletions or prunes obsolete remote shards.
 
-1. Copy WARCs to the bucket without deleting remote files.
-2. Sync CDXJ files, which makes the newly uploaded records visible.
-3. Sync WARCs, deleting obsolete remote WARC files only after index publication.
+`BucketStorage` records remote signatures and local SHA-256 hashes in
+`.state/publication.json`, bound to endpoint, region, bucket, prefix, and ID.
+Initial adoption verifies content, rather than assuming multipart ETags are hashes.
+Preflight refuses missing local baseline files and detects conflicting remote or
+unrecorded local changes. Validated annual generations are recorded before local
+promotion; intended upload hashes survive partial uploads and process failure.
+Preflight reconciles completed uploads before retrying outstanding publication.
 
-Only files at the root of `data/` for the configured archive are eligible.
-The configured prefix identifies the archive root; `data/` is appended automatically.
-Metadata and images are manually published siblings and are never managed by sync. Logs, staging,
-and unrelated bucket keys are excluded. A missing or empty local archive
-causes sync to fail rather than delete the bucket. Sync validates local CDXJ
-ranges against local WARC sizes before publication. A fetch and a manual sync
-cannot run concurrently on the same archive.
+`--restore` downloads managed data and discovery into temporary staging, validates
+cache provenance and replay indexes, refuses differing local files, checks remote
+stability, and installs complete files. `--evict-local` checks content for every
+local finalized data/cache object before removing output. It refuses pending
+transactions, unknown files, and missing/different remote copies. Neither operation
+changes collection definitions, assets, or published objects.
 
-An acquisition failure skips the affected year and allows later years to run.
-An rclone failure stops the run immediately. Local completed files stay
-available; `archive-magic-fetch ARCHIVE --sync-only` retries publication
-without contacting either source.
+`--publish-metadata` validates `[collection]`, uploads its referenced assets, then
+publishes generated `archive.json`. Name and homepage are required only for this
+operation. Fetch validates the manifest independently of Navigator; contract tests
+verify their agreement. Normal data publication never publishes presentation edits.
 
 ## Reset and migration
 
@@ -449,10 +402,9 @@ Both reset modes preserve discovery caches and reuse them to rebuild WARC
 contents. A successful empty selection can clear a local year through reset
 staging. WARC failures also leave completed CDX caches intact.
 
-Before switching an existing bucket-authoritative archive, finish pending
-publication with the old Fetch version. Restore its WARC/CDXJ objects into a
-fresh local `data_directory` once using rclone, and compare the local and
-remote file sets. Fetch performs no bucket download during normal operation.
+After local cleanup, run explicit `--restore` before resuming acquisition.
+Migration of the local workspace is offline and separate from bucket operations;
+see the migration guide for copy/verify/remove behavior.
 
 For existing flat bucket layouts, follow the [migration guide](../../docs/BUCKET-CATALOG-MIGRATION.md).
 Fetch does not migrate or delete old root objects automatically.
@@ -463,7 +415,7 @@ Fetch is organized by pipeline stage. Workflow modules expose one primary
 operation near the top, followed by private helpers. Shared records, cohesive
 stateful classes, and reusable primitives may expose the related operations they
 need. Internal Python import paths are not a compatibility interface; the CLI,
-configuration, caches, and published archive format are unchanged.
+configuration and cache formats change as documented; the published replay format remains unchanged.
 
 Action-oriented Python modules use lowercase `verb_noun.py` names, usually
 matching their primary operation: `build_collection_index.py`,
@@ -600,7 +552,7 @@ and `integration/`. A fake source exercises the complete shared pipeline, includ
 resume and revisits, without using Wayback acquisition. Dedicated tests cover
 response/client cleanup and retries spanning response decoding. Existing fixtures
 continue to cover cache boundaries, transport pacing, transaction recovery, and
-ordered rclone publication. Run Fetch and Navigator suites separately:
+verified bucket publication. Run Fetch and Navigator suites separately:
 
 ```console
 .venv/bin/python -m pytest archive-magic-fetch/tests -q

@@ -20,22 +20,22 @@ def write_cli_config(
     remote = ""
     if output_type == "remote":
         remote = """
+[storage.remote]
 bucket = "bucket"
 prefix = "example.org"
 endpoint_url = "https://s3.example.invalid"
 region = "auto"
 """
-    path = directory / "fetch.toml"
+    path = directory / "collection.toml"
     path.write_text(
         f"""
-[archive]
+[collection]
 id = "example.org"
-url_pattern = "*.example.org"
-[output]
-type = "{output_type}"
-data_directory = "data"
+[storage.local]
+directory = "../output"
 {remote}
 [fetch]
+url_pattern = "*.example.org"
 start = "2000-01-01"
 end = "2001-12-31"
 """,
@@ -72,7 +72,7 @@ def test_cli_rejects_reversed_range(tmp_path):
     assert code == 2
 
 
-@pytest.mark.parametrize("data_directory", ["data", "../storage/data"])
+@pytest.mark.parametrize("data_directory", ["../output", "../storage"])
 def test_cli_uses_configured_history(tmp_path, monkeypatch, data_directory):
     import archive_magic_fetch.run_application as app
     import archive_magic_fetch.cli as cli
@@ -80,7 +80,7 @@ def test_cli_uses_configured_history(tmp_path, monkeypatch, data_directory):
     config = write_cli_config(tmp_path)
     config.write_text(
         config.read_text().replace(
-            'data_directory = "data"', f'data_directory = "{data_directory}"'
+            'directory = "../output"', f'directory = "{data_directory}"'
         )
     )
     captured = []
@@ -94,8 +94,8 @@ def test_cli_uses_configured_history(tmp_path, monkeypatch, data_directory):
     assert captured[0].archive_id == "example.org"
     assert captured[0].date_start == "20000101000000"
     assert captured[0].date_end == "20011231235959"
-    assert captured[0].output.data_directory == (tmp_path / data_directory).resolve()
-    assert captured[0].index_directory == tmp_path / "index"
+    assert captured[0].output.data_directory == (tmp_path / data_directory / "data").resolve()
+    assert captured[0].index_directory == (tmp_path / data_directory / "discovery").resolve()
 
 
 def test_remote_reset_rejects_dates_and_warns_before_full_rebuild(
@@ -175,7 +175,7 @@ def test_cli_uses_instance_fetch_config_and_cli_overrides(
 
     archive = write_cli_config(tmp_path)
     archive.write_text(archive.read_text().replace(
-        "[archive]", f'[archive]\nsource = "{source}"'
+        "[fetch]", f'[fetch]\nsource = "{source}"'
     ))
     policy = tmp_path / "fetch-config.toml"
     policy.write_text(
@@ -216,16 +216,15 @@ def test_cli_uses_cdx_settings_from_toml(tmp_path, monkeypatch):
     import archive_magic_fetch.run_application as app
     import archive_magic_fetch.cli as cli
 
-    path = tmp_path / "fetch.toml"
+    path = tmp_path / "collection.toml"
     path.write_text(
         """
-[archive]
+[collection]
 id = "example.org"
-url_pattern = "*.example.org"
-[output]
-type = "local"
-data_directory = "data"
+[storage.local]
+directory = "../output"
 [fetch]
+url_pattern = "*.example.org"
 start = "2000-01-01"
 end = "2004-12-31"
 cdx_window_days = 3
@@ -291,7 +290,7 @@ def test_source_selection_in_application(tmp_path, monkeypatch, source):
 
     config = write_cli_config(tmp_path)
     if source:
-        config.write_text(config.read_text().replace('[archive]', f'[archive]\nsource = "{source}"'))
+        config.write_text(config.read_text().replace('[fetch]', f'[fetch]\nsource = "{source}"'))
     assert load_config(config).source == (source or "wayback")
     selected = []
     monkeypatch.setattr(app, "build_wayback_source", lambda **kw: "wayback")
@@ -307,13 +306,31 @@ def test_invalid_source_and_cc_sync_only(tmp_path, monkeypatch):
     from archive_magic_fetch.cli import main
 
     config = write_cli_config(tmp_path, output_type="remote")
-    config.write_text(config.read_text().replace('[archive]', '[archive]\nsource = "invalid"'))
+    config.write_text(config.read_text().replace('[fetch]', '[fetch]\nsource = "invalid"'))
     assert main([str(config)]) == 2
     config.write_text(config.read_text().replace('source = "invalid"', 'source = "common-crawl"'))
     def forbidden(**kwargs):
         raise AssertionError("sync must not construct any source")
     monkeypatch.setattr(app, "build_wayback_source", forbidden)
     monkeypatch.setattr(app, "build_common_crawl_source", forbidden)
+    from bucket_helpers import Bucket
+    monkeypatch.setattr("archive_magic_fetch.pipeline.publication.storage.boto3.client", lambda *a, **k: Bucket())
     synced = []
     monkeypatch.setattr(app, "sync_archive", lambda *args: synced.append(args))
     assert main([str(config), "--sync-only"]) == 0 and len(synced) == 1
+
+
+@pytest.mark.parametrize('flag', ['--restore', '--evict-local', '--publish-metadata'])
+def test_lifecycle_flags_require_remote_and_reject_dates(tmp_path, flag):
+    from archive_magic_fetch.cli import main
+    config = write_cli_config(tmp_path)
+    assert main([str(config), flag]) == 2
+    write_cli_config(tmp_path, output_type='remote')
+    assert main([str(config), flag, '--start', '2000']) == 2
+    assert main([str(config), flag, '--reset-data']) == 2
+
+
+def test_lifecycle_operations_are_mutually_exclusive(tmp_path):
+    from archive_magic_fetch.cli import _parse_args
+    with pytest.raises(SystemExit):
+        _parse_args([str(tmp_path), '--sync-only', '--restore'])

@@ -42,6 +42,9 @@ from archive_magic_fetch.runtime.report_progress import emit
 from archive_magic_fetch.runtime.calculate_retry_delay import iter_error_chain, retry_after_from_error
 from archive_magic_fetch.runtime.track_http_requests import RequestStats
 
+from .cache import wayback_path, wayback_document, validate_wayback, query_for
+from archive_magic_fetch.pipeline.publication.storage import completed_discovery
+
 DEFAULT_CDX_TIMEOUT_SECONDS = 300.0
 # wayback 0.5.1's CDX endpoint limit, enforced atomically with the run's limit.
 CDX_REQUEST_INTERVAL_SECONDS = 2.5
@@ -103,18 +106,15 @@ def load_or_fetch_year_cdx(
     if cdx_window_days < 1 or cdx_page_limit < 1:
         raise ValueError("CDX window days and page limit must be positive")
     search_url, match_type = normalize_cdx_search(url_pattern)
-    path = index_directory / f"{year:04d}.cdx.json"
+    path = wayback_path(index_directory, url_pattern, year)
     historical = year < current_year
     if historical and (path.exists() or path.is_symlink()):
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
-            if not isinstance(payload, list):
-                raise ValueError("expected an array of captures")
-            captures = tuple(_capture_from_dict(item) for item in payload)
-            if any(int(item.identity.timestamp[:4]) != year for item in captures):
-                raise ValueError(f"captures must belong to {year}")
+            captures = validate_wayback(payload, query=query_for(url_pattern), year=year)
         except (OSError, UnicodeError, ValueError) as error:
             raise ValueError(f"invalid CDX cache {path}: {error}") from error
+        completed_discovery(path)
         report(f"using cached CDX index for {year}: {path}")
         return _listing(captures, url_pattern, search_url, match_type, cdx_page_limit)
 
@@ -155,11 +155,12 @@ def load_or_fetch_year_cdx(
         tmp = exclusive_temp_path(path.parent, suffix=".cdx.json.tmp")
         try:
             with tmp.open("w", encoding="utf-8") as stream:
-                json.dump([_capture_to_dict(item) for item in captures], stream)
+                json.dump(wayback_document(url_pattern, year, [_capture_to_dict(item) for item in captures]), stream)
                 stream.write("\n")
             publish_file_atomically(tmp, path)
         finally:
             tmp.unlink(missing_ok=True)
+        completed_discovery(path)
         report(f"saved CDX index for {year}: {path}")
     return _listing(captures, url_pattern, search_url, match_type, cdx_page_limit)
 

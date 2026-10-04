@@ -1,54 +1,84 @@
-# Bucket catalog publication and migration
+# Workspace migration and bucket publication
 
-## New archives and presentation metadata
+## New local workspace
 
-Keep `fetch.toml` at the local website root. Set `output.prefix` to the archive
-root, not its `data/` child. Normal Fetch publication places WARC/CDXJ files in
-that child. Keep logs local.
+The [README diagrams](../README.md#user-workspace) define the user workspace and
+bucket structure, including comments for every folder. Durable authored inputs
+live under `~/archive-magic/collections/`; local output lives under `archives/`.
 
-Prepare `archive.json` with required `id`, `name`, and `homepage`. The ID must
-match archive filenames. Optional fields are `description`, `logo`, `preview`,
-and `featured_capture`. Image objects have `src` and `alt`; their source keys are
-relative to the archive root. Use PNG/JPEG/WebP/GIF, at most 8 MiB per image.
-The manifest must be at most 1 MiB. Unknown fields are rejected.
+`collection.toml` replaces both `fetch.toml` and authored `archive.json`. Move
+archive identity/presentation fields to `[collection]`, source/query/acquisition
+fields to `[fetch]`, and destinations to `[storage.local]` and optional
+`[storage.remote]`. `storage.local.directory` denotes the working root, not data/.
+Relative paths resolve from collection.toml. Omit name/homepage for acquisition-only
+collections; metadata publication requires both. Existing featured captures and
+asset paths retain their values. Do not include credentials.
 
-Capture previews at a viewport width that suits the archived site's layout,
-with modest side margins (for example, 800 pixels for a 750-pixel fixed-width
-site). Keep the full page height; the source image need not have a fixed aspect
-ratio. Navigator displays previews in a responsive 16:10 frame using
-`object-fit: cover` and `object-position: center top`, cropping excess length
-from the bottom while keeping the header visible.
+The old Fetch format is rejected; there is no legacy default-path fallback.
+The shared fetch-config.toml moves from ~/.config/archive-magic-fetch/ to
+~/archive-magic/. Explicit --config and ARCHIVE_MAGIC_FETCH_CONFIG still override it.
 
-Prefer the first visually complete capture on the chosen date. Exclude replay
-toolbars from the screenshot. Choose the width separately for each website;
-avoid a universal wide viewport that adds large empty margins to older sites.
-Retain the full-height source image so presentation cropping can change in CSS
-without recapturing or permanently cropping the asset.
+## Offline copy, verify, and remove
 
-A featured capture has an HTTP(S) `url` and 14-digit UTC `timestamp`:
-
-```json
-"featured_capture": {
-  "url": "https://example.org/",
-  "timestamp": "20120615000000"
-}
-```
-
-Navigator chooses the nearest indexed capture of that URL, preferring an earlier
-capture on a tie. Without this field, it selects the latest indexed homepage
-capture. Capture date coverage comes from indexes rather than hand-entered metadata.
-
-With a separately configured rclone remote named `r2`, publish explicitly:
+Stop Fetch writers and the local Navigator before migrating the workspace. From
+the code checkout, the migration utility handles the former per-collection layout:
 
 ```sh
-rclone copy /path/to/example.org/assets r2:example-org/assets
-rclone copyto /path/to/example.org/archive.json r2:example-org/archive.json
+uv run python -m archive_magic_fetch.migrate_workspace \
+  ./archives "$HOME/archive-magic" \
+  --policy "$HOME/.config/archive-magic-fetch/fetch-config.toml"
 ```
 
-For a shared bucket, append the archive-root prefix to both destination paths.
-Upload new assets before publishing the manifest that refers to them. Fetch's
-data sync does not manage these files. Navigator is read-only; it does not edit
-or upload metadata. Local authoring copies are not read by Navigator.
+This command performs no network operations. It refuses an existing destination,
+symlinks, unfamiliar files, or a source that changes during migration. It obtains
+the old archive locks, copies files to staging, compares hashes, validates converted
+configurations/caches, then installs the destination and removes the old archive
+tree and old shared policy file. Configuration values and asset/data/log bytes are
+preserved. Bytecode and .DS_Store files are discarded. An inventory of original
+and copied hashes is saved as migration-inventory.json.
+
+The supported input layout has each fetch.toml beside data/, index/, logs/, and
+optional assets/ and archive.json. Other layouts require an explicit manual
+conversion; the utility refuses to guess. Legacy Wayback arrays are wrapped in
+versioned envelopes and bound to the query in their adjacent fetch.toml. This is
+an assumption inherited from the old cache contract, recorded in migration notes.
+Common Crawl caches move into the v1 namespace without changing their envelopes.
+
+The catalog, Navigator cache, local notes, and machine-specific launcher move too.
+The launcher keeps its existing credential source. Obsolete navigator.toml contents
+are recorded in LOCAL-NOTES.md, not adopted as current configuration. Empty local
+data directories stay empty, with explicit restoration recorded as outstanding.
+No bucket metadata is republished and no discovery caches are uploaded by migration.
+
+## Publication, recovery, and freeing space
+
+```sh
+# Retry archive and discovery publication; no Wayback/Common Crawl acquisition.
+uv run archive-magic-fetch ~/archive-magic/collections/example.org --sync-only
+# Restore managed WARC/CDXJ and discovery files without overwriting local conflicts.
+uv run archive-magic-fetch ~/archive-magic/collections/example.org --restore
+# Verify actual bucket bytes, then remove local data, discovery, state, and logs.
+uv run archive-magic-fetch ~/archive-magic/collections/example.org --evict-local
+# Validate and publish assets, then generate archive.json from collection.toml.
+uv run archive-magic-fetch ~/archive-magic/collections/example.org --publish-metadata
+```
+
+A missing local baseline stops Fetch with restore instructions. Pending publications
+must be finished before eviction. Local absence never requests remote deletion.
+Ordinary publication preserves other years, unrelated objects, and obsolete remote
+shards. Only explicit --reset-data removes managed remote archive data.
+
+Metadata publication requires collection.id, name, and homepage. Optional fields
+are description, logo, preview, and featured_capture. Images use contained assets/
+paths, text alt descriptions, PNG/JPEG/WebP/GIF bytes, and at most 8 MiB each. The
+generated manifest is limited to 1 MiB. Uploads place assets before archive.json;
+data/discovery publication never implicitly publishes presentation edits.
+
+A featured_capture table contains an HTTP(S) url and a quoted 14-digit UTC timestamp.
+Navigator selects the nearest indexed capture, preferring the earlier one on ties.
+Without a featured capture it selects the latest homepage capture. Preserve full
+height preview images without replay toolbars; choose width for the archived site.
+Navigator uses a top-aligned 16:10 crop, so authored assets can retain full height.
 
 ## Moving an existing flat bucket archive
 
@@ -73,7 +103,7 @@ a dedicated `example-org` bucket; for a prefix, use its complete archive-root pa
    `--download` verifies content even when the provider lacks comparable hashes;
    this can transfer substantial data. Also compare the reviewed file list and
    byte sizes. Keep your existing local archive intact.
-4. Prepare the new catalog and bucket manifest. Keep Fetch's prefix at the archive
+4. Prepare the catalog and collection.toml; publish metadata explicitly. Keep `storage.remote.prefix` at the archive
    root; the new implementation appends `data/` automatically. Replace old Navigator
    TOML configurations with the JSON catalog.
 5. Explicitly remove only the reviewed old root objects after successful verification:
@@ -87,8 +117,8 @@ a dedicated `example-org` bucket; for a prefix, use its complete archive-root pa
 
 Both applications reject remaining root-level `.warc.gz` or `.cdxj` objects as a
 legacy layout, including when a cache exists. No migration happens automatically.
-Never delete the local Fetch data merely because remote copies exist: ordinary
-Fetch sync still treats the local archive as authoritative.
+Use `--evict-local` to verify bucket content before freeing local space.
+Use explicit `--restore` before resuming Fetch after eviction.
 
 ## Server configuration migration
 

@@ -14,6 +14,8 @@ from archive_magic_fetch.models import CaptureListing, CaptureRef, CommonCrawlLo
 from archive_magic_fetch.runtime.manage_archive_files import exclusive_temp_path, publish_file_atomically
 
 
+from archive_magic_fetch.pipeline.publication.storage import completed_discovery
+
 PAGE_SIZE = 5
 
 
@@ -32,10 +34,11 @@ def load_or_fetch_common_crawl_year(
         if catalog_timestamp(collection["from"]) > end or catalog_timestamp(collection["to"]) < start:
             continue
         coverage.append(collection["id"])
-        path = index_directory / "common-crawl" / query_hash / collection["id"] / f"{request.year}.json"
+        path = index_directory / "common-crawl" / "v1" / query_hash / collection["id"] / f"{request.year}.json"
         metadata = {"version": 1, "query": query, "from": start, "to": end, "collection": collection}
         cached = _load_cache(path, metadata)
         if cached is not None:
+            completed_discovery(path)
             captures.extend(cached)
             continue
         params = {**query, "from": start, "to": end, "output": "json", "pageSize": PAGE_SIZE}
@@ -63,6 +66,7 @@ def load_or_fetch_common_crawl_year(
                 if start <= capture.identity.timestamp <= end:
                     rows.append(capture)
         _save_cache(path, {**metadata, "captures": [asdict(c) for c in rows]})
+        completed_discovery(path)
         captures.extend(rows)
     return CaptureListing(tuple(captures), {"source": "common-crawl", **query, "from": start, "to": end, "collections": coverage})
 

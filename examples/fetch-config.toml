@@ -1,0 +1,10 @@
+# Shared acquisition policy, independent of per-collection definitions.
+[wayback]
+workers = 4
+starts_per_second = 8
+retries = 4
+
+[common-crawl]
+workers = 4
+starts_per_second = 8
+retries = 4

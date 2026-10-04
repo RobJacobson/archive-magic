@@ -1,75 +1,31 @@
-# Private S3-compatible bucket smoke test
+# Optional private S3/R2 lifecycle smoke check
 
-This procedure exercises a remote archive against a private bucket.
-Use a disposable prefix: the reset step intentionally deletes its managed archive data.
+This is an opt-in live procedure for a disposable bucket/prefix. The automated
+suite uses simulated buckets and never needs real cloud writes. The local user
+workspace migration also performs no bucket operations.
 
-## Configure
+1. Copy examples/collections/example.org/collection.toml into a fresh collection
+   directory outside your code checkout. Configure a disposable bucket/prefix,
+   credentials through the AWS chain, and a small acquisition date range.
+2. Keep storage.local.directory separate from authored inputs. Use the annotated
+   workspace structure in the root README. Add name/homepage and optional assets
+   if testing presentation publication.
+3. Run Fetch. Check that data/ contains WARCs and replay indexes and discovery/
+   contains source/query/version-qualified completed caches. No logs or settings
+   should appear in the bucket.
+4. Run --publish-metadata. Confirm assets precede the generated archive.json.
+5. Start Navigator with a catalog listing this bucket. Confirm authenticated WARC
+   range replay. Its cache/navigator/ contains indexes/assets, never full WARCs.
+6. Interrupt an upload and retry --sync-only. Completed local data/caches survive;
+   the retry must not contact capture sources or delete other bucket content.
+7. Run --evict-local. Content verification must succeed before local output is
+   removed. Collection definitions/assets remain, and Navigator continues serving.
+8. A normal Fetch run now must require --restore. Run explicit --restore, verify
+   local replay indexes and cache provenance, then resume Fetch without losing
+   older captures. Clear Navigator's cache and confirm a fresh bucket-only start.
+9. On disposable data only, test --reset-data: no date overrides, explicit warning,
+   managed data/ deletion, and preservation of discovery/, metadata, assets, and
+   unrelated objects. Remote reset uses rclone and requires its installation.
 
-1. Copy `examples/example.org/fetch.toml` and
-   `examples/catalog.json` outside either implementation directory.
-2. In `fetch.toml`, set `output.type = "remote"` and add:
-
-   ```toml
-   bucket = "your-private-bucket"
-   prefix = "archive-magic-smoke/example.org"
-   endpoint_url = "https://your-s3-compatible-endpoint"
-   region = "auto"
-   ```
-
-3. In `catalog.json`, set the shared endpoint/region and an entry with the same
-   bucket and archive-root prefix. Publish `archive.json` and optional assets
-   separately as described in the migration/publication guide.
-4. Limit `[fetch]` to a small historical interval for the smoke test. Keep
-   `data_directory = "data"` as the permanent local archive.
-5. Install rclone and configure credentials through AWS environment variables
-   or an AWS profile. Fetch derives rclone's bucket settings from `fetch.toml`;
-   it does not load `.env`. Missing credentials fail immediately instead of
-   probing EC2 instance metadata.
-
-## Publish and play
-
-From the Fetch project:
-
-```console
-uv run archive-magic-fetch /absolute/path/to/example.org/fetch.toml
-```
-
-Confirm the prefix's `data/` contains WARC and CDXJ objects and `data/` retains identical
-finalized files. Re-run Fetch without source changes and confirm it does not
-download archive files from the bucket.
-
-From the Navigator project:
-
-```console
-uv run archive-magic-navigator --catalog /absolute/path/to/catalog.json --open
-```
-
-Confirm that `navigator-cache/` contains indexes and presentation assets, no WARC copies, and
-that replay produces authenticated WARC range reads from the bucket.
-
-## Update and continuity
-
-Extend the selected source interval or wait for a new snapshot, then run Fetch
-again. The expected order is local annual promotion, bucket WARC copy, bucket
-CDXJ sync, then bucket WARC pruning. Earlier WARC objects must be untouched;
-an existing tail must be an exact prefix extension.
-
-To exercise recovery, interrupt or fail one upload and confirm the finalized
-WARC/CDXJ remain in `data/`. Then run
-`archive-magic-fetch /absolute/path/to/example.org --sync-only` and confirm
-it completes publication without contacting Wayback.
-
-Keep Navigator running during the update. It should use the previous validated
-index until the new CDXJ is committed, then adopt the new index on a later poll.
-
-## Destructive reset
-
-The explicit flag is authorization and does not prompt:
-
-```console
-uv run archive-magic-fetch /absolute/path/to/example.org --reset-data
-```
-
-Remote reset rejects `--start`/`--end`, prints a downtime warning, deletes only the
-selected archive's managed files under remote `data/`, clears the local data directory, and rebuilds the
-full configured range. Confirm archive.json, assets, unrelated files, and neighboring prefixes remain untouched.
+Do not run these destructive or chargeable live steps against a production
+collection merely to validate a local workspace migration.

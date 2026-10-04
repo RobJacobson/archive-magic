@@ -111,18 +111,23 @@ def run_fetch(
             if trace_path is not None:
                 emit(f"HTTP trace: {trace_path}")
             emit(f"HTTP 429 diagnostics (written on first 429): {diagnostics_path}")
-            with archive_lock(layout):
+            with archive_lock(layout, settings.collection_directory):
+                from archive_magic_fetch.pipeline.publication.storage import BucketStorage, active_storage
+                store = BucketStorage(settings.output, settings.archive_id) if settings.output.type == 'remote' else None
                 YearStage.recover(layout)
-                return _run_fetch(
-                    settings,
-                    layout=layout,
-                    run_id=run_id,
-                    workers=workers,
-                    current_year=current_year,
-                    source=source,
-                    download=download,
-                    clock=clock,
-                )
+                if store is not None:
+                    store.preflight(reset=settings.reset_data)
+                with active_storage(store):
+                    return _run_fetch(
+                        settings,
+                        layout=layout,
+                        run_id=run_id,
+                        workers=workers,
+                        current_year=current_year,
+                        source=source,
+                        download=download,
+                        clock=clock,
+                    )
         finally:
             try:
                 workers.close()
@@ -145,6 +150,9 @@ def _run_fetch(
 
     if settings.reset_data and settings.output.type == "remote":
         purge_remote(settings.output, layout.archive_id)
+        from archive_magic_fetch.pipeline.publication.storage import ACTIVE
+        if ACTIVE.get() is not None:
+            ACTIVE.get().reset_receipt()
         if layout.root.exists():
             shutil.rmtree(layout.root)
     reject_legacy_layout(layout)
@@ -190,6 +198,12 @@ def _run_fetch(
                 download=download,
                 clock=clock,
             )
+            from archive_magic_fetch.pipeline.publication.storage import ACTIVE
+            if ACTIVE.get() is not None:
+                paths = [item.path for item in result.warcs]
+                if result.index is not None:
+                    paths.append(stage.layout.collection_index(f'{year:04d}'))
+                ACTIVE.get().record_generation(paths)
             stage.commit(
                 result.warcs,
                 index_changed=bool(result.warcs)
@@ -198,10 +212,15 @@ def _run_fetch(
                     and not layout.collection_index(f"{year:04d}").is_file()
                 ),
             )
+            if ACTIVE.get() is not None:
+                ACTIVE.get().finish_generation()
         except Exception as error:  # noqa: BLE001 - isolate years
             if (stage.path / "ready.json").is_file():
                 raise
             stage.abort()
+            from archive_magic_fetch.pipeline.publication.storage import ACTIVE
+            if ACTIVE.get() is not None:
+                ACTIVE.get().recover_generation()
             emit(f"year {year}: failed ({error}); continuing with remaining years")
             failed_years.append(year)
             continue

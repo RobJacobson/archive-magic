@@ -12,7 +12,7 @@ def test_parse_args_defaults_and_modes(tmp_path):
     assert cli.parse_args(['--catalog', 'x.json', '--wayback-fallback', 'off']).wayback_fallback is False
 
 
-@pytest.mark.parametrize('args', [[], ['archive'], ['archive', '--catalog', 'x.json'], ['--catalog', 'x', '--port', '0'], ['--catalog', 'x', '--poll-interval', 'nan'], ['--catalog', 'x', '--poll-interval', '0']])
+@pytest.mark.parametrize('args', [ ['archive'], ['archive', '--catalog', 'x.json'], ['--catalog', 'x', '--port', '0'], ['--catalog', 'x', '--poll-interval', 'nan'], ['--catalog', 'x', '--poll-interval', '0']])
 def test_invalid_arguments(args):
     with pytest.raises(SystemExit) as error:
         cli.parse_args(args)
@@ -45,3 +45,8 @@ def test_help(capsys):
     output = capsys.readouterr().out
     assert '--catalog PATH' in output
     assert 'positional arguments' not in output
+
+
+def test_default_workspace_catalog(tmp_path, monkeypatch):
+    monkeypatch.setenv('HOME', str(tmp_path))
+    assert cli.parse_args([]).catalog == tmp_path / 'archive-magic' / 'catalog.json'

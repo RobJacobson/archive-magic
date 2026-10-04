@@ -1,3 +1,5 @@
+> Historical design plan. Local workspace/configuration/cache locations below were superseded by the [current annotated workspace layout](../README.md#user-workspace) and [migration guide](BUCKET-CATALOG-MIGRATION.md).
+
 # Support multiple archive buckets in Navigator
 
 ## Summary

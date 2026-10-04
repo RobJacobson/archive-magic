@@ -2,8 +2,8 @@
 
 ## Boundary and inputs
 
-Navigator serves bucket-backed catalogs independently of Fetch. `--catalog`
-requires a JSON file; legacy TOML and directory catalogs are rejected with migration
+Navigator serves bucket-backed catalogs independently of Fetch. The default
+catalog is `~/archive-magic/catalog.json`; `--catalog` selects another JSON file; legacy TOML and directory catalogs are rejected with migration
 instructions. Runtime flags control binding, cache, polling, fallback, and debugging.
 One catalog entry serves one website. Local-source CLI playback is retired; local
 index helpers remain internally covered for replay-format regression testing.
@@ -14,11 +14,16 @@ prefix locations. Credentials remain in the standard AWS environment/profile.
 Metadata and images come from the bucket's archive.json and relative object keys.
 The manifest ID must match existing WARC/CDXJ names. See repository examples.
 
-An archive root contains archive.json, assets/, and data/. All replay files are
+An archive root contains archive.json, assets/, data/, and optional discovery/.
+Navigator ignores discovery/ and never needs authored collection.toml files or
+the local archives/ tree. Fetch generates archive.json on explicit metadata publication. All replay files are
 flat under data/. Root-level WARC/CDXJ objects trigger an explicit migration error,
 never implicit copying/deletion. Navigator never writes to remote storage.
 
 ## Loading, cache, and publication
+
+The default cache is `cache/navigator/` beside the selected catalog, overridden
+by `--cache`. See the [annotated workspace diagrams](../../README.md#user-workspace).
 
 `catalog.py` owns per-location states and a sequential background refresh loop.
 Each entry independently downloads/validates its manifest, loads images, and
@@ -73,5 +78,4 @@ convenience server without production authentication, TLS, or content isolation.
 Unit tests cover contracts, paths, identities, cache separation, selection, refresh,
 failures and recovery. Real-pywb tests cover private multi-bucket cold starts,
 metadata/image updates, late route registration, replay ranges, and prior replay
-behavior. Fetch tests separately exercise publication/reset preservation with real
-rclone against temporary local directories. No tests mutate real buckets.
+behavior. Fetch tests separately exercise publication/reset preservation with simulated buckets and narrowly filtered reset checks. No tests mutate real buckets.

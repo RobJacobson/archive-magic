@@ -32,6 +32,7 @@ from helpers import (
     playback,
 )
 from warcio.archiveiterator import ArchiveIterator
+from archive_magic_fetch.pipeline.discovery.cache import wayback_path
 
 
 def test_statusless_capture_three_runs_no_extra_network(tmp_path):
@@ -1158,7 +1159,7 @@ def test_cdx_year_failure_continues_with_later_years(tmp_path, monkeypatch, caps
     assert inventory_collection(layout, "2004").contains(first)
     assert inventory_collection(layout, "2006").contains(later)
     assert not list_collection_warcs(layout, "2005")
-    assert not (tmp_path / "index" / "2005.cdx.json").exists()
+    assert not (wayback_path(tmp_path / "discovery", "http://example.org/", 2005)).exists()
     output = capsys.readouterr().out
     assert "year 2005: failed" in output
     assert "not querying" not in output
@@ -1224,8 +1225,8 @@ def test_cdx_504_skips_year_without_splitting_and_continues(
     ]
     assert result.exit_code == 1
     assert result.failed_years == (2004,)
-    assert not (tmp_path / "index" / "2004.cdx.json").exists()
-    assert (tmp_path / "index" / "2005.cdx.json").is_file()
+    assert not (wayback_path(tmp_path / "discovery", "http://example.org/", 2004)).exists()
+    assert (wayback_path(tmp_path / "discovery", "http://example.org/", 2005)).is_file()
     output = capsys.readouterr().out
     assert "year 2004: failed" in output
     assert "splitting into" not in output
@@ -1311,7 +1312,7 @@ def test_cdx_wall_clock_splits_28_then_7_and_stops_on_failure(
     assert not list_collection_warcs(layout, "2004")
     assert not layout.collection_index("2004").exists()
     assert calls[-1] == hole_7
-    assert not (tmp_path / "index" / "2004.cdx.json").exists()
+    assert not (wayback_path(tmp_path / "discovery", "http://example.org/", 2004)).exists()
     assert not (layout.logs_root / "cdx").exists()
     output = capsys.readouterr().out
     assert "CDX index took too long." in output
@@ -1442,7 +1443,7 @@ def test_cdx_failed_year_restarts_and_successful_fallback_is_cached(
         ),
     )
     assert first.exit_code == 1
-    assert not (tmp_path / "index" / "2004.cdx.json").exists()
+    assert not (wayback_path(tmp_path / "discovery", "http://example.org/", 2004)).exists()
     failed_calls = list(calls)
     calls.clear()
     fail_hole = False
@@ -1459,7 +1460,7 @@ def test_cdx_failed_year_restarts_and_successful_fallback_is_cached(
     assert calls[: len(failed_calls)] == failed_calls
     assert calls[-1][1] == "20041231235959"
     assert second.exit_code == 0
-    cached = json.loads((tmp_path / "index" / "2004.cdx.json").read_text())
+    cached = json.loads((wayback_path(tmp_path / "discovery", "http://example.org/", 2004)).read_text())["captures"]
     assert [item["timestamp"] for item in cached] == [
         january.timestamp,
         march.timestamp,
@@ -1542,7 +1543,7 @@ def test_legacy_cdx_checkpoint_is_ignored_and_preserved(tmp_path, monkeypatch, c
     assert calls == [("20040101000000", "20041231235959")]
     assert result.exit_code == 0
     assert json.loads(checkpoint.read_text())["url_pattern"] == "*.other.org"
-    assert (tmp_path / "index" / "2004.cdx.json").is_file()
+    assert (wayback_path(tmp_path / "discovery", "http://example.org/", 2004)).is_file()
 
 
 @pytest.mark.parametrize(
@@ -1656,7 +1657,7 @@ def test_interrupt_discards_staged_year_without_run_json(tmp_path, monkeypatch):
     logs = list(layout.logs_root.glob("*.log"))
     assert len(logs) == 1
     assert "fetching CDX index for 2004\n" in logs[0].read_text()
-    assert (tmp_path / "index" / "2004.cdx.json").is_file()
+    assert (wayback_path(tmp_path / "discovery", "http://example.org/", 2004)).is_file()
     assert not list(layout.collection_dir("2004").glob("*.partial"))
 
     downloaded.clear()

@@ -200,3 +200,28 @@ def test_all_unavailable_catalog_starts_and_recovers(tmp_path):
             fixture.seed('one', 'first')
             await_page(base, b'Organization first', process, root)
             assert b'Archived version one' in get(base + '/first/20200101000000id_/http://example.test/')[1]
+
+
+@pytest.mark.integration
+def test_bucket_replay_after_local_eviction_and_cache_clear(tmp_path):
+    import shutil
+    fixture = BucketFixture()
+    fixture.seed('one', 'first')
+    fixture.objects['one', 'discovery/wayback/v1/opaque/2020.cdx.json'] = b'not a Navigator input'
+    root = tmp_path / 'workspace'
+    local = root / 'archives' / 'first' / 'data'
+    local.mkdir(parents=True)
+    (local / 'local-only.warc.gz').write_bytes(b'local copy')
+    entries = [{'bucket': 'one'}]
+    with bucket_server(fixture) as s3:
+        endpoint = f'http://127.0.0.1:{s3.server_port}'
+        with navigator_server(root, endpoint, entries) as (base, process):
+            shutil.rmtree(root / 'archives')
+            assert b'Archived version one' in get(base + '/first/20200101000000id_/http://example.test/')[1]
+        assert (root / 'cache' / 'navigator').is_dir()
+        shutil.rmtree(root / 'cache')
+        with navigator_server(root, endpoint, entries) as (base, process):
+            assert b'Archived version one' in get(base + '/first/20200101000000id_/http://example.test/')[1]
+        assert not (root / 'archives').exists()
+        assert not any('/discovery/' in key or key.startswith('discovery/') for _, key, _ in fixture.requests)
+        assert not list(root.rglob('*.warc.gz'))

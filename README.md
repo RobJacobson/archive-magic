@@ -1,168 +1,199 @@
 # Archive Magic
 
-Archive Magic Fetch downloads Wayback or Common Crawl captures into WARC files and CDXJ
-indexes. Archive Magic Navigator independently serves published archives from
-private S3-compatible buckets, including Cloudflare R2.
+Fetch downloads Wayback or Common Crawl captures into WARC files and replay CDXJ
+indexes. Navigator independently serves published collections from private
+S3-compatible buckets, including Cloudflare R2.
 
-Install the workspace with `uv sync`. Fetch also requires rclone.
+Install the code workspace with `uv sync`. Fetch uses the AWS credential chain
+for S3 operations; its explicit destructive remote reset additionally requires
+rclone. Neither component automatically loads `.env` files.
 
-## Archive layout
+## User workspace
 
-On the Fetch host:
+Keep working files in `~/archive-magic`, separate from this code checkout:
 
 ```text
-example.org/
-  fetch.toml
-  archive.json
-  assets/
-    logo.png
-    preview.jpg
-  index/
-    2004.cdx.json
-  data/
-    example.org-2004-001.warc.gz
-    example.org-2004-index.cdxj
-  logs/
+~/archive-magic/                       # User workspace; survives replacing the code
+├── fetch-config.toml                 # Shared per-source pacing and retry settings
+├── catalog.json                      # Navigator's ordered bucket catalog
+├── LOCAL-NOTES.md                    # Optional local operational notes
+├── run-navigator.py                  # Optional machine-specific credential launcher
+├── collections/                      # Durable, authored collection definitions
+│   └── example.org/                  # One independently managed collection
+│       ├── collection.toml           # Acquisition, storage, and presentation settings
+│       ├── assets/                   # Original logos and preview images
+│       └── .archive-magic.lock       # Runtime lock; survives archive eviction
+├── archives/                         # Local output; restorable after S3 publication
+│   └── example.org/                  # Safe to evict after remote verification
+│       ├── data/                     # WARC payloads and replay CDXJ indexes
+│       ├── discovery/                # Completed source discovery caches
+│       ├── logs/                     # Disposable diagnostics; never uploaded
+│       └── .state/                   # Publication/recovery receipts; not logs
+└── cache/                            # Rebuildable application caches
+    └── navigator/                    # Bucket metadata, images, and replay indexes
 ```
 
-The bucket (or configured archive-root prefix) contains only `archive.json`,
-`assets/`, and `data/`. CDX caches, configuration files, and logs remain local. Logs retain
-their existing location beside the local data directory.
+The bucket or collection prefix contains:
 
-The local `archive.json` and images are authoring copies. Explicitly publish them
-when ready; Navigator reads their bucket copies. Ordinary Fetch publication
-neither uploads nor deletes presentation metadata and images.
-
-## Fetch
-
-Copy [fetch.toml](examples/example.org/fetch.toml) to the website root and set
-its archive ID, URL pattern, dates, and storage destination. `output.prefix`
-identifies the archive root; Fetch appends `data/` automatically. Relative local
-paths resolve from `fetch.toml`, with `data_directory = "data"` by default.
-Use `output.type = "local"` for acquisition without remote publication.
-Set `[archive].source = "common-crawl"` for CC, or omit it to use Wayback.
-
-```console
-uv run archive-magic-fetch /path/to/example.org
-uv run archive-magic-fetch /path/to/example.org --sync-only
+```text
+<bucket>/<optional-prefix>/           # Published collection root
+├── archive.json                      # Generated presentation manifest for Navigator
+├── assets/                           # Explicitly published presentation images
+├── data/                             # WARCs and replay CDXJ indexes
+└── discovery/                        # Validated discovery caches for future Fetch runs
 ```
 
-Fetch stores separate settings for each source in
-`~/.config/archive-magic-fetch/fetch-config.toml` (under `$XDG_CONFIG_HOME` when set).
-If the file is missing, Fetch creates it, including parent directories, with:
+Local logs, receipts, locks, credentials, and `collection.toml` are never uploaded.
+Back up `collections/`, shared configuration, and operational notes separately.
+S3 publication does not back up your authored acquisition settings.
+
+## Collection configuration
+
+Copy [collection.toml](examples/collections/example.org/collection.toml) to
+`~/archive-magic/collections/<name>/collection.toml`. This is the only authored
+configuration for that collection. The collection ID is shared by acquisition,
+filenames, and presentation metadata.
 
 ```toml
-[wayback]
-workers = 4
-starts_per_second = 8
-retries = 4
+[collection]
+id = "example.org"
+name = "Example Organization"
+homepage = "https://example.org/"
 
-[common-crawl]
-workers = 4
-starts_per_second = 8
-retries = 4
+[collection.logo]
+src = "assets/logo.png"
+alt = "Example Organization"
+
+[fetch]
+source = "wayback"
+url_pattern = "*.example.org"
+start = "2000-01-01"
+
+[storage.local]
+directory = "../../archives/example.org"
+
+[storage.remote]
+bucket = "example-org"
+prefix = ""
+endpoint_url = "https://ACCOUNT_ID.r2.cloudflarestorage.com"
+region = "auto"
 ```
 
-The archive's `source` selects its section. Both sections must contain all three
-settings; neither inherits from the other. `--config PATH` or
-`ARCHIVE_MAGIC_FETCH_CONFIG` selects another file, also created if missing;
-`--config` takes precedence. Existing files are left unchanged. Override settings
-for one run with `--workers`, `--starts-per-second`, and `--retries`.
-Date flags may narrow the configured range. Each year is staged and validated locally before publication:
-WARCs are copied first, CDXJ indexes synced second, and obsolete WARCs removed last.
-After an upload failure, `--sync-only` retries without contacting either source.
+Omit `[storage.remote]` for local-only acquisition. For AWS S3, omit
+`endpoint_url` and use the bucket's region. The local directory resolves relative
+to `collection.toml`; it must not overlap collection definitions or assets.
+Fetch derives `data/`, `discovery/`, `logs/`, and `.state/` underneath it.
 
-Pacing applies to every playback and Wayback CDX HTTP send, including retries and
-redirects, across all workers in one process. CDX also retains a minimum spacing
-of 2.5 seconds; the stricter limit applies. Each run logs request totals and peak
-counts over rolling one-second and one-minute windows; 429s also log current counts.
-Add `--trace-requests` to save one CSV row per request in `logs/<run>.requests.csv`,
-with UTC start time and duration rounded to milliseconds, six-character capture
-digests, attempt IDs, response status, phase (`cdx` or `playback`), and rolling counts. URLs and other
-variable-width fields appear on the right.
-See [request diagnostics](archive-magic-fetch/docs/ARCHITECTURE-FETCH.md#playback-request-diagnostics)
-for details. Separate Fetch processes have separate limits. Common Crawl discovery
-keeps its separate pacing. Every run saves selected 429 response headers and a
-bounded body excerpt to `logs/<run>.429.jsonl` on the first 429, even without
-`--trace-requests`.
+`name` and `homepage` may be omitted for acquisition-only collections; metadata
+publication requires them. Optional presentation fields are `description`,
+`logo`, `preview`, and `featured_capture` (HTTP(S) `url`, quoted 14-digit UTC
+`timestamp`). Images use contained `assets/` paths and text `alt` descriptions.
 
-With the default Wayback source, Fetch caches complete historical CDX years as `index/YYYY.cdx.json` beside
-`fetch.toml`, including when the data directory is elsewhere. On a cache miss,
-it queries the full calendar year and saves the listing before downloading WARC
-contents. Date options restrict playback downloads, not the CDX query. The
-current UTC year is always queried afresh for the full year and is never cached;
-future years are skipped. A failed annual acquisition saves no cache and skips
-that year's downloads, continuing with subsequent years with a nonzero final status.
+The old `fetch.toml` format is rejected. See the
+[migration and publication guide](docs/BUCKET-CATALOG-MIGRATION.md).
 
-Historical caches survive WARC failures and `--reset-data`. An empty array is a
-successfully queried empty year. Corrupt caches produce errors rather than being
-silently replaced. The URL pattern must remain fixed while reusing a cache;
-explicitly clear the CDX cache if you change the query. There is no automatic refresh.
+## Fetch and storage lifecycle
 
-Common Crawl uses complete per-crawl calendar-year caches under
-`index/common-crawl/`, isolated by query. Each run refreshes the crawl catalog;
-completed entries, including current-year entries, are reused until collection
-metadata changes or their cache is manually cleared. Narrow dates filter after
-full-year discovery. CC downloads individual compressed WARC ranges with strict
-gzip, length, and digest checks. Legacy ARC, unresolved source revisits, and
-malformed historical records requiring repair are unsupported. See
-[Common Crawl acquisition](archive-magic-fetch/docs/ARCHITECTURE-FETCH.md#common-crawl-acquisition)
-for details and an opt-in local smoke procedure. Changing source/query does not
-remove existing output; use a separate archive directory for isolated collections.
+Run these commands from the code checkout, or use the installed entry points:
 
-Local `data/` remains authoritative for Fetch's WARC/CDXJ mirror. Do not delete
-local archive files to free space and then sync: missing managed local files can
-be deleted remotely. Fetch does not restore or evict local history automatically.
+```sh
+# Acquire captures; automatically publish completed data and discovery to S3.
+uv run archive-magic-fetch ~/archive-magic/collections/example.org
 
-Remote `--reset-data` rejects date overrides and rebuilds the entire configured
-range. It deletes only this archive's managed WARC/CDXJ objects under remote
-`data/`, preserving metadata, images, and unrelated objects. It clears the local
-working data directory. Replay is unavailable until new indexes are published.
-Logs and CDX caches remain local and are preserved.
+# Retry data/discovery publication without contacting upstream capture sources.
+# Works for discovery-only output after WARC acquisition failed.
+uv run archive-magic-fetch ~/archive-magic/collections/example.org --sync-only
+
+# Explicitly recover data and discovery caches from the bucket.
+uv run archive-magic-fetch ~/archive-magic/collections/example.org --restore
+
+# Verify remote copies by content, then remove this collection's local output.
+uv run archive-magic-fetch ~/archive-magic/collections/example.org --evict-local
+
+# Publish authored assets, then generate and publish archive.json.
+uv run archive-magic-fetch ~/archive-magic/collections/example.org --publish-metadata
+```
+
+Operation flags are mutually exclusive. Restore, eviction, and metadata
+publication require remote storage and cannot use acquisition date/reset flags.
+Restoring does not overwrite differing local files: preserve or resolve those
+files first. Interrupted restore and publication operations can be retried.
+
+**Local deletion never requests remote deletion.** Fetch requires explicit
+`--restore` when a bucket-backed collection is missing local published content.
+Publication checks the remote baseline and records pending writes in `.state/`;
+conflicting remote or unrecorded local changes stop publication. Keep one active
+writer per bucket/prefix. Collection locks protect processes using the same
+local definition; there is no distributed lock between machines.
+
+WARCs upload before replay indexes. Ordinary publication does not prune obsolete
+remote shards or delete missing years. Explicit `--reset-data` remains destructive:
+remote mode rejects date overrides, clears managed remote WARC/CDXJ files under
+`data/`, and rebuilds the full configured range. It preserves discovery caches,
+metadata, assets, and unrelated objects; replay can be unavailable during reset.
+
+`--evict-local` refuses unpublished, changed, unknown, or unfinished output. It
+checks actual remote content, including multipart objects whose ETags are not
+content hashes. Verification can download as much data as the local archive.
+Navigator keeps serving from S3 after eviction. Manual deletion is also possible,
+but stop Fetch first and verify that needed data and discovery are published.
+Local-only collections have no bucket copy and cannot use restore or eviction.
+
+## Shared Fetch policy and discovery
+
+Shared settings live at `~/archive-magic/fetch-config.toml`; see the
+[example](examples/fetch-config.toml). A missing selected file is created with
+four workers, eight request starts per second, and four retries for each source.
+`--config PATH` overrides `ARCHIVE_MAGIC_FETCH_CONFIG`, which overrides the default.
+`XDG_CONFIG_HOME` no longer selects this file. Existing settings are not overwritten.
+`--workers`, `--starts-per-second`, and `--retries` override policy for one run.
+
+Historical Wayback queries cover complete calendar years and persist under
+`discovery/wayback/v1/<query-hash>/YYYY.cdx.json`, with query provenance and
+validated capture records. The current UTC year is queried afresh and never
+persisted; future years are skipped. Date restrictions filter playback, not discovery.
+
+Common Crawl caches complete per-crawl calendar-year queries under
+`discovery/common-crawl/v1/<query-hash>/<crawl-id>/YYYY.json`. Each run refreshes
+the crawl catalog; unchanged complete caches are reused, including current-year
+crawl results. Query changes select a different namespace. Source revisits,
+legacy ARC, and malformed records requiring historical repair remain unsupported.
+
+Completed caches upload before subsequent WARC work, even if that work fails.
+Only complete caches are published. Invalid caches fail rather than being silently
+replaced. Restore explicitly recovers caches; ordinary Fetch does not silently
+restore absent remote files. Source/query changes do not erase existing WARCs;
+use a separate collection definition/output directory for isolated acquisitions.
+
+Logs are disposable and local. `--trace-requests` adds request CSV diagnostics;
+429 responses also produce bounded diagnostic excerpts. Pacing is per process,
+with a separate minimum 2.5-second Wayback CDX spacing. See
+[Fetch architecture](archive-magic-fetch/docs/ARCHITECTURE-FETCH.md) for details.
 
 ## Navigator
 
-Copy [catalog.json](examples/catalog.json) to the Navigator server. List the
-bucket and optional prefix of each website in display order. No Fetch files are
-needed on that server, and no `navigator.toml` is used. Use a one-entry catalog
-for a single website.
+Copy [catalog.json](examples/catalog.json) to `~/archive-magic/catalog.json` and
+configure the endpoint, region, and ordered bucket/prefix entries. Use credentials
+with read/list access outside JSON. Navigator requires no Fetch installation,
+collection definitions, discovery caches, or local WARC files.
 
-```console
-uv run archive-magic-navigator --catalog /path/to/catalog.json --open
+```sh
+uv run archive-magic-navigator --open
+# Override deployment configuration and cache when needed:
+uv run archive-magic-navigator --catalog /path/to/catalog.json --cache /path/to/cache
 ```
 
-Configure the shared endpoint and region in the catalog and use standard AWS
-credentials outside JSON. Navigator needs read/list access to the selected
-buckets. For AWS S3, omit `endpoint_url` and set the appropriate region. Both
-programs use the standard credential environment/profile and do not load `.env`.
+The default catalog is `~/archive-magic/catalog.json`; the default cache is
+`cache/navigator/` beside the selected catalog. Navigator downloads presentation
+metadata, images, and replay indexes, then streams WARC ranges from the bucket.
+It ignores discovery caches and works with the entire local `archives/` tree absent.
 
-Each bucket's [archive.json](examples/example.org/archive.json) supplies its ID,
-name, homepage, optional description, logo, preview, and optional featured capture.
-The ID matches WARC/CDXJ filenames. Images use bucket-relative `src` and `alt`;
-external URLs are not accepted. Neither JSON format has a schema-version field.
+Metadata is generated by Fetch's explicit `--publish-metadata` command; editing
+`collection.toml` does not change the served site until publication. Assets publish
+before the manifest. Navigator refreshes content periodically; catalog or identity
+changes require a restart. `--poll-interval` defaults to 300 seconds.
 
-Navigator downloads indexes and presentation assets, then streams WARC byte
-ranges directly from storage. Its cache defaults to `navigator-cache/` beside
-the catalog. Runtime flags include `--cache`, `--poll-interval` (default 300
-seconds), `--bind`, `--port`, `--wayback-fallback {on,off}` (default on), `--open`,
-and `--debug`.
-
-The homepage displays metadata and actual capture coverage. A primary link opens
-the nearest featured capture or latest homepage capture; if absent, it opens
-archive search. Missing images use placeholders. Failed buckets do not prevent
-healthy archives from serving. Metadata, images, and indexes refresh periodically;
-server catalog edits and archive identity changes require a restart.
-
-Navigator defaults to localhost. It remains an unauthenticated development replay
-server, without production TLS or hostile-content isolation.
-
-## Publishing metadata and migrating
-
-See [the migration and publication guide](docs/BUCKET-CATALOG-MIGRATION.md) for
-manual metadata uploads and moving existing flat bucket archives into `data/`.
-Fetch and Navigator detect old root-level WARC/CDXJ files and require migration;
-they do not move or delete them automatically.
-
-See the [Fetch architecture](archive-magic-fetch/docs/ARCHITECTURE-FETCH.md) and
-[Navigator architecture](archive-magic-navigator/docs/ARCHITECTURE-NAVIGATOR.md)
-for implementation details.
+Other flags include `--bind`, `--port`, `--wayback-fallback {on,off}` (default on),
+`--open`, and `--debug`. It defaults to localhost and remains an unauthenticated
+development replay server without production TLS or hostile-content isolation.
+See [Navigator architecture](archive-magic-navigator/docs/ARCHITECTURE-NAVIGATOR.md).
