@@ -15,7 +15,7 @@ from archive_magic_fetch.models import (
     FailureCategory,
     UnresolvedFailure,
 )
-from archive_magic_fetch.runtime.http import RequestStats
+from archive_magic_fetch.runtime.track_http_requests import RequestStats
 
 Client = TypeVar("Client")
 

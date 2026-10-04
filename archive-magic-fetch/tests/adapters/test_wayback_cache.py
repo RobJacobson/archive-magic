@@ -3,7 +3,7 @@
 import json
 from pathlib import Path
 
-import archive_magic_fetch.pipeline.discovery.wayback as cdx
+import archive_magic_fetch.pipeline.discovery.load_or_fetch_year_cdx as cdx
 import pytest
 from archive_magic_fetch.archive.identity import identity_to_dict
 from archive_magic_fetch.models import CaptureRef

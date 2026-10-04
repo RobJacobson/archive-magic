@@ -11,7 +11,7 @@ from archive_magic_fetch.archive.identity import (
     normalize_original_url,
     revisit_group_key,
 )
-from archive_magic_fetch.pipeline.decoding.wayback import _same_original_url
+from archive_magic_fetch.pipeline.decoding.decode_memento import _same_original_url
 
 
 def test_normalize_original_url_strips_default_ports():

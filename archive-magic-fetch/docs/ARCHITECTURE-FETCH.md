@@ -182,12 +182,13 @@ per archive layout; no separate cache lock is added. Concurrent processes sharin
 a cache through different archive layouts are unsupported. Only WARC/CDXJ data
 is published to the bucket.
 
-After acquisition, requested playback captures are sorted and deduplicated by
-identity. Each CDX URL group is assigned to one worker, which walks its captures
+After acquisition, playback captures are filtered by the requested dates,
+deduplicated by identity, and sorted. Each CDX URL group is assigned to one worker,
+which walks its captures
 chronologically. There is no pre-pass selecting unique payloads or choosing
 which groups need downloads. The worker owns a map of successful digests to
 stored response references, seeded from earlier successful responses for that
-URL in the archive. It checks that map at each capture:
+URL in the same annual collection. It checks that map at each capture:
 
 1. An already stored capture needs no work.
 2. A digest already obtained at or before this timestamp produces a lightweight
@@ -200,13 +201,24 @@ Digest mismatches may still be retained for their own exact capture, but never
 mark the expected digest as obtained. Missing digests cannot deduplicate. The
 existing status distinction for empty payloads keeps empty 301 and 302 responses
 separate. Digest reuse is scoped to a CDX URL key, never shared solely by hash
-across different URL groups. Workers do not mutate each other's maps.
+across different URL groups or years. Each year stores its own full response for
+each successfully acquired URL/digest, even when another year has identical bytes.
+Workers do not mutate each other's maps.
 
 Exact playback does not follow Wayback's nearby-capture substitutions, synthesize
 slash redirects, or manufacture empty responses from CDX. Previously failed
 captures remain failures even if a later capture with the same digest succeeds.
-Revisits refer only to earlier successful responses. A staged write failure
-aborts the year; only successfully promoted data seeds later years and runs.
+Revisits refer only to earlier successful responses in the same year. A staged
+write failure aborts the year; only successfully promoted data seeds subsequent
+updates to that year. Resetting one year cannot invalidate another year's revisits.
+
+Resolution and writing share an explicit annual worker batch. On failure or
+Ctrl-C, it cancels queued groups, stops active groups before new captures,
+attempts, or transport sends, and wakes retry and pacing waits. In-flight HTTP
+operations finish under their existing timeouts. The batch drains before staging
+is discarded or the next year begins. Cancellation bypasses source failure
+classification; real backpressure already observed remains in force. Persistent
+worker clients remain open across successful and failed batches until run cleanup.
 
 For each year, Fetch creates a same-filesystem stage. Unchanged WARC shards
 are hard-linked into it; the final shard is copied only if new captures need to
@@ -218,8 +230,9 @@ Fetch discards unfinished staged work, leaving finalized local files unchanged.
 After validation, Fetch writes a small ready record in the stage, promotes
 changed WARCs, then promotes the CDXJ. A later fetch or manual sync completes
 a promotion interrupted between these steps before touching the bucket.
-Unchanged years do not replace their canonical files. Successful years update
-the cross-year representative map only after promotion.
+Unchanged years do not replace their canonical files. Indexing owns the decision
+to reuse an existing CDXJ, update changed shards, or rebuild a missing index.
+An explicit full rebuild remains available to archive-wide reconciliation.
 
 The default compressed WARC target is 250,000,000 bytes. Normal updates only
 extend a year's final shard or create a new shard; the previous byte prefix and
@@ -277,38 +290,65 @@ stateful classes, and reusable primitives may expose the related operations they
 need. Internal Python import paths are not a compatibility interface; the CLI,
 configuration, caches, and published archive format are unchanged.
 
+Action-oriented Python modules use lowercase `verb_noun.py` names, usually
+matching their primary operation: `build_collection_index.py`,
+`resolve_captures.py`, and `write_captures.py`. Use a specific action and object
+instead of a gerund or a generic name such as `stage.py`. Tests follow the same
+names with a `test_` prefix. Modules that define shared concepts may retain clear
+noun names (`models.py`, `contracts.py`, `layout.py`, `identity.py`, `dates.py`,
+and `format.py`); conventional `cli.py`, `__init__.py`, and `conftest.py` names
+remain appropriate. Package directories group responsibilities.
+
 ```text
 archive_magic_fetch/
-  cli.py                      main: parse arguments and dispatch
-  app.py                      run_application: configure fetch or sync-only
-  models.py                   capture, outcome, artifact, and metrics records
-  contracts.py                source callbacks and failure advice
-  config/                     archive config, host policy, effective settings
+  cli.py                            parse arguments and dispatch
+  run_application.py                configure fetch or sync-only
+  models.py                         capture, outcome, artifact, and metrics records
+  contracts.py                      source callbacks and failure advice
+  config/
+    load_archive_config.py          load and validate archive configuration
+    load_playback_policy.py         load host acquisition policy
+    build_settings.py               combine configuration and overrides
+    read_toml_section.py            read and validate a TOML section
+    models.py                       configuration records and defaults
   adapters/
-    wayback.py                build_source: bind the Wayback implementation
-    wayback_session.py        client construction and early transport repair
-    wayback_policy.py         failure interpretation and replay-specific rules
+    build_wayback_source.py         bind the Wayback implementation
+    create_wayback_client.py        construct clients and repair transport
+    interpret_wayback_failures.py   interpret failures and replay-specific rules
   pipeline/
-    runner.py                 run_fetch: coordinate annual work
+    run_fetch.py                    coordinate annual work
     discovery/
-      stage.py                discover_captures: select an ordered unique set
-      wayback.py              complete CDX acquisition and historical caching
+      discover_captures.py          select an ordered unique set
+      load_or_fetch_year_cdx.py     acquire complete CDX listings with caching
     retrieval/
-      stage.py                fetch_capture: execute and retry an acquisition
-      wayback.py              retrieve_memento: request exact replay
+      fetch_capture.py              execute and retry an acquisition
+      retrieve_memento.py           request exact replay
     decoding/
-      wayback.py              decode_memento: validate and normalize the response
-    resolution.py             resolve_captures: chronological reuse/acquisition
-    writing.py                write_captures: serialize and append WARCs
-    indexing.py               publish_collection_index: construct local CDXJ
-    reconciliation.py         repair existing indexes through the same indexer
-    commit.py                 YearStage: prepare, commit, abort, and recover
+      decode_memento.py             validate and normalize the response
+    resolve_captures.py             reuse stored payloads or acquire captures
+    write_captures.py               serialize and append WARCs
+    build_collection_index.py      construct local CDXJ
+    reconcile_missing_indexes.py   repair indexes through the same indexer
+    stage_year.py                   prepare, commit, abort, and recover a year
     publication/
-      stage.py                sync_archive: publish committed artifacts
-      reset.py                purge_remote: explicitly reset managed data
-      client.py               shared rclone configuration and command primitives
-  archive/                    layout, identity, dates, format, inventory, validation
-  runtime/                    workers, HTTP instrumentation, pacing, files, reporting
+      sync_archive.py               publish committed artifacts
+      purge_remote.py               explicitly reset managed data
+      run_rclone.py                 configure and invoke rclone
+  archive/
+    inventory_collection.py        read stored captures and reusable responses
+    validate_local_archive.py      validate finalized artifacts for publication
+    layout.py                       archive paths and artifact inventories
+    identity.py                     capture identity and digest primitives
+    dates.py                        date bounds and annual partitions
+    format.py                       archive fields and CDXJ primitives
+  runtime/
+    manage_capture_workers.py      schedule bounded work with persistent clients
+    track_http_requests.py         instrument HTTP sends and collect statistics
+    pace_requests.py               coordinate request starts and cooldowns
+    calculate_retry_delay.py       interpret retry timing and wrapped errors
+    manage_archive_files.py        lock archives and publish files atomically
+    report_progress.py             render progress and mirror run logs
+    write_run_record.py            initialize and write structured run records
 ```
 
 Application setup selects the adapter. The runner and shared stages depend on
@@ -326,7 +366,7 @@ Discover -> Resolve -> Write -> Index -> Commit -> Publish
 These are responsibility boundaries, not whole-run buffering barriers. Resolution
 walks each URL group chronologically. Bounded workers acquire missing captures,
 and one writer consumes the ordered outcomes. A successful response can enable
-later revisits; only promoted years seed subsequent years. Local commit and remote
+later revisits within the same year. Local commit and remote
 publication retain separate failure and recovery boundaries. Sync-only uses the
 same transaction recovery and publication code as fetch.
 
@@ -353,14 +393,19 @@ remain within Wayback discovery, independently of capture retry settings.
 
 The Wayback decoder closes its Memento even when reading fails or is interrupted.
 False-gzip repair remains at the session boundary, before the upstream client can
-consume a misleadingly encoded response. Worker clients close after outstanding
-work finishes, and request traces close even if client cleanup fails.
+consume a misleadingly encoded response; a repair failure or interruption closes
+the response there before propagating the error. Worker clients close after
+outstanding work finishes, and request traces close even if client cleanup fails.
 
 Capture identity and cache serialization are unchanged. `CaptureRef` and
 `CaptureResult` replace the old internal `ParsedCapture` and `PlaybackResult`
 names. Failure display labels are transient; existing run-record fields and trace
 column names remain unchanged. No source selector, CC locator, or new persistent
 provenance schema is introduced here.
+
+Archives previously written with cross-year revisits must be discarded and
+rebuilt before using annual independence. No conversion is provided. Historical
+discovery caches can be retained for the rebuild.
 
 ### Verification
 

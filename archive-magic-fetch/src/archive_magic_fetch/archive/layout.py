@@ -9,7 +9,7 @@ from typing import Optional
 from urllib.parse import urlsplit
 
 from archive_magic_fetch.models import IndexArtifact, WarcArtifact
-from archive_magic_fetch.runtime.filesystem import file_sha256
+from archive_magic_fetch.runtime.manage_archive_files import file_sha256
 
 _WWW_ALIAS_PREFIX = re.compile(r"^www\d*\.")
 

@@ -11,8 +11,8 @@ from unittest.mock import MagicMock
 from archive_magic_fetch.archive.identity import make_identity, payload_digest
 from archive_magic_fetch.archive.layout import ArchiveLayout, ensure_collection_dirs
 from archive_magic_fetch.models import CaptureIdentity, CaptureResult
-from archive_magic_fetch.pipeline.indexing import publish_collection_index
-from archive_magic_fetch.pipeline.writing import _CollectionWarcWriter
+from archive_magic_fetch.pipeline.build_collection_index import build_collection_index
+from archive_magic_fetch.pipeline.write_captures import _CollectionWarcWriter
 from wayback import CdxRecord
 
 
@@ -124,7 +124,7 @@ class FakeCdxClient:
 
 
 def patch_cdx(body: bytes):
-    import archive_magic_fetch.pipeline.discovery.wayback as cdx_mod
+    import archive_magic_fetch.pipeline.discovery.load_or_fetch_year_cdx as cdx_mod
 
     original = cdx_mod._fetch_cdx
     rows = json.loads(body)
@@ -143,7 +143,7 @@ def patch_cdx(body: bytes):
 
 
 def patch_cdx_by_year(bodies_by_year: dict[int, bytes]):
-    import archive_magic_fetch.pipeline.discovery.wayback as cdx_mod
+    import archive_magic_fetch.pipeline.discovery.load_or_fetch_year_cdx as cdx_mod
 
     original = cdx_mod._fetch_cdx
 
@@ -264,8 +264,8 @@ def found_capture_client(
 
 def fetch_memento(client, identity):
     from archive_magic_fetch.models import CaptureRef
-    from archive_magic_fetch.pipeline.decoding.wayback import decode_memento
-    from archive_magic_fetch.pipeline.retrieval.wayback import retrieve_memento
+    from archive_magic_fetch.pipeline.decoding.decode_memento import decode_memento
+    from archive_magic_fetch.pipeline.retrieval.retrieve_memento import retrieve_memento
 
     capture = CaptureRef(identity, "text/html")
     return decode_memento(retrieve_memento(client, capture), capture)
@@ -279,8 +279,8 @@ def make_source(
     from dataclasses import replace
     from pathlib import Path
 
-    from archive_magic_fetch.adapters.wayback import build_source
-    from archive_magic_fetch.adapters.wayback_session import ArchiveMagicWaybackSession
+    from archive_magic_fetch.adapters.build_wayback_source import build_source
+    from archive_magic_fetch.adapters.create_wayback_client import ArchiveMagicWaybackSession
 
     source = build_source(
         index_directory=settings.index_directory
@@ -334,10 +334,10 @@ class AcquisitionHarness:
     ):
         import time
 
-        from archive_magic_fetch.runtime.http import RequestStats
-        from archive_magic_fetch.runtime.pacing import StartGate
-        from archive_magic_fetch.runtime.reporting import emit
-        from archive_magic_fetch.runtime.workers import CaptureWorkers
+        from archive_magic_fetch.runtime.track_http_requests import RequestStats
+        from archive_magic_fetch.runtime.pace_requests import StartGate
+        from archive_magic_fetch.runtime.report_progress import emit
+        from archive_magic_fetch.runtime.manage_capture_workers import CaptureWorkers
 
         self.source = source
         self.clock = clock or time.monotonic
@@ -362,7 +362,7 @@ class AcquisitionHarness:
 
     def download(self, identity):
         from archive_magic_fetch.models import CaptureRef
-        from archive_magic_fetch.pipeline.retrieval.stage import fetch_capture
+        from archive_magic_fetch.pipeline.retrieval.fetch_capture import fetch_capture
 
         return fetch_capture(
             CaptureRef(identity, "text/html"),
@@ -376,7 +376,8 @@ class AcquisitionHarness:
         )
 
     def map(self, process, groups):
-        return self.workers.map(process, groups)
+        with self.workers.batch() as batch:
+            yield from batch.map(process, groups)
 
     def submit(self, process, group):
         return self.workers._executor.submit(process, group)
@@ -394,5 +395,5 @@ def make_collection(root: Path) -> ArchiveLayout:
     writer = _CollectionWarcWriter(layout, "2004")
     writer.write_playback(playback(make_capt()))
     writer.close()
-    publish_collection_index(layout, "2004")
+    build_collection_index(layout, "2004")
     return layout

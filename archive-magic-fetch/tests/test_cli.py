@@ -74,7 +74,7 @@ def test_cli_rejects_reversed_range(tmp_path):
 
 @pytest.mark.parametrize("data_directory", ["data", "../storage/data"])
 def test_cli_uses_configured_history(tmp_path, monkeypatch, data_directory):
-    import archive_magic_fetch.app as app
+    import archive_magic_fetch.run_application as app
     import archive_magic_fetch.cli as cli
 
     config = write_cli_config(tmp_path)
@@ -103,7 +103,7 @@ def test_remote_reset_rejects_dates_and_warns_before_full_rebuild(
     monkeypatch,
     capsys,
 ):
-    import archive_magic_fetch.app as app
+    import archive_magic_fetch.run_application as app
     import archive_magic_fetch.cli as cli
 
     config = write_cli_config(tmp_path, output_type="remote")
@@ -122,7 +122,7 @@ def test_remote_reset_rejects_dates_and_warns_before_full_rebuild(
 
 
 def test_cli_runtime_flags_override_defaults(tmp_path, monkeypatch):
-    import archive_magic_fetch.app as app
+    import archive_magic_fetch.run_application as app
     import archive_magic_fetch.cli as cli
 
     config = write_cli_config(tmp_path)
@@ -164,7 +164,7 @@ def test_cli_runtime_flags_override_defaults(tmp_path, monkeypatch):
 
 
 def test_cli_uses_instance_fetch_config_and_cli_overrides(tmp_path, monkeypatch):
-    import archive_magic_fetch.app as app
+    import archive_magic_fetch.run_application as app
     import archive_magic_fetch.cli as cli
 
     archive = write_cli_config(tmp_path)
@@ -199,7 +199,7 @@ retries = 6
 
 
 def test_cli_uses_cdx_settings_from_toml(tmp_path, monkeypatch):
-    import archive_magic_fetch.app as app
+    import archive_magic_fetch.run_application as app
     import archive_magic_fetch.cli as cli
 
     path = tmp_path / "fetch.toml"
@@ -239,7 +239,7 @@ def test_cli_rejects_start_before_project_range(tmp_path):
 
 def test_log_url_outcome_omits_already_represented_lines(capsys):
     from archive_magic_fetch.models import CaptureKind, CaptureOutcome, UrlOutcome
-    from archive_magic_fetch.runtime.reporting import log_url_outcome
+    from archive_magic_fetch.runtime.report_progress import log_url_outcome
 
     existing = make_capt(ts="19990117001820")
     downloaded = make_capt(

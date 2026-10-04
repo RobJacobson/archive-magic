@@ -1,8 +1,8 @@
 from pathlib import Path
 
 import pytest
-from archive_magic_fetch.config.archive import load_config
-from archive_magic_fetch.config.host import load_playback_policy
+from archive_magic_fetch.config.load_archive_config import load_config
+from archive_magic_fetch.config.load_playback_policy import load_playback_policy
 from archive_magic_fetch.config.models import (
     CONFIG_NAME,
     DEFAULT_CDX_PAGE_LIMIT,
@@ -15,7 +15,7 @@ from archive_magic_fetch.config.models import (
     FetchOutput,
     PlaybackPolicy,
 )
-from archive_magic_fetch.config.settings import build_settings
+from archive_magic_fetch.config.build_settings import build_settings
 
 
 def write_config(directory: Path, body: str, name: str = CONFIG_NAME) -> Path:

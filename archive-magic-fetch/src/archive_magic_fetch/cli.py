@@ -6,7 +6,7 @@ import argparse
 from pathlib import Path
 from typing import Optional, Sequence
 
-from archive_magic_fetch.app import run_application
+from archive_magic_fetch.run_application import run_application
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:

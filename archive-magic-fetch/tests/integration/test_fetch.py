@@ -8,7 +8,7 @@ from unittest.mock import MagicMock
 import pytest
 from archive_magic_fetch.archive.format import MISSING_CDX_STATUS
 from archive_magic_fetch.archive.identity import make_identity, payload_digest
-from archive_magic_fetch.archive.inventory import (
+from archive_magic_fetch.archive.inventory_collection import (
     get_warc_identity,
     inventory_collection,
 )
@@ -18,10 +18,10 @@ from archive_magic_fetch.archive.layout import (
     list_collection_warcs,
 )
 from archive_magic_fetch.config.models import FetchOutput
-from archive_magic_fetch.config.settings import FetchSettings
-from archive_magic_fetch.pipeline.indexing import publish_collection_index
-from archive_magic_fetch.pipeline.runner import run_fetch
-from archive_magic_fetch.pipeline.writing import _CollectionWarcWriter
+from archive_magic_fetch.config.build_settings import FetchSettings
+from archive_magic_fetch.pipeline.build_collection_index import build_collection_index
+from archive_magic_fetch.pipeline.run_fetch import run_fetch
+from archive_magic_fetch.pipeline.write_captures import _CollectionWarcWriter
 from helpers import (
     cdx_json,
     found_capture_client,
@@ -539,103 +539,66 @@ def test_empty_http_200_downloads_once_then_revisits(tmp_path):
     assert empty_responses == 2
 
 
-def test_matching_payloads_in_later_years_become_revisits(tmp_path):
-    layout = ArchiveLayout(tmp_path / "data", "example.org")
-    ensure_collection_dirs(layout)
+def test_matching_payloads_in_each_year_get_independent_responses(tmp_path):
     body = b"logo"
-    dig = payload_digest(body).split(":")[1]
-    downloads: list[str] = []
-
-    def download_fn(_client, identity):
-        downloads.append(identity.timestamp)
-        return playback(identity, body=body)
-
+    digest = payload_digest(body)
+    downloads = []
     bodies = {
-        2004: cdx_json(
+        year: cdx_json(
             [
                 [
-                    "com,example)/",
-                    "20040601000000",
+                    "org,example)/",
+                    f"{year}060{day}000000",
                     "http://example.org/",
                     "text/html",
                     "200",
-                    dig,
+                    digest.split(":")[1],
                     "4",
                 ]
+                for day in (1, 2)
             ]
-        ),
-        2005: cdx_json(
-            [
-                [
-                    "com,example)/",
-                    "20050601000000",
-                    "http://example.org/",
-                    "text/html",
-                    "200",
-                    dig,
-                    "4",
-                ]
-            ]
-        ),
+        )
+        for year in (2004, 2005)
     }
     original, cdx_mod = patch_cdx_by_year(bodies)
     try:
-        run_settings = FetchSettings(
-            url_pattern="http://example.org/",
-            date_start="20040601000000",
-            date_end="20050601000000",
-            archive_id="example.org",
-            output=FetchOutput("local", tmp_path / "data"),
+        settings = FetchSettings(
+            "http://example.org/",
+            "20040601000000",
+            "20050602000000",
+            "example.org",
+            FetchOutput("local", tmp_path / "data"),
         )
-        result = run_fetch(
-            run_settings,
-            sleep=lambda _s: None,
-            source=make_source(
-                run_settings,
-                client_factory=lambda: MagicMock(),
-                download=download_fn,
-                sleep=lambda _s: None,
-            ),
+
+        def download(_client, identity):
+            downloads.append(identity.timestamp)
+            return playback(identity, body=body)
+
+        source = make_source(
+            settings, client_factory=lambda: MagicMock(), download=download
         )
+        result = run_fetch(settings, source=source)
+        assert result.exit_code == 0
+        assert downloads == ["20040601000000", "20050601000000"]
+        assert result.metrics.downloads == result.metrics.revisits == 2
+        for year in ("2004", "2005"):
+            records = []
+            with list_collection_warcs(result.layout, year)[0].open("rb") as stream:
+                for record in ArchiveIterator(stream):
+                    records.append(record.rec_type)
+                    if record.rec_type == "revisit":
+                        assert (
+                            record.rec_headers.get_header("WARC-Refers-To-Date")
+                            == f"{year}-06-01T00:00:00Z"
+                        )
+                    record.raw_stream.read()
+            assert records == ["warcinfo", "response", "revisit"]
+        resumed = run_fetch(settings, source=source)
+        assert resumed.metrics.local_reuses == 4
+        assert resumed.metrics.downloads == 0
+        assert len(downloads) == 2
     finally:
         cdx_mod._fetch_cdx = original
-
-    assert result.exit_code == 0
-    assert downloads == ["20040601000000"]
-    assert result.metrics.downloads == 1
-    assert result.metrics.payload_reuses == 0
-    assert result.metrics.revisits == 1
-
-    types_2004 = []
-    with list_collection_warcs(layout, "2004")[0].open("rb") as stream:
-        for record in ArchiveIterator(stream):
-            types_2004.append(record.rec_type)
-            record.raw_stream.read()
-    assert types_2004.count("response") == 1
-    assert types_2004.count("revisit") == 0
-
-    types_2005 = []
-    refers_to_date = None
-    with list_collection_warcs(layout, "2005")[0].open("rb") as stream:
-        for record in ArchiveIterator(stream):
-            types_2005.append(record.rec_type)
-            if record.rec_type == "revisit":
-                refers_to_date = record.rec_headers.get_header("WARC-Refers-To-Date")
-            record.raw_stream.read()
-    assert types_2005.count("response") == 0
-    assert types_2005.count("revisit") == 1
-    assert refers_to_date == "2004-06-01T00:00:00Z"
-
-    inv = inventory_collection(layout, "2005")
-    assert inv.contains(
-        make_identity(
-            original_url="http://example.org/",
-            timestamp="20050601000000",
-            status_token="200",
-            payload_digest=payload_digest(body),
-            urlkey="com,example)/",
-        )
-    )
 
 
 def test_different_ia_digest_downloads_twice(tmp_path):
@@ -955,7 +918,7 @@ def test_scoped_rerun_keeps_prior_collection_and_records_only_current_failures(
     writer = _CollectionWarcWriter(layout, "2004")
     writer.write_playback(playback(capt))
     writer.close()
-    publish_collection_index(layout, "2004")
+    build_collection_index(layout, "2004")
     original_index = layout.collection_index("2004").read_bytes()
 
     body_2005 = cdx_json(
@@ -1096,7 +1059,7 @@ def test_failed_capture_retries_successfully_on_rerun(tmp_path):
 def test_multi_year_empty_run_shares_id_without_playback_collections(
     tmp_path, monkeypatch
 ):
-    from archive_magic_fetch.pipeline.discovery.wayback import _CdxResult
+    from archive_magic_fetch.pipeline.discovery.load_or_fetch_year_cdx import _CdxResult
 
     def empty_year(*, date_start, date_end, **_kwargs):
         return _CdxResult(
@@ -1106,7 +1069,7 @@ def test_multi_year_empty_run_shares_id_without_playback_collections(
         )
 
     monkeypatch.setattr(
-        "archive_magic_fetch.pipeline.discovery.wayback._fetch_cdx", empty_year
+        "archive_magic_fetch.pipeline.discovery.load_or_fetch_year_cdx._fetch_cdx", empty_year
     )
     run_settings = FetchSettings(
         url_pattern="http://example.org/",
@@ -1130,7 +1093,7 @@ def test_multi_year_empty_run_shares_id_without_playback_collections(
 
 def test_cdx_year_failure_continues_with_later_years(tmp_path, monkeypatch, capsys):
     from archive_magic_fetch.models import CaptureRef
-    from archive_magic_fetch.pipeline.discovery.wayback import _CdxResult
+    from archive_magic_fetch.pipeline.discovery.load_or_fetch_year_cdx import _CdxResult
 
     first = make_capt(ts="20040601000000")
     later = make_capt(
@@ -1163,7 +1126,7 @@ def test_cdx_year_failure_continues_with_later_years(tmp_path, monkeypatch, caps
         return playback(identity)
 
     monkeypatch.setattr(
-        "archive_magic_fetch.pipeline.discovery.wayback._fetch_cdx", fake_fetch_cdx
+        "archive_magic_fetch.pipeline.discovery.load_or_fetch_year_cdx._fetch_cdx", fake_fetch_cdx
     )
     run_settings = FetchSettings(
         url_pattern="http://example.org/",
@@ -1208,7 +1171,7 @@ def test_cdx_504_skips_year_without_splitting_and_continues(
     tmp_path, monkeypatch, capsys
 ):
     from archive_magic_fetch.models import CaptureRef
-    from archive_magic_fetch.pipeline.discovery.wayback import _CdxResult
+    from archive_magic_fetch.pipeline.discovery.load_or_fetch_year_cdx import _CdxResult
 
     later = make_capt(
         ts="20050601000000",
@@ -1235,7 +1198,7 @@ def test_cdx_504_skips_year_without_splitting_and_continues(
         )
 
     monkeypatch.setattr(
-        "archive_magic_fetch.pipeline.discovery.wayback._fetch_cdx", fake_fetch_cdx
+        "archive_magic_fetch.pipeline.discovery.load_or_fetch_year_cdx._fetch_cdx", fake_fetch_cdx
     )
     run_settings = FetchSettings(
         url_pattern="http://example.org/",
@@ -1275,7 +1238,7 @@ def test_cdx_wall_clock_splits_28_then_7_and_stops_on_failure(
     tmp_path, monkeypatch, capsys
 ):
     from archive_magic_fetch.models import CaptureRef
-    from archive_magic_fetch.pipeline.discovery.wayback import _CdxResult, _date_windows
+    from archive_magic_fetch.pipeline.discovery.load_or_fetch_year_cdx import _CdxResult, _date_windows
 
     january = make_capt(ts="20040105000000")
     calls: list[tuple[str, str]] = []
@@ -1316,7 +1279,7 @@ def test_cdx_wall_clock_splits_28_then_7_and_stops_on_failure(
         return playback(identity)
 
     monkeypatch.setattr(
-        "archive_magic_fetch.pipeline.discovery.wayback._fetch_cdx", fake_fetch_cdx
+        "archive_magic_fetch.pipeline.discovery.load_or_fetch_year_cdx._fetch_cdx", fake_fetch_cdx
     )
     run_settings = FetchSettings(
         url_pattern="http://example.org/",
@@ -1359,7 +1322,7 @@ def test_cdx_wall_clock_splits_28_then_7_and_stops_on_failure(
 
 def test_cdx_year_success_uses_single_query(tmp_path, monkeypatch):
     from archive_magic_fetch.models import CaptureRef
-    from archive_magic_fetch.pipeline.discovery.wayback import _CdxResult
+    from archive_magic_fetch.pipeline.discovery.load_or_fetch_year_cdx import _CdxResult
 
     capture = make_capt(ts="20040601000000")
     calls: list[tuple[str, str]] = []
@@ -1374,7 +1337,7 @@ def test_cdx_year_success_uses_single_query(tmp_path, monkeypatch):
         )
 
     monkeypatch.setattr(
-        "archive_magic_fetch.pipeline.discovery.wayback._fetch_cdx", fake_fetch_cdx
+        "archive_magic_fetch.pipeline.discovery.load_or_fetch_year_cdx._fetch_cdx", fake_fetch_cdx
     )
     run_settings = FetchSettings(
         url_pattern="http://example.org/",
@@ -1408,7 +1371,7 @@ def test_cdx_failed_year_restarts_and_successful_fallback_is_cached(
     tmp_path, monkeypatch
 ):
     from archive_magic_fetch.models import CaptureRef
-    from archive_magic_fetch.pipeline.discovery.wayback import _CdxResult, _date_windows
+    from archive_magic_fetch.pipeline.discovery.load_or_fetch_year_cdx import _CdxResult, _date_windows
 
     january = make_capt(ts="20040105000000")
     march = make_capt(
@@ -1459,7 +1422,7 @@ def test_cdx_failed_year_restarts_and_successful_fallback_is_cached(
         )
 
     monkeypatch.setattr(
-        "archive_magic_fetch.pipeline.discovery.wayback._fetch_cdx", fake_fetch_cdx
+        "archive_magic_fetch.pipeline.discovery.load_or_fetch_year_cdx._fetch_cdx", fake_fetch_cdx
     )
     settings = FetchSettings(
         url_pattern="http://example.org/",
@@ -1518,7 +1481,7 @@ def test_cdx_failed_year_restarts_and_successful_fallback_is_cached(
 
 def test_legacy_cdx_checkpoint_is_ignored_and_preserved(tmp_path, monkeypatch, capsys):
     from archive_magic_fetch.models import CaptureRef
-    from archive_magic_fetch.pipeline.discovery.wayback import _CdxResult
+    from archive_magic_fetch.pipeline.discovery.load_or_fetch_year_cdx import _CdxResult
 
     capture = make_capt(ts="20040601000000")
     layout = ArchiveLayout(tmp_path / "data", "example.org")
@@ -1557,7 +1520,7 @@ def test_legacy_cdx_checkpoint_is_ignored_and_preserved(tmp_path, monkeypatch, c
         )
 
     monkeypatch.setattr(
-        "archive_magic_fetch.pipeline.discovery.wayback._fetch_cdx", fake_fetch_cdx
+        "archive_magic_fetch.pipeline.discovery.load_or_fetch_year_cdx._fetch_cdx", fake_fetch_cdx
     )
     run_settings = FetchSettings(
         url_pattern="http://example.org/",
@@ -1609,7 +1572,7 @@ def test_legacy_layout_rejects_all_artifacts(tmp_path, legacy_name):
 
 
 def test_interrupt_discards_staged_year_without_run_json(tmp_path, monkeypatch):
-    import archive_magic_fetch.pipeline.writing as writing_module
+    import archive_magic_fetch.pipeline.write_captures as writing_module
 
     layout = ArchiveLayout(tmp_path / "data", "example.org")
     ensure_collection_dirs(layout)
