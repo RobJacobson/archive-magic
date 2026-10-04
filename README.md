@@ -56,8 +56,10 @@ After an upload failure, `--sync-only` retries without contacting Wayback.
 Playback pacing applies to every HTTP send, including retries and nearby-capture
 redirects, across all workers in one process. Each run logs request totals and peak
 counts over rolling one-second and one-minute windows; 429s also log current counts.
-Add `--trace-requests` to save each send and response with real UTC timestamps,
-capture/attempt IDs, and rolling counts in `logs/<run>.requests.jsonl`.
+Add `--trace-requests` to save one CSV row per request in `logs/<run>.requests.csv`,
+with UTC start time and duration rounded to milliseconds, six-character capture
+digests, attempt IDs, response status, and rolling counts. URLs and other
+variable-width fields appear on the right.
 See [request diagnostics](archive-magic-fetch/docs/ARCHITECTURE-FETCH.md#playback-request-diagnostics)
 for details. Separate Fetch processes have separate limits; CDX uses its own pacing.
 

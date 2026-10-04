@@ -91,7 +91,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--trace-requests",
         action="store_true",
-        help="write timestamped playback HTTP requests and rolling rates to logs/<run>.requests.jsonl",
+        help="write one CSV row per playback HTTP request with millisecond timing and rolling rates to logs/<run>.requests.csv",
     )
     parser.add_argument(
         "--retries",

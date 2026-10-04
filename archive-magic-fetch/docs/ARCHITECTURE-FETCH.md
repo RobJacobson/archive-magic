@@ -52,13 +52,23 @@ For a detailed trace:
 uv run archive-magic-fetch /path/to/archive --trace-requests
 ```
 
-This writes a flushed `logs/<run>.requests.jsonl` beside the normal run log. Every
-`request_start` has a real `time_utc`, monotonic timestamp, process/thread ID,
-request ID, method/URL, requested capture identity, attempt number, request number
-within that attempt, and recent/peak counts. A matching `request_end` has status,
-Retry-After, Location, or transport exception type. Response elapsed time covers
-headers only; streamed payload reads happen afterward. Interrupted sends may have
-only a start event. A final `summary` is written when workers shut down.
+This writes `logs/<run>.requests.csv` beside the normal run log, with a header and
+one row per request, flushed when its response headers or transport error arrive.
+`start_utc` is the actual UTC start time rounded to milliseconds; `duration_ms` is
+an integer number of milliseconds measured with the monotonic clock. Duration
+covers headers only; streamed payload reads happen afterward. `capture_time` is
+the historical capture date and `digest` is its last six characters, matching the
+progress log. The SURT URL key is omitted.
+
+Request ID, timing, HTTP status, capture date/digest, attempt number, request number
+within the attempt, and rolling 1s/60s counts are on the left. Counts are sampled
+at request start. Method and process ID follow, then variable-width fields:
+thread, Retry-After, error type, request URL, and redirect Location. CSV quoting
+preserves commas, quotes, and newlines within fields. Rows are appended in
+completion order; sort by request ID to recover start order with multiple workers.
+On orderly shutdown, unfinished requests get one row marked `Interrupted` with
+blank duration and status. Totals and peak rates remain in the normal run log,
+without adding non-request rows to the CSV.
 
 Repeated URLs with increasing `attempt` values are capture retries. A
 `request_in_attempt` greater than 1 exposes redirect requests. Capture
@@ -68,15 +78,13 @@ cannot establish the real request rate. Trace files contain full requested URLs.
 To count sends in each UTC calendar second and minute (rather than rolling windows):
 
 ```sh
-python - /path/to/logs/RUN.requests.jsonl <<'PY'
-import collections, json, sys
+python - /path/to/logs/RUN.requests.csv <<'PY'
+import collections, csv, sys
 buckets = {"second": collections.Counter(), "minute": collections.Counter()}
-with open(sys.argv[1]) as stream:
-    for line in stream:
-        event = json.loads(line)
-        if event["event"] == "request_start":
-            buckets["second"][event["time_utc"][:19]] += 1
-            buckets["minute"][event["time_utc"][:16]] += 1
+with open(sys.argv[1], newline="") as stream:
+    for row in csv.DictReader(stream):
+        buckets["second"][row["start_utc"][:19]] += 1
+        buckets["minute"][row["start_utc"][:16]] += 1
 for unit, counts in buckets.items():
     for timestamp, count in sorted(counts.items()):
         print(unit, timestamp + "Z", count)

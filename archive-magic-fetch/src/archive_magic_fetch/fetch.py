@@ -158,7 +158,7 @@ def run_fetch(
     init_run_record(layout, run_id)
     factory = client_factory or make_client
     trace_path = (
-        layout.run_log(run_id).with_suffix(".requests.jsonl")
+        layout.run_log(run_id).with_suffix(".requests.csv")
         if settings.trace_requests else None
     )
     with mirror_output(layout.run_log(run_id)):
