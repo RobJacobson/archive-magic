@@ -1,29 +1,54 @@
-"""Measure playback HTTP sends, including redirects and recovery requests."""
+"""Measure playback HTTP sends, including redirects and retries."""
 
 from __future__ import annotations
 
-import json
+import csv
 import os
 import threading
 import time
 from collections import deque
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Iterator, TextIO
 
 from requests.adapters import HTTPAdapter
 
-from .identity import identity_to_dict
 from .models import CaptureIdentity
 
 
+TRACE_COLUMNS = (
+    "request_id", "start_utc", "duration_ms", "status", "capture_time", "digest",
+    "attempt", "request_in_attempt", "starts_last_1s", "starts_last_60s",
+    "method", "pid", "thread", "retry_after", "error", "url", "location",
+)
+
+
+def format_trace_time(value: datetime) -> str:
+    """Format a UTC timestamp rounded to the nearest millisecond."""
+
+    rounded = value.astimezone(timezone.utc) + timedelta(microseconds=500)
+    return rounded.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def format_capture_time(timestamp: str) -> str:
+    """Use the same human-readable capture date as the progress log."""
+
+    if not timestamp:
+        return ""
+    return (
+        f"{timestamp[:4]}-{timestamp[4:6]}-{timestamp[6:8]}T"
+        f"{timestamp[8:10]}:{timestamp[10:12]}:{timestamp[12:14]}"
+    )
+
+
 class PlaybackRequestStats:
-    """One run's transport counters and optional flushed JSONL trace.
+    """One run's transport counters and optional flushed CSV trace.
 
     Windows are rolling (now - window, now], not calendar buckets. Starts
     count attempted HTTP sends, including connection failures. Response timing
-    ends at receipt of headers; streaming body reads happen later.
+    ends at receipt of headers; streaming body reads happen later. A row is
+    appended on completion, using the timestamp and counters from its start.
     """
 
     def __init__(
@@ -44,14 +69,21 @@ class PlaybackRequestStats:
         self._peak_second = 0
         self._peak_minute = 0
         self._http_429 = 0
+        self._pending: dict[int, dict[str, object]] = {}
         self._stream: TextIO | None = (
-            trace_path.open("x", encoding="utf-8", buffering=1)
+            trace_path.open("x", encoding="utf-8", newline="", buffering=1)
             if trace_path is not None else None
         )
+        self._writer = (
+            csv.DictWriter(self._stream, fieldnames=TRACE_COLUMNS, lineterminator="\n")
+            if self._stream is not None else None
+        )
+        if self._writer is not None:
+            self._writer.writeheader()
 
     @contextmanager
     def attempt(self, identity: CaptureIdentity, number: int) -> Iterator[None]:
-        self._local.capture = identity_to_dict(identity)
+        self._local.capture = identity
         self._local.attempt = number
         self._local.request_in_attempt = 0
         try:
@@ -72,16 +104,6 @@ class PlaybackRequestStats:
             "http_429": self._http_429,
         }
 
-    def _write(self, event: str, **fields) -> None:
-        if self._stream is not None:
-            self._stream.write(json.dumps({
-                "event": event,
-                "time_utc": datetime.now(timezone.utc).isoformat(timespec="microseconds"),
-                "pid": os.getpid(),
-                "thread": threading.current_thread().name,
-                **fields,
-            }, ensure_ascii=True) + "\n")
-
     def start(self, request) -> tuple[int, float]:
         # This is called at the adapter boundary, after Wayback's own limiter.
         # Never hold the stats lock while waiting: in-flight responses must
@@ -95,14 +117,22 @@ class PlaybackRequestStats:
             self._peak_second = max(self._peak_second, counts["starts_last_1s"])
             self._peak_minute = max(self._peak_minute, counts["starts_last_60s"])
             self._local.request_in_attempt = getattr(self._local, "request_in_attempt", 0) + 1
-            self._write(
-                "request_start", request_id=self._total, monotonic_s=now,
-                method=request.method, url=request.url,
-                capture=getattr(self._local, "capture", None),
-                attempt=getattr(self._local, "attempt", None),
-                request_in_attempt=self._local.request_in_attempt,
-                **self._counts(now),
-            )
+            if self._writer is not None:
+                capture = getattr(self._local, "capture", None)
+                self._pending[self._total] = {
+                    "request_id": self._total,
+                    "start_utc": format_trace_time(datetime.now(timezone.utc)),
+                    "capture_time": format_capture_time(capture.timestamp) if capture else "",
+                    "digest": capture.payload_digest[-6:] if capture else "",
+                    "attempt": getattr(self._local, "attempt", None),
+                    "request_in_attempt": self._local.request_in_attempt,
+                    "starts_last_1s": counts["starts_last_1s"],
+                    "starts_last_60s": counts["starts_last_60s"],
+                    "method": request.method,
+                    "pid": os.getpid(),
+                    "thread": threading.current_thread().name,
+                    "url": request.url,
+                }
             return self._total, now
 
     def finish(self, ticket: tuple[int, float], *, response=None, error=None) -> None:
@@ -114,14 +144,16 @@ class PlaybackRequestStats:
             if status == 429:
                 self._http_429 += 1
             counts = self._counts(now)
-            self._write(
-                "request_end", request_id=request_id, monotonic_s=now,
-                elapsed_to_headers_s=now - started, status=status,
-                retry_after=headers.get("Retry-After"),
-                location=headers.get("Location"),
-                error=type(error).__name__ if error is not None else None,
-                **counts,
-            )
+            row = self._pending.pop(request_id, None)
+            if row is not None and self._writer is not None:
+                self._writer.writerow({
+                    **row,
+                    "duration_ms": round((now - started) * 1000),
+                    "status": status,
+                    "retry_after": headers.get("Retry-After"),
+                    "location": headers.get("Location"),
+                    "error": type(error).__name__ if error is not None else None,
+                })
         if status == 429:
             self._report(
                 f"playback HTTP 429 request #{request_id}: "
@@ -137,7 +169,11 @@ class PlaybackRequestStats:
     def close(self) -> None:
         with self._lock:
             counts = self._counts(self._clock())
-            self._write("summary", **counts)
+            if self._writer is not None:
+                for row in self._pending.values():
+                    self._writer.writerow({**row, "error": "Interrupted"})
+                self._pending.clear()
+                self._writer = None
             if self._stream is not None:
                 self._stream.close()
                 self._stream = None

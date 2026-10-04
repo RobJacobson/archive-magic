@@ -86,12 +86,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         type=_positive_float,
         default=None,
         metavar="N",
-        help="playback HTTP requests per second, including retries/recovery (default: 16, or fetch-config.toml)",
+        help="playback HTTP requests per second, including retries/redirects (default: 16, or fetch-config.toml)",
     )
     parser.add_argument(
         "--trace-requests",
         action="store_true",
-        help="write timestamped playback HTTP requests and rolling rates to logs/<run>.requests.jsonl",
+        help="write one CSV row per playback HTTP request with millisecond timing and rolling rates to logs/<run>.requests.csv",
     )
     parser.add_argument(
         "--retries",

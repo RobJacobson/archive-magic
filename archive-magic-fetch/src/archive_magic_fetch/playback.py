@@ -1,14 +1,13 @@
-"""Wayback sessions, playback recovery, and response synthesis."""
+"""Wayback sessions and exact capture playback."""
 
 from __future__ import annotations
 
 import base64
-import contextlib
 import gzip
 import hashlib
 import re
-from collections.abc import Iterator, Mapping, Sequence
-from urllib.parse import urljoin, urlsplit, urlunsplit
+from collections.abc import Mapping
+from urllib.parse import urlsplit
 
 import requests
 from wayback import Mode, WaybackClient, WaybackSession
@@ -21,26 +20,18 @@ from wayback.exceptions import (
 )
 
 from .identity import (
-    cdx_timestamp_to_warc_date,
     is_empty_payload_digest,
     is_redirect_status_token,
-    normalize_original_url,
     normalize_payload_digest,
     same_original_url,
     timestamp_to_warc_date,
     warc_date_to_cdx,
 )
 from .models import CaptureIdentity, FailureCategory, PlaybackResult
-from .protocol import EMPTY_PAYLOAD_DIGEST
 from .request_stats import PlaybackHTTPAdapter, PlaybackRequestStats
 from .retry import parse_retry_after
 
 
-SLASH_REDIRECT_SOURCE_URI = "urn:archive-magic:slash-redirect"
-_FOUND_CAPTURE_AT = re.compile(r"found capture at\s+\d+", re.IGNORECASE)
-_WAYBACK_MEMENTO_LOCATION = re.compile(
-    r"/web/\d{1,14}(?:id_|oe_|if_|tf_|fw_)?/(https?://.*)$", re.IGNORECASE
-)
 _REPRESENTATION_HEADERS = {
     "content-digest", "content-encoding", "content-length", "content-md5",
     "digest", "etag", "repr-digest", "transfer-encoding",
@@ -195,41 +186,6 @@ def cdx_digest_matches_body(expected_digest: object, body: bytes) -> bool:
     return payload_digest(body + b"\n") == expected
 
 
-
-def _content_type_from_cdx_mime(mime: str) -> str:
-    if "/" in mime and "\r" not in mime and "\n" not in mime:
-        return mime
-    return "application/octet-stream"
-
-
-def empty_http_200_from_cdx(
-    identity: CaptureIdentity, *, mime: str
-) -> PlaybackResult | None:
-    """Materialize an HTTP 200 whose CDX digest is the empty payload.
-
-    CDX already attested that the entity is zero bytes, so playback is skipped.
-    Headers use the CDX MIME and ``Content-Length: 0``.
-    """
-
-    if identity.status_token != "200":
-        return None
-    if not is_empty_payload_digest(identity.payload_digest):
-        return None
-    return PlaybackResult(
-        identity=identity,
-        body=b"",
-        status_code=200,
-        headers=(
-            ("Content-Type", _content_type_from_cdx_mime(mime)),
-            ("Content-Length", "0"),
-        ),
-        warc_date=cdx_timestamp_to_warc_date(identity.timestamp),
-        source_uri="urn:archive-magic:empty-payload",
-        warc_payload_digest=EMPTY_PAYLOAD_DIGEST,
-        digest_matched=True,
-    )
-
-
 def _is_unusable_playback_body(
     body: bytes,
     *,
@@ -259,129 +215,6 @@ def _is_unusable_playback_body(
     return None
 
 
-def _trailing_slash_url(url: str) -> str | None:
-    """Return ``url`` with a trailing slash on the path, or None if it has one."""
-
-    normalized = normalize_original_url(url)
-    parts = urlsplit(normalized)
-    if parts.path.endswith("/"):
-        return None
-    new_path = f"{parts.path}/" if parts.path else "/"
-    return urlunsplit(
-        (parts.scheme, parts.netloc, new_path, parts.query, parts.fragment)
-    )
-
-
-def _original_url_from_wayback_location(location: str) -> str | None:
-    """Extract the original URL from a Wayback memento Location header."""
-
-    if location.startswith("/"):
-        candidate = location
-    else:
-        parts = urlsplit(location)
-        candidate = parts.path
-        if parts.query:
-            candidate = f"{candidate}?{parts.query}"
-        if parts.fragment:
-            candidate = f"{candidate}#{parts.fragment}"
-    match = _WAYBACK_MEMENTO_LOCATION.search(candidate)
-    if match is None:
-        return None
-    return match.group(1)
-
-
-def _found_capture_location(response) -> str | None:
-    """Return an absolute memento URL from a ``found capture at …`` 302."""
-
-    headers = getattr(response, "headers", None)
-    if headers is None:
-        return None
-    reason = headers.get("X-Archive-Redirect-Reason") or headers.get(
-        "x-archive-redirect-reason"
-    )
-    if not isinstance(reason, str) or _FOUND_CAPTURE_AT.search(reason) is None:
-        return None
-    location = headers.get("Location") or headers.get("location")
-    if not isinstance(location, str) or not location:
-        return None
-    if _original_url_from_wayback_location(location) is None:
-        return None
-    if location.startswith("/"):
-        return urljoin("https://web.archive.org/", location)
-    return location
-
-
-def _slash_redirect_result(
-    *,
-    identity: CaptureIdentity,
-    status_code: int,
-    location_url: str,
-) -> PlaybackResult:
-    return PlaybackResult(
-        identity=identity,
-        body=b"",
-        status_code=status_code,
-        headers=(
-            ("Location", location_url),
-            ("Content-Length", "0"),
-        ),
-        warc_date=cdx_timestamp_to_warc_date(identity.timestamp),
-        source_uri=SLASH_REDIRECT_SOURCE_URI,
-        warc_payload_digest=EMPTY_PAYLOAD_DIGEST,
-        digest_matched=True,
-    )
-
-
-def slash_redirect_from_cdx(
-    identity: CaptureIdentity,
-    *,
-    group_urls: Sequence[str],
-) -> PlaybackResult | None:
-    """Materialize a slash-normalizing redirect from CDX without playback.
-
-    SURT groups ``/path`` with ``/path/``. When CDX already listed the slash
-    variant in this URL group and called this row a 301/302, Location is that
-    slash URL. Wayback cannot play these captures exactly; asking it only adds
-    a GET that commonly stalls on retry.
-    """
-
-    if not is_redirect_status_token(identity.status_token):
-        return None
-    slash_url = _trailing_slash_url(identity.original_url)
-    if slash_url is None:
-        return None
-    if not any(same_original_url(other, slash_url) for other in group_urls):
-        return None
-    return _slash_redirect_result(
-        identity=identity,
-        status_code=int(identity.status_token),
-        location_url=normalize_original_url(slash_url),
-    )
-
-
-def _slash_redirect_from_substitution(
-    response,
-    *,
-    identity: CaptureIdentity,
-) -> PlaybackResult | None:
-    """Rebuild a slash-normalizing redirect from a nearby Wayback capture."""
-
-    if not is_redirect_status_token(identity.status_token):
-        return None
-    location = _found_capture_location(response)
-    if location is None:
-        return None
-    target = _original_url_from_wayback_location(location)
-    slash_url = _trailing_slash_url(identity.original_url)
-    if target is None or slash_url is None or not same_original_url(target, slash_url):
-        return None
-    return _slash_redirect_result(
-        identity=identity,
-        status_code=int(identity.status_token),
-        location_url=normalize_original_url(target),
-    )
-
-
 def _playback_from_memento(
     memento,
     *,
@@ -404,101 +237,19 @@ def _playback_from_memento(
     return body, status_code, memento_url, memento_timestamp, headers, url
 
 
-def _substituted_playback(
-    client,
-    response,
-    *,
-    identity: CaptureIdentity,
-) -> PlaybackResult | None:
-    """Keep Wayback's nearby memento under the requested CDX identity."""
-
-    location = _found_capture_location(response)
-    if location is None:
-        return None
-    try:
-        memento = client.get_memento(
-            location,
-            mode=Mode.original,
-            exact=True,
-            follow_redirects=False,
-        )
-    except MementoPlaybackError:
-        return None
-    body, status_code, memento_url, _timestamp, headers, _url = (
-        _playback_from_memento(memento, expected_digest=identity.payload_digest)
-    )
-    return PlaybackResult(
-        identity=identity,
-        body=body,
-        status_code=status_code,
-        headers=headers,
-        warc_date=cdx_timestamp_to_warc_date(identity.timestamp),
-        source_uri=memento_url,
-        warc_payload_digest=payload_digest(body),
-        digest_matched=cdx_digest_matches_body(identity.payload_digest, body),
-        substituted=True,
-    )
-
-
-@contextlib.contextmanager
-def _capture_first_session_response(client) -> Iterator[dict[str, object]]:
-    """Stash the first session response from a memento request."""
-
-    stashed: dict[str, object] = {}
-    session = getattr(client, "session", None)
-    original = getattr(session, "request", None) if session is not None else None
-    if not callable(original):
-        yield stashed
-        return
-
-    def wrapped(method, url, **kwargs):
-        response = original(method, url, **kwargs)
-        stashed.setdefault("response", response)
-        return response
-
-    session.request = wrapped
-    try:
-        yield stashed
-    finally:
-        session.request = original
-
-
 def download_exact(client, identity: CaptureIdentity) -> PlaybackResult:
     """Fetch and validate one exact capture identity."""
 
     expected_status = (
         int(identity.status_token) if identity.status_token.isdigit() else None
     )
-    playback_error: BaseException | None = None
-    stashed_response = None
-    memento = None
-    with _capture_first_session_response(client) as stashed:
-        try:
-            memento = client.get_memento(
-                identity.original_url,
-                timestamp=identity.timestamp,
-                mode=Mode.original,
-                exact=True,
-                follow_redirects=False,
-            )
-        except MementoPlaybackError as error:
-            reconstructed = _slash_redirect_from_substitution(
-                stashed.get("response"), identity=identity
-            )
-            if reconstructed is not None:
-                return reconstructed
-            playback_error = error
-            stashed_response = stashed.get("response")
-
-    if playback_error is not None:
-        substituted = _substituted_playback(
-            client, stashed_response, identity=identity
-        )
-        if substituted is not None:
-            return substituted
-        raise playback_error
-
-    assert memento is not None
+    memento = client.get_memento(
+        identity.original_url,
+        timestamp=identity.timestamp,
+        mode=Mode.original,
+        exact=True,
+        follow_redirects=False,
+    )
     body, status_code, memento_url, memento_timestamp, headers, url = (
         _playback_from_memento(memento, expected_digest=identity.payload_digest)
     )

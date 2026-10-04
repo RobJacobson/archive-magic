@@ -56,7 +56,6 @@ from .resolution import (
     CaptureKind,
     CaptureOutcome,
     UrlOutcome,
-    group_needs_playback,
     iter_url_outcomes,
     process_url_group,
 )
@@ -159,7 +158,7 @@ def run_fetch(
     init_run_record(layout, run_id)
     factory = client_factory or make_client
     trace_path = (
-        layout.run_log(run_id).with_suffix(".requests.jsonl")
+        layout.run_log(run_id).with_suffix(".requests.csv")
         if settings.trace_requests else None
     )
     with mirror_output(layout.run_log(run_id)):
@@ -219,7 +218,7 @@ def _run_fetch(
     emit(
         f"download: workers={settings.playback_workers}, "
         f"starts/second={settings.playback_starts_per_second:g}, "
-        f"retries={settings.retries} (HTTP sends, including retries/recovery; per process)"
+        f"retries={settings.retries} (HTTP sends, including retries/redirects; per process)"
     )
 
     run_skips_errors = 0
@@ -426,25 +425,21 @@ def fetch_payload_data(
         grouped[capture.identity.urlkey].append(capture)
     groups = list(grouped.values())
     identities = frozenset(inventory.identities)
-    representatives = dict(inventory.by_url_digest)
+    representatives_by_url = defaultdict(dict)
+    for key, stored in inventory.by_url_digest.items():
+        representatives_by_url[key[0]][key] = stored
 
     def process(group: Sequence[ParsedCapture]) -> UrlOutcome:
         return process_url_group(
             group,
             workers=workers,
             existing_identities=identities,
-            existing_representatives=representatives,
+            existing_representatives=representatives_by_url.get(
+                group[0].identity.urlkey, {}
+            ),
         )
 
-    outcomes = iter_url_outcomes(
-        groups,
-        process,
-        workers,
-        tuple(
-            not group_needs_playback(group, identities, representatives)
-            for group in groups
-        ),
-    )
+    outcomes = iter_url_outcomes(groups, process, workers)
     return PayloadData(url_count=len(groups), outcomes=outcomes)
 
 
@@ -539,16 +534,10 @@ def _commit_capture_outcome(
     metrics.warc_write_s += time.monotonic() - started
     metrics.represented += 1
     inventory.identities.add(outcome.identity)
-    if outcome.kind in {
-        CaptureKind.EMPTY,
-        CaptureKind.SLASH_REDIRECT,
-    }:
-        metrics.payload_reuses += 1
-    else:
-        metrics.downloads += 1
-        if not result.digest_matched:
-            metrics.digest_mismatch_accepted += 1
-    if result.digest_matched or outcome.kind is CaptureKind.SLASH_REDIRECT:
+    metrics.downloads += 1
+    if not result.digest_matched:
+        metrics.digest_mismatch_accepted += 1
+    if result.digest_matched:
         inventory.remember_representative(stored_from_playback(result))
     return None
 

@@ -33,7 +33,6 @@ from helpers import (
     patch_cdx,
     patch_cdx_by_year,
     playback,
-    substitution_client,
 )
 
 def test_statusless_capture_three_runs_no_extra_network(tmp_path):
@@ -182,247 +181,65 @@ def test_reset_data_redownloads_instead_of_reusing(tmp_path):
         fetch_mod.fetch_cdx = original
 
 
-def test_slash_redirect_substitution_is_stored_and_revisited(tmp_path):
-    layout = ArchiveLayout(tmp_path / "data", "example.org")
-    ensure_collection_dirs(layout)
-    digest = "TV7A2C32YG3CFKH2CYRHAL2D4UPH7RCE"
-    first = make_capt(
-        url="http://example.org/conference",
-        ts="20040303170500",
-        status="301",
-        digest=f"sha1:{digest}",
-        urlkey="org,example)/conference",
-    )
-    second = make_capt(
-        url="http://example.org/conference",
-        ts="20040516142118",
-        status="301",
-        digest=f"sha1:{digest}",
-        urlkey="org,example)/conference",
-    )
-    clients: list[object] = []
-
-    def client_factory():
-        client = substitution_client(
-            "http://example.org/conference/", "20040510064339"
-        )
-        clients.append(client)
-        return client
-
-    body = cdx_json(
-        [
-            [
-                first.urlkey,
-                first.timestamp,
-                first.original_url,
-                "text/html",
-                "301",
-                digest,
-                "379",
-            ],
-            [
-                second.urlkey,
-                second.timestamp,
-                second.original_url,
-                "text/html",
-                "301",
-                digest,
-                "377",
-            ],
-        ]
-    )
-    original, cdx_mod, fetch_mod = patch_cdx(body)
-    try:
-        result = run_fetch(
-            FetchSettings(
-                url_pattern="http://example.org/",
-                date_start="20040303170500",
-                date_end="20040516142118",
-                archive_id="example.org",
-                output=FetchOutput("local", tmp_path / "data"),
-            ),
-            client_factory=client_factory,
-            sleep=lambda _s: None,
-        )
-    finally:
-        cdx_mod.fetch_cdx = original
-        fetch_mod.fetch_cdx = original
-
-    assert result.exit_code == 0
-    assert sum(getattr(client, "calls", 0) for client in clients) == 1
-    warc = list_collection_warcs(layout, "2004")[0]
-    with warc.open("rb") as stream:
-        records = list(ArchiveIterator(stream))
-    responses = [rec for rec in records if rec.rec_type == "response"]
-    revisits = [rec for rec in records if rec.rec_type == "revisit"]
-    assert len(responses) == 1
-    assert len(revisits) == 1
-    assert responses[0].http_headers.get_statuscode() == "301"
-    assert (
-        responses[0].http_headers.get_header("Location")
-        == "http://example.org/conference/"
-    )
-    inv = inventory_collection(layout, "2004")
-    assert inv.contains(first)
-    assert inv.contains(second)
-
-
-def test_found_capture_substitution_is_stored_under_cdx_identity(tmp_path):
-    from archive_magic_fetch.protocol import CDX_DIGEST_MATCH_HEADER
+@pytest.mark.parametrize("status", ["200", "301"])
+def test_unplayable_capture_leaves_same_digest_available_for_next_capture(tmp_path, status):
+    from archive_magic_fetch.playback import download_exact
+    from helpers import memento_client
 
     layout = ArchiveLayout(tmp_path / "data", "example.org")
-    ensure_collection_dirs(layout)
-    identity = make_capt(
-        url="http://example.org/groups/?PHPSESSID=abc",
-        ts="20041009172745",
-        status="200",
-        digest="sha1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-        urlkey="org,example)/groups",
+    body = b"shared content"
+    captures = [make_capt(
+        url="http://example.org/groups",
+        ts=f"2004100{day}000000",
+        status=status,
+        digest=payload_digest(body),
+    ) for day in (1, 2, 3)]
+    client = found_capture_client(
+        "http://example.org/groups/", "20041009202542", body,
     )
-    body = b"<html>groups</html>"
-    clients: list[object] = []
+    requested = []
 
-    def client_factory():
-        client = found_capture_client(
-            "http://example.org/groups/", "20041009202542", body
-        )
-        clients.append(client)
-        return client
+    def download(_client, identity):
+        requested.append(identity)
+        if identity == captures[0]:
+            return download_exact(client, identity)
+        return download_exact(memento_client(identity, body), identity)
 
-    cdx_body = cdx_json(
-        [
-            [
-                identity.urlkey,
-                identity.timestamp,
-                identity.original_url,
-                "text/html",
-                "200",
-                identity.payload_digest.split(":")[1],
-                "100",
-            ]
-        ]
-    )
+    cdx_body = cdx_json([
+        [identity.urlkey, identity.timestamp, identity.original_url,
+         "text/html", status, identity.payload_digest.split(":")[1], "14"]
+        for identity in captures
+    ])
     original, cdx_mod, fetch_mod = patch_cdx(cdx_body)
     try:
         result = run_fetch(
             FetchSettings(
                 url_pattern="http://example.org/",
-                date_start="20041009172745",
-                date_end="20041009172745",
-                archive_id="example.org",
-                output=FetchOutput("local", tmp_path / "data"),
-            ),
-            client_factory=client_factory,
-            sleep=lambda _s: None,
-        )
-    finally:
-        cdx_mod.fetch_cdx = original
-        fetch_mod.fetch_cdx = original
-
-    assert result.exit_code == 0
-    assert result.metrics.downloads == 1
-    assert result.metrics.digest_mismatch_accepted == 1
-    assert sum(getattr(client, "calls", 0) for client in clients) == 2
-    warc = list_collection_warcs(layout, "2004")[0]
-    with warc.open("rb") as stream:
-        stored = None
-        for record in ArchiveIterator(stream):
-            if record.rec_type == "response":
-                assert record.rec_headers.get_header("WARC-Target-URI") == (
-                    identity.original_url
-                )
-                assert record.rec_headers.get_header("WARC-Date") == (
-                    "2004-10-09T17:27:45Z"
-                )
-                assert record.rec_headers.get_header(CDX_DIGEST_MATCH_HEADER) == (
-                    "false"
-                )
-                stored = record.content_stream().read()
-            else:
-                record.raw_stream.read()
-    assert stored == body
-    inv = inventory_collection(layout, "2004")
-    assert inv.contains(identity)
-
-
-def test_slash_redirect_from_cdx_skips_playback_and_revisits(tmp_path):
-    layout = ArchiveLayout(tmp_path / "data", "example.org")
-    ensure_collection_dirs(layout)
-    digest = "TV7A2C32YG3CFKH2CYRHAL2D4UPH7RCE"
-    empty_dig = payload_digest(b"").split(":")[1]
-    downloads: list[str] = []
-
-    def download_fn(_client, identity):
-        downloads.append(identity.timestamp)
-        return playback(identity)
-
-    body = cdx_json(
-        [
-            [
-                "org,example)/conference",
-                "20040303170500",
-                "http://example.org/conference",
-                "text/html",
-                "301",
-                digest,
-                "379",
-            ],
-            [
-                "org,example)/conference",
-                "20040303180000",
-                "http://example.org/conference/",
-                "text/html",
-                "200",
-                empty_dig,
-                "0",
-            ],
-            [
-                "org,example)/conference",
-                "20040516142118",
-                "http://example.org/conference",
-                "text/html",
-                "301",
-                digest,
-                "377",
-            ],
-        ]
-    )
-    original, cdx_mod, fetch_mod = patch_cdx(body)
-    try:
-        result = run_fetch(
-            FetchSettings(
-                url_pattern="http://example.org/",
-                date_start="20040303170500",
-                date_end="20040516142118",
+                date_start=captures[0].timestamp,
+                date_end=captures[-1].timestamp,
                 archive_id="example.org",
                 output=FetchOutput("local", tmp_path / "data"),
             ),
             client_factory=lambda: MagicMock(),
-            download_fn=download_fn,
+            download_fn=download,
             sleep=lambda _s: None,
         )
     finally:
         cdx_mod.fetch_cdx = original
         fetch_mod.fetch_cdx = original
 
-    assert result.exit_code == 0
-    assert downloads == []
-    assert result.metrics.downloads == 0
-    assert result.metrics.payload_reuses == 2
+    assert requested == captures[:2]
+    assert client.calls == 1
+    assert result.metrics.downloads == 1
     assert result.metrics.revisits == 1
-    warc = list_collection_warcs(layout, "2004")[0]
-    with warc.open("rb") as stream:
-        records = list(ArchiveIterator(stream))
-    responses = [rec for rec in records if rec.rec_type == "response"]
-    revisits = [rec for rec in records if rec.rec_type == "revisit"]
-    assert len(responses) == 2
-    assert len(revisits) == 1
-    redirect = next(
-        rec for rec in responses if rec.http_headers.get_statuscode() == "301"
-    )
-    assert redirect.http_headers.get_header("Location") == (
-        "http://example.org/conference/"
-    )
+    assert result.metrics.unresolved == 1
+    assert [failure.identity for failure in result.failures] == captures[:1]
+    inv = inventory_collection(layout, "2004")
+    assert inv.identities == set(captures[1:])
+    with list_collection_warcs(layout, "2004")[0].open("rb") as stream:
+        records = [(record.rec_type, record.rec_headers.get_header("WARC-Date"))
+                   for record in ArchiveIterator(stream) if record.rec_type != "warcinfo"]
+    assert records == [("response", "2004-10-02T00:00:00Z"), ("revisit", "2004-10-03T00:00:00Z")]
 
 
 def test_same_year_representative_revisits_include_redirects(tmp_path):
@@ -592,7 +409,7 @@ def test_identical_digest_with_missing_cdx_status_is_a_revisit(tmp_path):
     assert result.metrics.revisits == 1
 
 
-def test_empty_http_200_skips_playback_and_revisits(tmp_path):
+def test_empty_http_200_downloads_once_then_revisits(tmp_path):
     layout = ArchiveLayout(tmp_path / "data", "example.org")
     ensure_collection_dirs(layout)
     empty_dig = payload_digest(b"").split(":")[1]
@@ -652,9 +469,9 @@ def test_empty_http_200_skips_playback_and_revisits(tmp_path):
         fetch_mod.fetch_cdx = original
 
     assert result.exit_code == 0
-    assert downloads == ["20040603000000"]
-    assert result.metrics.downloads == 1
-    assert result.metrics.payload_reuses == 1
+    assert set(downloads) == {"20040601000000", "20040603000000"}
+    assert result.metrics.downloads == 2
+    assert result.metrics.payload_reuses == 0
     assert result.metrics.revisits == 1
     warc = list_collection_warcs(layout, "2004")[0]
     types = []
@@ -765,7 +582,6 @@ def test_matching_payloads_in_later_years_become_revisits(tmp_path):
             urlkey="com,example)/",
         )
     )
-
 
 
 def test_different_ia_digest_downloads_twice(tmp_path):

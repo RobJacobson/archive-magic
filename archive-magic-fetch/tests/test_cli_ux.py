@@ -446,7 +446,6 @@ def test_playback_workers_run_url_groups_in_parallel():
                 [[1], [2], [3], [4]],
                 process,
                 workers,
-                (False, False, False, False),
             )
         )
     finally:
@@ -456,7 +455,7 @@ def test_playback_workers_run_url_groups_in_parallel():
     assert len(threads) == 4
 
 
-def test_represented_url_groups_skip_playback_workers():
+def test_every_url_group_is_walked_once_by_a_worker():
     main_thread = threading.current_thread().name
     seen: list[tuple[int, str]] = []
     workers = PlaybackWorkers(
@@ -477,20 +476,17 @@ def test_represented_url_groups_skip_playback_workers():
                 [[1], [2], [3]],
                 process,
                 workers,
-                (True, False, True),
             )
         )
     finally:
         workers.close()
 
     assert results == [1, 2, 3]
-    assert seen[0] == (1, main_thread)
-    assert seen[1][0] == 2
-    assert seen[1][1] != main_thread
-    assert seen[2] == (3, main_thread)
+    assert [number for number, _thread in seen] == [1, 2, 3]
+    assert all(thread != main_thread for _number, thread in seen)
 
 
-def test_skip_groups_yield_before_next_download_starts():
+def test_url_scheduling_remains_bounded_without_a_prepass():
     started_downloads: list[int] = []
     workers = PlaybackWorkers(
         lambda: MagicMock(),
@@ -511,7 +507,6 @@ def test_skip_groups_yield_before_next_download_starts():
             [[1], [2], [3], [4], [5]],
             process,
             workers,
-            (True, False, True, True, False),
         )
         assert next(iterator) == 1
         assert next(iterator) == 2

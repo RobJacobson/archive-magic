@@ -31,8 +31,8 @@ per-archive `fetch.toml`.
 
 `starts_per_second` controls HTTP transport sends shared across a run's workers.
 At 2, sends are spaced at least 0.5 seconds apart. The gate sits immediately before
-the Requests HTTP adapter sends, so extra requests for nearby-capture recovery,
-redirects, and capture retries each consume a slot. Wayback and urllib3 automatic
+the Requests HTTP adapter sends, so redirects and capture retries each consume
+a slot. Wayback and urllib3 automatic
 retries are disabled. `retries = 4` allows up to five capture attempts; one attempt
 can issue several HTTP requests. Existing `playback_attempts` metrics still count
 capture attempts. Duplicate capture identities and reusable revisits require no
@@ -52,31 +52,39 @@ For a detailed trace:
 uv run archive-magic-fetch /path/to/archive --trace-requests
 ```
 
-This writes a flushed `logs/<run>.requests.jsonl` beside the normal run log. Every
-`request_start` has a real `time_utc`, monotonic timestamp, process/thread ID,
-request ID, method/URL, requested capture identity, attempt number, request number
-within that attempt, and recent/peak counts. A matching `request_end` has status,
-Retry-After, Location, or transport exception type. Response elapsed time covers
-headers only; streamed payload reads happen afterward. Interrupted sends may have
-only a start event. A final `summary` is written when workers shut down.
+This writes `logs/<run>.requests.csv` beside the normal run log, with a header and
+one row per request, flushed when its response headers or transport error arrive.
+`start_utc` is the actual UTC start time rounded to milliseconds; `duration_ms` is
+an integer number of milliseconds measured with the monotonic clock. Duration
+covers headers only; streamed payload reads happen afterward. `capture_time` is
+the historical capture date and `digest` is its last six characters, matching the
+progress log. The SURT URL key is omitted.
+
+Request ID, timing, HTTP status, capture date/digest, attempt number, request number
+within the attempt, and rolling 1s/60s counts are on the left. Counts are sampled
+at request start. Method and process ID follow, then variable-width fields:
+thread, Retry-After, error type, request URL, and redirect Location. CSV quoting
+preserves commas, quotes, and newlines within fields. Rows are appended in
+completion order; sort by request ID to recover start order with multiple workers.
+On orderly shutdown, unfinished requests get one row marked `Interrupted` with
+blank duration and status. Totals and peak rates remain in the normal run log,
+without adding non-request rows to the CSV.
 
 Repeated URLs with increasing `attempt` values are capture retries. A
-`request_in_attempt` greater than 1 exposes recovery or redirect requests. Capture
+`request_in_attempt` greater than 1 exposes redirect requests. Capture
 timestamps in ordinary progress output are historical capture dates, so they
 cannot establish the real request rate. Trace files contain full requested URLs.
 
 To count sends in each UTC calendar second and minute (rather than rolling windows):
 
 ```sh
-python - /path/to/logs/RUN.requests.jsonl <<'PY'
-import collections, json, sys
+python - /path/to/logs/RUN.requests.csv <<'PY'
+import collections, csv, sys
 buckets = {"second": collections.Counter(), "minute": collections.Counter()}
-with open(sys.argv[1]) as stream:
-    for line in stream:
-        event = json.loads(line)
-        if event["event"] == "request_start":
-            buckets["second"][event["time_utc"][:19]] += 1
-            buckets["minute"][event["time_utc"][:16]] += 1
+with open(sys.argv[1], newline="") as stream:
+    for row in csv.DictReader(stream):
+        buckets["second"][row["start_utc"][:19]] += 1
+        buckets["minute"][row["start_utc"][:16]] += 1
 for unit, counts in buckets.items():
     for timestamp, count in sorted(counts.items()):
         print(unit, timestamp + "Z", count)
@@ -175,9 +183,30 @@ a cache through different archive layouts are unsupported. Only WARC/CDXJ data
 is published to the bucket.
 
 After acquisition, requested playback captures are sorted and deduplicated by
-identity. The existing URL-owned playback workers, chronological ordering within
-each URL, retry policy, and cross-year digest representatives remain in use.
-Individual unresolved mementos retain the existing skip-and-record policy.
+identity. Each CDX URL group is assigned to one worker, which walks its captures
+chronologically. There is no pre-pass selecting unique payloads or choosing
+which groups need downloads. The worker owns a map of successful digests to
+stored response references, seeded from earlier successful responses for that
+URL in the archive. It checks that map at each capture:
+
+1. An already stored capture needs no work.
+2. A digest already obtained at or before this timestamp produces a lightweight
+   revisit, preserving the capture date without another HTTP request.
+3. Otherwise, attempt exact playback with the configured retry policy. A
+   successful digest-matched response enters the map. A failure is recorded and
+   the next capture is attempted, even if it advertises the same digest.
+
+Digest mismatches may still be retained for their own exact capture, but never
+mark the expected digest as obtained. Missing digests cannot deduplicate. The
+existing status distinction for empty payloads keeps empty 301 and 302 responses
+separate. Digest reuse is scoped to a CDX URL key, never shared solely by hash
+across different URL groups. Workers do not mutate each other's maps.
+
+Exact playback does not follow Wayback's nearby-capture substitutions, synthesize
+slash redirects, or manufacture empty responses from CDX. Previously failed
+captures remain failures even if a later capture with the same digest succeeds.
+Revisits refer only to earlier successful responses. A staged write failure
+aborts the year; only successfully promoted data seeds later years and runs.
 
 For each year, Fetch creates a same-filesystem stage. Unchanged WARC shards
 are hard-linked into it; the final shard is copied only if new captures need to
