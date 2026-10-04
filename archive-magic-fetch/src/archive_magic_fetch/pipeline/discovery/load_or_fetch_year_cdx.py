@@ -26,7 +26,7 @@ from archive_magic_fetch.archive.identity import (
     identity_to_dict,
     make_identity,
 )
-from archive_magic_fetch.archive.layout import normalize_domain
+from archive_magic_fetch.archive.normalize_cdx_search import normalize_cdx_search
 from archive_magic_fetch.config.models import (
     DEFAULT_CDX_PAGE_LIMIT,
     DEFAULT_CDX_WINDOW_DAYS,
@@ -52,18 +52,6 @@ CDX_RATE_LIMIT_ATTEMPTS = 10
 CDX_RATE_LIMIT_INITIAL_DELAY = 60.0
 
 CDX_RATE_LIMIT_MAX_DELAY = 600.0
-
-_DOMAIN_WILDCARD = re.compile(
-    r"""
-    ^
-    (?:[a-zA-Z][a-zA-Z0-9+.-]*://)?  # optional http:// or https://
-    \*\.                              # one leading *.
-    (?P<host>[^*/?#.][^*/?#]*)        # host[:port], no extra * or path
-    /?                                # optional trailing slash
-    $
-    """,
-    re.VERBOSE,
-)
 
 
 @dataclass(frozen=True)
@@ -108,7 +96,7 @@ def load_or_fetch_year_cdx(
         )
     if cdx_window_days < 1 or cdx_page_limit < 1:
         raise ValueError("CDX window days and page limit must be positive")
-    search_url, match_type = _normalize_cdx_search(url_pattern)
+    search_url, match_type = normalize_cdx_search(url_pattern)
     path = index_directory / f"{year:04d}.cdx.json"
     historical = year < current_year
     if historical and (path.exists() or path.is_symlink()):
@@ -167,23 +155,6 @@ def load_or_fetch_year_cdx(
             tmp.unlink(missing_ok=True)
         report(f"saved CDX index for {year}: {path}")
     return _listing(captures, url_pattern, search_url, match_type, cdx_page_limit)
-
-
-def _normalize_cdx_search(url_pattern: str) -> tuple[str, str | None]:
-    """Map url_pattern sugar to a CDX URL and match_type.
-
-    ``*.example.org`` becomes ``("example.org", "domain")``. A trailing
-    ``/*`` becomes a prefix match. Anything else is searched as written.
-    """
-
-    text = url_pattern.strip()
-    wildcard = _DOMAIN_WILDCARD.fullmatch(text)
-    if wildcard is not None:
-        host, port = normalize_domain(wildcard["host"], allow_bare=True)
-        return (host if port is None else f"{host}:{port}"), "domain"
-    if text.endswith("/*"):
-        return text.removesuffix("*"), "prefix"
-    return text, None
 
 
 def _date_windows(
@@ -321,7 +292,7 @@ def _fetch_cdx(
 
     if limit <= 0:
         raise ValueError(f"cdx page limit must be positive, got {limit}")
-    search_url, match_type = _normalize_cdx_search(url_pattern)
+    search_url, match_type = normalize_cdx_search(url_pattern)
     last_error: BaseException | None = None
     attempt = 0
     max_attempts = 1

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Mapping, Sequence
 
@@ -98,3 +99,32 @@ def validate_cdxj_against_warcs(
                 f"CDXJ range out of bounds for {filename}: "
                 f"offset={offset_i} length={length_i} size={size}"
             )
+
+
+_REPRESENTATION_HEADERS = {
+    "content-digest",
+    "content-encoding",
+    "content-length",
+    "content-md5",
+    "digest",
+    "etag",
+    "repr-digest",
+    "transfer-encoding",
+}
+
+
+
+def semantic_headers(
+    headers: Iterable[tuple[str, str]],
+    payload_length: int,
+    *,
+    status_code: int,
+) -> list[tuple[str, str]]:
+    skip = set(_REPRESENTATION_HEADERS)
+    if status_code != 206:
+        skip.add("content-range")
+    semantic = [
+        (name, value) for name, value in headers if name.lower() not in skip
+    ]
+    semantic.append(("Content-Length", str(payload_length)))
+    return semantic

@@ -23,6 +23,7 @@ from archive_magic_fetch.config.read_toml_section import read_section
 class _Archive:
     id: str
     url_pattern: str
+    source: str = "wayback"
 
 
 @dataclass(frozen=True)
@@ -64,6 +65,8 @@ def load_config(value: Path | str) -> FetchConfig:
         if document:
             raise TypeError(f"unexpected table(s): {', '.join(sorted(document))}")
         archive_id = _safe_id(archive.id)
+        if archive.source not in ("wayback", "common-crawl"):
+            raise ValueError("archive.source must be 'wayback' or 'common-crawl'")
     except (
         OSError,
         tomllib.TOMLDecodeError,
@@ -80,6 +83,7 @@ def load_config(value: Path | str) -> FetchConfig:
 
     return FetchConfig(
         archive_id=archive_id,
+        source=archive.source,
         url_pattern=archive.url_pattern,
         output=output,
         warc_target_bytes=options.warc_target_bytes,

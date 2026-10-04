@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -34,9 +35,31 @@ class CaptureIdentity:
 
 
 @dataclass(frozen=True)
+class CommonCrawlLocator:
+    crawl_id: str
+    filename: str
+    offset: int
+    length: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.crawl_id, str) or not re.fullmatch(r"CC-MAIN-[0-9-]+", self.crawl_id):
+            raise ValueError("invalid Common Crawl collection ID")
+        if (not isinstance(self.filename, str)
+                or not re.fullmatch(r"[A-Za-z0-9_./-]+", self.filename)
+                or self.filename.startswith("/")
+                or any(part in ("", ".", "..") for part in self.filename.split("/"))):
+            raise ValueError("unsafe Common Crawl filename")
+        if type(self.offset) is not int or self.offset < 0:
+            raise ValueError("Common Crawl offset must be nonnegative")
+        if type(self.length) is not int or self.length <= 0:
+            raise ValueError("Common Crawl length must be positive")
+
+
+@dataclass(frozen=True)
 class CaptureRef:
     identity: CaptureIdentity
     mime: str
+    locator: CommonCrawlLocator | None = None
 
 
 @dataclass(frozen=True)
@@ -121,7 +144,7 @@ class CaptureKind(str, Enum):
 
 @dataclass(frozen=True)
 class CaptureOutcome:
-    identity: CaptureIdentity
+    capture: CaptureRef
     kind: CaptureKind
     playback: CaptureResult | None = None
     representative: StoredResponse | None = None

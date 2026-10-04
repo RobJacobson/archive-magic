@@ -57,8 +57,8 @@ def build_source(
         fetch=_fetch,
         preflight=_preflight,
         failure_advice=failure_advice,
-        capture_link=lambda identity: wayback_url(
-            identity.timestamp, identity.original_url
+        capture_link=lambda capture: wayback_url(
+            capture.identity.timestamp, capture.identity.original_url
         ),
     )
 

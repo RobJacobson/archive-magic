@@ -1,8 +1,11 @@
 [archive]
 id = "example.org"
 url_pattern = "*.example.org"
-# Complete historical CDX years are cached in index/ beside this file.
-# Keep this query fixed, or explicitly clear the cache when changing it.
+source = "wayback" # default; set "common-crawl" for WARC range acquisition
+# Wayback: complete historical CDX years are cached in index/ beside this file.
+# Wayback: keep this query fixed, or clear the cache when changing it.
+# CC: complete per-crawl full-year queries are cached in index/common-crawl/,
+# isolated by query. New catalogs add crawls; unchanged entries require manual refresh.
 
 [output]
 type = "remote"
@@ -14,5 +17,6 @@ region = "auto"
 
 [fetch]
 # Dates select WARC captures; uncached CDX queries cover each full calendar year.
-# The current UTC year is queried on every run and is never cached.
+# Wayback: the current UTC year is queried every run and never cached.
+# CC: completed current-year crawl queries are cached too.
 start = "2000-01-01"

@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
+from archive_magic_fetch.archive.normalize_cdx_search import normalize_cdx_search
 from archive_magic_fetch.archive.dates import parse_date_bound, year_ranges
 from archive_magic_fetch.config.models import FetchOutput
 from archive_magic_fetch.config.build_settings import build_settings
@@ -15,7 +16,6 @@ from archive_magic_fetch.pipeline.discovery.load_or_fetch_year_cdx import (
     _format_cdx_index_scope,
     _format_cdx_window_label,
     _next_split_days,
-    _normalize_cdx_search,
     _window_calendar_days,
 )
 from wayback import CdxRecord
@@ -543,16 +543,16 @@ def test_next_split_days_uses_28_then_7():
 
 
 def test_normalize_cdx_search_rewrites_wildcard_and_prefix():
-    assert _normalize_cdx_search("*.example.org") == ("example.org", "domain")
-    assert _normalize_cdx_search("http://*.example.org/") == (
+    assert normalize_cdx_search("*.example.org") == ("example.org", "domain")
+    assert normalize_cdx_search("http://*.example.org/") == (
         "example.org",
         "domain",
     )
-    assert _normalize_cdx_search("http://example.org/path/*") == (
+    assert normalize_cdx_search("http://example.org/path/*") == (
         "http://example.org/path/",
         "prefix",
     )
-    assert _normalize_cdx_search("http://example.org/a") == (
+    assert normalize_cdx_search("http://example.org/a") == (
         "http://example.org/a",
         None,
     )

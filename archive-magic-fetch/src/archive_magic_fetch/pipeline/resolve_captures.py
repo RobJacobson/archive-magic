@@ -126,7 +126,7 @@ def _resolve_capture(
 ) -> tuple[CaptureOutcome, DownloadOutcome | None]:
     identity = capture.identity
     if identity in existing_identities:
-        return CaptureOutcome(identity, CaptureKind.EXISTING), None
+        return CaptureOutcome(capture, CaptureKind.EXISTING), None
 
     key = revisit_group_key(identity)
     representative = successful_downloads.get(key) if key is not None else None
@@ -135,13 +135,13 @@ def _resolve_capture(
         and representative.identity.timestamp <= identity.timestamp
     ):
         return CaptureOutcome(
-            identity, CaptureKind.REVISIT, representative=representative
+            capture, CaptureKind.REVISIT, representative=representative
         ), None
 
     downloaded = download(capture)
     if downloaded.failure is not None:
         return CaptureOutcome(
-            identity,
+            capture,
             CaptureKind.FAILURE,
             failure=downloaded.failure,
             attempts=downloaded.attempts,
@@ -153,7 +153,7 @@ def _resolve_capture(
     if result.digest_matched and key is not None:
         successful_downloads[key] = stored_from_capture(result)
     return CaptureOutcome(
-        identity,
+        capture,
         CaptureKind.DOWNLOADED,
         playback=result,
         attempts=downloaded.attempts,
