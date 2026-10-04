@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from collections import defaultdict
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Mapping, Optional, Sequence
 
 from archive_magic_fetch.archive.format import parse_cdxj_line
 from archive_magic_fetch.archive.identity import current_run_id, identity_to_dict
@@ -134,6 +134,8 @@ def write_run_record(
 def published_warc_artifacts(
     layout: ArchiveLayout,
     collection_id: str,
+    *,
+    record_counts: Mapping[str, int] | None = None,
 ) -> list[WarcArtifact]:
     """Summarize committed WARCs from the CDXJ and size inventory."""
 
@@ -167,7 +169,7 @@ def published_warc_artifacts(
                 path=path,
                 size_bytes=size_bytes,
                 sha256=sha256,
-                record_count=capture_counts[filename] + 1,
+                record_count=(record_counts or {}).get(filename, capture_counts[filename] + 1),
             )
         )
     return artifacts

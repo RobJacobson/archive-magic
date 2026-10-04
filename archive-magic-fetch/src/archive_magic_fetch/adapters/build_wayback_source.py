@@ -39,6 +39,7 @@ def build_source(
     cdx_window_days: int = DEFAULT_CDX_WINDOW_DAYS,
     cdx_page_limit: int = DEFAULT_CDX_PAGE_LIMIT,
     sleep: Callable[[float], None] = time.sleep,
+    checkpoint_directory: Path | None = None,
 ) -> SourceAdapter[WaybackClient]:
     def discover(request: DiscoveryRequest, stats: RequestStats | None) -> CaptureListing:
         return discovery.load_or_fetch_year_cdx(
@@ -50,6 +51,7 @@ def build_source(
             cdx_page_limit=cdx_page_limit,
             sleep=sleep,
             stats=stats,
+            checkpoint_directory=checkpoint_directory,
         )
 
     return SourceAdapter(

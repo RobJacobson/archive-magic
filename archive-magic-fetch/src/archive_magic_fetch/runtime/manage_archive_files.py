@@ -8,6 +8,7 @@ if TYPE_CHECKING:
     from archive_magic_fetch.archive.layout import ArchiveLayout
 import fcntl
 import hashlib
+import json
 import os
 import shutil
 import tempfile
@@ -31,10 +32,47 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def sync_file(path: Path) -> None:
+    """Make a closed file's bytes durable before publishing a checkpoint."""
+    with path.open("rb") as stream:
+        os.fsync(stream.fileno())
+
+
+def sync_directory(path: Path) -> None:
+    """Persist directory entries after file creation, replacement, or removal."""
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def mkdir_durably(path: Path) -> None:
+    missing = []
+    parent = path
+    while not parent.exists():
+        missing.append(parent)
+        parent = parent.parent
+    path.mkdir(parents=True, exist_ok=True)
+    for directory in reversed(missing):
+        sync_directory(directory.parent)
+
+
+def write_json_durably(path: Path, value: object) -> None:
+    """Install complete checkpoint metadata after syncing its contents."""
+    mkdir_durably(path.parent)
+    temporary = exclusive_temp_path(path.parent, suffix=".json.tmp")
+    try:
+        temporary.write_text(json.dumps(value, sort_keys=True) + "\n", encoding="utf-8")
+        publish_file_atomically(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def publish_file_atomically(source: Path, destination: Path) -> None:
     """Atomically replace destination with a complete source file."""
 
-    destination.parent.mkdir(parents=True, exist_ok=True)
+    mkdir_durably(destination.parent)
     if source.parent.resolve() != destination.parent.resolve():
         # Same-filesystem publish via temporary sibling of destination.
         fd, tmp_name = tempfile.mkstemp(
@@ -46,19 +84,23 @@ def publish_file_atomically(source: Path, destination: Path) -> None:
         tmp_path = Path(tmp_name)
         try:
             shutil.copyfile(source, tmp_path)
+            sync_file(tmp_path)
             os.replace(tmp_path, destination)
+            sync_directory(destination.parent)
         finally:
             if tmp_path.exists():
                 tmp_path.unlink()
         source.unlink(missing_ok=True)
         return
+    sync_file(source)
     os.replace(source, destination)
+    sync_directory(destination.parent)
 
 
 def exclusive_temp_path(directory: Path, *, suffix: str) -> Path:
     """Return an exclusive temporary path in directory."""
 
-    directory.mkdir(parents=True, exist_ok=True)
+    mkdir_durably(directory)
     fd, name = tempfile.mkstemp(prefix=".tmp-", suffix=suffix, dir=directory)
     os.close(fd)
     path = Path(name)

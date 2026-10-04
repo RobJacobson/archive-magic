@@ -111,7 +111,7 @@ def test_inventory_remembers_redirect_representative_by_status(tmp_path):
     )
 
 
-def test_trailing_newline_soft_match_seeds_revisit_and_survives_inventory(
+def test_trailing_newline_soft_match_seeds_current_revisit_but_not_resume_representative(
     tmp_path,
 ):
     """IA CDX hashed body+LF; playback body without LF still revisits."""
@@ -206,8 +206,9 @@ def test_trailing_newline_soft_match_seeds_revisit_and_survives_inventory(
             "200",
             not_after_timestamp="20040602000000",
         )
-        is not None
+        is None
     )
+    assert len(inv.identities) == 2
 
 
 def test_custom_cdx_urlkey_survives_warc_inventory(tmp_path):

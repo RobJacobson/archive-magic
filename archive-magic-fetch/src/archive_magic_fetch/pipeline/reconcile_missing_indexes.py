@@ -7,7 +7,9 @@ from archive_magic_fetch.archive.layout import ArchiveLayout, list_collection_wa
 from archive_magic_fetch.pipeline.build_collection_index import build_collection_index
 
 
-def reconcile_missing_indexes(layout: ArchiveLayout) -> list[str]:
+def reconcile_missing_indexes(
+    layout: ArchiveLayout, *, exclude_collections: set[str] | None = None,
+) -> list[str]:
     """Rebuild missing indexes; incrementally replace lines for new or newer WARCs."""
 
     updated: list[str] = []
@@ -25,6 +27,8 @@ def reconcile_missing_indexes(layout: ArchiveLayout) -> list[str]:
         }
     )
     for collection_id in collection_ids:
+        if exclude_collections and collection_id in exclude_collections:
+            continue
         layout.validate_collection_id(collection_id)
         warcs = list_collection_warcs(layout, collection_id)
         if not warcs:

@@ -107,10 +107,14 @@ def run_application(args) -> int:
         assert settings is not None
         result = run_fetch(
             settings,
-            source=build_common_crawl_source(index_directory=settings.index_directory)
+            source=build_common_crawl_source(
+                index_directory=settings.index_directory,
+                checkpoint_directory=settings.output.data_directory.parent / '.state' / 'discovery',
+            )
             if config.source == "common-crawl"
             else build_wayback_source(
                 index_directory=settings.index_directory,
+                checkpoint_directory=settings.output.data_directory.parent / '.state' / 'discovery',
                 cdx_window_days=settings.cdx_window_days,
                 cdx_page_limit=settings.cdx_page_limit,
             ),

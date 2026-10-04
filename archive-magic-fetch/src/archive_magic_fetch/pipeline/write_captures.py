@@ -42,6 +42,7 @@ from archive_magic_fetch.models import (
     WarcArtifact,
 )
 from archive_magic_fetch.pipeline.resolve_captures import PayloadData
+from archive_magic_fetch.archive.scan_warcs import scan_warc
 from archive_magic_fetch.runtime.report_progress import log_url_outcome
 
 
@@ -62,6 +63,7 @@ def write_captures(
     target_bytes: int,
     inventory: CollectionInventory,
     capture_link,
+    checkpoint=None,
 ) -> WarcBuild:
     """Append resolved payloads, validating each member before it reaches disk."""
 
@@ -82,6 +84,9 @@ def write_captures(
             )
             if failure is not None:
                 failures.append(failure)
+        if checkpoint is not None:
+            checkpoint(sorted(writer.touched))
+        writer.touched.clear()
         log_url_outcome(number, payloads.url_count, outcome, capture_link=capture_link)
     started = time.monotonic()
     warcs = writer.close()
@@ -274,6 +279,7 @@ class _CollectionWarcWriter:
     current_path: Path | None = None
     _base_size: int = 0
     _changed: bool = False
+    touched: set[Path] = field(default_factory=set)
 
     def __post_init__(self) -> None:
         if self.sequence:
@@ -303,6 +309,7 @@ class _CollectionWarcWriter:
         self._ensure_current()
         assert self.current_path is not None
         _append_bytes(self.current_path, data)
+        self.touched.add(self.current_path)
         self._changed = True
         if self.current_path.stat().st_size >= self.target_bytes:
             self._finalize_current()
@@ -322,16 +329,7 @@ class _CollectionWarcWriter:
         path = self.current_path
         if path is None or not self._changed:
             return
-        try:
-            count = _validate_warc(path)
-        except BaseException:
-            if self._base_size:
-                with path.open("r+b") as stream:
-                    stream.truncate(self._base_size)
-            else:
-                path.unlink(missing_ok=True)
-            self._reset_current()
-            raise
+        count = _validate_warc(path)
         self.finalized.append(
             warc_artifact_from_path(
                 self.layout,
@@ -352,16 +350,4 @@ class _CollectionWarcWriter:
 def _validate_warc(path: Path) -> int:
     """Require a complete WARC with valid digests and at least one capture."""
 
-    count = 0
-    first_type: str | None = None
-    with path.open("rb") as stream:
-        for record in ArchiveIterator(stream, check_digests="raise"):
-            if first_type is None:
-                first_type = record.rec_type
-            record.raw_stream.read()
-            count += 1
-    if first_type != "warcinfo":
-        raise ValueError(f"WARC missing leading warcinfo: {path}")
-    if count < 2:
-        raise ValueError(f"WARC contains no captures: {path}")
-    return count
+    return scan_warc(path).records

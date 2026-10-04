@@ -154,13 +154,13 @@ def inventory_collection(
                 continue
             warc_payload = normalize_payload_digest(meta.get("digest"))
             cdx_payload = normalize_payload_digest(identity.payload_digest)
-            if warc_payload is None or cdx_payload is None:
+            if warc_payload is None or cdx_payload is None or warc_payload != cdx_payload:
                 continue
             if meta.get("cdxDigestMatch") is not True:
                 continue
-            status_code = (
-                int(identity.status_token) if identity.status_token.isdigit() else 200
-            )
+            # Older rows omitted the actual HTTP status; retain their fallback.
+            http_status = str(meta.get("status", identity.status_token))
+            status_code = int(http_status) if http_status.isdigit() else 200
             inv.remember_representative(
                 StoredResponse(
                     identity=identity,

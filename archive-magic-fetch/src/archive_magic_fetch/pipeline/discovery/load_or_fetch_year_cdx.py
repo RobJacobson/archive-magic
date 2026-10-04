@@ -37,12 +37,14 @@ from archive_magic_fetch.models import CaptureListing, CaptureRef
 from archive_magic_fetch.runtime.manage_archive_files import (
     exclusive_temp_path,
     publish_file_atomically,
+    write_json_durably,
 )
 from archive_magic_fetch.runtime.report_progress import emit
 from archive_magic_fetch.runtime.calculate_retry_delay import iter_error_chain, retry_after_from_error
 from archive_magic_fetch.runtime.track_http_requests import RequestStats
 
 from .cache import wayback_path, wayback_document, validate_wayback, query_for
+from .checkpoints import progress_root, clear_progress
 from archive_magic_fetch.pipeline.publication.storage import completed_discovery
 
 DEFAULT_CDX_TIMEOUT_SECONDS = 300.0
@@ -91,6 +93,7 @@ def load_or_fetch_year_cdx(
     sleep: Callable[[float], None] = time.sleep,
     report: Callable[[str], None] = emit,
     stats: RequestStats | None = None,
+    checkpoint_directory: Path | None = None,
 ) -> CaptureListing:
     """Return a full calendar-year listing, caching only completed past years.
 
@@ -108,6 +111,8 @@ def load_or_fetch_year_cdx(
     search_url, match_type = normalize_cdx_search(url_pattern)
     path = wayback_path(index_directory, url_pattern, year)
     historical = year < current_year
+    private_root = progress_root(index_directory, checkpoint_directory)
+    progress = private_root / "wayback" / "v1" / path.parent.name / f"{year:04d}"
     if historical and (path.exists() or path.is_symlink()):
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
@@ -115,36 +120,67 @@ def load_or_fetch_year_cdx(
         except (OSError, UnicodeError, ValueError) as error:
             raise ValueError(f"invalid CDX cache {path}: {error}") from error
         completed_discovery(path)
+        clear_progress(progress, private_root)
         report(f"using cached CDX index for {year}: {path}")
         return _listing(captures, url_pattern, search_url, match_type, cdx_page_limit)
 
     def acquire(date_start: str, date_end: str) -> tuple[CaptureRef, ...]:
+        checkpoint = progress / f"{date_start}-{date_end}.json"
+        scope = {"version": 1, "source": "wayback", "query": query_for(url_pattern),
+                 "from": date_start, "to": date_end}
+        split_days = None
+        if historical and checkpoint.exists():
+            try:
+                saved = json.loads(checkpoint.read_text(encoding="utf-8"))
+                if (not isinstance(saved, dict) or type(saved.get("version")) is not int
+                        or any(saved.get(k) != v for k, v in scope.items())
+                        or set(saved) not in (set(scope) | {"captures"}, set(scope) | {"split_days"})):
+                    raise ValueError("checkpoint scope/version mismatch")
+                if "captures" in saved:
+                    if not isinstance(saved["captures"], list):
+                        raise ValueError("invalid checkpoint captures")
+                    captures = tuple(_capture_from_dict(item) for item in saved["captures"])
+                    if any(not date_start <= item.identity.timestamp <= date_end for item in captures):
+                        raise ValueError("checkpoint capture outside window")
+                    report(f"using CDX checkpoint: {_format_cdx_window_label(date_start, date_end)}")
+                    return captures
+                split_days = saved["split_days"]
+                if type(split_days) is not int or not 1 <= split_days < _window_calendar_days(date_start, date_end):
+                    raise ValueError("invalid checkpoint split")
+            except (OSError, UnicodeError, ValueError, TypeError) as error:
+                raise ValueError(f"invalid CDX checkpoint {checkpoint}: {error}") from error
         report(
             "fetching CDX index for "
             f"{_format_cdx_index_scope(year, date_start, date_end)}"
         )
-        try:
-            return _fetch_cdx(
-                url_pattern=url_pattern,
-                date_start=date_start,
-                date_end=date_end,
-                limit=cdx_page_limit,
-                sleep=sleep,
-                report=report,
-                stats=stats,
-            ).captures
-        except Exception as error:  # noqa: BLE001 - CDX network boundary
-            split_days = (
-                _next_split_days(date_start, date_end, cdx_window_days)
-                if _cdx_should_split(error)
-                else None
-            )
-            if split_days is None:
-                raise
-            report("CDX index took too long.")
-            report(f"fetching {split_days}-day ranges.")
-        # Fail immediately on any terminal child error. No partial result or
-        # completed-window checkpoint survives a failed annual acquisition.
+        if split_days is None:
+            try:
+                captures = _fetch_cdx(
+                    url_pattern=url_pattern,
+                    date_start=date_start,
+                    date_end=date_end,
+                    limit=cdx_page_limit,
+                    sleep=sleep,
+                    report=report,
+                    stats=stats,
+                ).captures
+            except Exception as error:  # noqa: BLE001 - CDX network boundary
+                split_days = (
+                    _next_split_days(date_start, date_end, cdx_window_days)
+                    if _cdx_should_split(error) else None
+                )
+                if split_days is None:
+                    raise
+                report("CDX index took too long.")
+                report(f"fetching {split_days}-day ranges.")
+                if historical:
+                    write_json_durably(checkpoint, {**scope, "split_days": split_days})
+            else:
+                if any(not date_start <= item.identity.timestamp <= date_end for item in captures):
+                    raise ValueError("CDX capture outside requested query window")
+                if historical:
+                    write_json_durably(checkpoint, {**scope, "captures": [_capture_to_dict(c) for c in captures]})
+                return captures
         captures = []
         for start, end in _date_windows(date_start, date_end, split_days):
             captures.extend(acquire(start, end))
@@ -160,6 +196,7 @@ def load_or_fetch_year_cdx(
             publish_file_atomically(tmp, path)
         finally:
             tmp.unlink(missing_ok=True)
+        clear_progress(progress, private_root)
         completed_discovery(path)
         report(f"saved CDX index for {year}: {path}")
     return _listing(captures, url_pattern, search_url, match_type, cdx_page_limit)

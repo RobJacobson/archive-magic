@@ -9,7 +9,7 @@ from functools import partial
 
 from archive_magic_fetch.archive.dates import year_ranges
 from archive_magic_fetch.archive.identity import current_utc_cdx_timestamp
-from archive_magic_fetch.archive.inventory_collection import inventory_collection
+from archive_magic_fetch.archive.normalize_cdx_search import normalize_cdx_search
 from archive_magic_fetch.archive.layout import (
     ArchiveLayout,
     cleanup_temps,
@@ -35,7 +35,7 @@ from archive_magic_fetch.pipeline.reconcile_missing_indexes import reconcile_mis
 from archive_magic_fetch.pipeline.resolve_captures import resolve_captures
 from archive_magic_fetch.pipeline.retrieval.fetch_capture import fetch_capture
 from archive_magic_fetch.pipeline.write_captures import write_captures
-from archive_magic_fetch.runtime.manage_archive_files import archive_lock
+from archive_magic_fetch.runtime.manage_archive_files import archive_lock, mkdir_durably
 from archive_magic_fetch.runtime.track_http_requests import RequestStats
 from archive_magic_fetch.runtime.pace_requests import StartGate
 from archive_magic_fetch.runtime.write_run_record import (
@@ -79,7 +79,7 @@ def run_fetch(
 
     current_year = int(current_utc_cdx_timestamp()[:4])
     layout = ArchiveLayout(settings.output.data_directory, settings.archive_id)
-    layout.logs_root.mkdir(parents=True, exist_ok=True)
+    mkdir_durably(layout.logs_root)
     run_id = init_run_id(layout)
     init_run_record(layout, run_id)
     trace_path = (
@@ -158,7 +158,12 @@ def _run_fetch(
     reject_legacy_layout(layout)
     ensure_collection_dirs(layout)
     cleanup_temps(layout)
-    reconcile_missing_indexes(layout)
+    # Selected years get a full, strict rebuild in their working view. Avoid
+    # reading them twice or trusting a malformed canonical index beforehand.
+    reconcile_missing_indexes(layout, exclude_collections={
+        f"{year:04d}" for year in range(int(settings.date_start[:4]),
+                                      min(int(settings.date_end[:4]), current_year) + 1)
+    })
 
     metrics = RunMetrics()
     all_failures: list[UnresolvedFailure] = []
@@ -179,12 +184,14 @@ def _run_fetch(
             emit(f"skipping future CDX year {year}")
             continue
         year_started = clock()
-        stage = YearStage(
-            layout,
-            f"{year:04d}",
-            reset=settings.reset_data and settings.output.type == "local",
-        )
+        stage = None
         try:
+            query_url, match_type = normalize_cdx_search(settings.url_pattern)
+            stage = YearStage(
+                layout, f"{year:04d}", reset=settings.reset_data,
+                binding={"source": source.name, "query": {"url": query_url, "matchType": match_type},
+                         "date_start": year_start, "date_end": year_end},
+            )
             result = _run_year(
                 settings,
                 layout=stage.layout,
@@ -201,23 +208,20 @@ def _run_fetch(
             from archive_magic_fetch.pipeline.publication.storage import ACTIVE
             if ACTIVE.get() is not None:
                 paths = [item.path for item in result.warcs]
-                if result.index is not None:
+                if stage.index_changed():
                     paths.append(stage.layout.collection_index(f'{year:04d}'))
                 ACTIVE.get().record_generation(paths)
             stage.commit(
                 result.warcs,
-                index_changed=bool(result.warcs)
-                or (
-                    result.index is not None
-                    and not layout.collection_index(f"{year:04d}").is_file()
-                ),
+                index_changed=stage.index_changed(),
             )
             if ACTIVE.get() is not None:
                 ACTIVE.get().finish_generation()
         except Exception as error:  # noqa: BLE001 - isolate years
-            if (stage.path / "ready.json").is_file():
+            if stage is not None and (stage.path / "ready.json").is_file():
                 raise
-            stage.abort()
+            if stage is not None:
+                stage.abort()
             from archive_magic_fetch.pipeline.publication.storage import ACTIVE
             if ACTIVE.get() is not None:
                 ACTIVE.get().recover_generation()
@@ -225,13 +229,17 @@ def _run_fetch(
             failed_years.append(year)
             continue
         except BaseException:
-            stage.abort()
+            if stage is not None:
+                stage.abort()
             raise
         if settings.output.type == "remote" and list_collection_warcs(
             layout, f"{year:04d}"
         ):
             sync_archive(layout, settings.output, year=f"{year:04d}")
-        year_warcs = published_warc_artifacts(layout, f"{year:04d}")
+        year_warcs = published_warc_artifacts(
+            layout, f"{year:04d}",
+            record_counts={name: scanned.records for name, scanned in stage.scans.items()},
+        )
         index_path = layout.collection_index(f"{year:04d}")
         collection_index = (
             index_artifact_from_path(layout, index_path)
@@ -297,6 +305,9 @@ def _run_year(
 
     collection_id = f"{year:04d}"
     year_metrics = RunMetrics()
+    idx_started = clock()
+    inventory = stage.prepare_inventory()
+    year_metrics.index_s += clock() - idx_started
     cdx_started = clock()
     acquisition = discover_captures(
         source,
@@ -310,7 +321,6 @@ def _run_year(
     year_metrics.selected += len(selected)
     query = acquisition.query
 
-    inventory = inventory_collection(layout, collection_id)
     if any(capture.identity not in inventory.identities for capture in selected):
         stage.prepare_mutable_tail(settings.warc_target_bytes)
     with workers.batch() as batch:
@@ -328,19 +338,20 @@ def _run_year(
             target_bytes=settings.warc_target_bytes,
             inventory=inventory,
             capture_link=source.capture_link,
+            checkpoint=stage.checkpoint,
         )
     _accumulate_metrics(year_metrics, built.metrics)
     year_failures = list(built.failures)
-    new_warcs = list(built.warcs)
-
-    for artifact in new_warcs:
-        emit(f"  staged {artifact.relative_key}")
-
     idx_started = clock()
     collection_index = build_collection_index(
-        layout, collection_id, changed_warcs=[item.path for item in new_warcs]
+        layout, collection_id, changed_warcs=[item.path for item in built.warcs],
+        on_scan=stage.remember_scan,
     )
     year_metrics.index_s += clock() - idx_started
+    # Index only this invocation's writes, but promote all retained changes.
+    new_warcs = stage.changed_warcs()
+    for artifact in new_warcs:
+        emit(f"  staged {artifact.relative_key}")
 
     return _YearResult(
         metrics=year_metrics,

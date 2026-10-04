@@ -22,7 +22,7 @@ from archive_magic_fetch.archive.layout import ArchiveLayout
 from archive_magic_fetch.archive.validate_local_archive import validate_local_archive
 from archive_magic_fetch.config.presentation import metadata, asset_path
 from archive_magic_fetch.models import PublicationError
-from archive_magic_fetch.runtime.manage_archive_files import file_sha256
+from archive_magic_fetch.runtime.manage_archive_files import file_sha256, write_json_durably
 
 ACTIVE = ContextVar('archive_storage', default=None)
 
@@ -43,14 +43,7 @@ def active_storage(store):
 
 
 def atomic_json(path, value):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(mode='w', dir=path.parent, delete=False) as stream:
-        temporary = Path(stream.name)
-        json.dump(value, stream, sort_keys=True)
-    try:
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
+    write_json_durably(path, value)
 
 
 class BucketStorage:
@@ -245,7 +238,8 @@ class BucketStorage:
         if all(actual[key] == digest for key, digest in generation['files'].items()):
             self.finish_generation()
         elif all(actual[key] == self.state['baseline'].get(key, {}).get('sha256') for key in generation['files']):
-            # The process stopped before ready.json; staging recovery discarded it.
+            # Promotion never started. Acquisition remains private and can resume;
+            # canonical files retain the previous publication intentions.
             self.state['pending'] = generation['previous']
             self.finish_generation()
         else:
@@ -307,7 +301,9 @@ class BucketStorage:
             self.save()
 
     def unresolved(self):
-        if (self.layout.root / '.staging').exists() or self.state['pending'] or self.state.get('generation'):
+        discovery_work = self.root / '.state' / 'discovery'
+        if ((self.layout.root / '.staging').exists() or self.state['pending'] or self.state.get('generation')
+                or (discovery_work.exists() and any(p.is_file() for p in discovery_work.rglob('*')))):
             raise PublicationError('unresolved transaction; finish or retry publication before restore/eviction')
 
     def evict(self):

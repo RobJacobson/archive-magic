@@ -53,7 +53,10 @@ def test_interrupted_stage_keeps_canonical_year_unchanged(tmp_path):
 
     assert layout.collection_warc_path("2004", 1).read_bytes() == old_warc
     assert layout.collection_index("2004").read_bytes() == old_index
-    assert not (layout.root / ".staging").exists()
+    assert stage.state_path.is_file()
+    YearStage.recover(layout)
+    resumed = YearStage(layout, "2004")
+    assert resumed.prepare_inventory().contains(make_capt(ts="20040616000000"))
 
 
 def test_recovery_finishes_validated_promotion_before_sync(tmp_path, monkeypatch):

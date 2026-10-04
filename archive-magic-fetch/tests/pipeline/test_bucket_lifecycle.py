@@ -277,3 +277,86 @@ def test_promoted_generation_survives_crash_before_receipt(setup, tmp_path):
     retry.preflight()
     assert 'data/' + old.name in retry.state['pending']
     assert 'generation' not in retry.state
+
+
+@pytest.mark.parametrize('work', ['acquisition', 'discovery'])
+@pytest.mark.parametrize('operation', ['restore', 'evict'])
+def test_lifecycle_rejects_outstanding_private_work(setup, work, operation):
+    from archive_magic_fetch.pipeline.stage_year import YearStage
+    store, bucket = setup
+    store.publish()
+    if work == 'acquisition':
+        path = YearStage(store.layout, '2004').state_path
+    else:
+        path = store.root / '.state' / 'discovery' / 'wayback' / 'window.json'
+        path.parent.mkdir(parents=True)
+        path.write_text('private progress')
+    before = path.read_bytes()
+    with pytest.raises(PublicationError, match='unresolved'):
+        getattr(store, operation)()
+    assert path.read_bytes() == before
+
+
+def test_resumed_zero_download_generation_publishes_retained_warcs(tmp_path, monkeypatch):
+    from dataclasses import replace
+    from archive_magic_fetch.archive.identity import payload_digest
+    from archive_magic_fetch.config.build_settings import FetchSettings
+    from archive_magic_fetch.models import CaptureRef
+    from archive_magic_fetch.pipeline.run_fetch import run_fetch
+    from archive_magic_fetch.pipeline.discovery.load_or_fetch_year_cdx import _CdxResult
+    from unittest.mock import MagicMock
+
+    bucket = Bucket()
+    monkeypatch.setattr('archive_magic_fetch.pipeline.publication.storage.boto3.client', lambda *a, **kw: bucket)
+    first = make_capt(digest=payload_digest(b'hello'))
+    later = replace(first, timestamp='20040616000000')
+    monkeypatch.setattr('archive_magic_fetch.pipeline.discovery.load_or_fetch_year_cdx._fetch_cdx',
+                        lambda **kw: _CdxResult(tuple(CaptureRef(c, 'text/html') for c in (first, later)), 'example.org', 'domain'))
+    output = FetchOutput('remote', tmp_path / 'data', 'bucket', 'prefix')
+    settings = FetchSettings('*.example.org', '20040101000000', '20041231235959', 'example.org', output, warc_target_bytes=1)
+    calls = []
+    def download(client, capture):
+        calls.append(capture)
+        return playback(capture)
+    source = make_source(settings, client_factory=MagicMock, download=download, sleep=lambda _: None)
+    with monkeypatch.context() as patch:
+        patch.setattr('archive_magic_fetch.pipeline.run_fetch.build_collection_index',
+                      lambda *a, **kw: (_ for _ in ()).throw(OSError('index interrupted')))
+        assert run_fetch(settings, source=source).exit_code == 1
+    assert not any('/data/' in key for key in bucket.objects)
+    result = run_fetch(settings, source=source)
+    assert result.exit_code == 0 and calls == [first]
+    assert result.metrics.downloads == 0 and result.metrics.local_reuses == 2
+    assert len([key for key in bucket.objects if key.endswith('.warc.gz')]) == 2
+    assert bucket.uploads[-1].endswith('-index.cdxj')
+    assert not any('.staging' in key or '.state' in key for key in bucket.objects)
+
+
+def test_later_year_publishes_while_earlier_acquisition_remains_unfinished(tmp_path, monkeypatch):
+    from archive_magic_fetch.config.build_settings import FetchSettings
+    from archive_magic_fetch.models import CaptureRef
+    from archive_magic_fetch.pipeline.run_fetch import run_fetch
+    from archive_magic_fetch.pipeline.discovery.load_or_fetch_year_cdx import _CdxResult
+    from archive_magic_fetch.pipeline.build_collection_index import build_collection_index
+    from unittest.mock import MagicMock
+
+    bucket = Bucket()
+    monkeypatch.setattr('archive_magic_fetch.pipeline.publication.storage.boto3.client', lambda *a, **kw: bucket)
+    def discover(**kw):
+        capture = make_capt(ts=kw['date_start'][:4] + '0615000000')
+        return _CdxResult((CaptureRef(capture, 'text/html'),), 'example.org', 'domain')
+    monkeypatch.setattr('archive_magic_fetch.pipeline.discovery.load_or_fetch_year_cdx._fetch_cdx', discover)
+    def fail_earlier(layout, year, **kw):
+        if year == '2004':
+            raise OSError('index interrupted')
+        return build_collection_index(layout, year, **kw)
+    monkeypatch.setattr('archive_magic_fetch.pipeline.run_fetch.build_collection_index', fail_earlier)
+    output = FetchOutput('remote', tmp_path / 'data', 'bucket', 'prefix')
+    settings = FetchSettings('*.example.org', '20040101000000', '20051231235959', 'example.org', output)
+    source = make_source(settings, client_factory=MagicMock,
+                         download=lambda client, capture: playback(capture), sleep=lambda _: None)
+    result = run_fetch(settings, source=source)
+    assert result.failed_years == (2004,) and result.metrics.downloads == 1
+    assert (tmp_path / 'data' / '.staging' / '2004' / 'work.json').is_file()
+    assert any('2005' in key and key.endswith('.cdxj') for key in bucket.objects)
+    assert not any('2004' in key and '/data/' in key for key in bucket.objects)

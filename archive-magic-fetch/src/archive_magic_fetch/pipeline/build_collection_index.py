@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Mapping, Optional, Sequence
+from typing import Callable, Mapping, Optional, Sequence
 
 from cdxj_indexer.main import CDXJIndexer
 
@@ -24,10 +24,12 @@ from archive_magic_fetch.archive.layout import (
     index_artifact_from_path,
     list_collection_warcs,
 )
+from archive_magic_fetch.archive.scan_warcs import StrictWarcReader, WarcReadOptions, WarcScan
 from archive_magic_fetch.models import IndexArtifact
 from archive_magic_fetch.runtime.manage_archive_files import (
     exclusive_temp_path,
     publish_file_atomically,
+    sync_directory,
 )
 
 _CDX_DIGEST_FIELD = "archive-magic:cdx-digest"
@@ -48,8 +50,17 @@ def build_collection_index(
     *,
     changed_warcs: Sequence[Path] | None = None,
     warc_sizes: Mapping[str, int] | None = None,
+    read_options: Mapping[Path, WarcReadOptions] | None = None,
+    on_scan: Callable[[Path, WarcScan], None] | None = None,
+    before_install: Callable[[], None] | None = None,
 ) -> Optional[IndexArtifact]:
-    """Build or reuse an annual CDXJ; changed_warcs=None forces a full rebuild."""
+    """Build or reuse CDXJ through the strict local WARC reader.
+
+    ``changed_warcs=None`` forces a full rebuild. Recovery options and scan
+    callbacks are supplied by the annual stage; ordinary indexing cannot
+    repair files. ``before_install`` durably checkpoints recovered bytes
+    before range validation and index installation.
+    """
 
     collection_id = layout.validate_collection_id(collection_id)
     index_path = layout.collection_index(collection_id)
@@ -72,6 +83,9 @@ def build_collection_index(
                 sort=True,
                 records="response,revisit",
                 dir_root=str(collection_dir),
+                read_options=read_options,
+                on_scan=on_scan,
+                year=collection_id if collection_id.isdigit() and len(collection_id) == 4 else None,
             ).process_all()
             replacement_lines = _read_cdxj_lines(tmp)
 
@@ -86,13 +100,22 @@ def build_collection_index(
             ]
             lines = sorted([*retained, *replacement_lines])
 
+        # Recovery may have removed an eligible empty final shard.
+        surviving = list_collection_warcs(layout, collection_id)
+        if before_install is not None:
+            before_install()
+        if not surviving and warc_sizes is None:
+            index_path.unlink(missing_ok=True)
+            sync_directory(collection_dir)
+            return None
         sizes = (
-            {path.name: path.stat().st_size for path in warcs}
+            {path.name: path.stat().st_size for path in surviving}
             if warc_sizes is None
             else dict(warc_sizes)
         )
         for path in inputs:
-            sizes[path.name] = path.stat().st_size
+            if path.is_file():
+                sizes[path.name] = path.stat().st_size
         validate_cdxj_against_warcs(
             layout,
             collection_id,
@@ -106,9 +129,8 @@ def build_collection_index(
             index_path,
             capture_count=len(lines),
         )
-    except Exception:
+    finally:
         tmp.unlink(missing_ok=True)
-        raise
 
 
 class _ArchiveMagicCDXJIndexer(CDXJIndexer):
@@ -129,6 +151,34 @@ class _ArchiveMagicCDXJIndexer(CDXJIndexer):
         _CDX_STATUS_FIELD,
         _CDX_URLKEY_FIELD,
     ]
+
+    def __init__(
+        self, *args, read_options: Mapping[Path, WarcReadOptions] | None = None,
+        on_scan: Callable[[Path, WarcScan], None] | None = None,
+        year: str | None = None, **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self.read_options = read_options or {}
+        self.on_scan = on_scan
+        self.year = year
+        self.reader: StrictWarcReader | None = None
+
+    def process_one(self, input_, output, filename):
+        self.input_path = Path(filename)
+        try:
+            super().process_one(input_, output, filename)
+            assert self.reader is not None and self.reader.result is not None
+            if self.on_scan is not None:
+                self.on_scan(self.input_path, self.reader.result)
+        finally:
+            if self.reader is not None:
+                self.reader.close()
+                self.reader = None
+
+    def _create_record_iter(self, input_):
+        options = self.read_options.get(self.input_path, WarcReadOptions(year=self.year))
+        self.reader = StrictWarcReader(input_, self.input_path, options)
+        return self.reader
 
     def get_field(self, record, name, it, filename):
         if name == _CDX_DIGEST_FIELD:

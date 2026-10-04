@@ -16,16 +16,18 @@ from archive_magic_fetch.pipeline.retrieval.retrieve_warc_range import retrieve_
 from archive_magic_fetch.runtime.track_http_requests import InstrumentedHTTPAdapter
 
 
-def build_source(*, index_directory: Path) -> SourceAdapter:
+def build_source(*, index_directory: Path, checkpoint_directory: Path | None = None) -> SourceAdapter:
     index = CommonCrawlIndex()
 
     def discover(request, stats):
         with requests.Session() as client:
             return load_or_fetch_common_crawl_year(
                 request, index_directory=index_directory, index=index, client=client,
+                checkpoint_directory=checkpoint_directory,
             )
 
-    return SourceAdapter(discover, _open_client, _fetch, _preflight, failure_advice, _capture_link)
+    return SourceAdapter(discover, _open_client, _fetch, _preflight, failure_advice, _capture_link,
+                         name="common-crawl")
 
 
 @contextmanager

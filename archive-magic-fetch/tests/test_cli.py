@@ -320,6 +320,50 @@ def test_invalid_source_and_cc_sync_only(tmp_path, monkeypatch):
     assert main([str(config), "--sync-only"]) == 0 and len(synced) == 1
 
 
+def test_sync_only_finishes_ready_year_and_leaves_acquisition_private(tmp_path, monkeypatch):
+    import archive_magic_fetch.pipeline.stage_year as staging
+    from archive_magic_fetch.cli import main
+    from archive_magic_fetch.pipeline.build_collection_index import build_collection_index
+    from archive_magic_fetch.pipeline.write_captures import _CollectionWarcWriter
+    from bucket_helpers import Bucket
+    from helpers import make_collection
+
+    config = write_cli_config(tmp_path / 'definition', output_type='remote')
+    layout = make_collection(tmp_path / 'output' / 'data')
+    canonical = layout.collection_warc_path('2004', 1)
+    original = canonical.read_bytes()
+    unfinished = staging.YearStage(layout, '2004')
+    unfinished.prepare_mutable_tail(250_000_000)
+    writer = _CollectionWarcWriter(unfinished.layout, '2004')
+    writer.write_playback(playback(make_capt(ts='20040616000000')))
+    unfinished.checkpoint(list(writer.touched))
+    retained = {path: path.read_bytes() for path in unfinished.path.iterdir() if path.is_file()}
+    ready = staging.YearStage(layout, '2005')
+    writer = _CollectionWarcWriter(ready.layout, '2005')
+    writer.write_playback(playback(make_capt(ts='20050615000000')))
+    changed = writer.close()
+    build_collection_index(ready.layout, '2005', changed_warcs=[item.path for item in changed])
+    with monkeypatch.context() as patch:
+        patch.setattr(staging, '_promote', lambda *a: (_ for _ in ()).throw(OSError('before promotion')))
+        with pytest.raises(OSError):
+            ready.commit(changed, index_changed=True)
+    private = tmp_path / 'output' / '.state' / 'discovery' / 'window.json'
+    private.parent.mkdir(parents=True)
+    private.write_text('private discovery')
+    bucket = Bucket()
+    monkeypatch.setattr('archive_magic_fetch.pipeline.publication.storage.boto3.client', lambda *a, **kw: bucket)
+    def no_source(**kwargs):
+        pytest.fail('sync-only constructed a capture source')
+    monkeypatch.setattr('archive_magic_fetch.run_application.build_wayback_source', no_source)
+    assert main([str(config), '--sync-only']) == 0
+    assert not ready.path.exists()
+    assert {path: path.read_bytes() for path in retained} == retained
+    assert private.read_text() == 'private discovery'
+    assert bucket.objects['example.org/data/' + canonical.name] == original
+    assert any('2005' in key for key in bucket.objects)
+    assert not any('.state' in key or '.staging' in key for key in bucket.objects)
+
+
 @pytest.mark.parametrize('flag', ['--restore', '--evict-local', '--publish-metadata'])
 def test_lifecycle_flags_require_remote_and_reject_dates(tmp_path, flag):
     from archive_magic_fetch.cli import main

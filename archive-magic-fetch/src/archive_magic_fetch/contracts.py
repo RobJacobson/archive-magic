@@ -55,3 +55,4 @@ class SourceAdapter(Generic[Client]):
     preflight: Callable[[CaptureRef], UnresolvedFailure | None]
     failure_advice: Callable[[BaseException, int], FailureAdvice]
     capture_link: Callable[[CaptureRef], str]
+    name: str = "wayback"
