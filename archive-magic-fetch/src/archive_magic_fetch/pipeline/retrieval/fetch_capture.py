@@ -46,8 +46,13 @@ def fetch_capture(
         except CancelledError:
             raise
         except Exception as error:
-            check_cancelled(cancelled)
             advice = source.failure_advice(error, attempt)
+            # An in-flight request can report backpressure after cancellation;
+            # its cooldown still applies to subsequent annual batches.
+            if advice.cooldown is not None:
+                kind, delay, label = advice.cooldown
+                gate.pause(kind, delay, capture.identity, label=label)
+            check_cancelled(cancelled)
             categories.append(advice.category.value)
             retryable = advice.retryable
             if advice.group is not None:
@@ -57,10 +62,7 @@ def fetch_capture(
                     and failures[advice.group] >= advice.group_limit
                 ):
                     retryable = False
-            if advice.cooldown is not None:
-                kind, delay, label = advice.cooldown
-                gate.pause(kind, delay, capture.identity, label=label)
-            elif advice.reset_gate:
+            if advice.cooldown is None and advice.reset_gate:
                 gate.note_success()
             if retryable and attempt < max_attempts:
                 if advice.cooldown is None:

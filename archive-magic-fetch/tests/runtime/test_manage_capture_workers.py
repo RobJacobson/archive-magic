@@ -101,6 +101,83 @@ def test_batch_drains_active_work_and_preserves_consumer_failure(failure):
     assert raised.value is failure
 
 
+@pytest.mark.parametrize(
+    "cooldown",
+    [("http", 120, "HTTP 429"), ("tcp", 60, "TCP connection refused")],
+)
+def test_cancelled_batch_preserves_late_backpressure_for_next_batch(cooldown):
+    started = Event()
+    writer_failure = OSError("writer failed")
+    request_failure = RuntimeError("in-flight request failed")
+    now = 100.0
+    delays = []
+
+    def sleep(seconds):
+        nonlocal now
+        delays.append(seconds)
+        now += seconds
+
+    gate = StartGate(0, clock=lambda: now, sleep=sleep, report=lambda _: None)
+    stats = RequestStats(gate.wait, report=lambda _: None, clock=lambda: now)
+    advice = MagicMock(
+        return_value=FailureAdvice(
+            FailureCategory.RETRY_EXHAUSTED, True, cooldown=cooldown
+        )
+    )
+    capture = CaptureRef(make_capt(), "text/html")
+    attempts = []
+    cancelled_requests = []
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            with pytest.raises(OSError) as raised:
+                with CaptureBatch(executor, 2) as batch:
+                    def fetch(client, reference):
+                        attempts.append(reference)
+                        started.set()
+                        assert batch.cancelled.wait(2)
+                        raise request_failure
+
+                    source = replace(make_source(), fetch=fetch, failure_advice=advice)
+
+                    def process(group):
+                        if group == 1:
+                            assert started.wait(2)
+                            return group
+                        try:
+                            return fetch_capture(
+                                capture,
+                                source=source,
+                                client=object,
+                                gate=gate,
+                                stats=stats,
+                                max_attempts=5,
+                                cancelled=batch.cancelled,
+                                clock=lambda: now,
+                                sleep=sleep,
+                            )
+                        except CancelledError:
+                            cancelled_requests.append(capture)
+                            raise
+
+                    outcomes = batch.map(process, [1, 2])
+                    assert next(outcomes) == 1
+                    raise writer_failure
+            assert raised.value is writer_failure
+            assert attempts == cancelled_requests == [capture]
+            advice.assert_called_once_with(request_failure, 1)
+            assert delays == []
+
+            with CaptureBatch(executor, 2) as next_batch:
+                list(
+                    next_batch.map(
+                        lambda _: gate.wait(cancelled=next_batch.cancelled), [1]
+                    )
+                )
+            assert delays == [cooldown[1]]
+    finally:
+        stats.close()
+
+
 def test_cancelled_retry_wait_does_not_start_another_attempt():
     cancelled = ObservedEvent()
     fetch = MagicMock(side_effect=TimeoutError("retry me"))
