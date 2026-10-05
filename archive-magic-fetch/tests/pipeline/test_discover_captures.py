@@ -203,19 +203,20 @@ def test_save_and_warc_failures_have_separate_cache_outcomes(
         if boundary == "CDX save":
             patch.setattr(cdx, "publish_file_atomically", fail)
         else:
-            patch.setattr(fetch, "build_collection_index", fail)
+            patch.setattr(fetch.YearStage, "prepare_commit", fail)
         result = run(settings, download_fn=download)
     assert result.exit_code == 1
     assert result.failed_years == (2004,)
     assert path.exists() is (boundary == "WARC index")
     assert len(downloaded) == (1 if boundary == "WARC index" else 0)
     assert not list(result.layout.root.glob("*.warc.gz"))
-    assert not (result.layout.root / ".staging").exists()
+    assert (result.layout.root / ".staging" / "2004" / "work.json").is_file()
     assert (
         "simulated failure" in next(result.layout.logs_root.glob("*.log")).read_text()
     )
     assert run(settings, download_fn=download).exit_code == 0
-    assert len(queries) == (1 if boundary == "WARC index" else 2)
+    assert len(queries) == 1
+    assert len(downloaded) == 1
 
 
 @pytest.mark.parametrize("failure", ["corrupt", "429"])

@@ -145,7 +145,7 @@ def test_worker_client_closes_when_acquisition_fails_or_is_interrupted(
         assert result.failures[0].message == str(failure)
     assert closed == [True]
     assert not list(settings.output.data_directory.glob("*.warc.gz"))
-    assert not (settings.output.data_directory / ".staging").exists()
+    assert (settings.output.data_directory / ".staging").exists() is isinstance(failure, KeyboardInterrupt)
 
 
 def _annual_fixture(tmp_path):
@@ -354,4 +354,4 @@ def test_failed_year_drains_workers_before_abort_and_next_year(
     assert len(clients) == len(closed) == 2
     assert all(client.stats._stream is None for client in clients)
     assert all(path.read_bytes() == data for path, data in original_files.items())
-    assert not (layout.root / ".staging").exists()
+    assert (layout.root / ".staging" / "2004" / "work.json").is_file()

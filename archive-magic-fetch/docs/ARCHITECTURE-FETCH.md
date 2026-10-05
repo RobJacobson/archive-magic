@@ -152,7 +152,7 @@ The envelope binds source, normalized query, year, and capture records. An exist
 requests for that year. Each record contains `urlkey`, `original_url`, `timestamp`,
 `status_token`, `payload_digest`, and `mime`; an empty captures array represents a successfully
 queried empty year. Fetch saves a cache only after every page and fallback slice
-succeeds, writing a temporary sibling and atomically renaming it before WARC work.
+succeeds, writing a temporary sibling and atomically renaming it before playback.
 Temporary files are never cache hits. Invalid JSON, fields, timestamps, or records
 from the wrong year fail that year without replacing or re-fetching the cache.
 The current UTC year is always queried afresh and never reads or writes a
@@ -164,21 +164,31 @@ connection refused retry the same window up to ten attempts with exponential
 pauses from 60s capped at 10 minutes, honoring a longer `Retry-After`. Other
 transient failures retain their three-attempt budget. A 300-second wall-clock
 budget triggers smaller windows: first `cdx_window_days` (default 28), then
-7-day windows when smaller. Fallback slices run sequentially in memory. A
-terminal failure stops that year immediately, discards its results, skips WARC
-processing, and continues to later years with a nonzero final exit status.
-Failed acquisitions retain no progress between runs.
+7-day windows when smaller. Fallback slices run sequentially. For historical
+years, `.state/discovery/wayback/v1/<query-hash>/YYYY/` retains the split plan and
+each completed window, including successful empty windows. A restart follows
+the saved plan, avoiding the failed annual query and completed windows. A window
+is the checkpoint boundary: pages within an interrupted window are reacquired;
+resume keys are not persisted. Checkpoints validate source, normalized query,
+bounds, version, and capture records. Only complete calendar-year coverage
+becomes the annual cache or starts playback. A terminal discovery failure retains
+private progress, stops that year, and allows later years to finish, with a
+nonzero final exit status. Current-year Wayback queries never reuse or create
+discovery checkpoints.
 
-There is no persisted partial Wayback checkpoint. Historical caches remain
-reusable indefinitely, so later upstream additions require an intentional cache
-refresh. Source, query, and format version select a namespace; changing queries
-cannot silently reuse an incompatible listing. Completed Common Crawl units
-remain reusable according to their crawl metadata freshness checks.
+Private discovery progress lives under the working root's `.state/discovery/`,
+outside publishable caches. Completed caches are installed and synced before
+their private progress is removed. Historical Wayback caches remain reusable
+indefinitely, so later upstream additions require an intentional cache refresh.
+Source, query, and format version select a namespace; changing queries cannot
+silently reuse an incompatible listing. Completed Common Crawl units remain
+reusable according to their crawl metadata freshness checks.
 
 The CLI derives discovery from the working root. Programmatic settings may
 supply `index_directory`; its default is `data_directory.parent / "discovery"`.
-Completed validated cache files invoke the active bucket publication callback
-immediately, including before a later WARC or discovery unit fails. Missing
+Completed validated cache files invoke the publication callback passed explicitly
+in the discovery request immediately, including before a later WARC or discovery
+unit fails. Missing
 remote caches require explicit restore. Logs are never used as publication state.
 
 After acquisition, playback captures are filtered by the requested dates,
@@ -208,8 +218,9 @@ Exact playback does not follow Wayback's nearby-capture substitutions, synthesiz
 slash redirects, or manufacture empty responses from CDX. Previously failed
 captures remain failures even if a later capture with the same digest succeeds.
 Revisits refer only to earlier successful responses in the same year. A staged
-write failure aborts the year; only successfully promoted data seeds subsequent
-updates to that year. Resetting one year cannot invalidate another year's revisits.
+write failure aborts the year but retains written records. Validated full
+responses in the retained stage seed revisits on restart. Resetting one year
+cannot invalidate another year's revisits.
 
 Playback backpressure pauses all workers for 60, 120, 180 seconds and so on,
 capped at ten minutes unless the source requests a longer wait. A failure after
@@ -227,26 +238,79 @@ page requests; already in-flight requests finish under their socket timeouts.
 Resolution and writing share an explicit annual worker batch. On failure or
 Ctrl-C, it cancels queued groups, stops active groups before new captures,
 attempts, or transport sends, and wakes retry and pacing waits. In-flight HTTP
-operations finish under their existing timeouts. The batch drains before staging
-is discarded or the next year begins. Cancellation bypasses source failure
+operations finish under their existing timeouts. The batch drains before returning
+or beginning the next year; acquisition staging is retained. Cancellation bypasses
+source failure
 classification; real backpressure already observed remains in force. Persistent
 worker clients remain open across successful and failed batches until run cleanup.
 
-For each year, Fetch creates a same-filesystem stage. Unchanged WARC shards
-are hard-linked into it; the final shard is copied only if new captures need to
-append to it, and the CDXJ is copied. The
-existing serialized WARC writer appends validated gzip members to that stage,
-and the CDXJ indexer validates the resulting byte ranges. On failure or Ctrl-C,
-Fetch discards unfinished staged work, leaving finalized local files unchanged.
+For each year, Fetch opens or creates `data/.staging/YYYY/` on the same filesystem.
+Its versioned `work.json` records archive/source/query/year/effective playback
+dates, format version, original canonical file signatures, replacement mode,
+and durable byte offsets per shard. Worker counts, pacing, retries, and shard
+target may change on resume. The state is installed durably before acquisition.
+Unchanged canonical WARC shards are hard-linked into the stage; the mutable tail
+is copied before its first append. Resuming never copies over retained downloads.
+Any copied or previously generated staged CDXJ is replaced by a fresh startup
+index before it can supply the resume inventory.
 
-After validation, Fetch writes a small ready record in the stage, promotes
-changed WARCs, then promotes the CDXJ. A later fetch or manual sync completes
-a promotion interrupted between these steps before touching the bucket.
-Unchanged years do not replace their canonical files. Indexing owns the decision
-to reuse an existing CDXJ, update changed shards, or rebuild a missing index.
-An explicit full rebuild remains available to archive-wide reconciliation.
+Workers still buffer one complete URL result each, and bounded futures yield URL
+results in order. The single writer appends each group's response/revisit records,
+then flushes and `fsync`s every touched shard, syncs new directory entries, and
+atomically replaces and syncs the work-state checkpoint. Only then does it log
+URL completion. Errors and Ctrl-C retain acquiring stages. The remaining loss
+window consists of downloaded URL results still buffered in workers or waiting
+to be written; these may require downloading again.
 
-The default compressed WARC target is 250,000,000 bytes. Normal updates only
+Startup streams the working WARC view once, including its canonical baseline,
+through a strict record iterator shared by recovery, indexing,
+and restore. It explicitly verifies complete gzip members and CRCs, WARC framing,
+record digests, and checkpoint boundaries; parser EOF alone does not establish
+gzip completion. Each decoded member spills to temporary storage as needed and
+stays available while the existing CDXJ indexer extracts fields and compressed
+locators. Recovery and indexing share that spool without decompressing it again.
+After recovery, Fetch syncs surviving recovered bytes and their checkpoint,
+validates CDXJ ranges, and atomically installs the working index. Only then does
+the CDXJ inventory reader build compact identities and response references and
+allow discovery/playback. Partial or stale staged indexes cannot seed reuse.
+Responses and revisits both prevent duplicate exact capture records; only full
+responses with equal normalized WARC/CDX digests and an affirmative match flag
+seed payload reuse. Representatives retain their actual HTTP status, with the
+existing fallback for legacy CDXJ rows. Failed captures remain eligible for retry.
+URL completion logs are never an inventory.
+
+Only an incomplete final member in the highest private shard, beyond its durable
+checkpoint, may be truncated automatically. Complete preceding records survive,
+including records from an interrupted URL group, and are synced into the recovered
+checkpoint. A newly created uncheckpointed shard containing only `warcinfo` is
+removed. Missing checkpointed bytes, invalid complete records, canonical corruption,
+or corruption in earlier shards fail explicitly and preserve files. A later write
+or validation failure cannot roll back a previously checkpointed URL group.
+
+The writer validates each serialized member before appending and returns changed
+shard paths. It does not scan whole shards on close or rotation; final indexing
+owns that validation and the verified record counts. Index preparation returns
+scan results and temporary rows without installing them. The stage removes any
+eligible empty tail, checkpoints recovered bytes, then installs the index after
+range validation. Failed preparation or installation removes temporary indexes.
+
+Finalization reindexes only shards written during the current invocation and
+merges their entries into the verified startup index. With no appends, it reuses
+that index without another decompression pass. Verified shard counts and sizes
+are retained for artifact descriptions. The stage prepares one `YearChanges`
+value containing artifact sizes, hashes and counts, changed files, and reset
+deletions. It compares against the original canonical baseline, including
+downloads retained from earlier invocations and index-only corrections. Local
+promotion, remote generation receipts, and run logging reuse that same value.
+After validating and syncing final artifacts, Fetch durably installs
+`ready.json`, promotes changed WARCs, then promotes CDXJ. Indexing or publication
+preparation failures retain acquisition for retry. A later fetch or manual sync
+finishes interrupted ready promotions; unfinished acquiring stages remain private.
+Unchanged years do not replace canonical files. An explicit full index rebuild
+remains available to archive-wide reconciliation.
+
+The default compressed WARC target is 250,000,000 bytes, a soft limit checked
+between records. A URL group can span shards. Normal updates only
 extend a year's final shard or create a new shard; the previous byte prefix and
 CDXJ offsets remain valid. Older yearly shards are not rewritten.
 
@@ -291,6 +355,15 @@ Valid empty results are cached. Page counts precede date filtering, so a numbere
 page's recognized no-captures 404 is also a valid empty result; other HTTP or
 parsing errors still fail discovery. Corrupt entries fail explicitly, without silently
 refetching or replacing them. Wayback uses its separate versioned envelope and query namespace.
+
+Incomplete queries retain each successfully parsed numbered page, including
+recognized empty pages, under
+`.state/discovery/common-crawl/v1/<query-hash>/<crawl-id>/<year>/`. A restart obtains
+a fresh page count before reusing those pages. Query, collection metadata, page
+size, and page count must match; changed metadata or counts invalidate that unit's
+private page progress. An interrupted page is reacquired. A complete crawl/year
+cache is durably installed before private progress is cleared. Partial pages never
+become a complete listing or start playback.
 
 Completed entries are reused even for the current year. A new run's catalog adds
 newly published collections and invalidates entries whose collection metadata
@@ -373,6 +446,9 @@ all local data and discovery without contacting upstream capture sources. It can
 publish discovery alone when WARC acquisition failed. Data indexes are validated
 against WARC byte ranges; WARCs upload before indexes. No ordinary operation
 mirrors missing local files as remote deletions or prunes obsolete remote shards.
+Sync-only finishes ready promotions and leaves acquiring stages untouched.
+Working WARCs and private discovery checkpoints are never uploaded. An earlier
+unfinished year does not prevent later completed years from publishing.
 
 `BucketStorage` records remote signatures and local SHA-256 hashes in
 `.state/publication.json`, bound to endpoint, region, bucket, prefix, and ID.
@@ -386,7 +462,8 @@ Preflight reconciles completed uploads before retrying outstanding publication.
 cache provenance and replay indexes, refuses differing local files, checks remote
 stability, and installs complete files. `--evict-local` checks content for every
 local finalized data/cache object before removing output. It refuses pending
-transactions, unknown files, and missing/different remote copies. Neither operation
+transactions, outstanding WARC acquisition or discovery progress, unknown files,
+and missing/different remote copies. Neither operation
 changes collection definitions, assets, or published objects.
 
 `--publish-metadata` validates `[collection]`, uploads its referenced assets, then
@@ -401,9 +478,16 @@ Local `--reset-data` rebuilds selected years through staging. Remote
 overrides, warns of playback downtime, deletes only managed files for this archive
 under remote `data/`, preserving metadata, assets and unrelated objects,
 clears the local data directory, and rebuilds and publishes years in order.
-Both reset modes preserve discovery caches and reuse them to rebuild WARC
-contents. A successful empty selection can clear a local year through reset
-staging. WARC failures also leave completed CDX caches intact.
+Explicit reset discards selected unfinished WARC stages under the same local or
+remote scope. Both reset modes preserve compatible discovery caches/checkpoints
+and reuse them to rebuild WARC contents. If replacement is interrupted, a subsequent
+ordinary run resumes the saved replacement mode. A successful empty selection can
+clear a local year through reset staging. WARC failures also leave discovery intact.
+
+Incompatible acquisition settings or a changed canonical baseline fail with the
+stage preserved; restore matching settings or explicitly reset. Legacy unfinished
+stages without resume metadata are preserved and rejected, rather than silently
+deleted. Existing readiness manifests remain recoverable.
 
 After local cleanup, run explicit `--restore` before resuming acquisition.
 Migration of the local workspace is offline and separate from bucket operations;
@@ -454,6 +538,7 @@ archive_magic_fetch/
       discover_captures.py          select an ordered unique set
       load_or_fetch_year_cdx.py     acquire complete Wayback listings with caching
       load_or_fetch_common_crawl_year.py  acquire complete per-crawl annual queries
+      checkpoints.py                manage private discovery progress
     retrieval/
       fetch_capture.py              execute and retry an acquisition
       retrieve_memento.py           request exact replay
@@ -465,13 +550,14 @@ archive_magic_fetch/
     write_captures.py               serialize and append WARCs
     build_collection_index.py      construct local CDXJ
     reconcile_missing_indexes.py   repair indexes through the same indexer
-    stage_year.py                   prepare, commit, abort, and recover a year
+    stage_year.py                   resume, checkpoint, promote, and recover a year
     publication/
       sync_archive.py               publish committed artifacts
       purge_remote.py               explicitly reset managed data
       run_rclone.py                 configure and invoke rclone
   archive/
     inventory_collection.py        read stored captures and reusable responses
+    scan_warcs.py                   shared strict record iterator and tail recovery
     validate_local_archive.py      validate finalized artifacts for publication
     layout.py                       archive paths and artifact inventories
     identity.py                     capture identity and digest primitives
@@ -492,10 +578,12 @@ Application setup selects the adapter. The runner and shared stages depend on
 neutral contracts; they do not construct Wayback clients or inspect Wayback
 exceptions. Archive and runtime support do not import pipeline stages. Discovery
 reads the source index; output indexing constructs our archive's CDXJ. They remain
-separate despite both using CDX terminology.
+separate despite both using CDX terminology. Each year starts with recovery and
+CDXJ generation, followed by inventory loading. Acquisition then follows these
+boundaries:
 
 ```text
-Discover -> Resolve -> Write -> Index -> Commit -> Publish
+Discover -> Resolve -> Write -> final Index -> Commit -> Publish
                 |
                 +-- when needed: Retrieve -> Decode
 ```
@@ -512,7 +600,8 @@ same transaction recovery and publication code as fetch.
 `SourceAdapter` is a typed bundle of callables, assembled with composition:
 
 - `discover(request, stats)` returns a complete `CaptureListing` and query metadata;
-  Wayback discovery installs the run's shared transport instrumentation.
+  its optional `request.on_cache_complete(path)` callback publishes each completed
+  cache immediately. Wayback discovery installs the run's shared transport instrumentation.
 - `open_client(stats)` is a context manager creating one persistent worker client;
   the source explicitly installs transport instrumentation before yielding it.
 - `fetch(client, capture)` performs one retrieval-and-decoding attempt and returns
@@ -523,6 +612,8 @@ same transaction recovery and publication code as fetch.
   delay, coordinated cooldown, and optional failure-group limit.
 - `capture_link(capture)` receives the complete `CaptureRef` and supplies the source URL used in terminal links. Capture outcomes carry that reference through reporting.
 
+The runner receives the publisher explicitly, and discovery depends only on its
+completion callback. Publication does not depend on ambient context variables.
 The retrieval stage owns attempts and counters. The source owns interpretation:
 Wayback stub digests, exact-capture rules, newline digest tolerance, and exception
 classification stay in its implementation. Retry advice preserves the distinction
@@ -555,7 +646,13 @@ and `integration/`. A fake source exercises the complete shared pipeline, includ
 resume and revisits, without using Wayback acquisition. Dedicated tests cover
 response/client cleanup and retries spanning response decoding. Existing fixtures
 continue to cover cache boundaries, transport pacing, transaction recovery, and
-verified bucket publication. Run Fetch and Navigator suites separately:
+verified bucket publication. Indexing tests compare library fields, sorting, and
+compressed locators across shards; startup tests assert one decompression pass,
+rejection of failed or partial indexes, index-only corrections, and no second
+indexing scan when a resumed run appends nothing. Inventory tests cover exact
+identities, digest/flag restrictions, actual HTTP status and legacy fallback,
+empty redirects, scope, and earlier-response restrictions. Navigator exercises
+replay of recovered responses and revisits across shards. Run the suites separately:
 
 ```console
 .venv/bin/python -m pytest archive-magic-fetch/tests -q

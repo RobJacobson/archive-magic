@@ -109,7 +109,8 @@ def test_failed_page_never_publishes_partial_crawl(tmp_path, failure):
         return Response(json.dumps(row(capture))) if params["page"] == 0 else failure
     with pytest.raises((ValueError, requests.HTTPError)):
         query(tmp_path, Client(serve))
-    assert not list(tmp_path.rglob("*.json")) and failure.closed
+    assert not list((tmp_path / "index").rglob("*.json")) and failure.closed
+    assert len(list((tmp_path / ".state" / "discovery").rglob("0.json"))) == 1
 
 
 def test_completed_crawl_survives_later_failure_without_returning_partial_year(tmp_path):

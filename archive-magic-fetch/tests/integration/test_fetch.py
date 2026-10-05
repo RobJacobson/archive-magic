@@ -1368,7 +1368,7 @@ def test_cdx_year_success_uses_single_query(tmp_path, monkeypatch):
     assert "failed_windows" not in year_record["query"]
 
 
-def test_cdx_failed_year_restarts_and_successful_fallback_is_cached(
+def test_cdx_failed_year_resumes_windows_and_successful_fallback_is_cached(
     tmp_path, monkeypatch
 ):
     from archive_magic_fetch.models import CaptureRef
@@ -1457,7 +1457,9 @@ def test_cdx_failed_year_restarts_and_successful_fallback_is_cached(
             sleep=lambda _seconds: None,
         ),
     )
-    assert calls[: len(failed_calls)] == failed_calls
+    assert calls[0] == hole_7
+    assert year_bounds not in calls and heavy_28 not in calls
+    assert all(window not in calls for window in failed_calls if window not in {year_bounds, heavy_28, hole_7})
     assert calls[-1][1] == "20041231235959"
     assert second.exit_code == 0
     cached = json.loads((wayback_path(tmp_path / "discovery", "http://example.org/", 2004)).read_text())["captures"]
@@ -1572,7 +1574,7 @@ def test_legacy_layout_rejects_all_artifacts(tmp_path, legacy_name):
         )
 
 
-def test_interrupt_discards_staged_year_without_run_json(tmp_path, monkeypatch):
+def test_interrupt_retains_staged_year_without_run_json(tmp_path, monkeypatch):
     import archive_magic_fetch.pipeline.write_captures as writing_module
 
     layout = ArchiveLayout(tmp_path / "data", "example.org")
@@ -1684,7 +1686,8 @@ def test_interrupt_discards_staged_year_without_run_json(tmp_path, monkeypatch):
         cdx_mod._fetch_cdx = original
 
     assert result.exit_code == 0
-    assert downloaded == [first.original_url, second.original_url]
+    assert downloaded == [second.original_url]
+    assert result.metrics.local_reuses == 1
     assert [path.name for path in list_collection_warcs(layout, "2004")] == [
         "example.org-2004-001.warc.gz"
     ]

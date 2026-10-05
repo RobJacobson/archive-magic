@@ -5,8 +5,6 @@ observed remote baseline; they are not a distributed lock.
 """
 from __future__ import annotations
 
-from contextlib import contextmanager
-from contextvars import ContextVar
 import hashlib
 import json
 import os
@@ -21,36 +19,8 @@ from botocore.config import Config
 from archive_magic_fetch.archive.layout import ArchiveLayout
 from archive_magic_fetch.archive.validate_local_archive import validate_local_archive
 from archive_magic_fetch.config.presentation import metadata, asset_path
-from archive_magic_fetch.models import PublicationError
-from archive_magic_fetch.runtime.manage_archive_files import file_sha256
-
-ACTIVE = ContextVar('archive_storage', default=None)
-
-
-def completed_discovery(path):
-    store = ACTIVE.get()
-    if store is not None:
-        store.publish_files([Path(path)])
-
-
-@contextmanager
-def active_storage(store):
-    token = ACTIVE.set(store)
-    try:
-        yield
-    finally:
-        ACTIVE.reset(token)
-
-
-def atomic_json(path, value):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(mode='w', dir=path.parent, delete=False) as stream:
-        temporary = Path(stream.name)
-        json.dump(value, stream, sort_keys=True)
-    try:
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
+from archive_magic_fetch.models import IndexArtifact, PublicationError, WarcArtifact
+from archive_magic_fetch.runtime.manage_archive_files import file_sha256, write_json_durably
 
 
 class BucketStorage:
@@ -129,7 +99,7 @@ class BucketStorage:
         return digest.hexdigest()
 
     def save(self):
-        atomic_json(self.receipt, self.state)
+        write_json_durably(self.receipt, self.state)
 
     def preflight(self, *, reset=False):
         """Verify baseline and recover completed uploads before any acquisition."""
@@ -194,6 +164,10 @@ class BucketStorage:
         from archive_magic_fetch.pipeline.discovery.cache import validate_cache
         validate_cache(path, path.relative_to(self.root / 'discovery').as_posix())
 
+    def publish_discovery(self, path: Path) -> None:
+        """Publish a completed cache as soon as discovery installs it."""
+        self.publish_files([path])
+
     def publish_files(self, paths):
         paths = list(paths)
         if not paths:
@@ -226,10 +200,10 @@ class BucketStorage:
             self.state['pending'].pop(relative)
             self.save()
 
-    def record_generation(self, paths):
+    def record_generation(self, artifacts: tuple[WarcArtifact | IndexArtifact, ...]):
         """Persist validated staged bytes before their recoverable local promotion."""
         self.assert_remote_unchanged()
-        self.state['generation'] = {'previous': dict(self.state['pending']), 'files': {'data/' + path.name: file_sha256(path) for path in paths}}
+        self.state['generation'] = {'previous': dict(self.state['pending']), 'files': {'data/' + item.path.name: item.sha256 for item in artifacts}}
         self.state['pending'].update(self.state['generation']['files'])
         self.save()
 
@@ -245,7 +219,8 @@ class BucketStorage:
         if all(actual[key] == digest for key, digest in generation['files'].items()):
             self.finish_generation()
         elif all(actual[key] == self.state['baseline'].get(key, {}).get('sha256') for key in generation['files']):
-            # The process stopped before ready.json; staging recovery discarded it.
+            # Promotion never started. Acquisition remains private and can resume;
+            # canonical files retain the previous publication intentions.
             self.state['pending'] = generation['previous']
             self.finish_generation()
         else:
@@ -291,9 +266,9 @@ class BucketStorage:
                     from archive_magic_fetch.pipeline.discovery.cache import validate_cache
                     validate_cache(target, relative.removeprefix('discovery/'))
             if any(key.startswith('data/') for key in inventory):
-                from archive_magic_fetch.pipeline.write_captures import _validate_warc
+                from archive_magic_fetch.archive.scan_warcs import scan_warc
                 for path in (stage / 'data').glob('*.warc.gz'):
-                    _validate_warc(path)
+                    scan_warc(path)
                 validate_local_archive(ArchiveLayout(stage / 'data', self.archive_id), allow_unindexed=True)
             if self.inventory() != inventory:
                 raise PublicationError('bucket changed during restore; retry')
@@ -307,7 +282,9 @@ class BucketStorage:
             self.save()
 
     def unresolved(self):
-        if (self.layout.root / '.staging').exists() or self.state['pending'] or self.state.get('generation'):
+        discovery_work = self.root / '.state' / 'discovery'
+        if ((self.layout.root / '.staging').exists() or self.state['pending'] or self.state.get('generation')
+                or (discovery_work.exists() and any(p.is_file() for p in discovery_work.rglob('*')))):
             raise PublicationError('unresolved transaction; finish or retry publication before restore/eviction')
 
     def evict(self):

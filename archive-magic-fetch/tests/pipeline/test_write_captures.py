@@ -19,12 +19,13 @@ from archive_magic_fetch.archive.layout import (
     ensure_collection_dirs,
     list_collection_warcs,
 )
+from archive_magic_fetch.archive.scan_warcs import scan_warc
 from archive_magic_fetch.config.models import FetchOutput
 from archive_magic_fetch.config.build_settings import FetchSettings
 from archive_magic_fetch.models import CaptureResult
 from archive_magic_fetch.pipeline.build_collection_index import build_collection_index
 from archive_magic_fetch.pipeline.run_fetch import run_fetch
-from archive_magic_fetch.pipeline.write_captures import _CollectionWarcWriter, _validate_warc
+from archive_magic_fetch.pipeline.write_captures import _CollectionWarcWriter
 from helpers import (
     cdx_json,
     fetch_memento,
@@ -66,7 +67,7 @@ def test_empty_redirect_playback_is_stored_with_location(tmp_path):
     writer = _CollectionWarcWriter(layout, "2008")
     writer.write_playback(result)
     artifacts = writer.close()
-    with artifacts[0].path.open("rb") as stream:
+    with artifacts[0].open("rb") as stream:
         records = list(ArchiveIterator(stream))
     responses = [rec for rec in records if rec.rec_type == "response"]
     assert len(responses) == 1
@@ -111,7 +112,7 @@ def test_inventory_remembers_redirect_representative_by_status(tmp_path):
     )
 
 
-def test_trailing_newline_soft_match_seeds_revisit_and_survives_inventory(
+def test_trailing_newline_soft_match_seeds_current_revisit_but_not_resume_representative(
     tmp_path,
 ):
     """IA CDX hashed body+LF; playback body without LF still revisits."""
@@ -206,8 +207,9 @@ def test_trailing_newline_soft_match_seeds_revisit_and_survives_inventory(
             "200",
             not_after_timestamp="20040602000000",
         )
-        is not None
+        is None
     )
+    assert len(inv.identities) == 2
 
 
 def test_custom_cdx_urlkey_survives_warc_inventory(tmp_path):
@@ -349,15 +351,14 @@ def test_warc_rollover_naming_has_no_arbitrary_sequence_limit(tmp_path):
         writer.write_playback(playback(capt, body=b"x" * 100))
     warcs = writer.close()
     assert len(warcs) == 2
-    assert warcs[0].relative_key.endswith("-2004-001.warc.gz")
-    assert warcs[1].relative_key.endswith("-2004-002.warc.gz")
-    for artifact in warcs:
-        assert artifact.record_count == 2
-        assert _validate_warc(artifact.path) == artifact.record_count
+    assert warcs[0].name.endswith("-2004-001.warc.gz")
+    assert warcs[1].name.endswith("-2004-002.warc.gz")
+    for path in warcs:
+        assert scan_warc(path).records == 2
 
     writer = _CollectionWarcWriter(layout, "2005", target_bytes=1, sequence=1000)
     writer.write_playback(playback(make_capt()))
-    assert writer.close()[0].path.name.endswith("-1000.warc.gz")
+    assert writer.close()[0].name.endswith("-1000.warc.gz")
 
 
 def test_resume_appends_to_same_shard_under_size_cap(tmp_path):

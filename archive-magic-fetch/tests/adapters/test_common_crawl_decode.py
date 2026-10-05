@@ -1,6 +1,8 @@
 """Strict source validation, independently of warcio's permissive reader."""
 
+import base64
 import gzip
+import hashlib
 from dataclasses import replace
 from io import BytesIO
 
@@ -13,6 +15,21 @@ from archive_magic_fetch.models import CommonCrawlLocator
 from archive_magic_fetch.pipeline.decoding.decode_warc_capture import decode_warc_capture
 from archive_magic_fetch.pipeline.write_captures import _build_response_record, _serialize_record
 from common_crawl_helpers import record
+
+
+@pytest.mark.parametrize("encoding", ["hex", "base32", "base64"])
+@pytest.mark.parametrize("matches", [True, False])
+def test_source_digest_encodings_preserve_validation(encoding, matches):
+    digest = hashlib.sha1(b"hello" if matches else b"wrong").digest()
+    token = (digest.hex() if encoding == "hex" else
+             base64.b32encode(digest).decode().lower() if encoding == "base32" else
+             base64.b64encode(digest).decode())
+    capture, data = record(warc_headers=(("WARC-Payload-Digest", "sha1:" + token),))
+    if matches:
+        assert decode_warc_capture(data, capture).body == b"hello"
+    else:
+        with pytest.raises(CorruptRecord, match="payload digest mismatch"):
+            decode_warc_capture(data, capture)
 
 
 def test_raw_payload_and_ordered_repeated_headers_survive_output():

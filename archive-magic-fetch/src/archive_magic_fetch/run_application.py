@@ -97,20 +97,23 @@ def run_application(args) -> int:
         if args.sync_only:
             layout = ArchiveLayout(config.output.data_directory, config.archive_id)
             with archive_lock(layout, config.collection_directory):
-                from archive_magic_fetch.pipeline.publication.storage import BucketStorage, active_storage
+                from archive_magic_fetch.pipeline.publication.storage import BucketStorage
                 store = BucketStorage(config.output, config.archive_id)
                 YearStage.recover(layout)
                 store.preflight()
-                with active_storage(store):
-                    sync_archive(layout, config.output)
+                sync_archive(layout, config.output, publisher=store)
             return 0
         assert settings is not None
         result = run_fetch(
             settings,
-            source=build_common_crawl_source(index_directory=settings.index_directory)
+            source=build_common_crawl_source(
+                index_directory=settings.index_directory,
+                checkpoint_directory=settings.output.data_directory.parent / '.state' / 'discovery',
+            )
             if config.source == "common-crawl"
             else build_wayback_source(
                 index_directory=settings.index_directory,
+                checkpoint_directory=settings.output.data_directory.parent / '.state' / 'discovery',
                 cdx_window_days=settings.cdx_window_days,
                 cdx_page_limit=settings.cdx_page_limit,
             ),

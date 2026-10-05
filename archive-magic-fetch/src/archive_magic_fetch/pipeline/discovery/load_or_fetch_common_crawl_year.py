@@ -11,16 +11,16 @@ from archive_magic_fetch.archive.identity import make_identity, normalize_payloa
 from archive_magic_fetch.archive.normalize_cdx_search import normalize_cdx_search
 from archive_magic_fetch.contracts import DiscoveryRequest
 from archive_magic_fetch.models import CaptureListing, CaptureRef, CommonCrawlLocator
-from archive_magic_fetch.runtime.manage_archive_files import exclusive_temp_path, publish_file_atomically
-
-
-from archive_magic_fetch.pipeline.publication.storage import completed_discovery
+from archive_magic_fetch.runtime.manage_archive_files import exclusive_temp_path, publish_file_atomically, write_json_durably
+from archive_magic_fetch.runtime.report_progress import emit
+from .checkpoints import progress_root, clear_progress
 
 PAGE_SIZE = 5
 
 
 def load_or_fetch_common_crawl_year(
     request: DiscoveryRequest, *, index_directory: Path, index: CommonCrawlIndex, client,
+    checkpoint_directory: Path | None = None,
 ) -> CaptureListing:
     search_url, match_type = normalize_cdx_search(request.url_pattern)
     start, end = f"{request.year}0101000000", f"{request.year}1231235959"
@@ -30,15 +30,19 @@ def load_or_fetch_common_crawl_year(
     query_hash = hashlib.sha256(json.dumps(query, sort_keys=True).encode()).hexdigest()
     captures = []
     coverage = []
+    private_root = progress_root(index_directory, checkpoint_directory)
     for collection in index.catalog(client):
         if catalog_timestamp(collection["from"]) > end or catalog_timestamp(collection["to"]) < start:
             continue
         coverage.append(collection["id"])
         path = index_directory / "common-crawl" / "v1" / query_hash / collection["id"] / f"{request.year}.json"
+        progress = private_root / "common-crawl" / "v1" / query_hash / collection["id"] / str(request.year)
         metadata = {"version": 1, "query": query, "from": start, "to": end, "collection": collection}
         cached = _load_cache(path, metadata)
         if cached is not None:
-            completed_discovery(path)
+            clear_progress(progress, private_root)
+            if request.on_cache_complete is not None:
+                request.on_cache_complete(path)
             captures.extend(cached)
             continue
         params = {**query, "from": start, "to": end, "output": "json", "pageSize": PAGE_SIZE}
@@ -50,23 +54,46 @@ def load_or_fetch_common_crawl_year(
             pages = value.get("pages") if isinstance(value, dict) else None
             if type(pages) is not int or pages < 0:
                 raise ValueError("invalid Common Crawl page count")
+        unit = {**metadata, "pages": pages, "page_size": PAGE_SIZE}
+        manifest = progress / "query.json"
+        if manifest.exists():
+            saved = json.loads(manifest.read_text(encoding="utf-8"))
+            if (not isinstance(saved, dict) or set(saved) != set(unit)
+                    or any(saved[k] != unit[k] for k in ("version", "query", "from", "to"))
+                    or type(saved["pages"]) is not int or saved["pages"] < 0
+                    or type(saved["page_size"]) is not int or saved["page_size"] < 1):
+                raise ValueError(f"invalid Common Crawl checkpoint: {manifest}")
+            validate_collection(saved["collection"])
+            if saved != unit:
+                clear_progress(progress, private_root)
+        write_json_durably(manifest, unit)
         rows = []
         for page in range(pages):
+            page_path = progress / f"{page}.json"
+            page_metadata = {**unit, "page": page}
+            cached_page = _load_cache(page_path, page_metadata)
+            if cached_page is not None:
+                emit(f"using Common Crawl checkpoint: {collection['id']} year {request.year} page {page}")
+                rows.extend(cached_page)
+                continue
             # Page counts precede date filtering. A numbered page can therefore
             # return the recognized no-captures response for this calendar year.
             text = index.read(
                 client, collection["cdx-api"], {**params, "page": page}, allow_empty=True,
             )
-            if text is None:
-                continue
-            for line in text.splitlines():
+            page_rows = []
+            for line in (text or "").splitlines():
                 if not line.strip():
                     continue
                 capture = _parse_row(json.loads(line), collection["id"])
                 if start <= capture.identity.timestamp <= end:
-                    rows.append(capture)
+                    page_rows.append(capture)
+            _save_cache(page_path, {**page_metadata, "captures": [asdict(c) for c in page_rows]})
+            rows.extend(page_rows)
         _save_cache(path, {**metadata, "captures": [asdict(c) for c in rows]})
-        completed_discovery(path)
+        clear_progress(progress, private_root)
+        if request.on_cache_complete is not None:
+            request.on_cache_complete(path)
         captures.extend(rows)
     return CaptureListing(tuple(captures), {"source": "common-crawl", **query, "from": start, "to": end, "collections": coverage})
 
@@ -111,7 +138,7 @@ def _load_cache(path: Path, metadata: dict) -> tuple[CaptureRef, ...] | None:
         value = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(value, dict) or set(value) != {*metadata, "captures"}:
             raise ValueError("invalid cache envelope")
-        if any(value[key] != metadata[key] for key in ("version", "query", "from", "to")):
+        if any(value[key] != metadata[key] for key in metadata if key != "collection"):
             raise ValueError("cache scope/version mismatch")
         if not isinstance(value["captures"], list):
             raise ValueError("invalid cached captures")

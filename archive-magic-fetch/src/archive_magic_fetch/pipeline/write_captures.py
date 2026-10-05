@@ -1,4 +1,4 @@
-"""Write resolved captures to validated annual WARC shards."""
+"""Write validated capture records to annual WARC shards."""
 
 from __future__ import annotations
 
@@ -27,7 +27,6 @@ from archive_magic_fetch.archive.inventory_collection import (
 from archive_magic_fetch.archive.layout import (
     ArchiveLayout,
     last_collection_warc,
-    warc_artifact_from_path,
 )
 from archive_magic_fetch.config.models import DEFAULT_WARC_TARGET_BYTES
 from archive_magic_fetch.models import (
@@ -39,7 +38,6 @@ from archive_magic_fetch.models import (
     RunMetrics,
     StoredResponse,
     UnresolvedFailure,
-    WarcArtifact,
 )
 from archive_magic_fetch.pipeline.resolve_captures import PayloadData
 from archive_magic_fetch.runtime.report_progress import log_url_outcome
@@ -51,7 +49,7 @@ class WarcBuild:
 
     metrics: RunMetrics
     failures: tuple[UnresolvedFailure, ...]
-    warcs: tuple[WarcArtifact, ...]
+    changed_warcs: tuple[Path, ...]
 
 
 def write_captures(
@@ -62,6 +60,7 @@ def write_captures(
     target_bytes: int,
     inventory: CollectionInventory,
     capture_link,
+    checkpoint=None,
 ) -> WarcBuild:
     """Append resolved payloads, validating each member before it reaches disk."""
 
@@ -82,6 +81,9 @@ def write_captures(
             )
             if failure is not None:
                 failures.append(failure)
+        if checkpoint is not None:
+            checkpoint(sorted(writer.touched))
+        writer.touched.clear()
         log_url_outcome(number, payloads.url_count, outcome, capture_link=capture_link)
     started = time.monotonic()
     warcs = writer.close()
@@ -270,10 +272,9 @@ class _CollectionWarcWriter:
     collection_id: str
     target_bytes: int = DEFAULT_WARC_TARGET_BYTES
     sequence: int = 0
-    finalized: list[WarcArtifact] = field(default_factory=list)
+    changed: set[Path] = field(default_factory=set)
     current_path: Path | None = None
-    _base_size: int = 0
-    _changed: bool = False
+    touched: set[Path] = field(default_factory=set)
 
     def __post_init__(self) -> None:
         if self.sequence:
@@ -283,7 +284,6 @@ class _CollectionWarcWriter:
             self.sequence = 1
         elif last[1].stat().st_size < self.target_bytes:
             self.sequence, self.current_path = last
-            self._base_size = self.current_path.stat().st_size
         else:
             self.sequence = last[0] + 1
 
@@ -293,19 +293,20 @@ class _CollectionWarcWriter:
     def write_revisit(self, result: RevisitResult) -> None:
         self._append_record(_serialize_record(_build_revisit_record(result)))
 
-    def close(self) -> list[WarcArtifact]:
-        """Validate changed shards and return their current artifact metadata."""
+    def close(self) -> list[Path]:
+        """Return changed shard paths for the indexer to validate and describe."""
 
-        self._finalize_current()
-        return list(self.finalized)
+        return sorted(self.changed)
 
     def _append_record(self, data: bytes) -> None:
         self._ensure_current()
         assert self.current_path is not None
         _append_bytes(self.current_path, data)
-        self._changed = True
+        self.touched.add(self.current_path)
+        self.changed.add(self.current_path)
         if self.current_path.stat().st_size >= self.target_bytes:
-            self._finalize_current()
+            self.current_path = None
+            self.sequence += 1
 
     def _ensure_current(self) -> None:
         if self.current_path is not None:
@@ -313,55 +314,5 @@ class _CollectionWarcWriter:
         path = self.layout.collection_warc_path(self.collection_id, self.sequence)
         path.parent.mkdir(parents=True, exist_ok=True)
         self.current_path = path
-        self._base_size = path.stat().st_size if path.is_file() else 0
-        if self._base_size == 0:
+        if not path.is_file() or path.stat().st_size == 0:
             _append_bytes(path, _warcinfo(path.name))
-            self._changed = True
-
-    def _finalize_current(self) -> None:
-        path = self.current_path
-        if path is None or not self._changed:
-            return
-        try:
-            count = _validate_warc(path)
-        except BaseException:
-            if self._base_size:
-                with path.open("r+b") as stream:
-                    stream.truncate(self._base_size)
-            else:
-                path.unlink(missing_ok=True)
-            self._reset_current()
-            raise
-        self.finalized.append(
-            warc_artifact_from_path(
-                self.layout,
-                path,
-                collection_id=self.collection_id,
-                record_count=count,
-            )
-        )
-        self._reset_current()
-        self.sequence += 1
-
-    def _reset_current(self) -> None:
-        self.current_path = None
-        self._base_size = 0
-        self._changed = False
-
-
-def _validate_warc(path: Path) -> int:
-    """Require a complete WARC with valid digests and at least one capture."""
-
-    count = 0
-    first_type: str | None = None
-    with path.open("rb") as stream:
-        for record in ArchiveIterator(stream, check_digests="raise"):
-            if first_type is None:
-                first_type = record.rec_type
-            record.raw_stream.read()
-            count += 1
-    if first_type != "warcinfo":
-        raise ValueError(f"WARC missing leading warcinfo: {path}")
-    if count < 2:
-        raise ValueError(f"WARC contains no captures: {path}")
-    return count

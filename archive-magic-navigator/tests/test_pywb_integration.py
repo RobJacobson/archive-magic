@@ -289,6 +289,60 @@ def memento_server():
 
 
 @pytest.mark.integration
+def test_real_pywb_replays_recovered_response_and_revisit_across_shards(tmp_path):
+    """Fetch's repaired working shards become replayable canonical collections."""
+    pytest.importorskip("archive_magic_fetch.pipeline.stage_year")
+    from dataclasses import replace
+    from archive_magic_fetch.archive.identity import make_identity, payload_digest
+    from archive_magic_fetch.archive.inventory_collection import revisit_from_stored, stored_from_capture
+    from archive_magic_fetch.archive.layout import ArchiveLayout
+    from archive_magic_fetch.models import CaptureResult
+    from archive_magic_fetch.pipeline.stage_year import YearStage
+    from archive_magic_fetch.pipeline.write_captures import (
+        _CollectionWarcWriter, _build_revisit_record, _serialize_record, _warcinfo,
+    )
+
+    root = tmp_path / "archives" / "resumed"
+    layout = ArchiveLayout(root, "resumed")
+    body = b"<!doctype html><html><body>Recovered shard response</body></html>"
+    identity = make_identity(original_url="http://example.org/", timestamp="20200601000000",
+                             status_token="200", payload_digest=payload_digest(body))
+    result = CaptureResult(identity, body, 200, (("Content-Type", "text/html"),),
+                           "2020-06-01T00:00:00Z", "fixture://source", payload_digest(body))
+    later = replace(identity, timestamp="20200701000000")
+    stage = YearStage(layout, "2020")
+    writer = _CollectionWarcWriter(stage.layout, "2020", target_bytes=1)
+    writer.write_playback(result)
+    incomplete = stage.layout.collection_warc_path("2020", 2)
+    revisit = revisit_from_stored(later, stored_from_capture(result))
+    incomplete.write_bytes(_warcinfo(incomplete.name) + _serialize_record(_build_revisit_record(revisit))[:-4])
+
+    resumed = YearStage(layout, "2020")
+    inventory = resumed.prepare_inventory()
+    assert inventory.contains(identity) and not inventory.contains(later)
+    assert not incomplete.exists()
+    stored = inventory.lookup_representative(identity.urlkey, identity.payload_digest, "200",
+                                              not_after_timestamp=later.timestamp)
+    assert stored is not None
+    writer = _CollectionWarcWriter(resumed.layout, "2020", target_bytes=1)
+    writer.write_revisit(revisit_from_stored(later, stored))
+    resumed.checkpoint(list(writer.touched))
+    changes = resumed.prepare_commit(writer.close())
+    resumed.commit(changes)
+
+    collection = select_archive_root(root, "resumed")
+    assert validate_archive(collection).record_count == 2
+    before = snapshot_tree(root)
+    snapshot = LocalArchiveStore(root, tmp_path / "cache", 300).load_archive("resumed")
+    with pywb_server(tmp_path, [snapshot]) as base:
+        status, original, _ = get(base + "/resumed/20200601000000id_/http://example.org/")
+        revisit_status, revisited, _ = get(base + "/resumed/20200701000000id_/http://example.org/")
+        assert status == revisit_status == 200
+        assert original == revisited == body
+    assert snapshot_tree(root) == before
+
+
+@pytest.mark.integration
 def test_real_pywb_replays_versions_revisit_and_subresources_read_only(
     tmp_path,
 ):

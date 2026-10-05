@@ -154,8 +154,10 @@ def reject_legacy_layout(layout: ArchiveLayout) -> None:
 def ensure_collection_dirs(layout: ArchiveLayout) -> None:
     """Create the data and log directories."""
 
-    layout.root.mkdir(parents=True, exist_ok=True)
-    layout.logs_root.mkdir(parents=True, exist_ok=True)
+    from archive_magic_fetch.runtime.manage_archive_files import mkdir_durably
+
+    mkdir_durably(layout.root)
+    mkdir_durably(layout.logs_root)
 
 
 def cleanup_temps(layout: ArchiveLayout) -> None:
@@ -164,6 +166,8 @@ def cleanup_temps(layout: ArchiveLayout) -> None:
     if not layout.root.is_dir():
         return
     for path in layout.root.rglob("*"):
+        if ".staging" in path.relative_to(layout.root).parts:
+            continue
         if not path.is_file():
             continue
         if _TEMP_NAME.match(path.name) or path.name.endswith(".warc.gz.partial"):

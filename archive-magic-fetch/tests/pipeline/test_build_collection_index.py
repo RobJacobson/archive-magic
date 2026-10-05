@@ -108,7 +108,7 @@ def test_incremental_index_replaces_tail_lines_without_reading_earlier_warcs(tmp
     updated = build_collection_index(
         layout,
         "2004",
-        changed_warcs=[item.path for item in changed],
+        changed_warcs=changed,
         warc_sizes=sizes,
     )
 
@@ -156,7 +156,7 @@ def test_reconcile_missing_indexes_replaces_only_changed_warcs(tmp_path, monkeyp
         "archive_magic_fetch.pipeline.reconcile_missing_indexes.build_collection_index", wrapped
     )
     assert reconcile_missing_indexes(layout) == ["2004"]
-    assert calls == [[item.path.name for item in changed]]
+    assert calls == [[path.name for path in changed]]
     lines = layout.collection_index("2004").read_text().splitlines()
     assert all(line in lines for line in first_lines)
     assert {json.loads(line.split(" ", 2)[2])["cdxDigest"] for line in lines} == {
@@ -246,3 +246,77 @@ def test_reset_collection_data_deletes_warc_and_cdxj(tmp_path):
     assert list_collection_warcs(layout, "2004") == []
     assert not index_path.is_file()
     assert not partial.exists()
+
+
+def test_strict_index_matches_library_fields_sorting_and_compressed_locators(tmp_path, monkeypatch):
+    import gzip
+    from io import BytesIO
+    from warcio.archiveiterator import ArchiveIterator
+    from archive_magic_fetch.archive.format import parse_cdxj_line
+    from archive_magic_fetch.archive.inventory_collection import revisit_from_stored, stored_from_capture
+    from archive_magic_fetch.pipeline.build_collection_index import _ArchiveMagicCDXJIndexer
+
+    layout = ArchiveLayout(tmp_path / "data", "example.org")
+    ensure_collection_dirs(layout)
+    writer = _CollectionWarcWriter(layout, "2004", target_bytes=1)
+    first = make_capt(url="http://example.org/z", ts="20040602000000", digest=payload_digest(b"hello"))
+    response = playback(first)
+    writer.write_playback(response)
+    later = make_capt(url=first.original_url, ts="20040603000000", digest=first.payload_digest)
+    writer.write_revisit(revisit_from_stored(later, stored_from_capture(response)))
+    writer.write_playback(playback(make_capt(url="http://example.org/a", ts="20040601000000")))
+    writer.close()
+    actual = build_collection_index(layout, "2004").path.read_bytes()
+
+    # Compare the exact existing serializer using the library's permissive
+    # reader, independently of the new strict offset/length implementation.
+    with monkeypatch.context() as patch:
+        def library_process(self, input_, output, filename):
+            from cdxj_indexer.main import CDXJIndexer
+            return CDXJIndexer.process_one(self, input_, output, filename)
+        patch.setattr(_ArchiveMagicCDXJIndexer, "process_one", library_process)
+        patch.setattr(_ArchiveMagicCDXJIndexer, "_create_record_iter",
+                      lambda self, stream: ArchiveIterator(stream, verify_http=True))
+        expected = tmp_path / "library.cdxj"
+        _ArchiveMagicCDXJIndexer(output=str(expected),
+                                inputs=[str(p) for p in list_collection_warcs(layout, "2004")],
+                                sort=True, records="response,revisit", dir_root=str(layout.root)).process_all()
+    assert actual == expected.read_bytes()
+    lines = actual.decode().splitlines()
+    assert lines == sorted(lines)
+    for line in lines:
+        _, timestamp, meta = parse_cdxj_line(line)
+        path = layout.root / meta["filename"]
+        with path.open("rb") as stream:
+            stream.seek(int(meta["offset"]))
+            member = stream.read(int(meta["length"]))
+        records = list(ArchiveIterator(BytesIO(gzip.decompress(member))))
+        assert len(records) == 1
+        assert records[0].rec_headers.get_header("WARC-Date").replace("-", "").replace(":", "").replace("T", "").rstrip("Z") == timestamp
+
+
+def test_indexer_reads_missing_digest_payload_from_the_validated_spool(tmp_path, monkeypatch):
+    import gzip
+    import re
+    import archive_magic_fetch.archive.scan_warcs as scanning
+    from archive_magic_fetch.pipeline.write_captures import _build_response_record, _serialize_record, _warcinfo
+
+    layout = ArchiveLayout(tmp_path / "data", "example.org")
+    ensure_collection_dirs(layout)
+    body = b"0123456789" * 200_000
+    capture = make_capt(digest=payload_digest(body))
+    path = layout.collection_warc_path("2004", 1)
+    raw = gzip.decompress(_serialize_record(_build_response_record(playback(capture, body=body))))
+    raw = re.sub(br"WARC-Payload-Digest: [^\r]+\r\n", b"", raw)
+    path.write_bytes(_warcinfo(path.name) + gzip.compress(raw))
+    spools = []
+    original = scanning.SpooledTemporaryFile
+    def spool(*args, **kwargs):
+        stream = original(*args, **kwargs)
+        spools.append(stream)
+        return stream
+    monkeypatch.setattr(scanning, "SpooledTemporaryFile", spool)
+    artifact = build_collection_index(layout, "2004")
+    meta = json.loads(artifact.path.read_text().split(" ", 2)[2])
+    assert meta["digest"] == payload_digest(body)
+    assert len(spools) == 2 and spools[1]._rolled and all(stream.closed for stream in spools)

@@ -80,14 +80,14 @@ def test_fetch_waits_for_sync_and_stops_after_sync_failure(tmp_path, monkeypatch
             match_type=None,
         )
 
-    def fail_sync(_layout, _output, *, year):
+    def fail_sync(self, year=None):
         synced.append(year)
         raise PublicationError("simulated upload outage")
 
     monkeypatch.setattr(
         "archive_magic_fetch.pipeline.discovery.load_or_fetch_year_cdx._fetch_cdx", cdx
     )
-    monkeypatch.setattr(fetch_module, "sync_archive", fail_sync)
+    monkeypatch.setattr(fetch_module.BucketStorage, "publish", fail_sync)
     root = tmp_path / "data"
     settings = FetchSettings(
         url_pattern="http://example.org/",
