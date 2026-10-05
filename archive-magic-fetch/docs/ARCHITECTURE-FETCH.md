@@ -186,8 +186,9 @@ reusable according to their crawl metadata freshness checks.
 
 The CLI derives discovery from the working root. Programmatic settings may
 supply `index_directory`; its default is `data_directory.parent / "discovery"`.
-Completed validated cache files invoke the active bucket publication callback
-immediately, including before a later WARC or discovery unit fails. Missing
+Completed validated cache files invoke the publication callback passed explicitly
+in the discovery request immediately, including before a later WARC or discovery
+unit fails. Missing
 remote caches require explicit restore. Logs are never used as publication state.
 
 After acquisition, playback captures are filtered by the requested dates,
@@ -262,7 +263,7 @@ window consists of downloaded URL results still buffered in workers or waiting
 to be written; these may require downloading again.
 
 Startup streams the working WARC view once, including its canonical baseline,
-through a strict record iterator shared by recovery, indexing, writer validation,
+through a strict record iterator shared by recovery, indexing,
 and restore. It explicitly verifies complete gzip members and CRCs, WARC framing,
 record digests, and checkpoint boundaries; parser EOF alone does not establish
 gzip completion. Each decoded member spills to temporary storage as needed and
@@ -286,13 +287,22 @@ removed. Missing checkpointed bytes, invalid complete records, canonical corrupt
 or corruption in earlier shards fail explicitly and preserve files. A later write
 or validation failure cannot roll back a previously checkpointed URL group.
 
+The writer validates each serialized member before appending and returns changed
+shard paths. It does not scan whole shards on close or rotation; final indexing
+owns that validation and the verified record counts. Index preparation returns
+scan results and temporary rows without installing them. The stage removes any
+eligible empty tail, checkpoints recovered bytes, then installs the index after
+range validation. Failed preparation or installation removes temporary indexes.
+
 Finalization reindexes only shards written during the current invocation and
 merges their entries into the verified startup index. With no appends, it reuses
 that index without another decompression pass. Verified shard counts and sizes
-are retained for artifact descriptions. Promotion separately compares all staged
-shards and the final index with the original canonical baseline, including
-downloads retained from earlier invocations and index-only corrections. After
-validating and syncing final artifacts, Fetch durably installs
+are retained for artifact descriptions. The stage prepares one `YearChanges`
+value containing artifact sizes, hashes and counts, changed files, and reset
+deletions. It compares against the original canonical baseline, including
+downloads retained from earlier invocations and index-only corrections. Local
+promotion, remote generation receipts, and run logging reuse that same value.
+After validating and syncing final artifacts, Fetch durably installs
 `ready.json`, promotes changed WARCs, then promotes CDXJ. Indexing or publication
 preparation failures retain acquisition for retry. A later fetch or manual sync
 finishes interrupted ready promotions; unfinished acquiring stages remain private.
@@ -590,7 +600,8 @@ same transaction recovery and publication code as fetch.
 `SourceAdapter` is a typed bundle of callables, assembled with composition:
 
 - `discover(request, stats)` returns a complete `CaptureListing` and query metadata;
-  Wayback discovery installs the run's shared transport instrumentation.
+  its optional `request.on_cache_complete(path)` callback publishes each completed
+  cache immediately. Wayback discovery installs the run's shared transport instrumentation.
 - `open_client(stats)` is a context manager creating one persistent worker client;
   the source explicitly installs transport instrumentation before yielding it.
 - `fetch(client, capture)` performs one retrieval-and-decoding attempt and returns
@@ -601,6 +612,8 @@ same transaction recovery and publication code as fetch.
   delay, coordinated cooldown, and optional failure-group limit.
 - `capture_link(capture)` receives the complete `CaptureRef` and supplies the source URL used in terminal links. Capture outcomes carry that reference through reporting.
 
+The runner receives the publisher explicitly, and discovery depends only on its
+completion callback. Publication does not depend on ambient context variables.
 The retrieval stage owns attempts and counters. The source owns interpretation:
 Wayback stub digests, exact-capture rules, newline digest tolerance, and exception
 classification stay in its implementation. Retry advice preserves the distinction

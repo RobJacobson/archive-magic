@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import base64
-import hashlib
 import hmac
 import zlib
 from dataclasses import dataclass
@@ -14,6 +12,7 @@ from typing import BinaryIO
 from warcio.archiveiterator import ArchiveIterator
 from warcio.exceptions import ArchiveLoadFailed
 
+from archive_magic_fetch.archive.digests import parse_warc_digest
 from archive_magic_fetch.archive.inventory_collection import get_warc_identity
 from archive_magic_fetch.runtime.manage_archive_files import sync_file
 
@@ -189,10 +188,7 @@ def _verify_block_digests(stream, headers, start, length, path) -> None:
         if name.lower() != "warc-block-digest":
             continue
         try:
-            algorithm, separator, expected = value.partition(":")
-            if not separator:
-                raise ValueError("missing algorithm")
-            digester = hashlib.new(algorithm.lower())
+            digester, supplied = parse_warc_digest(value)
             stream.seek(start)
             remaining = length
             while remaining:
@@ -202,12 +198,6 @@ def _verify_block_digests(stream, headers, start, length, path) -> None:
                 digester.update(chunk)
                 remaining -= len(chunk)
             actual = digester.digest()
-            if len(expected) == len(actual) * 2:
-                supplied = bytes.fromhex(expected)
-            elif len(expected) == len(base64.b32encode(actual)):
-                supplied = base64.b32decode(expected.upper())
-            else:
-                supplied = base64.b64decode(expected, altchars=b"-_", validate=True)
         except (ValueError, TypeError) as error:
             raise ValueError(f"invalid WARC block digest: {path}") from error
         if not hmac.compare_digest(actual, supplied):

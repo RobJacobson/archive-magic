@@ -45,7 +45,6 @@ from archive_magic_fetch.runtime.track_http_requests import RequestStats
 
 from .cache import wayback_path, wayback_document, validate_wayback, query_for
 from .checkpoints import progress_root, clear_progress
-from archive_magic_fetch.pipeline.publication.storage import completed_discovery
 
 DEFAULT_CDX_TIMEOUT_SECONDS = 300.0
 # wayback 0.5.1's CDX endpoint limit, enforced atomically with the run's limit.
@@ -94,6 +93,7 @@ def load_or_fetch_year_cdx(
     report: Callable[[str], None] = emit,
     stats: RequestStats | None = None,
     checkpoint_directory: Path | None = None,
+    on_cache_complete: Callable[[Path], None] | None = None,
 ) -> CaptureListing:
     """Return a full calendar-year listing, caching only completed past years.
 
@@ -119,7 +119,8 @@ def load_or_fetch_year_cdx(
             captures = validate_wayback(payload, query=query_for(url_pattern), year=year)
         except (OSError, UnicodeError, ValueError) as error:
             raise ValueError(f"invalid CDX cache {path}: {error}") from error
-        completed_discovery(path)
+        if on_cache_complete is not None:
+            on_cache_complete(path)
         clear_progress(progress, private_root)
         report(f"using cached CDX index for {year}: {path}")
         return _listing(captures, url_pattern, search_url, match_type, cdx_page_limit)
@@ -197,7 +198,8 @@ def load_or_fetch_year_cdx(
         finally:
             tmp.unlink(missing_ok=True)
         clear_progress(progress, private_root)
-        completed_discovery(path)
+        if on_cache_complete is not None:
+            on_cache_complete(path)
         report(f"saved CDX index for {year}: {path}")
     return _listing(captures, url_pattern, search_url, match_type, cdx_page_limit)
 

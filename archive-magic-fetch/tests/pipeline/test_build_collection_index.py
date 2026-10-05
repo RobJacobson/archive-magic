@@ -108,7 +108,7 @@ def test_incremental_index_replaces_tail_lines_without_reading_earlier_warcs(tmp
     updated = build_collection_index(
         layout,
         "2004",
-        changed_warcs=[item.path for item in changed],
+        changed_warcs=changed,
         warc_sizes=sizes,
     )
 
@@ -156,7 +156,7 @@ def test_reconcile_missing_indexes_replaces_only_changed_warcs(tmp_path, monkeyp
         "archive_magic_fetch.pipeline.reconcile_missing_indexes.build_collection_index", wrapped
     )
     assert reconcile_missing_indexes(layout) == ["2004"]
-    assert calls == [[item.path.name for item in changed]]
+    assert calls == [[path.name for path in changed]]
     lines = layout.collection_index("2004").read_text().splitlines()
     assert all(line in lines for line in first_lines)
     assert {json.loads(line.split(" ", 2)[2])["cdxDigest"] for line in lines} == {

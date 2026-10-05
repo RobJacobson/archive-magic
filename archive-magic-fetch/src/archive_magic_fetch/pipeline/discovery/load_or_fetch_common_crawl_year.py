@@ -15,9 +15,6 @@ from archive_magic_fetch.runtime.manage_archive_files import exclusive_temp_path
 from archive_magic_fetch.runtime.report_progress import emit
 from .checkpoints import progress_root, clear_progress
 
-
-from archive_magic_fetch.pipeline.publication.storage import completed_discovery
-
 PAGE_SIZE = 5
 
 
@@ -44,7 +41,8 @@ def load_or_fetch_common_crawl_year(
         cached = _load_cache(path, metadata)
         if cached is not None:
             clear_progress(progress, private_root)
-            completed_discovery(path)
+            if request.on_cache_complete is not None:
+                request.on_cache_complete(path)
             captures.extend(cached)
             continue
         params = {**query, "from": start, "to": end, "output": "json", "pageSize": PAGE_SIZE}
@@ -94,7 +92,8 @@ def load_or_fetch_common_crawl_year(
             rows.extend(page_rows)
         _save_cache(path, {**metadata, "captures": [asdict(c) for c in rows]})
         clear_progress(progress, private_root)
-        completed_discovery(path)
+        if request.on_cache_complete is not None:
+            request.on_cache_complete(path)
         captures.extend(rows)
     return CaptureListing(tuple(captures), {"source": "common-crawl", **query, "from": start, "to": end, "collections": coverage})
 

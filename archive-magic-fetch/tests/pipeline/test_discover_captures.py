@@ -203,7 +203,7 @@ def test_save_and_warc_failures_have_separate_cache_outcomes(
         if boundary == "CDX save":
             patch.setattr(cdx, "publish_file_atomically", fail)
         else:
-            patch.setattr(fetch, "build_collection_index", fail)
+            patch.setattr(fetch.YearStage, "prepare_commit", fail)
         result = run(settings, download_fn=download)
     assert result.exit_code == 1
     assert result.failed_years == (2004,)

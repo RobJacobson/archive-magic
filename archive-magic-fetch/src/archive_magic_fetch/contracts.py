@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Generic, TypeVar
 
 from archive_magic_fetch.models import (
@@ -26,6 +27,7 @@ class DiscoveryRequest:
     url_pattern: str
     year: int
     current_year: int
+    on_cache_complete: Callable[[Path], None] | None = None
 
 
 @dataclass(frozen=True)

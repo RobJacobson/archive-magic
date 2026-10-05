@@ -5,7 +5,6 @@ from __future__ import annotations
 import pytest
 from archive_magic_fetch.archive.inventory_collection import inventory_collection
 from archive_magic_fetch.pipeline.stage_year import YearStage
-from archive_magic_fetch.pipeline.build_collection_index import build_collection_index
 from archive_magic_fetch.pipeline.write_captures import _CollectionWarcWriter
 from helpers import make_capt, make_collection, playback
 
@@ -25,15 +24,11 @@ def test_staged_append_preserves_prior_offsets_and_promotes_index_last(tmp_path)
     writer = _CollectionWarcWriter(stage.layout, "2004")
     writer.write_playback(playback(second))
     changed = writer.close()
-    build_collection_index(
-        stage.layout,
-        "2004",
-        changed_warcs=[item.path for item in changed],
-    )
+    changes = stage.prepare_commit(changed)
 
     assert warc.read_bytes() == old_bytes
     assert layout.collection_index("2004").read_bytes() == old_index
-    stage.commit(changed, index_changed=True)
+    stage.commit(changes)
 
     assert warc.read_bytes().startswith(old_bytes)
     assert inventory_collection(layout, "2004").contains(second)
@@ -73,11 +68,7 @@ def test_recovery_finishes_validated_promotion_before_sync(tmp_path, monkeypatch
     writer = _CollectionWarcWriter(stage.layout, "2004")
     writer.write_playback(playback(second))
     changed = writer.close()
-    build_collection_index(
-        stage.layout,
-        "2004",
-        changed_warcs=[item.path for item in changed],
-    )
+    changes = stage.prepare_commit(changed)
     original_replace = staging.os.replace
     failed = False
 
@@ -90,7 +81,7 @@ def test_recovery_finishes_validated_promotion_before_sync(tmp_path, monkeypatch
 
     monkeypatch.setattr(staging.os, "replace", fail_index_once)
     with pytest.raises(OSError, match="simulated crash"):
-        stage.commit(changed, index_changed=True)
+        stage.commit(changes)
     monkeypatch.setattr(staging.os, "replace", original_replace)
 
     YearStage.recover(layout)
@@ -110,8 +101,8 @@ def test_staged_reset_replaces_the_entire_year(tmp_path):
     writer = _CollectionWarcWriter(stage.layout, "2004")
     writer.write_playback(playback(replacement))
     changed = writer.close()
-    build_collection_index(stage.layout, "2004")
-    stage.commit(changed, index_changed=True)
+    changes = stage.prepare_commit(changed)
+    stage.commit(changes)
 
     inventory = inventory_collection(layout, "2004")
     assert inventory.contains(replacement)

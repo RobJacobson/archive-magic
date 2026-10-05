@@ -52,6 +52,7 @@ def build_source(
             sleep=sleep,
             stats=stats,
             checkpoint_directory=checkpoint_directory,
+            on_cache_complete=request.on_cache_complete,
         )
 
     return SourceAdapter(

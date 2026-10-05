@@ -1,7 +1,5 @@
 """Strictly validate a gzip member and normalize its Common Crawl response."""
 
-import base64
-import hashlib
 import hmac
 import re
 from concurrent.futures import CancelledError
@@ -13,6 +11,7 @@ from warcio.archiveiterator import ArchiveIterator
 from archive_magic_fetch.adapters.interpret_common_crawl_failures import (
     CorruptRecord, IdentityMismatch, SourceTruncated, UnsupportedRecord,
 )
+from archive_magic_fetch.archive.digests import parse_warc_digest
 from archive_magic_fetch.archive.format import semantic_headers
 from archive_magic_fetch.archive.identity import (
     normalize_original_url, normalize_payload_digest, payload_digest, warc_date_to_cdx,
@@ -100,17 +99,10 @@ def _header_end(data: bytes) -> int:
 
 
 def _verify_digest(value: str, data: bytes, kind: str) -> None:
-    algorithm, separator, expected = value.partition(":")
-    if not separator:
-        raise CorruptRecord(f"invalid {kind} digest")
     try:
-        digest = hashlib.new(algorithm.lower(), data).digest()
-        if len(expected) == len(digest) * 2:
-            supplied = bytes.fromhex(expected)
-        elif len(expected) == len(base64.b32encode(digest)):
-            supplied = base64.b32decode(expected.upper())
-        else:
-            supplied = base64.b64decode(expected, altchars=b"-_", validate=True)
+        digester, supplied = parse_warc_digest(value)
+        digester.update(data)
+        digest = digester.digest()
     except (ValueError, TypeError) as error:
         raise CorruptRecord(f"unsupported or invalid {kind} digest") from error
     if not hmac.compare_digest(digest, supplied):

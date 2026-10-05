@@ -297,7 +297,6 @@ def test_real_pywb_replays_recovered_response_and_revisit_across_shards(tmp_path
     from archive_magic_fetch.archive.inventory_collection import revisit_from_stored, stored_from_capture
     from archive_magic_fetch.archive.layout import ArchiveLayout
     from archive_magic_fetch.models import CaptureResult
-    from archive_magic_fetch.pipeline.build_collection_index import build_collection_index
     from archive_magic_fetch.pipeline.stage_year import YearStage
     from archive_magic_fetch.pipeline.write_captures import (
         _CollectionWarcWriter, _build_revisit_record, _serialize_record, _warcinfo,
@@ -328,10 +327,8 @@ def test_real_pywb_replays_recovered_response_and_revisit_across_shards(tmp_path
     writer = _CollectionWarcWriter(resumed.layout, "2020", target_bytes=1)
     writer.write_revisit(revisit_from_stored(later, stored))
     resumed.checkpoint(list(writer.touched))
-    writer.close()
-    changed = resumed.changed_warcs()
-    build_collection_index(resumed.layout, "2020", changed_warcs=[item.path for item in changed])
-    resumed.commit(changed, index_changed=True)
+    changes = resumed.prepare_commit(writer.close())
+    resumed.commit(changes)
 
     collection = select_archive_root(root, "resumed")
     assert validate_archive(collection).record_count == 2

@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import shutil
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from functools import partial
+from pathlib import Path
 
 from archive_magic_fetch.archive.dates import year_ranges
 from archive_magic_fetch.archive.identity import current_utc_cdx_timestamp
@@ -14,23 +16,18 @@ from archive_magic_fetch.archive.layout import (
     ArchiveLayout,
     cleanup_temps,
     ensure_collection_dirs,
-    index_artifact_from_path,
-    list_collection_warcs,
     reject_legacy_layout,
 )
 from archive_magic_fetch.config.build_settings import FetchSettings
 from archive_magic_fetch.contracts import DiscoveryRequest, SourceAdapter
 from archive_magic_fetch.models import (
-    IndexArtifact,
     RunMetrics,
     UnresolvedFailure,
-    WarcArtifact,
 )
-from archive_magic_fetch.pipeline.stage_year import YearStage
+from archive_magic_fetch.pipeline.stage_year import YearChanges, YearStage
 from archive_magic_fetch.pipeline.discovery.discover_captures import discover_captures
-from archive_magic_fetch.pipeline.build_collection_index import build_collection_index
 from archive_magic_fetch.pipeline.publication.purge_remote import purge_remote
-from archive_magic_fetch.pipeline.publication.sync_archive import sync_archive
+from archive_magic_fetch.pipeline.publication.storage import BucketStorage
 from archive_magic_fetch.pipeline.reconcile_missing_indexes import reconcile_missing_indexes
 from archive_magic_fetch.pipeline.resolve_captures import resolve_captures
 from archive_magic_fetch.pipeline.retrieval.fetch_capture import fetch_capture
@@ -41,7 +38,6 @@ from archive_magic_fetch.runtime.pace_requests import StartGate
 from archive_magic_fetch.runtime.write_run_record import (
     init_run_id,
     init_run_record,
-    published_warc_artifacts,
     write_run_record,
 )
 from archive_magic_fetch.runtime.report_progress import emit, format_elapsed, mirror_output
@@ -63,8 +59,7 @@ class FetchResult:
 class _YearResult:
     metrics: RunMetrics
     failures: tuple[UnresolvedFailure, ...]
-    warcs: tuple[WarcArtifact, ...]
-    index: IndexArtifact | None
+    changes: YearChanges
     query: dict[str, object]
 
 
@@ -72,6 +67,7 @@ def run_fetch(
     settings: FetchSettings,
     *,
     source: SourceAdapter,
+    publisher: BucketStorage | None = None,
     sleep=time.sleep,
     clock=time.monotonic,
 ) -> FetchResult:
@@ -112,22 +108,16 @@ def run_fetch(
                 emit(f"HTTP trace: {trace_path}")
             emit(f"HTTP 429 diagnostics (written on first 429): {diagnostics_path}")
             with archive_lock(layout, settings.collection_directory):
-                from archive_magic_fetch.pipeline.publication.storage import BucketStorage, active_storage
-                store = BucketStorage(settings.output, settings.archive_id) if settings.output.type == 'remote' else None
+                if publisher is None and settings.output.type == "remote":
+                    publisher = BucketStorage(settings.output, settings.archive_id)
                 YearStage.recover(layout)
-                if store is not None:
-                    store.preflight(reset=settings.reset_data)
-                with active_storage(store):
-                    return _run_fetch(
-                        settings,
-                        layout=layout,
-                        run_id=run_id,
-                        workers=workers,
-                        current_year=current_year,
-                        source=source,
-                        download=download,
-                        clock=clock,
-                    )
+                if publisher is not None:
+                    publisher.preflight(reset=settings.reset_data)
+                return _run_fetch(
+                    settings, layout=layout, run_id=run_id, workers=workers,
+                    current_year=current_year, source=source, download=download,
+                    clock=clock, publisher=publisher,
+                )
         finally:
             try:
                 workers.close()
@@ -145,14 +135,14 @@ def _run_fetch(
     source: SourceAdapter,
     download,
     clock,
+    publisher: BucketStorage | None,
 ) -> FetchResult:
     """Execute serial years with parallel playback and one WARC writer."""
 
     if settings.reset_data and settings.output.type == "remote":
         purge_remote(settings.output, layout.archive_id)
-        from archive_magic_fetch.pipeline.publication.storage import ACTIVE
-        if ACTIVE.get() is not None:
-            ACTIVE.get().reset_receipt()
+        if publisher is not None:
+            publisher.reset_receipt()
         if layout.root.exists():
             shutil.rmtree(layout.root)
     reject_legacy_layout(layout)
@@ -204,27 +194,20 @@ def _run_fetch(
                 source=source,
                 download=download,
                 clock=clock,
+                on_cache_complete=publisher.publish_discovery if publisher is not None else None,
             )
-            from archive_magic_fetch.pipeline.publication.storage import ACTIVE
-            if ACTIVE.get() is not None:
-                paths = [item.path for item in result.warcs]
-                if stage.index_changed():
-                    paths.append(stage.layout.collection_index(f'{year:04d}'))
-                ACTIVE.get().record_generation(paths)
-            stage.commit(
-                result.warcs,
-                index_changed=stage.index_changed(),
-            )
-            if ACTIVE.get() is not None:
-                ACTIVE.get().finish_generation()
+            if publisher is not None:
+                publisher.record_generation(result.changes.artifacts)
+            stage.commit(result.changes)
+            if publisher is not None:
+                publisher.finish_generation()
         except Exception as error:  # noqa: BLE001 - isolate years
-            if stage is not None and (stage.path / "ready.json").is_file():
+            if stage is not None and stage.promotion_ready:
                 raise
             if stage is not None:
                 stage.abort()
-            from archive_magic_fetch.pipeline.publication.storage import ACTIVE
-            if ACTIVE.get() is not None:
-                ACTIVE.get().recover_generation()
+            if publisher is not None:
+                publisher.recover_generation()
             emit(f"year {year}: failed ({error}); continuing with remaining years")
             failed_years.append(year)
             continue
@@ -232,20 +215,8 @@ def _run_fetch(
             if stage is not None:
                 stage.abort()
             raise
-        if settings.output.type == "remote" and list_collection_warcs(
-            layout, f"{year:04d}"
-        ):
-            sync_archive(layout, settings.output, year=f"{year:04d}")
-        year_warcs = published_warc_artifacts(
-            layout, f"{year:04d}",
-            record_counts={name: scanned.records for name, scanned in stage.scans.items()},
-        )
-        index_path = layout.collection_index(f"{year:04d}")
-        collection_index = (
-            index_artifact_from_path(layout, index_path)
-            if index_path.is_file()
-            else None
-        )
+        if publisher is not None and result.changes.warcs:
+            publisher.publish(year=f"{year:04d}")
         write_run_record(
             layout,
             collection_id=f"{year:04d}",
@@ -254,8 +225,8 @@ def _run_fetch(
             date_start=year_start,
             date_end=year_end,
             query=result.query,
-            warcs=year_warcs,
-            index=collection_index,
+            warcs=result.changes.warcs,
+            index=result.changes.index,
             metrics=result.metrics,
             failures=result.failures,
         )
@@ -300,6 +271,7 @@ def _run_year(
     source: SourceAdapter,
     download,
     clock,
+    on_cache_complete: Callable[[Path], None] | None = None,
 ) -> _YearResult:
     """Acquire captures and build one yearly collection in staging."""
 
@@ -311,7 +283,7 @@ def _run_year(
     cdx_started = clock()
     acquisition = discover_captures(
         source,
-        DiscoveryRequest(settings.url_pattern, year, current_year),
+        DiscoveryRequest(settings.url_pattern, year, current_year, on_cache_complete),
         date_start=date_start,
         date_end=date_end,
         stats=workers.stats,
@@ -343,21 +315,15 @@ def _run_year(
     _accumulate_metrics(year_metrics, built.metrics)
     year_failures = list(built.failures)
     idx_started = clock()
-    collection_index = build_collection_index(
-        layout, collection_id, changed_warcs=[item.path for item in built.warcs],
-        on_scan=stage.remember_scan,
-    )
+    changes = stage.prepare_commit(built.changed_warcs)
     year_metrics.index_s += clock() - idx_started
-    # Index only this invocation's writes, but promote all retained changes.
-    new_warcs = stage.changed_warcs()
-    for artifact in new_warcs:
+    for artifact in changes.changed_warcs:
         emit(f"  staged {artifact.relative_key}")
 
     return _YearResult(
         metrics=year_metrics,
         failures=tuple(year_failures),
-        warcs=tuple(new_warcs),
-        index=collection_index,
+        changes=changes,
         query=query,
     )
 

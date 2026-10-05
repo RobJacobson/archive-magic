@@ -316,14 +316,13 @@ def test_invalid_source_and_cc_sync_only(tmp_path, monkeypatch):
     from bucket_helpers import Bucket
     monkeypatch.setattr("archive_magic_fetch.pipeline.publication.storage.boto3.client", lambda *a, **k: Bucket())
     synced = []
-    monkeypatch.setattr(app, "sync_archive", lambda *args: synced.append(args))
+    monkeypatch.setattr(app, "sync_archive", lambda *args, **kwargs: synced.append((args, kwargs)))
     assert main([str(config), "--sync-only"]) == 0 and len(synced) == 1
 
 
 def test_sync_only_finishes_ready_year_and_leaves_acquisition_private(tmp_path, monkeypatch):
     import archive_magic_fetch.pipeline.stage_year as staging
     from archive_magic_fetch.cli import main
-    from archive_magic_fetch.pipeline.build_collection_index import build_collection_index
     from archive_magic_fetch.pipeline.write_captures import _CollectionWarcWriter
     from bucket_helpers import Bucket
     from helpers import make_collection
@@ -342,11 +341,11 @@ def test_sync_only_finishes_ready_year_and_leaves_acquisition_private(tmp_path, 
     writer = _CollectionWarcWriter(ready.layout, '2005')
     writer.write_playback(playback(make_capt(ts='20050615000000')))
     changed = writer.close()
-    build_collection_index(ready.layout, '2005', changed_warcs=[item.path for item in changed])
+    changes = ready.prepare_commit(changed)
     with monkeypatch.context() as patch:
         patch.setattr(staging, '_promote', lambda *a: (_ for _ in ()).throw(OSError('before promotion')))
         with pytest.raises(OSError):
-            ready.commit(changed, index_changed=True)
+            ready.commit(changes)
     private = tmp_path / 'output' / '.state' / 'discovery' / 'window.json'
     private.parent.mkdir(parents=True)
     private.write_text('private discovery')

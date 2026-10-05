@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Mapping, Optional, Sequence
+from typing import Iterator, Mapping, Sequence
 
 from cdxj_indexer.main import CDXJIndexer
 
@@ -50,85 +52,83 @@ def build_collection_index(
     *,
     changed_warcs: Sequence[Path] | None = None,
     warc_sizes: Mapping[str, int] | None = None,
-    read_options: Mapping[Path, WarcReadOptions] | None = None,
-    on_scan: Callable[[Path, WarcScan], None] | None = None,
-    before_install: Callable[[], None] | None = None,
-) -> Optional[IndexArtifact]:
-    """Build or reuse CDXJ through the strict local WARC reader.
+) -> IndexArtifact | None:
+    """Build and install an index; ``None`` changes forces a full rebuild."""
+    with prepare_collection_index(layout, collection_id, changed_warcs=changed_warcs) as prepared:
+        return prepared.install(warc_sizes=warc_sizes)
 
-    ``changed_warcs=None`` forces a full rebuild. Recovery options and scan
-    callbacks are supplied by the annual stage; ordinary indexing cannot
-    repair files. ``before_install`` durably checkpoints recovered bytes
-    before range validation and index installation.
-    """
 
-    collection_id = layout.validate_collection_id(collection_id)
-    index_path = layout.collection_index(collection_id)
-    warcs = list_collection_warcs(layout, collection_id)
-    if not warcs:
-        return None
-    if changed_warcs is not None and not changed_warcs and index_path.is_file():
-        return index_artifact_from_path(layout, index_path)
-    full_rebuild = changed_warcs is None or not index_path.is_file()
-    inputs = warcs if full_rebuild else list(changed_warcs)
+@dataclass
+class PreparedIndex:
+    """Scanned records awaiting checkpointing, range validation, and installation."""
 
-    collection_dir = layout.collection_dir(collection_id)
-    tmp = exclusive_temp_path(collection_dir, suffix=".cdxj.tmp")
-    try:
-        replacement_lines: list[str] = []
-        if inputs:
-            _ArchiveMagicCDXJIndexer(
-                output=str(tmp),
-                inputs=[str(path) for path in inputs],
-                sort=True,
-                records="response,revisit",
-                dir_root=str(collection_dir),
-                read_options=read_options,
-                on_scan=on_scan,
-                year=collection_id if collection_id.isdigit() and len(collection_id) == 4 else None,
-            ).process_all()
-            replacement_lines = _read_cdxj_lines(tmp)
+    layout: ArchiveLayout
+    collection_id: str
+    temporary: Path | None
+    lines: list[str]
+    scans: dict[Path, WarcScan]
 
-        if full_rebuild:
-            lines = replacement_lines
-        else:
-            changed_names = {path.name for path in inputs}
-            retained = [
-                line
-                for line in _read_cdxj_lines(index_path)
-                if parse_cdxj_line(line)[2].get("filename") not in changed_names
-            ]
-            lines = sorted([*retained, *replacement_lines])
-
-        # Recovery may have removed an eligible empty final shard.
-        surviving = list_collection_warcs(layout, collection_id)
-        if before_install is not None:
-            before_install()
+    def install(self, *, warc_sizes: Mapping[str, int] | None = None) -> IndexArtifact | None:
+        index_path = self.layout.collection_index(self.collection_id)
+        surviving = list_collection_warcs(self.layout, self.collection_id)
+        if self.temporary is None:
+            return index_artifact_from_path(self.layout, index_path) if surviving else None
         if not surviving and warc_sizes is None:
-            index_path.unlink(missing_ok=True)
-            sync_directory(collection_dir)
+            if index_path.exists():
+                index_path.unlink()
+                sync_directory(index_path.parent)
             return None
-        sizes = (
-            {path.name: path.stat().st_size for path in surviving}
-            if warc_sizes is None
-            else dict(warc_sizes)
-        )
-        for path in inputs:
+        sizes = (dict(warc_sizes) if warc_sizes is not None
+                 else {path.name: path.stat().st_size for path in surviving})
+        for path in self.scans:
             if path.is_file():
                 sizes[path.name] = path.stat().st_size
         validate_cdxj_against_warcs(
-            layout,
-            collection_id,
-            lines,
-            warc_sizes=sizes or None,
+            self.layout, self.collection_id, self.lines, warc_sizes=sizes or None,
         )
-        tmp.write_text("".join(f"{line}\n" for line in lines), encoding="utf-8")
-        publish_file_atomically(tmp, index_path)
-        return index_artifact_from_path(
-            layout,
-            index_path,
-            capture_count=len(lines),
+        self.temporary.write_text("".join(f"{line}\n" for line in self.lines), encoding="utf-8")
+        publish_file_atomically(self.temporary, index_path)
+        return index_artifact_from_path(self.layout, index_path, capture_count=len(self.lines))
+
+
+@contextmanager
+def prepare_collection_index(
+    layout: ArchiveLayout,
+    collection_id: str,
+    *,
+    changed_warcs: Sequence[Path] | None = None,
+    read_options: Mapping[Path, WarcReadOptions] | None = None,
+) -> Iterator[PreparedIndex]:
+    """Scan once and prepare index rows without installing them.
+
+    The annual stage owns recovery decisions and checkpoints before calling
+    ``install``. Temporary output is removed even when that work fails.
+    """
+    collection_id = layout.validate_collection_id(collection_id)
+    index_path = layout.collection_index(collection_id)
+    warcs = list_collection_warcs(layout, collection_id)
+    if not warcs or (changed_warcs is not None and not changed_warcs and index_path.is_file()):
+        yield PreparedIndex(layout, collection_id, None, [], {})
+        return
+    full_rebuild = changed_warcs is None or not index_path.is_file()
+    inputs = warcs if full_rebuild else list(changed_warcs)
+    collection_dir = layout.collection_dir(collection_id)
+    tmp = exclusive_temp_path(collection_dir, suffix=".cdxj.tmp")
+    try:
+        indexer = _ArchiveMagicCDXJIndexer(
+            output=str(tmp), inputs=[str(path) for path in inputs],
+            sort=True, records="response,revisit", dir_root=str(collection_dir),
+            read_options=read_options,
+            year=collection_id if collection_id.isdigit() and len(collection_id) == 4 else None,
         )
+        indexer.process_all()
+        lines = _read_cdxj_lines(tmp)
+        if not full_rebuild:
+            changed_names = {path.name for path in inputs}
+            retained = [line for line in _read_cdxj_lines(index_path)
+                        if parse_cdxj_line(line)[2].get("filename") not in changed_names]
+            lines = sorted([*retained, *lines])
+        yield PreparedIndex(layout, collection_id, tmp, lines, indexer.scans)
     finally:
         tmp.unlink(missing_ok=True)
 
@@ -154,12 +154,11 @@ class _ArchiveMagicCDXJIndexer(CDXJIndexer):
 
     def __init__(
         self, *args, read_options: Mapping[Path, WarcReadOptions] | None = None,
-        on_scan: Callable[[Path, WarcScan], None] | None = None,
         year: str | None = None, **kwargs,
     ):
         super().__init__(*args, **kwargs)
         self.read_options = read_options or {}
-        self.on_scan = on_scan
+        self.scans: dict[Path, WarcScan] = {}
         self.year = year
         self.reader: StrictWarcReader | None = None
 
@@ -168,8 +167,7 @@ class _ArchiveMagicCDXJIndexer(CDXJIndexer):
         try:
             super().process_one(input_, output, filename)
             assert self.reader is not None and self.reader.result is not None
-            if self.on_scan is not None:
-                self.on_scan(self.input_path, self.reader.result)
+            self.scans[self.input_path] = self.reader.result
         finally:
             if self.reader is not None:
                 self.reader.close()

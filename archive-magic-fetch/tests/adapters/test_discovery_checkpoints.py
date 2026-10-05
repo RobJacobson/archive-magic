@@ -19,6 +19,7 @@ def test_common_crawl_resumes_completed_empty_pages_and_invalidates_changed_unit
     capture = record()[0]
     failed, changed = [True], [False]
     calls = []
+    completed = []
     def serve(url, **kw):
         if url == CATALOG_URL:
             catalog = collection()
@@ -37,12 +38,13 @@ def test_common_crawl_resumes_completed_empty_pages_and_invalidates_changed_unit
         return Response(json.dumps(row(capture)))
     def acquire():
         return load_or_fetch_common_crawl_year(
-            DiscoveryRequest("*.example.org", 2017, 2017), index_directory=tmp_path / "discovery",
+            DiscoveryRequest("*.example.org", 2017, 2017, completed.append), index_directory=tmp_path / "discovery",
             index=CommonCrawlIndex(sleep=lambda _: None, clock=lambda: 0), client=Client(serve),
         )
     with pytest.raises(KeyboardInterrupt):
         acquire()
     assert calls == [0, 1, 2]
+    assert completed == []
     assert not list((tmp_path / "discovery").rglob("2017.json"))
     empty_page = next((tmp_path / ".state" / "discovery").rglob("1.json"))
     assert json.loads(empty_page.read_text())["captures"] == []
@@ -52,6 +54,7 @@ def test_common_crawl_resumes_completed_empty_pages_and_invalidates_changed_unit
     assert result.captures
     expected = [2] if change == "none" else list(range(4 if change == "page_count" else 3))
     assert calls == expected
+    assert len(completed) == 1 and completed[0].is_file()
     assert not (tmp_path / ".state" / "discovery").exists()
 
 
@@ -59,6 +62,7 @@ def test_common_crawl_resumes_completed_empty_pages_and_invalidates_changed_unit
 def test_wayback_completed_empty_windows_resume_only_for_historical_years(tmp_path, monkeypatch, current):
     import archive_magic_fetch.pipeline.discovery.load_or_fetch_year_cdx as cdx
     calls, broken = [], [True]
+    completed = []
     year = ("20040101000000", "20041231235959")
     first = ("20040101000000", "20040128235959")
     second = ("20040129000000", "20040225235959")
@@ -75,18 +79,22 @@ def test_wayback_completed_empty_windows_resume_only_for_historical_years(tmp_pa
     monkeypatch.setattr(cdx, "_fetch_cdx", fetch)
     def acquire():
         return load_or_fetch_year_cdx(index_directory=tmp_path / "discovery", year=2004,
-                                     current_year=2004 if current else 2005, url_pattern="*.example.org")
+                                     current_year=2004 if current else 2005, url_pattern="*.example.org",
+                                     on_cache_complete=completed.append)
     with pytest.raises(KeyboardInterrupt):
         acquire()
     assert calls == [year, first, second]
+    assert completed == []
     assert (tmp_path / ".state" / "discovery").exists() is (not current)
     broken[0] = False
     calls.clear()
     assert acquire().captures == (capture,)
     if current:
+        assert completed == []
         assert calls[:3] == [year, first, second]
         assert not (tmp_path / "discovery").exists()
     else:
+        assert len(completed) == 1 and completed[0].is_file()
         assert calls[0] == second and year not in calls and first not in calls
         assert wayback_path(tmp_path / "discovery", "*.example.org", 2004).exists()
     assert not (tmp_path / ".state" / "discovery").exists()

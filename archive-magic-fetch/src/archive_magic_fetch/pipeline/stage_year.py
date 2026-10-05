@@ -12,9 +12,9 @@ from typing import Sequence
 
 from archive_magic_fetch.archive.layout import ArchiveLayout, list_collection_warcs, warc_artifact_from_path
 from archive_magic_fetch.archive.inventory_collection import CollectionInventory, inventory_collection
-from archive_magic_fetch.archive.scan_warcs import WarcReadOptions, WarcScan, scan_warc
-from archive_magic_fetch.pipeline.build_collection_index import build_collection_index
-from archive_magic_fetch.models import WarcArtifact
+from archive_magic_fetch.archive.scan_warcs import WarcReadOptions, WarcScan
+from archive_magic_fetch.pipeline.build_collection_index import prepare_collection_index
+from archive_magic_fetch.models import IndexArtifact, WarcArtifact
 from archive_magic_fetch.runtime.manage_archive_files import (
     file_sha256, mkdir_durably, publish_file_atomically, sync_file,
     sync_directory, write_json_durably, exclusive_temp_path,
@@ -30,6 +30,22 @@ class YearWorkState:
     reset: bool
     durable_sizes: dict[str, int]
     initialized: bool = False
+
+
+@dataclass(frozen=True)
+class YearChanges:
+    """One verified generation shared by promotion, publication, and run logging."""
+
+    warcs: tuple[WarcArtifact, ...]
+    index: IndexArtifact | None
+    changed_warcs: tuple[WarcArtifact, ...]
+    index_changed: bool
+    deleted: tuple[str, ...]
+
+    @property
+    def artifacts(self) -> tuple[WarcArtifact | IndexArtifact, ...]:
+        index = (self.index,) if self.index_changed and self.index is not None else ()
+        return (*self.changed_warcs, *index)
 
 
 class YearStage:
@@ -192,29 +208,24 @@ class YearStage:
                 raise ValueError(f"checkpointed WARC bytes are missing: {path}")
             options[path] = WarcReadOptions(self.year, durable, repair, allow_empty=True)
 
-        def remember_recovery(path: Path, scanned: WarcScan) -> None:
-            permission = options[path]
-            durable, repair = permission.durable_size, permission.repair_tail
-            if not scanned.captures:
-                if not repair or durable or path.name in self.state.baseline:
-                    raise ValueError(f"WARC contains no captures: {path}")
-                path.unlink()
-                sync_directory(self.path)
-            elif scanned.size > durable:
-                recovered.append(path)
-            if scanned.captures:
-                self.remember_scan(path, scanned)
-            if scanned.repaired:
-                emit(f"year {self.year}: repaired incomplete WARC tail: {path.name}")
-
-        if paths:
-            build_collection_index(
-                self.layout, self.year, read_options=options, on_scan=remember_recovery,
-                # Salvaged complete records must be durable before the new
-                # index can become authoritative for capture reuse.
-                before_install=lambda: self.checkpoint(recovered),
-            )
-        else:
+        with prepare_collection_index(self.layout, self.year, read_options=options) as prepared:
+            for path, scanned in prepared.scans.items():
+                permission = options[path]
+                if not scanned.captures:
+                    if not permission.repair_tail or permission.durable_size or path.name in self.state.baseline:
+                        raise ValueError(f"WARC contains no captures: {path}")
+                    path.unlink()
+                    sync_directory(self.path)
+                else:
+                    self.scans[path.name] = scanned
+                    if scanned.size > permission.durable_size:
+                        recovered.append(path)
+                if scanned.repaired:
+                    emit(f"year {self.year}: repaired incomplete WARC tail: {path.name}")
+            # Inventory may only consume an index after its recovered bytes are durable.
+            self.checkpoint(recovered)
+            prepared.install()
+        if not paths:
             self.layout.collection_index(self.year).unlink(missing_ok=True)
             sync_directory(self.path)
         inventory = inventory_collection(self.layout, self.year)
@@ -223,15 +234,9 @@ class YearStage:
                  f"from {len(self.scans)} shards")
         return inventory
 
-    def remember_scan(self, path: Path, scanned: WarcScan) -> None:
-        """Keep verified counts for artifact descriptions in this invocation."""
-        self.scans[path.name] = scanned
-
-    def index_changed(self) -> bool:
-        """Compare the final index with this acquisition's canonical baseline."""
-        path = self.layout.collection_index(self.year)
-        baseline = self.state.baseline.get(path.name)
-        return path.is_file() and (self.reset or baseline is None or not _matches(path, baseline))
+    @property
+    def promotion_ready(self) -> bool:
+        return (self.path / "ready.json").is_file()
 
     def checkpoint(self, paths: Sequence[Path]) -> None:
         """Sync all URL-group bytes before atomically advancing durable offsets."""
@@ -250,20 +255,30 @@ class YearStage:
             self.state.durable_sizes = previous
             raise
 
-    def changed_warcs(self) -> list[WarcArtifact]:
-        """Include changes from every invocation in this acquisition generation."""
-        artifacts = []
+    def prepare_commit(self, changed_warcs: Sequence[Path] | None = None) -> YearChanges:
+        """Index this invocation's writes and describe all retained changes once."""
+        with prepare_collection_index(self.layout, self.year, changed_warcs=changed_warcs) as prepared:
+            self.scans.update({path.name: scan for path, scan in prepared.scans.items()})
+            index = prepared.install()
+        warcs = []
+        changed = []
         for path in list_collection_warcs(self.layout, self.year):
-            baseline = self.state.baseline.get(path.name)
-            if self.reset or baseline is None or not _matches(path, baseline):
-                scanned = self.scans.get(path.name)
-                if scanned is None or scanned.size != path.stat().st_size:
-                    scanned = scan_warc(path, year=self.year)
-                    self.remember_scan(path, scanned)
-                artifacts.append(warc_artifact_from_path(
-                    self.layout, path, collection_id=self.year, record_count=scanned.records,
-                ))
-        return artifacts
+            scanned = self.scans[path.name]
+            if scanned.size != path.stat().st_size:
+                raise ValueError(f"WARC changed after indexing: {path}")
+            artifact = warc_artifact_from_path(
+                self.layout, path, collection_id=self.year, record_count=scanned.records,
+            )
+            warcs.append(artifact)
+            if self.reset or _artifact_description(artifact) != self.state.baseline.get(path.name):
+                changed.append(artifact)
+        index_changed = index is not None and (
+            self.reset or _artifact_description(index) != self.state.baseline.get(index.path.name)
+        )
+        names = {item.path.name for item in warcs}
+        deleted = tuple(path.name for path in list_collection_warcs(self.canonical, self.year)
+                        if self.reset and path.name not in names)
+        return YearChanges(tuple(warcs), index, tuple(changed), index_changed, deleted)
 
     def abort(self) -> None:
         """Retain acquisition bytes; only explicit reset or commit discards work."""
@@ -278,52 +293,30 @@ class YearStage:
             parent.rmdir()
             sync_directory(parent.parent)
 
-    def commit(
-        self,
-        changed_warcs: Sequence[WarcArtifact],
-        *,
-        index_changed: bool,
-    ) -> None:
+    def commit(self, changes: YearChanges) -> None:
         """Record a recoverable transaction, then install WARC bytes before index."""
-
-        if self.reset:
-            warc_paths = list_collection_warcs(self.layout, self.year)
-        else:
-            warc_paths = [item.path for item in changed_warcs]
-        index = self.layout.collection_index(self.year)
-        index_entry = (
-            _description(index)
-            if index.is_file() and (index_changed or self.reset)
-            else None
-        )
-        if not warc_paths and index_entry is None and not self.reset:
+        if not changes.artifacts and not self.reset:
             self.discard()
             return
-        staged_names = {path.name for path in warc_paths}
-        deleted = (
-            [
-                path.name
-                for path in list_collection_warcs(self.canonical, self.year)
-                if path.name not in staged_names
-            ]
-            if self.reset
-            else []
-        )
         manifest = {
             "year": self.year,
             "reset": self.reset,
-            "warcs": [_description(path) for path in warc_paths],
-            "index": index_entry,
-            "delete": deleted,
+            "warcs": [_artifact_description(item) for item in changes.changed_warcs],
+            "index": _artifact_description(changes.index) if changes.index_changed else None,
+            "delete": list(changes.deleted),
         }
-        self.checkpoint(warc_paths)
-        if index_entry is not None:
-            sync_file(index)
+        self.checkpoint([item.path for item in changes.changed_warcs])
+        if changes.index_changed and changes.index is not None:
+            sync_file(changes.index.path)
         write_json_durably(self.path / "ready.json", manifest)
         _promote(self.canonical, self.path, manifest)
         if self.path.parent.is_dir() and not any(self.path.parent.iterdir()):
             self.path.parent.rmdir()
             sync_directory(self.canonical.root)
+
+
+def _artifact_description(artifact: WarcArtifact | IndexArtifact) -> dict[str, object]:
+    return {"name": artifact.path.name, "size": artifact.size_bytes, "sha256": artifact.sha256}
 
 
 def _description(path: Path) -> dict[str, object]:

@@ -46,6 +46,50 @@ def settings(tmp_path, **changes):
                          FetchOutput("local", tmp_path / "data"), playback_workers=1, **changes)
 
 
+@pytest.mark.parametrize("target_bytes", [1, 250_000_000])
+def test_new_shards_are_scanned_once_and_logged_with_verified_counts(tmp_path, monkeypatch, target_bytes):
+    import archive_magic_fetch.archive.scan_warcs as scanning
+    from archive_magic_fetch.runtime.manage_archive_files import file_sha256
+
+    first = make_capt(url="http://example.org/a")
+    second = make_capt(url="http://example.org/b")
+    scans = []
+    original = scanning.StrictWarcReader._records
+    def counted(reader):
+        scans.append(reader.path.name)
+        yield from original(reader)
+    monkeypatch.setattr(scanning.StrictWarcReader, "_records", counted)
+    result = run_fetch(settings(tmp_path, warc_target_bytes=target_bytes),
+                       source=fixture_source([first, second], []))
+    assert result.exit_code == 0
+    paths = list_collection_warcs(result.layout, "2004")
+    assert scans == [path.name for path in paths]
+    record = json.loads(next(result.layout.logs_root.glob("*.json")).read_text())["years"]["2004"]
+    assert sum(item["record_count"] - 1 for item in record["warcs"]) == 2
+    assert {item["filename"]: item["sha256"] for item in record["warcs"]} == {
+        path.name: file_sha256(path) for path in paths
+    }
+
+
+def test_final_index_rejects_corrupt_written_shard_before_promotion(tmp_path, monkeypatch):
+    import archive_magic_fetch.pipeline.write_captures as writing
+
+    original = writing._CollectionWarcWriter.close
+    def corrupt(writer):
+        paths = original(writer)
+        data = bytearray(paths[0].read_bytes())
+        data[-8] ^= 1
+        paths[0].write_bytes(data)
+        return paths
+    monkeypatch.setattr(writing._CollectionWarcWriter, "close", corrupt)
+    result = run_fetch(settings(tmp_path), source=fixture_source([make_capt()], []))
+    assert result.failed_years == (2004,)
+    assert not list_collection_warcs(result.layout, "2004")
+    stage = result.layout.root / ".staging" / "2004"
+    assert list(stage.glob("*.warc.gz")) and not (stage / "ready.json").exists()
+    assert not list(stage.glob("*.cdxj.tmp"))
+
+
 @pytest.mark.parametrize("failure", [OSError("interrupted writer"), KeyboardInterrupt()])
 def test_completed_url_survives_and_is_not_downloaded_again(tmp_path, monkeypatch, failure):
     import archive_magic_fetch.pipeline.write_captures as writing
@@ -75,14 +119,13 @@ def test_completed_url_survives_and_is_not_downloaded_again(tmp_path, monkeypatc
 
 
 def test_index_failure_resumes_with_zero_downloads_and_promotes(tmp_path, monkeypatch):
-    import archive_magic_fetch.pipeline.run_fetch as runner
 
     first = make_capt(digest=payload_digest(b"hello"))
     later = replace(first, timestamp="20040616000000")
     calls, config = [], settings(tmp_path)
     source = fixture_source([first, later], calls)
     with monkeypatch.context() as patch:
-        patch.setattr(runner, "build_collection_index", lambda *a, **kw: (_ for _ in ()).throw(OSError("index failed")))
+        patch.setattr(YearStage, "prepare_commit", lambda *a, **kw: (_ for _ in ()).throw(OSError("index failed")))
         assert run_fetch(config, source=source).exit_code == 1
     result = run_fetch(config, source=source)
     assert calls == [first]
@@ -343,7 +386,7 @@ def test_failed_earlier_capture_remains_retryable_after_later_payload_persists(t
         return playback(capture.identity)
     source = replace(source, fetch=fetch)
     with monkeypatch.context() as patch:
-        patch.setattr('archive_magic_fetch.pipeline.run_fetch.build_collection_index',
+        patch.setattr('archive_magic_fetch.pipeline.stage_year.YearStage.prepare_commit',
                       lambda *a, **kw: (_ for _ in ()).throw(OSError('index interrupted')))
         assert run_fetch(settings(tmp_path), source=source).exit_code == 1
     broken[0] = False
@@ -462,7 +505,7 @@ def test_resumed_no_append_invocation_decompresses_each_shard_only_at_startup(tm
     calls, config = [], settings(tmp_path, warc_target_bytes=1)
     source = fixture_source([capture, later], calls)
     with monkeypatch.context() as patch:
-        patch.setattr('archive_magic_fetch.pipeline.run_fetch.build_collection_index',
+        patch.setattr('archive_magic_fetch.pipeline.stage_year.YearStage.prepare_commit',
                       lambda *a, **kw: (_ for _ in ()).throw(OSError("interrupted index")))
         assert run_fetch(config, source=source).exit_code == 1
     scans = []
@@ -481,21 +524,20 @@ def test_resumed_no_append_invocation_decompresses_each_shard_only_at_startup(tm
 
 
 def test_final_index_reads_only_current_writes_but_promotes_retained_shards(tmp_path, monkeypatch):
-    import archive_magic_fetch.pipeline.run_fetch as runner
 
     first = make_capt(url="http://example.org/a", digest=payload_digest(b"hello"))
     second = make_capt(url="http://example.org/b", digest=payload_digest(b"hello"))
     calls, config = [], settings(tmp_path, warc_target_bytes=1)
     with monkeypatch.context() as patch:
-        patch.setattr(runner, "build_collection_index",
+        patch.setattr(YearStage, "prepare_commit",
                       lambda *a, **kw: (_ for _ in ()).throw(OSError("index interrupted")))
         assert run_fetch(config, source=fixture_source([first], calls)).exit_code == 1
     inputs = []
-    original = runner.build_collection_index
-    def final_index(*args, **kwargs):
-        inputs.append([p.name for p in kwargs["changed_warcs"]])
-        return original(*args, **kwargs)
-    monkeypatch.setattr(runner, "build_collection_index", final_index)
+    original = YearStage.prepare_commit
+    def final_index(stage, changed_warcs):
+        inputs.append([p.name for p in changed_warcs])
+        return original(stage, changed_warcs)
+    monkeypatch.setattr(YearStage, "prepare_commit", final_index)
     result = run_fetch(config, source=fixture_source([first, second], calls))
     assert result.exit_code == 0 and calls == [first, second]
     assert inputs == [["example.org-2004-002.warc.gz"]]
