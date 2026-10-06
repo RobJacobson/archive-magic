@@ -386,13 +386,26 @@ requires HTTP 206, matching range metadata, and the exact compressed byte count.
 Reads are bounded to the advertised length plus one byte; ignored ranges,
 redirects, and unexpected outer content encoding are rejected before consuming
 an unbounded body. Responses close on success, failure, or interruption.
+Advertised ranges over 32 MiB compressed are rejected before a request. Both ARC
+and WARC decompression enforce a 64 MiB output limit in bounded increments, using
+a one-byte overflow probe. ARC header lines are limited to 64 KiB (excluding the
+LF). WARC header sections and HTTP header sections each have a 64 KiB limit,
+including the version/status line and terminating blank line. Bounds count raw
+bytes, including multibyte characters, and are checked with bounded reads before
+the relevant parser runs. These limits do not apply to Wayback playback.
 
 Validation first uses independent gzip decompression with completed member,
 CRC, and trailer-size checks. Missing trailers, extra members, and trailing
-garbage fail. Then warcio parses one WARC record, with explicit block-length and
-framing checks and independent verification of every supplied block and payload
-digest. Both WARC and HTTP header boundaries are measured from raw bytes, not
-warcio's decoded-character counts, so UTF-8 headers retain correct byte extents. Parser EOF or an aggregate digest flag alone does not establish validity.
+garbage fail. One decoder detects ARC or WARC from the bytes and uses warcio with
+`verify_http=True, arc2warc=False, no_record_parse=True`. Archive headers are parsed
+first; HTTP parsing is deferred until framing, header bounds, and shared HTTP
+syntax validation pass, then uses the same iterator's HTTP loader.
+Small format-specific helpers validate framing
+and extract the HTTP block, target URL, and capture date; HTTP validation and
+`CaptureResult` construction are shared. WARC verification checks every supplied
+block and payload digest independently. All header boundaries are measured from
+raw bytes, not warcio's decoded-character counts, so UTF-8 headers retain correct
+byte extents. Parser EOF or an aggregate digest flag alone does not establish validity.
 Target URL, timestamp, and available original HTTP status must match discovery.
 The HTTP 206 of the range transport is not the original response status.
 
@@ -406,14 +419,61 @@ An index-only digest mismatch can retain a valid exact response, but cannot seed
 reuse. Missing digests cannot seed reuse either. A failed supplied WARC digest
 is an acquisition failure, not an accepted index mismatch.
 
-Support is limited to complete WARC 1.0/1.1 response records (CC's WARC era,
-starting in 2013). Legacy ARC, segmented or non-response records, declared
-truncation, and unresolved source revisits are explicit failures. Shared
+Support includes complete ARC 1.0 and WARC 1.0/1.1 HTTP(S) response records.
+ARC requires five nonempty header fields, a valid 14-digit UTC timestamp, and a
+nonnegative decimal block length. Its block must exactly fit the remaining bytes,
+with at most one LF separator outside the block. Both formats use the same HTTP
+header validator, rejecting malformed field names, missing colons, control
+characters, and invalid status lines before parsing. Repeated fields, valid
+historical continuation lines, and Unicode values remain supported.
+File-description and non-HTTP ARC records are unsupported. A nonempty,
+case-insensitive `x-commoncrawl-ContentTruncated` HTTP header is an explicit
+truncation failure in either format, even if another occurrence is empty.
+Segmented or non-response WARC records, declared truncation, and unresolved
+source revisits also remain explicit failures. Shared
 same-year reuse can still satisfy a capture without acquisition. External revisit
 chains are never copied into output or fetched to reconstruct payloads.
 
-Strict rejection without historical repair excludes some otherwise recoverable
-captures. For example, `CC-MAIN-2018-34` has an
+Strict decoding runs first. After one complete gzip member verifies, an ARC-only
+helper may recover two
+[documented defects](https://github.com/commoncrawl/arc2warc-conversion#format-issues-in-common-crawl-arc-files):
+literal ASCII spaces in a URL path/query, and an incorrect numeric block length.
+It splits the ARC header from the right into the URL and four metadata fields.
+Controls, malformed authorities, invalid dates, missing fields, and nonnumeric
+lengths remain failures. Space and `%20` equivalence is permitted only during
+recovery identity comparison; discovery identities are unchanged.
+
+Recovery evaluates at most two candidates: the complete remaining HTTP block,
+or that block excluding one final LF separator. Only ARC header bytes are
+corrected for parsing; selected HTTP and payload bytes are preserved exactly.
+The same decoder validates each candidate's HTTP response, URL, timestamp, and
+available index status. Exactly one candidate must match a present, valid indexed
+SHA-1 over its exact payload, with no source-truncation marker or unconsumed bytes.
+Missing/mismatched digests and ambiguous candidates are skips. No arbitrary
+offset search, payload whitespace stripping, HTTP repair, or gzip repair occurs.
+Strictly valid captures retain the existing index-digest mismatch policy above.
+
+`CaptureResult.source_repairs` carries stable codes `arc-url-spaces` and
+`arc-block-length`. Download progress shows these codes, and response WARCs store
+them in `Archive-Magic-Source-Repairs` (comma-separated) alongside the original
+`WARC-Source-URI`. A verified recovered response can seed same-year payload reuse.
+`source_recovered` in run metrics and JSON counts, and `source-recovered` in
+completion summaries, count successful recovered response writes, excluding
+ordinary reuse and generated revisits. When the indexed URL contains spaces,
+`CDX-Original-URL` preserves it on responses and revisits while WARC target URIs
+use `%20`. Reading this optional field requires equivalence with the WARC target;
+CDXJ retains the original `url`, preserving exact resume identities. Existing
+WARCs, indexes, discovery caches, and checkpoints require no migration.
+
+Both inputs use the same range downloader, retry policy, and WARC 1.1 output
+writer; ARC support adds no configuration or discovery-cache version. Previously
+skipped ARC captures are retried on an ordinary run without `--reset-data`.
+Common Crawl failure advice supplies concise unsupported-record and truncation
+display reasons through `FailureAdvice.display_reason`. Detailed JSON messages
+are retained. Unresolved captures alone still do not
+cause a nonzero exit status.
+
+Other historical defects remain excluded. For example, `CC-MAIN-2018-34` has an
 [extra CRLF defect](https://commoncrawl.org/errata/extra-line-in-response-records-between-headers-and-payload)
 between HTTP headers and payload. Records failing length or digest verification
 remain failures; Fetch does not strip bytes to repair them or reject the entire
@@ -423,10 +483,20 @@ fully crawled. Wayback-specific stub detection and newline tolerance do not appl
 
 Retrieval and decoding are one shared acquisition attempt. Connection/read
 timeouts are 10/60 seconds. Host worker/rate/retry policy applies; transport
-retries are disabled. Corrupt records, incomplete transfers, timeouts, connection
-failures, 429, and 5xx may retry within that budget. Invalid locators, identity
+retries are disabled. Gzip integrity failures, incomplete transfers, timeouts,
+connection failures, 429, and 5xx may retry within that budget. Invalid locators, identity
 mismatches, unsupported types, declared source truncation, and permanent HTTP
-failures do not. Per-capture delays start at five seconds and double to 60 seconds,
+failures do not. After gzip integrity verifies, malformed WARC records (including
+framing, parsing, and supplied source-digest failures), malformed ARC records,
+and failed recovery candidates are nonretryable `unavailable` failures.
+`MalformedWarcRecord` retains the detailed validation error and reports
+`malformed WARC` on the console. WARC failures never invoke ARC recovery or repair
+record bytes. Size-limit failures are also nonretryable `unavailable`.
+Console reasons include `malformed WARC`, `malformed ARC`,
+`ARC recovery could not verify payload`, and `archive record exceeds size limit`;
+JSON retains the detailed error. Later captures continue. Damaged discovery
+caches and invalid index rows still fail validation rather than disappearing.
+Per-capture delays start at five seconds and double to 60 seconds,
 honoring longer `Retry-After`. HTTP 429/503 and connection refusal pause the pool
 for at least 60 seconds or a longer requested delay. Cancellation-aware waits,
 worker draining, and late backpressure preservation remain shared behavior.
@@ -434,6 +504,10 @@ worker draining, and late backpressure preservation remain shared behavior.
 ### Optional local smoke procedure
 
 Automated tests use generated source records and fake HTTP responses. For an
+offline recovery smoke test, mutate the URL or numeric length of a known ARC
+fixture and fetch it through mocked range transport into a temporary archive.
+Check the indexed digest, repair metadata, and zero new writes on a second run;
+do not modify an existing collection's captures. For an
 explicitly opted-in live check, copy the repository collection example, set
 `fetch.source = "common-crawl"`, choose a small date range, and omit
 `[storage.remote]` for local-only acquisition. Follow the smoke guide for any
@@ -542,10 +616,10 @@ archive_magic_fetch/
     retrieval/
       fetch_capture.py              execute and retry an acquisition
       retrieve_memento.py           request exact replay
-      retrieve_warc_range.py        request and bound one CC compressed byte range
+      retrieve_common_crawl_range.py        request and bound one CC compressed byte range
     decoding/
       decode_memento.py             validate and normalize the Wayback response
-      decode_warc_capture.py        strictly validate and normalize a CC record
+      decode_common_crawl_capture.py        strictly validate and normalize a CC record
     resolve_captures.py             reuse stored payloads or acquire captures
     write_captures.py               serialize and append WARCs
     build_collection_index.py      construct local CDXJ
@@ -632,7 +706,7 @@ filename, offset, length); that locator is retained in CC discovery caches but i
 not part of capture identity. Failure display labels are transient; existing
 run-record fields remain unchanged; the request trace adds a `phase` column. CC query metadata in
 run records identifies the source and selected collections. `WARC-Source-URI`
-records the source WARC URL, while terminal capture links open its collection's
+records the source ARC or WARC URL, while terminal capture links open its collection's
 index query rather than offering a fictitious replay URL.
 
 Archives previously written with cross-year revisits must be discarded and

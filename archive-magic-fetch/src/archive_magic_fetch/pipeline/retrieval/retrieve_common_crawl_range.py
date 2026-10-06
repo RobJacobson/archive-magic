@@ -3,17 +3,20 @@
 import re
 from concurrent.futures import CancelledError
 
-from archive_magic_fetch.adapters.interpret_common_crawl_failures import CorruptRecord
+from archive_magic_fetch.adapters.interpret_common_crawl_failures import CorruptRecord, RecordLimitExceeded
 from archive_magic_fetch.models import CaptureRef
 
 
 _DATA_ROOT = "https://data.commoncrawl.org/"
+MAX_COMPRESSED_RECORD_BYTES = 32 * 1024 * 1024
 
 
-def retrieve_warc_range(client, capture: CaptureRef) -> bytes:
+def retrieve_common_crawl_range(client, capture: CaptureRef) -> bytes:
     locator = capture.locator
     if locator is None:
         raise ValueError("Common Crawl capture has no locator")
+    if locator.length > MAX_COMPRESSED_RECORD_BYTES:
+        raise RecordLimitExceeded("archive record exceeds compressed size limit")
     end = locator.offset + locator.length - 1
     # Do not follow redirects: even a redirect response body could be unbounded.
     with client.get(

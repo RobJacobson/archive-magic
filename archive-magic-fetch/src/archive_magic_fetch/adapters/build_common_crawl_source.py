@@ -10,9 +10,9 @@ from archive_magic_fetch.adapters.interpret_common_crawl_failures import failure
 from archive_magic_fetch.adapters.query_common_crawl_index import CommonCrawlIndex
 from archive_magic_fetch.contracts import SourceAdapter
 from archive_magic_fetch.models import FailureCategory, UnresolvedFailure
-from archive_magic_fetch.pipeline.decoding.decode_warc_capture import decode_warc_capture
+from archive_magic_fetch.pipeline.decoding.decode_common_crawl_capture import decode_common_crawl_capture
 from archive_magic_fetch.pipeline.discovery.load_or_fetch_common_crawl_year import load_or_fetch_common_crawl_year
-from archive_magic_fetch.pipeline.retrieval.retrieve_warc_range import retrieve_warc_range
+from archive_magic_fetch.pipeline.retrieval.retrieve_common_crawl_range import retrieve_common_crawl_range
 from archive_magic_fetch.runtime.track_http_requests import InstrumentedHTTPAdapter
 
 
@@ -39,14 +39,21 @@ def _open_client(stats):
 
 
 def _fetch(client, capture):
-    return decode_warc_capture(retrieve_warc_range(client, capture), capture)
+    return decode_common_crawl_capture(retrieve_common_crawl_range(client, capture), capture)
 
 
 def _preflight(capture):
-    if capture.locator is None or not capture.locator.filename.endswith(".warc.gz"):
+    if capture.locator is None:
         return UnresolvedFailure(
             capture.identity, FailureCategory.UNAVAILABLE,
-            "Common Crawl acquisition requires a WARC locator; legacy ARC is unsupported",
+            "Common Crawl acquisition requires an archive record locator",
+            display_reason="missing archive locator",
+        )
+    if not capture.locator.filename.endswith((".warc.gz", ".arc.gz")):
+        return UnresolvedFailure(
+            capture.identity, FailureCategory.UNAVAILABLE,
+            "Common Crawl acquisition supports only .warc.gz and .arc.gz records",
+            display_reason="unsupported archive format",
         )
     return None
 

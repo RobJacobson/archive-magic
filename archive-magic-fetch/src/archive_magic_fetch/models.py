@@ -72,6 +72,7 @@ class CaptureResult:
     source_uri: str
     warc_payload_digest: str
     digest_matched: bool = True
+    source_repairs: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -122,6 +123,7 @@ class RunMetrics:
     downloads: int = 0
     revisits: int = 0
     digest_mismatch_accepted: int = 0
+    source_recovered: int = 0
     selected: int = 0
     represented: int = 0
     unresolved: int = 0

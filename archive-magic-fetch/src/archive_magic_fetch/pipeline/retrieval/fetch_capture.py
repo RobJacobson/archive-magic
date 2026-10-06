@@ -72,6 +72,7 @@ def fetch_capture(
                     capture.identity,
                     advice.category,
                     str(error) or type(error).__name__,
+                    display_reason=advice.display_reason,
                 ),
                 attempt,
                 clock() - started,

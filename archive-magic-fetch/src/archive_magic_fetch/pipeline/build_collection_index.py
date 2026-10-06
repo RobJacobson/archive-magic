@@ -10,6 +10,7 @@ from typing import Iterator, Mapping, Sequence
 from cdxj_indexer.main import CDXJIndexer
 
 from archive_magic_fetch.archive.format import (
+    get_warc_original_url,
     CDX_DIGEST_MATCH_HEADER,
     CDX_PAYLOAD_DIGEST_HEADER,
     CDX_STATUS_HEADER,
@@ -179,6 +180,8 @@ class _ArchiveMagicCDXJIndexer(CDXJIndexer):
         return self.reader
 
     def get_field(self, record, name, it, filename):
+        if name == "warc-target-uri":
+            return get_warc_original_url(record)
         if name == _CDX_DIGEST_FIELD:
             if record.rec_type not in {"response", "revisit"}:
                 return None

@@ -18,6 +18,9 @@ CDX_STATUS_HEADER = "CDX-Status"
 CDX_URLKEY_HEADER = "CDX-Urlkey"
 
 
+CDX_ORIGINAL_URL_HEADER = "CDX-Original-URL"
+
+
 CDX_DIGEST_MATCH_HEADER = "CDX-Digest-Match"
 
 
@@ -28,6 +31,18 @@ MISSING_CDX_STATUS = "-"
 
 
 EMPTY_PAYLOAD_DIGEST = "sha1:3I42H3S6NNFQ2MSVX7XZKYAYSCX5QBYJ"
+
+
+def get_warc_original_url(record) -> str | None:
+    """Retain indexed URL spaces while requiring an equivalent WARC target URI."""
+    target = record.rec_headers.get_header("WARC-Target-URI")
+    original = record.rec_headers.get_header(CDX_ORIGINAL_URL_HEADER)
+    if original is None:
+        return target
+    if (not original or any(ord(char) < 32 or ord(char) == 127 for char in original)
+            or original.replace(" ", "%20") != target):
+        raise ValueError(f"WARC record has inconsistent {CDX_ORIGINAL_URL_HEADER}")
+    return original
 
 
 def cdxj_filenames(path: Path) -> set[str]:

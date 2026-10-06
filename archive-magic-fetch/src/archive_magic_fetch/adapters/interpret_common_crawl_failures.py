@@ -14,10 +14,18 @@ from archive_magic_fetch.runtime.calculate_retry_delay import (
 
 def failure_advice(error: BaseException, attempt: int) -> FailureAdvice:
     delay = max(min(5 * 2 ** (attempt - 1), 60), retry_after_from_error(error) or 0)
+    if isinstance(error, MalformedArcRecord):
+        reason = ("ARC recovery could not verify payload"
+                  if str(error).startswith("ARC recovery could not verify payload") else "malformed ARC")
+        return FailureAdvice(FailureCategory.UNAVAILABLE, False, display_reason=reason)
+    if isinstance(error, MalformedWarcRecord):
+        return FailureAdvice(FailureCategory.UNAVAILABLE, False, display_reason="malformed WARC")
+    if isinstance(error, RecordLimitExceeded):
+        return FailureAdvice(FailureCategory.UNAVAILABLE, False, display_reason="archive record exceeds size limit")
     if isinstance(error, UnsupportedRecord):
-        return FailureAdvice(FailureCategory.UNAVAILABLE, False)
+        return FailureAdvice(FailureCategory.UNAVAILABLE, False, display_reason=str(error))
     if isinstance(error, SourceTruncated):
-        return FailureAdvice(FailureCategory.TRUNCATED, False)
+        return FailureAdvice(FailureCategory.TRUNCATED, False, display_reason=str(error))
     if isinstance(error, IdentityMismatch):
         return FailureAdvice(FailureCategory.EXACT_MISMATCH, False)
     response = getattr(error, "response", None)
@@ -50,6 +58,18 @@ class CorruptRecord(ValueError):
 
 class UnsupportedRecord(ValueError):
     """A source format requires capabilities deliberately outside this adapter."""
+
+
+class MalformedArcRecord(UnsupportedRecord):
+    """An intact gzip member contains ARC content that cannot be safely recovered."""
+
+
+class MalformedWarcRecord(UnsupportedRecord):
+    """An intact gzip member contains an invalid WARC record; redownloading cannot repair it."""
+
+
+class RecordLimitExceeded(UnsupportedRecord):
+    """An archive record exceeds a bounded acquisition or decoding limit."""
 
 
 class SourceTruncated(ValueError):
