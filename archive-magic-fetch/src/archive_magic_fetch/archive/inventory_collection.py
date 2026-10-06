@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from archive_magic_fetch.archive.format import (
+    get_warc_original_url,
     CDX_PAYLOAD_DIGEST_HEADER,
     CDX_STATUS_HEADER,
     CDX_URLKEY_HEADER,
@@ -97,7 +98,7 @@ class CollectionInventory:
 def get_warc_identity(record) -> CaptureIdentity:
     """Rebuild capture identity from Archive Magic WARC headers."""
 
-    target_uri = record.rec_headers.get_header("WARC-Target-URI")
+    target_uri = get_warc_original_url(record)
     warc_date = record.rec_headers.get_header("WARC-Date")
     cdx_digest = record.rec_headers.get_header(CDX_PAYLOAD_DIGEST_HEADER)
     cdx_status = record.rec_headers.get_header(CDX_STATUS_HEADER)

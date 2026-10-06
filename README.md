@@ -162,8 +162,23 @@ persisted; future years are skipped. Date restrictions filter playback, not disc
 Common Crawl caches complete per-crawl calendar-year queries under
 `discovery/common-crawl/v1/<query-hash>/<crawl-id>/YYYY.json`. Each run refreshes
 the crawl catalog; unchanged complete caches are reused, including current-year
-crawl results. Query changes select a different namespace. Source revisits,
-legacy ARC, and malformed records requiring historical repair remain unsupported.
+crawl results. Query changes select a different namespace. Complete ARC 1.0 and
+WARC 1.0/1.1 HTTP response records are supported and written as WARC 1.1 output.
+ARC URLs containing spaces and incorrect numeric block lengths can be recovered
+automatically, but only when capture identity and the exact indexed SHA-1 verify
+one unambiguous payload. Gzip damage, malformed HTTP headers, source revisits,
+explicit truncation, and other malformed records remain excluded. Common Crawl
+records are limited to 32 MiB compressed and 64 MiB decompressed. The ARC header
+line, WARC header section, and HTTP header section each have a 64 KiB limit.
+After gzip integrity verifies, malformed WARC records (including source-digest
+failures) and unrecoverable ARC records are skipped without repeated downloads;
+transport and gzip integrity failures retain retries. Both formats reject
+malformed HTTP headers and explicit Common Crawl truncation markers. WARC bytes
+are not automatically repaired. Repair codes appear beside
+downloads and in WARC metadata; `source_recovered` counts newly written recovered
+responses. Existing discovery caches and captures need no reset or migration.
+Skip messages explain the reason; skipped captures alone do not change the
+command's exit status.
 
 Completed caches upload before subsequent WARC work, even if that work fails.
 Only complete caches are published. Invalid caches fail rather than being silently

@@ -234,6 +234,7 @@ def _run_fetch(
         all_failures.extend(result.failures)
         emit(
             f"year {year} done: downloads={result.metrics.downloads} "
+            f"source-recovered={result.metrics.source_recovered} "
             f"payload-reuses={result.metrics.payload_reuses} "
             f"revisits={result.metrics.revisits} "
             f"already-represented={result.metrics.local_reuses} "
@@ -243,6 +244,7 @@ def _run_fetch(
 
     emit(
         f"done: downloads={metrics.downloads} revisits={metrics.revisits} "
+        f"source-recovered={metrics.source_recovered} "
         f"payload-reuses={metrics.payload_reuses} "
         f"already-represented={metrics.local_reuses} "
         f"skips/errors={metrics.unresolved}"
@@ -340,6 +342,7 @@ def _accumulate_metrics(total: RunMetrics, current: RunMetrics) -> None:
         "downloads",
         "revisits",
         "digest_mismatch_accepted",
+        "source_recovered",
         "selected",
         "represented",
         "unresolved",

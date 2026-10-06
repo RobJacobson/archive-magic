@@ -78,6 +78,7 @@ def write_run_record(
             "downloaded": metrics.downloads,
             "revisited": metrics.revisits,
             "digest_mismatch_accepted": metrics.digest_mismatch_accepted,
+            "source_recovered": metrics.source_recovered,
             "unresolved": metrics.unresolved,
         },
         "metrics": {

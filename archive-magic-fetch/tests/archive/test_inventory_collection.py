@@ -7,12 +7,20 @@ import pytest
 
 from archive_magic_fetch.archive.identity import payload_digest
 from archive_magic_fetch.archive.inventory_collection import (
-    inventory_collection, revisit_from_stored, stored_from_capture,
+    get_warc_identity, inventory_collection, revisit_from_stored, stored_from_capture,
 )
 from archive_magic_fetch.archive.layout import ArchiveLayout
 from archive_magic_fetch.pipeline.stage_year import YearStage
-from archive_magic_fetch.pipeline.write_captures import _CollectionWarcWriter
+from archive_magic_fetch.pipeline.write_captures import _CollectionWarcWriter, _build_response_record
 from helpers import make_capt, playback
+
+
+@pytest.mark.parametrize("original", ["http://other.org/a path", "http://example.org/a\tpath", ""])
+def test_original_url_metadata_cannot_override_warc_target(original):
+    record = _build_response_record(playback(make_capt(url="http://example.org/a path")))
+    record.rec_headers.replace_header("CDX-Original-URL", original)
+    with pytest.raises(ValueError, match="inconsistent CDX-Original-URL"):
+        get_warc_identity(record)
 
 
 def test_generated_inventory_preserves_identities_status_scope_and_earliest_response(tmp_path):

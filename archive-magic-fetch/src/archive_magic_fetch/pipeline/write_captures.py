@@ -15,6 +15,7 @@ from warcio.warcwriter import WARCWriter
 
 from archive_magic_fetch.archive.format import (
     CDX_DIGEST_MATCH_HEADER,
+    CDX_ORIGINAL_URL_HEADER,
     CDX_PAYLOAD_DIGEST_HEADER,
     CDX_STATUS_HEADER,
     CDX_URLKEY_HEADER,
@@ -127,6 +128,8 @@ def _commit_capture_outcome(
     metrics.represented += 1
     inventory.identities.add(outcome.capture.identity)
     metrics.downloads += 1
+    if result.source_repairs:
+        metrics.source_recovered += 1
     if not result.digest_matched:
         metrics.digest_mismatch_accepted += 1
     if result.digest_matched:
@@ -158,6 +161,17 @@ def _status_line(status_code: int) -> str:
     return f"{status_code} {reason}".rstrip()
 
 
+def _identity_headers(identity: CaptureIdentity) -> dict[str, str]:
+    headers = {
+        CDX_PAYLOAD_DIGEST_HEADER: identity.payload_digest,
+        CDX_STATUS_HEADER: identity.status_token,
+        CDX_URLKEY_HEADER: identity.urlkey,
+    }
+    if " " in identity.original_url:
+        headers[CDX_ORIGINAL_URL_HEADER] = identity.original_url
+    return headers
+
+
 def _build_response_record(result: CaptureResult):
     """Create a WARC 1.1 response record for a playback result."""
 
@@ -167,17 +181,17 @@ def _build_response_record(result: CaptureResult):
         protocol="HTTP/1.1",
     )
     warc_headers = {
-        CDX_PAYLOAD_DIGEST_HEADER: result.identity.payload_digest,
-        CDX_STATUS_HEADER: result.identity.status_token,
-        CDX_URLKEY_HEADER: result.identity.urlkey,
+        **_identity_headers(result.identity),
         "WARC-Date": result.warc_date,
         "WARC-Source-URI": result.source_uri,
         "WARC-Payload-Digest": result.warc_payload_digest,
     }
     if not result.digest_matched:
         warc_headers[CDX_DIGEST_MATCH_HEADER] = "false"
+    if result.source_repairs:
+        warc_headers["Archive-Magic-Source-Repairs"] = ",".join(result.source_repairs)
     return RecordBuilder(warc_version=RecordBuilder.WARC_1_1).create_warc_record(
-        result.identity.original_url,
+        result.identity.original_url.replace(" ", "%20"),
         "response",
         payload=BytesIO(result.body),
         length=len(result.body),
@@ -190,7 +204,7 @@ def _build_revisit_record(result: RevisitResult):
     """Create a WARC 1.1 revisit record."""
 
     return RecordBuilder(warc_version=RecordBuilder.WARC_1_1).create_warc_record(
-        result.identity.original_url,
+        result.identity.original_url.replace(" ", "%20"),
         "revisit",
         http_headers=StatusAndHeaders(
             _status_line(result.http_status_code),
@@ -198,15 +212,13 @@ def _build_revisit_record(result: RevisitResult):
             protocol="HTTP/1.1",
         ),
         warc_headers_dict={
-            CDX_PAYLOAD_DIGEST_HEADER: result.identity.payload_digest,
-            CDX_STATUS_HEADER: result.identity.status_token,
-            CDX_URLKEY_HEADER: result.identity.urlkey,
+            **_identity_headers(result.identity),
             "WARC-Date": result.warc_date,
             "WARC-Payload-Digest": result.warc_payload_digest,
             "WARC-Profile": (
                 "http://netpreserve.org/warc/1.1/revisit/identical-payload-digest"
             ),
-            "WARC-Refers-To-Target-URI": result.refers_to_target_uri,
+            "WARC-Refers-To-Target-URI": result.refers_to_target_uri.replace(" ", "%20"),
             "WARC-Refers-To-Date": result.refers_to_date,
         },
     )

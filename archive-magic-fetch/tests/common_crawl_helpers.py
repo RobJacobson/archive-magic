@@ -70,27 +70,32 @@ class Client:
 
 
 def record(*, timestamp="20170615000000", body=b"hello", status="200", headers=(),
-           warc_headers=(), kind="response", length_delta=0):
+           warc_headers=(), kind="response", length_delta=0, format="warc"):
+    assert format in {"warc", "arc"}
     http = (f"HTTP/1.1 {status} Fixture\r\n" + "".join(f"{k}: {v}\r\n" for k, v in headers) + "\r\n").encode()
     block = http + body
-    fields = [
-        ("WARC-Type", kind), ("WARC-Record-ID", "<urn:uuid:00000000-0000-0000-0000-000000000001>"),
-        ("WARC-Target-URI", "https://example.org/"),
-        ("WARC-Date", cdx_timestamp_to_warc_date(timestamp)),
-        ("Content-Type", "application/http; msgtype=response"),
-        ("WARC-Payload-Digest", payload_digest(body)),
-        ("WARC-Block-Digest", payload_digest(block)),
-        ("Content-Length", str(len(block) + length_delta)),
-    ]
-    for name, value in warc_headers:
-        fields = [(k, v) for k, v in fields if k.lower() != name.lower()]
-        if value is not None:
-            fields.append((name, value))
-    raw = ("WARC/1.0\r\n" + "".join(f"{k}: {v}\r\n" for k, v in fields) + "\r\n").encode() + block + b"\r\n\r\n"
+    if format == "arc":
+        raw = (f"https://example.org/ 1.2.3.4 {timestamp} text/html {len(block) + length_delta}\n".encode()
+               + block + b"\n")
+    else:
+        fields = [
+            ("WARC-Type", kind), ("WARC-Record-ID", "<urn:uuid:00000000-0000-0000-0000-000000000001>"),
+            ("WARC-Target-URI", "https://example.org/"),
+            ("WARC-Date", cdx_timestamp_to_warc_date(timestamp)),
+            ("Content-Type", "application/http; msgtype=response"),
+            ("WARC-Payload-Digest", payload_digest(body)),
+            ("WARC-Block-Digest", payload_digest(block)),
+            ("Content-Length", str(len(block) + length_delta)),
+        ]
+        for name, value in warc_headers:
+            fields = [(k, v) for k, v in fields if k.lower() != name.lower()]
+            if value is not None:
+                fields.append((name, value))
+        raw = ("WARC/1.0\r\n" + "".join(f"{k}: {v}\r\n" for k, v in fields) + "\r\n").encode() + block + b"\r\n\r\n"
     data = gzip.compress(raw)
     capture = CaptureRef(
         make_identity(original_url="https://example.org/", timestamp=timestamp, status_token=status, payload_digest=payload_digest(body)),
-        "text/html", CommonCrawlLocator("CC-MAIN-2017-26", f"crawl-data/CC-MAIN-2017-26/{timestamp}.warc.gz", 100, len(data)),
+        "text/html", CommonCrawlLocator("CC-MAIN-2017-26", f"crawl-data/CC-MAIN-2017-26/{timestamp}.{format}.gz", 100, len(data)),
     )
     return capture, data
 

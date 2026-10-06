@@ -161,6 +161,8 @@ def _capture_line(outcome: CaptureOutcome) -> tuple[str, str]:
     assert outcome.kind is CaptureKind.DOWNLOADED
     assert outcome.playback is not None
     extra = playback_timing(outcome)
+    if outcome.playback.source_repairs:
+        extra += ", recovered: " + ", ".join(outcome.playback.source_repairs)
     if not outcome.playback.digest_matched:
         extra += ", digest mismatch kept"
     style = "warning" if not outcome.playback.digest_matched else "success"
