@@ -5,7 +5,7 @@ from __future__ import annotations
 import shutil
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from functools import partial
 from pathlib import Path
 
@@ -235,7 +235,6 @@ def _run_fetch(
         emit(
             f"year {year} done: downloads={result.metrics.downloads} "
             f"source-recovered={result.metrics.source_recovered} "
-            f"payload-reuses={result.metrics.payload_reuses} "
             f"revisits={result.metrics.revisits} "
             f"already-represented={result.metrics.local_reuses} "
             f"skips/errors={result.metrics.unresolved}"
@@ -245,7 +244,6 @@ def _run_fetch(
     emit(
         f"done: downloads={metrics.downloads} revisits={metrics.revisits} "
         f"source-recovered={metrics.source_recovered} "
-        f"payload-reuses={metrics.payload_reuses} "
         f"already-represented={metrics.local_reuses} "
         f"skips/errors={metrics.unresolved}"
     )
@@ -331,26 +329,28 @@ def _run_year(
 
 
 def _accumulate_metrics(total: RunMetrics, current: RunMetrics) -> None:
-    """Add one collection's metrics to the invocation totals."""
+    """Add one collection's metrics to the invocation totals.
 
-    for name in (
-        "cdx_duration_s",
-        "playback_attempts",
-        "playback_bytes",
-        "local_reuses",
-        "payload_reuses",
-        "downloads",
-        "revisits",
-        "digest_mismatch_accepted",
-        "source_recovered",
-        "selected",
-        "represented",
-        "unresolved",
-        "warc_write_s",
-        "index_s",
-    ):
-        setattr(total, name, getattr(total, name) + getattr(current, name))
-    for category, count in current.attempts_by_category.items():
-        total.attempts_by_category[category] = (
-            total.attempts_by_category.get(category, 0) + count
-        )
+    Every numeric field is a sum. A gauge or maximum needs its own case;
+    any other field type fails here instead of disappearing from the total.
+    """
+
+    if type(total) is not type(current):
+        raise TypeError("metric records do not match")
+    for field in fields(total):
+        incoming = getattr(current, field.name)
+        if field.name == "attempts_by_category":
+            if not isinstance(incoming, dict):
+                raise TypeError("run metric attempts_by_category is not a mapping")
+            for category, count in incoming.items():
+                if isinstance(count, bool) or not isinstance(count, int):
+                    raise TypeError(
+                        f"run metric attempts_by_category[{category!r}] is not an additive count"
+                    )
+                total.attempts_by_category[category] = (
+                    total.attempts_by_category.get(category, 0) + count
+                )
+            continue
+        if isinstance(incoming, bool) or not isinstance(incoming, (int, float)):
+            raise TypeError(f"run metric {field.name} is not an additive number")
+        setattr(total, field.name, getattr(total, field.name) + incoming)

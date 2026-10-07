@@ -74,7 +74,6 @@ def write_run_record(
             "selected": metrics.selected,
             "represented": metrics.represented,
             "locally_reused": metrics.local_reuses,
-            "payload_reused": metrics.payload_reuses,
             "downloaded": metrics.downloads,
             "revisited": metrics.revisits,
             "digest_mismatch_accepted": metrics.digest_mismatch_accepted,

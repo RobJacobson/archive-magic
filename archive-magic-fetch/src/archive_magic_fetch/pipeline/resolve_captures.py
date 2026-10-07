@@ -82,12 +82,7 @@ def _process_url_group(
     resumed runs. No candidate selection or failure cache is needed.
     """
 
-    urlkey = captures[0].identity.urlkey
-    successful_downloads = {
-        key: stored
-        for key, stored in existing_representatives.items()
-        if key[0] == urlkey
-    }
+    successful_downloads = dict(existing_representatives)
     outcomes: list[CaptureOutcome] = []
     attempts = 0
     playback_bytes = 0

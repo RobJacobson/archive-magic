@@ -17,6 +17,7 @@ import boto3
 from botocore.config import Config
 
 from archive_magic_fetch.archive.layout import ArchiveLayout
+from archive_magic_fetch.pipeline.discovery.cache import is_managed_discovery_path
 from archive_magic_fetch.archive.validate_local_archive import validate_local_archive
 from archive_magic_fetch.config.presentation import metadata, asset_path
 from archive_magic_fetch.models import IndexArtifact, PublicationError, WarcArtifact
@@ -51,11 +52,7 @@ class BucketStorage:
         if any(p in {'', '.', '..'} for p in parts) or '\\' in relative:
             return False
         if relative.startswith('discovery/'):
-            return bool(re.fullmatch(
-                r'discovery/(?:wayback/v1/[0-9a-f]{64}/[0-9]{4}\.cdx\.json|'
-                r'common-crawl/v1/[0-9a-f]{64}/[A-Za-z0-9._-]+/[0-9]{4}\.json)',
-                relative,
-            ))
+            return is_managed_discovery_path(relative)
         return bool(re.fullmatch(r'data/' + re.escape(self.archive_id) + r'-\d{4}-(?:\d{3,}\.warc\.gz|index\.cdxj)', relative))
 
     def inventory(self):
