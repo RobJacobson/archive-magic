@@ -522,7 +522,6 @@ def test_empty_http_200_downloads_once_then_revisits(tmp_path):
     assert result.exit_code == 0
     assert set(downloads) == {"20040601000000", "20040603000000"}
     assert result.metrics.downloads == 2
-    assert result.metrics.payload_reuses == 0
     assert result.metrics.revisits == 1
     warc = list_collection_warcs(layout, "2004")[0]
     types = []
@@ -891,7 +890,7 @@ def test_completed_run_reports_expected_failures(tmp_path):
     assert set(record["years"]) == {"2004"}
     record = record["years"]["2004"]
     assert record["collection_id"] == "2004"
-    assert record["counts"]["payload_reused"] == 0
+    assert "payload_reused" not in record["counts"]
     assert set(record["metrics"]) == {
         "cdx_duration_s",
         "playback_attempts",

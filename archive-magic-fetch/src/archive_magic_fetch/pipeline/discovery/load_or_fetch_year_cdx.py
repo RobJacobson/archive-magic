@@ -24,7 +24,6 @@ from archive_magic_fetch.adapters.interpret_wayback_failures import (
 from archive_magic_fetch.adapters.create_wayback_client import ArchiveMagicWaybackSession
 from archive_magic_fetch.archive.dates import validate_date_range, year_ranges
 from archive_magic_fetch.archive.identity import (
-    identity_from_dict,
     identity_to_dict,
     make_identity,
 )
@@ -43,7 +42,7 @@ from archive_magic_fetch.runtime.report_progress import emit
 from archive_magic_fetch.runtime.calculate_retry_delay import iter_error_chain, retry_after_from_error
 from archive_magic_fetch.runtime.track_http_requests import RequestStats
 
-from .cache import wayback_path, wayback_document, validate_wayback, query_for
+from .cache import query_for, validate_wayback, wayback_capture_from_dict, wayback_document, wayback_path
 from .checkpoints import progress_root, clear_progress
 
 DEFAULT_CDX_TIMEOUT_SECONDS = 300.0
@@ -140,7 +139,7 @@ def load_or_fetch_year_cdx(
                 if "captures" in saved:
                     if not isinstance(saved["captures"], list):
                         raise ValueError("invalid checkpoint captures")
-                    captures = tuple(_capture_from_dict(item) for item in saved["captures"])
+                    captures = tuple(wayback_capture_from_dict(item) for item in saved["captures"])
                     if any(not date_start <= item.identity.timestamp <= date_end for item in captures):
                         raise ValueError("checkpoint capture outside window")
                     report(f"using CDX checkpoint: {_format_cdx_window_label(date_start, date_end)}")
@@ -544,26 +543,6 @@ def _capture_to_dict(capture: CaptureRef) -> dict[str, str]:
     payload = identity_to_dict(capture.identity)
     payload["mime"] = capture.mime
     return payload
-
-
-def _capture_from_dict(data: object) -> CaptureRef:
-    fields = (
-        "urlkey",
-        "original_url",
-        "timestamp",
-        "status_token",
-        "payload_digest",
-        "mime",
-    )
-    if not isinstance(data, dict) or any(
-        not isinstance(data.get(key), str) or not data[key] for key in fields
-    ):
-        raise ValueError("capture fields must be non-empty strings")
-    timestamp = data["timestamp"]
-    if len(timestamp) != 14 or not timestamp.isascii() or not timestamp.isdigit():
-        raise ValueError(f"invalid CDX timestamp: {timestamp!r}")
-    datetime.strptime(timestamp, "%Y%m%d%H%M%S")
-    return CaptureRef(identity=identity_from_dict(data), mime=data["mime"])
 
 
 def _listing(captures, url_pattern, search_url, match_type, page_limit):

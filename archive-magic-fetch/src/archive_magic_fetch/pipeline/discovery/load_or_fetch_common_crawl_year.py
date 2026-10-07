@@ -1,18 +1,23 @@
 """Acquire complete calendar-year CC queries, cached independently per crawl."""
 
-import hashlib
 import json
 from dataclasses import asdict
-from datetime import datetime
 from pathlib import Path
 
 from archive_magic_fetch.adapters.query_common_crawl_index import CommonCrawlIndex, catalog_timestamp, validate_collection
-from archive_magic_fetch.archive.identity import make_identity, normalize_payload_digest
 from archive_magic_fetch.archive.normalize_cdx_search import normalize_cdx_search
 from archive_magic_fetch.contracts import DiscoveryRequest
-from archive_magic_fetch.models import CaptureListing, CaptureRef, CommonCrawlLocator
+from archive_magic_fetch.models import CaptureListing, CaptureRef
 from archive_magic_fetch.runtime.manage_archive_files import exclusive_temp_path, publish_file_atomically, write_json_durably
 from archive_magic_fetch.runtime.report_progress import emit
+from .cache import (
+    cached_common_crawl_capture,
+    calendar_year,
+    common_crawl_cache_relative,
+    parse_common_crawl_index_row,
+    query_hash,
+    validate_discovery_query,
+)
 from .checkpoints import progress_root, clear_progress
 
 PAGE_SIZE = 5
@@ -27,7 +32,7 @@ def load_or_fetch_common_crawl_year(
     query = {"url": search_url}
     if match_type is not None:
         query["matchType"] = match_type
-    query_hash = hashlib.sha256(json.dumps(query, sort_keys=True).encode()).hexdigest()
+    digest = query_hash(query)
     captures = []
     coverage = []
     private_root = progress_root(index_directory, checkpoint_directory)
@@ -35,8 +40,8 @@ def load_or_fetch_common_crawl_year(
         if catalog_timestamp(collection["from"]) > end or catalog_timestamp(collection["to"]) < start:
             continue
         coverage.append(collection["id"])
-        path = index_directory / "common-crawl" / "v1" / query_hash / collection["id"] / f"{request.year}.json"
-        progress = private_root / "common-crawl" / "v1" / query_hash / collection["id"] / str(request.year)
+        path = index_directory / common_crawl_cache_relative(query, collection["id"], request.year)
+        progress = private_root / "common-crawl" / "v1" / digest / collection["id"] / str(request.year)
         metadata = {"version": 1, "query": query, "from": start, "to": end, "collection": collection}
         cached = _load_cache(path, metadata)
         if cached is not None:
@@ -85,7 +90,7 @@ def load_or_fetch_common_crawl_year(
             for line in (text or "").splitlines():
                 if not line.strip():
                     continue
-                capture = _parse_row(json.loads(line), collection["id"])
+                capture = parse_common_crawl_index_row(json.loads(line), collection["id"])
                 if start <= capture.identity.timestamp <= end:
                     page_rows.append(capture)
             _save_cache(page_path, {**page_metadata, "captures": [asdict(c) for c in page_rows]})
@@ -98,40 +103,12 @@ def load_or_fetch_common_crawl_year(
     return CaptureListing(tuple(captures), {"source": "common-crawl", **query, "from": start, "to": end, "collections": coverage})
 
 
-def _parse_row(row, crawl_id: str) -> CaptureRef:
-    if not isinstance(row, dict):
-        raise ValueError("invalid Common Crawl index row")
-    for key in ("urlkey", "url", "timestamp", "mime", "filename"):
-        if not isinstance(row.get(key), str) or not row[key]:
-            raise ValueError(f"invalid Common Crawl {key}")
-    timestamp = row["timestamp"]
-    if len(timestamp) != 14 or not timestamp.isascii() or not timestamp.isdigit():
-        raise ValueError("invalid Common Crawl timestamp")
-    datetime.strptime(timestamp, "%Y%m%d%H%M%S")
-    status = row.get("status", "-")
-    digest = row.get("digest", "-")
-    if (not isinstance(status, str) or not isinstance(digest, str)
-            or (status != "-" and (len(status) != 3 or not status.isascii() or not status.isdigit()
-                                  or not 100 <= int(status) <= 599))
-            or (digest != "-" and normalize_payload_digest(digest) is None)):
-        raise ValueError("invalid Common Crawl status/digest")
-    return CaptureRef(
-        make_identity(original_url=row["url"], timestamp=timestamp, status_token=status,
-                      payload_digest=digest, urlkey=row["urlkey"]),
-        row["mime"],
-        CommonCrawlLocator(crawl_id, row["filename"], _integer(row.get("offset")), _integer(row.get("length"))),
-    )
-
-
-def _integer(value) -> int:
-    if type(value) is int:
-        return value
-    if isinstance(value, str) and value.isascii() and value.isdigit():
-        return int(value)
-    raise ValueError("invalid Common Crawl offset/length")
-
-
 def _load_cache(path: Path, metadata: dict) -> tuple[CaptureRef, ...] | None:
+    """Return cached captures, or None when the file is absent or its catalog entry is stale.
+
+    Query shape and calendar bounds are checked on the stored document. A changed
+    collection record with the same id is a freshness miss, not a corrupt file.
+    """
     if not path.exists():
         return None
     try:
@@ -140,21 +117,19 @@ def _load_cache(path: Path, metadata: dict) -> tuple[CaptureRef, ...] | None:
             raise ValueError("invalid cache envelope")
         if any(value[key] != metadata[key] for key in metadata if key != "collection"):
             raise ValueError("cache scope/version mismatch")
+        validate_discovery_query(value["query"])
+        calendar_year(value["from"], value["to"])
         if not isinstance(value["captures"], list):
             raise ValueError("invalid cached captures")
-        captures = []
-        for entry in value["captures"]:
-            identity, locator = entry["identity"], entry["locator"]
-            capture = _parse_row({
-                "urlkey": identity["urlkey"], "url": identity["original_url"],
-                "timestamp": identity["timestamp"], "status": identity["status_token"],
-                "digest": identity["payload_digest"], "mime": entry["mime"],
-                "filename": locator["filename"], "offset": locator["offset"], "length": locator["length"],
-            }, locator["crawl_id"])
-            if (locator["crawl_id"] != metadata["collection"]["id"]
-                    or not metadata["from"] <= capture.identity.timestamp <= metadata["to"]):
-                raise ValueError("cached capture outside scope")
-            captures.append(capture)
+        captures = [
+            cached_common_crawl_capture(
+                entry,
+                crawl_id=metadata["collection"]["id"],
+                start=metadata["from"],
+                end=metadata["to"],
+            )
+            for entry in value["captures"]
+        ]
         if not isinstance(value["collection"], dict) or set(value["collection"]) != set(metadata["collection"]):
             raise ValueError("invalid cached collection metadata")
         validate_collection(value["collection"])

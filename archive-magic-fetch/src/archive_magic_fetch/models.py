@@ -8,6 +8,9 @@ from enum import Enum
 from pathlib import Path
 
 
+COMMON_CRAWL_ID = re.compile(r"CC-MAIN-[0-9-]+")
+
+
 class FailureCategory(str, Enum):
     BLOCKED = "blocked"
     EXACT_MISMATCH = "exact_mismatch"
@@ -42,7 +45,7 @@ class CommonCrawlLocator:
     length: int
 
     def __post_init__(self) -> None:
-        if not isinstance(self.crawl_id, str) or not re.fullmatch(r"CC-MAIN-[0-9-]+", self.crawl_id):
+        if not isinstance(self.crawl_id, str) or not COMMON_CRAWL_ID.fullmatch(self.crawl_id):
             raise ValueError("invalid Common Crawl collection ID")
         if (not isinstance(self.filename, str)
                 or not re.fullmatch(r"[A-Za-z0-9_./-]+", self.filename)
@@ -119,7 +122,6 @@ class RunMetrics:
     playback_attempts: int = 0
     playback_bytes: int = 0
     local_reuses: int = 0
-    payload_reuses: int = 0
     downloads: int = 0
     revisits: int = 0
     digest_mismatch_accepted: int = 0
