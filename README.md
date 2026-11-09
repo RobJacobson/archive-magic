@@ -1,5 +1,7 @@
 # Archive Magic
 
+The [project files](FILES.md) show the code checkout's main directories.
+
 Fetch downloads Wayback or Common Crawl captures into WARC files and replay CDXJ
 indexes. Navigator independently serves published collections from private
 S3-compatible buckets, including Cloudflare R2.
